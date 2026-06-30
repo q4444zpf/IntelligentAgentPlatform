@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.playwright-cli/
+frontend/*.log
