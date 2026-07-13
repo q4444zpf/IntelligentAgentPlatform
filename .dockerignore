@@ -1,0 +1,17 @@
+.git
+.github
+.claude
+.env
+.env.*
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/node_modules
+**/dist
+**/*.log
+backend/data/*.db
+backend/data/*.json
+backend/data/*.migrated
+docs
+tests
+
