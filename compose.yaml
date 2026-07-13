@@ -1,3 +1,5 @@
+name: intelligent-agent-platform
+
 services:
   api:
     build:
