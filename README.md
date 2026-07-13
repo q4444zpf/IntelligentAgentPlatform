@@ -1,0 +1,135 @@
+# 水利智能体平台
+
+面向水利业务的专业智能体平台，规划覆盖水模型管理、模型上传与注册、控制模型、拖拽式流程编排、智能体与技能管理、多智能体协作、多用户权限、专属会话、大模型配置，以及 Web、嵌入式 AI Chatbox 和桌面客户端集成。
+
+## 当前实现
+
+- Web 管理控制台原型，包含工作台、AI 对话、资源库、智能体、Prompt、MCP、Skill / Tool、知识库、流程编排、多智能体协同、大模型配置、系统集成、用户权限、审计日志、沙箱监控和系统设置等页面。
+- FastAPI 后端服务，提供健康检查和大模型供应商配置 API。
+- 大模型供应商、密钥、模型参数和默认模型使用 SQLite 持久化。
+- 支持前后端分别启动，也可通过根目录脚本联合启动。
+
+## 技术栈
+
+### 前端
+
+- Vue 3
+- TypeScript
+- Vite
+- Ant Design Vue
+- Vue Router
+- Pinia
+
+### 后端
+
+- Python 3
+- FastAPI
+- Uvicorn
+- Pydantic
+- HTTPX
+- SQLite
+- Pytest
+
+## 目录结构
+
+```text
+.
+├── frontend/       Web 控制台和嵌入式交互界面
+├── backend/        API、模型供应商配置和数据持久化
+├── start-dev.ps1   Windows 前后端联合启动脚本
+└── docs/           架构、接口和部署文档（规划）
+```
+
+## 环境要求
+
+- Node.js 20 或更高版本
+- npm
+- Python 3.11 或更高版本
+
+## 快速启动
+
+首次运行时分别安装前后端依赖：
+
+```powershell
+cd frontend
+npm install
+
+cd ..\backend
+python -m pip install -r requirements.txt
+```
+
+回到项目根目录，联合启动前后端：
+
+```powershell
+.\start-dev.ps1
+```
+
+启动后可访问：
+
+- Web 控制台：<http://127.0.0.1:5173>
+- 后端 API：<http://127.0.0.1:8000>
+- Swagger API 文档：<http://127.0.0.1:8000/docs>
+
+## 分别启动
+
+启动后端：
+
+```powershell
+cd backend
+python -m uvicorn app.main:app --reload --port 8000
+```
+
+启动前端：
+
+```powershell
+cd frontend
+npm run dev
+```
+
+前端开发服务器会将 `/api` 请求代理到 `http://127.0.0.1:8000`。
+
+## 后端说明
+
+后端入口为 `backend/app/main.py`，当前提供以下接口组：
+
+- `GET /api/health`：服务健康检查。
+- `/api/models`：查询和管理大模型供应商。
+- `/api/models/{provider_id}/config`：配置供应商连接信息。
+- `/api/models/{provider_id}/models`：添加和管理供应商模型。
+- `/api/models/{provider_id}/discover`：发现供应商可用模型。
+- `/api/models/{provider_id}/test`：测试供应商连接。
+- `/api/models/active`：查询或设置当前默认模型。
+
+运行数据默认保存在 `backend/data/model-providers.db`。可通过环境变量 `MODEL_PROVIDER_DATABASE` 指定其他 SQLite 数据库文件：
+
+```powershell
+$env:MODEL_PROVIDER_DATABASE = "D:\data\model-providers.db"
+python -m uvicorn app.main:app --reload --port 8000
+```
+
+内置供应商定义位于 `backend/app/model_providers/registry.py`。如果启动时检测到旧版 `backend/data/model-providers.json` 且数据库为空，后端会自动导入数据，并将原文件重命名为 `model-providers.json.migrated`。
+
+## 构建与测试
+
+前端类型检查和生产构建：
+
+```powershell
+cd frontend
+npm run build
+```
+
+后端测试：
+
+```powershell
+cd backend
+python -m pytest
+```
+
+## 配置与安全
+
+- 不要提交 API Key、模型凭据、数据库密码、LLM 密钥或客户水利项目数据。
+- 敏感信息应通过环境变量或密钥管理服务提供。
+- 示例配置仅使用安全占位值，例如 `LLM_API_KEY=change-me`。
+- 执行水库、闸门、泵站等控制命令时，应保留权限校验、审计记录和人工确认机制。
+
+更详细的模块说明参见 [frontend/README.md](frontend/README.md) 和 [backend/README.md](backend/README.md)。

@@ -9,3 +9,8 @@ frontend/dist/
 frontend/.vite/
 frontend/.playwright-cli/
 frontend/*.log
+
+# Backend runtime data may contain model credentials.
+backend/data/
+**/__pycache__/
+**/*.pyc
