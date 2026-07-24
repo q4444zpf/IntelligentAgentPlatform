@@ -1,5 +1,19 @@
 <template>
   <div class="page-grid">
+    <a-alert v-if="errorMessage" type="warning" show-icon :message="errorMessage" closable @close="errorMessage = ''" />
+
+    <div class="dashboard-heading">
+      <div>
+        <a-typography-title :level="3">平台运行总览</a-typography-title>
+        <a-typography-text type="secondary">集中查看资源、模型和安全执行状态</a-typography-text>
+      </div>
+      <a-space>
+        <a-badge :status="overview ? 'success' : 'processing'" :text="overview ? `API 正常 · v${overview.version}` : '正在检查 API'" />
+        <a-button :loading="loading" @click="loadOverview">刷新状态</a-button>
+      </a-space>
+    </div>
+
+    <a-spin :spinning="loading && !overview">
     <div class="metric-grid">
       <a-card v-for="item in metrics" :key="item.label" class="metric-card">
         <div class="metric-label">{{ item.label }}</div>
@@ -7,6 +21,7 @@
         <a-tag :color="item.color">{{ item.hint }}</a-tag>
       </a-card>
     </div>
+    </a-spin>
 
     <a-row :gutter="16">
       <a-col :span="14">
@@ -53,12 +68,21 @@
 </template>
 
 <script setup lang="ts">
-const metrics = [
+import { computed, onMounted, onUnmounted, ref } from 'vue';
+
+import { platformApi, type PlatformOverview } from '@/api/platform';
+
+const overview = ref<PlatformOverview | null>(null);
+const loading = ref(false);
+const errorMessage = ref('');
+let controller: AbortController | undefined;
+
+const metrics = computed(() => [
   { label: '智能体', value: 18, hint: '个人 / 公用 / 系统', color: 'blue' },
-  { label: 'MCP / Skill', value: 33, hint: '沙箱受控调用', color: 'green' },
-  { label: '流程实例', value: 126, hint: '今日运行', color: 'cyan' },
-  { label: '待审核', value: 7, hint: '公用发布', color: 'gold' },
-];
+  { label: '已配置供应商', value: overview.value?.configured_provider_count ?? '-', hint: `共 ${overview.value?.provider_count ?? '-'} 个供应商`, color: 'green' },
+  { label: '可用模型', value: overview.value?.enabled_model_count ?? '-', hint: `共 ${overview.value?.model_count ?? '-'} 个模型`, color: 'cyan' },
+  { label: '流程实例', value: 126, hint: '今日运行', color: 'gold' },
+]);
 
 const steps = [
   { title: '创建个人资源', description: '用户维护自己的智能体、MCP、Skill、知识库和流程。' },
@@ -99,4 +123,22 @@ const auditRows = [
   { event: '提交公用资源发布', source: '个人资源空间', level: '中', color: 'orange', time: '10:12' },
   { event: '大模型调用成功', source: 'LLM Router', level: '低', color: 'green', time: '09:58' },
 ];
+
+async function loadOverview() {
+  controller?.abort();
+  controller = new AbortController();
+  loading.value = true;
+  errorMessage.value = '';
+  try {
+    overview.value = await platformApi.overview(controller.signal);
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') return;
+    errorMessage.value = error instanceof Error ? error.message : '平台状态读取失败';
+  } finally {
+    loading.value = false;
+  }
+}
+
+onMounted(loadOverview);
+onUnmounted(() => controller?.abort());
 </script>

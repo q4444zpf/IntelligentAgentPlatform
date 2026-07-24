@@ -1,6 +1,6 @@
 <template>
   <a-layout class="app-shell">
-    <a-layout-sider v-model:collapsed="collapsed" collapsible :width="248" class="app-sider">
+    <a-layout-sider v-model:collapsed="collapsed" collapsible breakpoint="lg" :collapsed-width="0" :width="248" class="app-sider">
       <div class="brand">
         <div class="brand-mark">智</div>
         <div v-if="!collapsed" class="brand-text">

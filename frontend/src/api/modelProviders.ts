@@ -38,19 +38,7 @@ export interface ApiProvider {
   models: ApiModel[];
 }
 
-const baseUrl = import.meta.env.VITE_API_BASE_URL || '/api';
-
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${baseUrl}${path}`, {
-    ...init,
-    headers: { 'Content-Type': 'application/json', ...init?.headers },
-  });
-  if (!response.ok) {
-    const payload = await response.json().catch(() => ({}));
-    throw new Error(payload.detail || `请求失败（HTTP ${response.status}）`);
-  }
-  return response.json() as Promise<T>;
-}
+import { request } from './client';
 
 export const modelProviderApi = {
   list: () => request<ApiProvider[]>('/models'),

@@ -7,7 +7,6 @@
 
 body {
   margin: 0;
-  min-width: 1180px;
   background: #eef3f8;
 }
 
@@ -82,6 +81,16 @@ body {
 .page-grid {
   display: grid;
   gap: 16px;
+}
+
+.dashboard-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+}
+
+.dashboard-heading .ant-typography {
+  margin: 0;
 }
 
 .metric-grid {
@@ -183,10 +192,67 @@ body {
   border-right: 1px solid #e7edf5;
 }
 
+.chat-list-heading,
+.chat-room-header,
+.composer-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.chat-list-heading .ant-typography,
+.chat-room-header .ant-typography {
+  margin: 0;
+}
+
+.agent-option {
+  padding: 10px 8px !important;
+  cursor: pointer;
+  border-radius: 6px;
+}
+
+.agent-option:hover,
+.agent-option.active {
+  background: #e8f2fc;
+}
+
+.side-section-title {
+  margin-bottom: 8px;
+  color: #667085;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.chat-safety-alert {
+  margin-top: 18px;
+}
+
 .chat-room {
   display: flex;
   flex-direction: column;
   padding: 18px;
+}
+
+.message-list {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 420px;
+  max-height: 560px;
+  padding: 18px 4px;
+  overflow-y: auto;
+}
+
+.message-label {
+  margin-bottom: 4px;
+  color: #356d9f;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.prompt-chips {
+  margin-bottom: 10px;
 }
 
 .message {
@@ -208,6 +274,82 @@ body {
   border: 1px solid #e1eaf4;
 }
 
+.composer-footer {
+  margin-top: 10px;
+}
+
 .ant-card-head-title {
   font-weight: 700;
+}
+
+@media (max-width: 900px) {
+  .app-header {
+    padding: 0 16px;
+  }
+
+  .page-subtitle {
+    display: none;
+  }
+
+  .app-content {
+    padding: 16px;
+  }
+
+  .dashboard-heading,
+  .toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .chat-panel {
+    grid-template-columns: 1fr;
+  }
+
+  .chat-list {
+    border-right: 0;
+    border-bottom: 1px solid #e7edf5;
+  }
+
+  .message-list {
+    min-height: 320px;
+  }
+}
+
+@media (max-width: 600px) {
+  .app-header .ant-tag,
+  .app-header .ant-badge {
+    display: none;
+  }
+
+  .app-header .ant-space {
+    margin-left: 10px;
+  }
+
+  .app-header {
+    height: auto;
+    min-height: 64px;
+  }
+
+  .metric-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .app-content {
+    padding: 12px;
+  }
+
+  .chat-room,
+  .chat-list {
+    padding: 12px;
+  }
+
+  .chat-room-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
 }

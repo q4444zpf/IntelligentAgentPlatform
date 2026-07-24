@@ -5,7 +5,7 @@
 ## 当前实现
 
 - Web 管理控制台原型，包含工作台、AI 对话、资源库、智能体、Prompt、MCP、Skill / Tool、知识库、流程编排、多智能体协同、大模型配置、系统集成、用户权限、审计日志、沙箱监控和系统设置等页面。
-- FastAPI 后端服务，提供健康检查和大模型供应商配置 API。
+- FastAPI 后端服务，提供健康检查、平台运行总览和大模型供应商配置 API。
 - 大模型供应商、密钥、模型参数和默认模型使用 SQLite 持久化。
 - 支持前后端分别启动，也可通过根目录脚本联合启动。
 
@@ -93,6 +93,7 @@ npm run dev
 后端入口为 `backend/app/main.py`，当前提供以下接口组：
 
 - `GET /api/health`：服务健康检查。
+- `GET /api/platform/overview`：平台运行总览，包括供应商、模型和当前默认模型状态。
 - `/api/models`：查询和管理大模型供应商。
 - `/api/models/{provider_id}/config`：配置供应商连接信息。
 - `/api/models/{provider_id}/models`：添加和管理供应商模型。
