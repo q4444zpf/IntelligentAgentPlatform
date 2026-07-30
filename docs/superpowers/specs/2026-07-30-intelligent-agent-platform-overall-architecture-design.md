@@ -219,7 +219,71 @@ Deep Agents 用于实例化平台配置的智能体，原生映射系统提示�
 
 一期禁止执行真实设备控制。后续引入控制能力时，必须另行设计双人复核、人工确认、指令签名、回滚策略和控制网隔离，不复用普通 MCP 自动执行策略。
 
-## 10. 错误处理与恢复
+## 10. Deep Agents 文件与 Shell 沙箱
+
+Deep Agents 保留文件和 Shell 能力，但不得直接访问 API、Agent Worker 或宿主机的真实文件系统和命令解释器。文件操作通过虚拟 Workspace Backend，Shell、Skill 脚本、stdio MCP 和用户代码通过独立 Sandbox Executor 执行。
+
+### 10.1 虚拟工作空间
+
+Deep Agent 只看到以下虚拟目录：
+
+| 虚拟目录 | 数据来源 | 默认权限 |
+| --- | --- | --- |
+| `/inputs` | MinIO 中当前 Run 的用户附件 | 只读 |
+| `/skills` | 当前 Agent 版本绑定的 Skill | 只读 |
+| `/knowledge` | KnowledgeService 返回的检索材料 | 只读 |
+| `/workspace` | 当前 Run 独立的临时工作区 | 读写 |
+| `/memories` | 经授权的长期记忆 Store | 受控读写 |
+| `/outputs` | 当前 Run 的 MinIO 成果前缀 | 只允许创建当前 Run 成果 |
+
+默认使用 Deep Agents `StateBackend` 保存临时工作文件，并通过自定义 Backend 将输入、Skill、记忆和成果映射到 PostgreSQL、MinIO 或平台服务。只有在独立沙箱容器内部才允许使用 `FilesystemBackend`，且根目录必须固定为当前 Run 工作目录并启用虚拟路径限制。
+
+禁止将宿主机根目录、应用源码目录、数据库目录、容器运行时 Socket 或任意用户提供的绝对路径配置为 Agent Backend。Agent 不能看到 MinIO 对象密钥之外的服务器路径。
+
+### 10.2 Shell 执行通道
+
+Deep Agent 使用结构化 `execute_command` Tool 提交命令、参数、固定虚拟工作目录和超时，不在 Worker 内调用本地 `subprocess`。调用链为：
+
+```text
+Deep Agent 或 LangGraph 节点
+→ Agent/用户/项目权限校验
+→ 风险策略与人工确认
+→ Sandbox Executor
+→ 独立受限容器
+→ stdout、stderr、退出码和成果清单
+```
+
+命令请求必须使用可审计的程序名和参数数组，禁止通过 `shell=True` 拼接任意命令字符串。Sandbox Executor 校验命令白名单、环境变量白名单、工作目录和输入文件归属，执行结果限制大小并关联 Run、RunStep 和 `trace_id`。
+
+### 10.3 容器隔离要求
+
+沙箱容器必须满足：
+
+- 使用非 root 用户和只读根文件系统；
+- 仅挂载当前 Run 的临时目录，不挂载平台源码、业务数据库或宿主机目录；
+- 不使用特权模式、宿主机 PID/IPC/网络命名空间或 Docker Socket；
+- 默认关闭网络，需要联网的工具按目标域名、地址、端口和协议配置白名单；
+- 限制 CPU、内存、磁盘、进程数、打开文件数、单文件大小和输出大小；
+- 设置启动、执行和空闲超时，支持取消和强制终止；
+- 清除宿主机环境变量，只注入当前任务所需的短期凭据；
+- 任务结束后销毁容器和临时工作区，持久成果通过受控接口写入 MinIO；
+- 记录镜像摘要、命令、脱敏参数、网络策略、资源用量、退出状态和阻断原因。
+
+Agent Worker 不得访问 Docker Socket。只有 Sandbox Executor 可以访问专用的 rootless Podman、containerd 或等效受限容器运行时；该运行时不得管理平台主服务容器。
+
+### 10.4 分级执行策略
+
+执行能力分为：
+
+1. 低风险受控调用：LLM、知识库、经审核的远程只读 MCP 和平台 API 在受限 Agent Worker 中执行。
+2. 受信任 Skill：管理员审核的脚本可在长期受限 Sandbox Worker 中执行，仍不得访问宿主机目录和任意网络。
+3. 不可信执行：导入 Skill 脚本、用户代码、文件解析和 stdio MCP 使用每个 Run 独立的一次性容器，并按策略触发人工确认。
+
+智能体版本必须保存文件权限、Shell 模式、网络策略、工作区配额、命令超时、CPU/内存限制、Skill 脚本权限、stdio MCP 权限和人工确认规则。默认策略为虚拟文件只读、`/workspace` 可写、Shell 关闭、网络仅允许平台已授权服务。
+
+Deep Agents 的 Backend 路径限制和 LangGraph 的检查点、超时、人工确认属于应用层控制，不能替代容器级进程、文件系统、网络和资源隔离。只有 Sandbox Executor 成功启用并通过安全测试后，Web 页面才可以显示“沙箱已隔离”。
+
+## 11. 错误处理与恢复
 
 - LLM 限流和暂时性网络错误执行有限次数指数退避；参数、权限和业务校验错误不自动重试。
 - MCP 调用设置连接超时、执行超时、最大结果大小和幂等键。
@@ -228,8 +292,9 @@ Deep Agents 用于实例化平台配置的智能体，原生映射系统提示�
 - SSE 断开不取消 Run。前端使用 Run ID 和事件序号续传；最终状态以 PostgreSQL 为准。
 - Milvus 异常时知识库进入降级状态。无法取得可靠引用时必须向用户明确提示，不生成伪造引用。
 - MinIO、Milvus 和 Redis 均需健康检查；关键依赖不可用时 API 返回结构化错误码和追踪 ID。
+- Sandbox Executor 不可用时，涉及 Shell、脚本、stdio MCP 或不可信文件处理的节点必须失败关闭，不能回退到 Agent Worker 本地执行。
 
-## 11. API 边界
+## 12. API 边界
 
 一期核心运行 API：
 
@@ -249,13 +314,17 @@ Deep Agents 用于实例化平台配置的智能体，原生映射系统提示�
 
 API 统一返回业务错误码、用户可读信息和 `trace_id`。异步任务创建接口返回 `202 Accepted` 和 Run ID。
 
-## 12. 部署拓扑
+Sandbox Executor 仅提供内部服务接口，包括创建任务、读取状态、取消任务和读取成果清单。内部接口使用服务身份认证，不通过 Web 网关暴露，且不接受任意宿主机路径、挂载配置或容器运行参数。
+
+## 13. 部署拓扑
 
 Docker Compose 统一部署：
 
 - `web`：Nginx 与前端静态资源；
 - `api`：FastAPI 平台核心；
 - `worker`：Celery Agent Worker；
+- `sandbox-executor`：沙箱任务校验、容器生命周期和审计；
+- `sandbox-runtime`：专用 rootless 容器运行时，不管理平台主服务；
 - `postgres`：业务数据库；
 - `redis`：任务、事件和缓存；
 - `milvus`：单节点向量数据库；
@@ -264,9 +333,9 @@ Docker Compose 统一部署：
 
 每个服务配置健康检查、持久化卷、资源限制和重启策略。数据库、对象存储和 Milvus 数据目录必须纳入备份。生产环境通过环境变量或 Secret 注入凭据，仓库只保留安全占位配置。
 
-## 13. 测试策略
+## 14. 测试策略
 
-### 13.1 单元测试
+### 14.1 单元测试
 
 - 项目范围与角色权限计算；
 - Agent、团队和工具授权交集；
@@ -274,8 +343,9 @@ Docker Compose 统一部署：
 - MCP 参数校验、脱敏和错误分类；
 - Run 状态转换和失败策略。
 - 流程 DSL 校验、资源版本固化和 LangGraph 编译结果。
+- 虚拟路径规范化、目录权限、命令策略、环境变量过滤和资源配额校验。
 
-### 13.2 集成测试
+### 14.2 集成测试
 
 - PostgreSQL 事务与迁移；
 - Redis 队列、取消、心跳和事件；
@@ -285,8 +355,10 @@ Docker Compose 统一部署：
 - LLM Gateway 的流式响应、限流和重试。
 - Deep Agent 的 Memory、Skill 渐进加载、工具授权和临时子智能体权限继承。
 - LangGraph 检查点、并行汇合、人工中断、恢复和取消。
+- Sandbox Executor 的任务创建、超时、取消、输出限制、网络白名单和成果回收。
+- 验证沙箱无法读取宿主机、平台源码、其他 Run 工作区、Secret 和容器运行时 Socket。
 
-### 13.3 工作流测试
+### 14.3 工作流测试
 
 - 单智能体问答与引用溯源；
 - 主管规划、成员协作和最终汇总；
@@ -294,16 +366,17 @@ Docker Compose 统一部署：
 - Worker 中断后的状态恢复；
 - SSE 断线续传和页面刷新恢复；
 - 用户、Agent 或团队尝试跨项目访问时被拒绝。
+- Sandbox Executor 故障时高风险节点失败关闭，且不会回退到本地执行。
 
-### 13.4 端到端测试
+### 14.4 端到端测试
 
 使用 Playwright 覆盖登录、选择项目、创建会话、切换单/多智能体、拖拽并发布流程、查看协同步骤、取消 Run、打开引用和下载成果。桌面与移动视口均验证页面无重叠、状态清晰且长内容可阅读。
 
-## 14. 演进路线
+## 15. 演进路线
 
 第一阶段完成 PostgreSQL、项目权限、真实会话与 Run 基础设施，并将现有 AI 问答页面接入 SSE。
 
-第二阶段完成 Deep Agent Runtime、LLM Gateway、Skill 渐进加载、MCP 工具真实调用和审计。
+第二阶段完成 Deep Agent Runtime、虚拟 Workspace Backend、Sandbox Executor、LLM Gateway、Skill 渐进加载、MCP 工具真实调用和审计。
 
 第三阶段完成 Milvus 知识库、引用溯源、Deep Agents 临时委派以及固定团队边界下的 LangGraph 协同。
 
