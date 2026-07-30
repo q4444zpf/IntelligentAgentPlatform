@@ -25,14 +25,15 @@
 
 ## 2. 架构决策
 
-采用“模块化 FastAPI 核心 + 独立 Agent Worker”的架构。平台仍作为一套产品统一部署，不在一期拆分大量微服务。
+采用“模块化 FastAPI 核心 + 调度 Worker + 沙箱执行平面”的架构。平台仍作为一套产品统一部署，不在一期拆分大量微服务。
 
 - FastAPI 核心负责同步业务 API、配置管理、权限校验、会话、运行建档和审计。
-- Agent Worker 负责长耗时的 LLM、RAG、多智能体编排和 MCP 工具调用。
+- 调度 Worker 负责版本快照、任务排队、执行包生成和 Sandbox Executor 调用，不承载 LangGraph、Deep Agents 或工具的实际执行。
+- Sandbox Executor 为每个 Run 创建 Workflow Runner，并为高风险步骤创建 Action Sandbox。
 - Deep Agents 作为单个智能体的标准运行框架，承载提示词、`AGENTS.md`、`SKILL.md`、工具、工作空间、上下文管理和临时子智能体委派。
 - LangGraph 作为发布型多智能体团队和可视化工作流的编排运行时，承载显式节点、条件、并行、检查点、暂停和恢复。
-- API 与 Worker 使用同一代码仓库和领域模型，通过任务队列和持久化运行状态协作。
-- 小规模部署时 API 和 Worker 各运行一个实例；任务量增加时优先横向扩展 Worker。
+- API 与调度 Worker 使用同一代码仓库和领域模型，通过任务队列和持久化运行状态协作。
+- 小规模部署时 API、调度 Worker 和 Sandbox Executor 各运行一个实例；任务量增加时优先扩展 Sandbox Executor 容量和 Workflow Runner 并发。
 - 只有当负载、团队所有权或独立发布周期形成明确边界时，才将领域模块拆为独立服务。
 
 该方案按中型规模设计、小型规模部署，目标支持 20 至 100 名用户以及约 5 至 30 个并发智能体任务。
@@ -68,10 +69,10 @@ FastAPI 按领域模块组织，而不是按页面组织：
 
 ### 3.3 Agent 执行平面
 
-独立 Worker 包含：
+独立 Worker 负责运行建档、版本快照、DSL 校验、执行包生成和沙箱调度，不直接执行 LangGraph 图、Deep Agent、Shell 或用户代码。实际执行平面包含：
 
-- Deep Agent Runtime：按平台配置创建智能体，加载 `AGENTS.md`、已绑定 Skill、MCP、知识库工具、运行上下文和人工确认策略；
-- LangGraph Runtime：将已发布团队或工作流版本编译为状态图，负责节点调度、检查点、暂停和恢复；
+- Workflow Runner Sandbox：每个 Run 在独立受限容器中运行 LangGraph 和 Deep Agents，加载不可变执行包，负责节点调度、检查点、暂停和恢复；
+- Deep Agent Runtime：在 Workflow Runner 内按平台快照创建智能体，加载 `AGENTS.md`、已绑定 Skill、MCP、知识库工具、运行上下文和人工确认策略；
 - 协同编排器：主管 Deep Agent 规划、成员分派和结果汇总；
 - LLM Gateway：统一模型调用、流式输出、重试、计量和追踪；
 - RAG Runtime：权限过滤、查询改写、混合检索、重排和引用；
@@ -132,8 +133,8 @@ Skill 是 Deep Agent 按需加载的行为说明和资源包，不默认作为�
 1. 用户在 AI 问答中选择项目、执行主体、知识库和业务资源并发送消息。
 2. API 校验用户、项目、Agent 或团队的访问权限，保存用户消息并创建 Run。
 3. API 将 Run 标识放入 Redis 任务队列，立即向前端返回 Run ID。
-4. Worker 领取任务，从 PostgreSQL 读取版本快照、权限、上下文和运行限制。
-5. 单智能体进入 Deep Agent Runtime；临时协作由 Deep Agent 在白名单内委派；发布型团队或流程载入对应 LangGraph 版本。
+4. Worker 领取任务，从 PostgreSQL 读取版本快照、权限、上下文和运行限制，生成不可变执行包并提交 Sandbox Executor。
+5. Sandbox Executor 为当前 Run 启动独立 Workflow Runner。单智能体在其中进入 Deep Agent Runtime；临时协作由 Deep Agent 在白名单内委派；发布型团队或流程载入对应 LangGraph 版本。
 6. 成员执行 RAG、LLM 或 MCP 步骤。每个步骤建立 RunStep 并持续写入 RunEvent。
 7. MCP Executor 在调用前执行项目权限、Agent 工具权限和 JSON Schema 三重校验。
 8. Redis 发布实时事件，API 通过 SSE 向前端推送规划、成员状态、工具进度、增量回答和成果事件。
@@ -219,9 +220,9 @@ Deep Agents 用于实例化平台配置的智能体，原生映射系统提示�
 
 一期禁止执行真实设备控制。后续引入控制能力时，必须另行设计双人复核、人工确认、指令签名、回滚策略和控制网隔离，不复用普通 MCP 自动执行策略。
 
-## 10. Deep Agents 文件与 Shell 沙箱
+## 10. Deep Agents 与 LangGraph 运行沙箱
 
-Deep Agents 保留文件和 Shell 能力，但不得直接访问 API、Agent Worker 或宿主机的真实文件系统和命令解释器。文件操作通过虚拟 Workspace Backend，Shell、Skill 脚本、stdio MCP 和用户代码通过独立 Sandbox Executor 执行。
+Deep Agents 和 LangGraph 均不得直接运行在 API、平台 Worker 或宿主机环境。每个 Run 的 LangGraph 与 Deep Agents 在独立 Workflow Runner沙箱中执行；文件操作通过虚拟 Workspace Backend；Shell、Skill 脚本、stdio MCP 和用户代码进入隔离级别更高的 Action Sandbox。
 
 ### 10.1 虚拟工作空间
 
@@ -242,14 +243,14 @@ Deep Agent 只看到以下虚拟目录：
 
 ### 10.2 Shell 执行通道
 
-Deep Agent 使用结构化 `execute_command` Tool 提交命令、参数、固定虚拟工作目录和超时，不在 Worker 内调用本地 `subprocess`。调用链为：
+Deep Agent 使用结构化 `execute_command` Tool 提交命令、参数、固定虚拟工作目录和超时，不在平台 Worker 或 Workflow Runner 内调用本地 `subprocess`。调用链为：
 
 ```text
 Deep Agent 或 LangGraph 节点
 → Agent/用户/项目权限校验
 → 风险策略与人工确认
 → Sandbox Executor
-→ 独立受限容器
+→ 独立 Action Sandbox 容器
 → stdout、stderr、退出码和成果清单
 ```
 
@@ -269,19 +270,36 @@ Deep Agent 或 LangGraph 节点
 - 任务结束后销毁容器和临时工作区，持久成果通过受控接口写入 MinIO；
 - 记录镜像摘要、命令、脱敏参数、网络策略、资源用量、退出状态和阻断原因。
 
-Agent Worker 不得访问 Docker Socket。只有 Sandbox Executor 可以访问专用的 rootless Podman、containerd 或等效受限容器运行时；该运行时不得管理平台主服务容器。
+平台 Worker 和 Workflow Runner 均不得访问 Docker Socket。只有 Sandbox Executor 可以访问专用的 rootless Podman、containerd 或等效受限容器运行时；该运行时不得管理平台主服务容器。
 
 ### 10.4 分级执行策略
 
 执行能力分为：
 
-1. 低风险受控调用：LLM、知识库、经审核的远程只读 MCP 和平台 API 在受限 Agent Worker 中执行。
-2. 受信任 Skill：管理员审核的脚本可在长期受限 Sandbox Worker 中执行，仍不得访问宿主机目录和任意网络。
-3. 不可信执行：导入 Skill 脚本、用户代码、文件解析和 stdio MCP 使用每个 Run 独立的一次性容器，并按策略触发人工确认。
+1. 图与智能体运行：LangGraph、Deep Agents、LLM、知识库和经审核的远程只读 MCP 在每个 Run 独立的 Workflow Runner 中执行。
+2. 受信任 Skill：管理员审核的脚本进入受限 Action Sandbox，不在 Workflow Runner 进程中执行。
+3. 不可信执行：导入 Skill 脚本、用户代码、文件解析和 stdio MCP 使用每个步骤独立的一次性 Action Sandbox，并按策略触发人工确认。
 
 智能体版本必须保存文件权限、Shell 模式、网络策略、工作区配额、命令超时、CPU/内存限制、Skill 脚本权限、stdio MCP 权限和人工确认规则。默认策略为虚拟文件只读、`/workspace` 可写、Shell 关闭、网络仅允许平台已授权服务。
 
-Deep Agents 的 Backend 路径限制和 LangGraph 的检查点、超时、人工确认属于应用层控制，不能替代容器级进程、文件系统、网络和资源隔离。只有 Sandbox Executor 成功启用并通过安全测试后，Web 页面才可以显示“沙箱已隔离”。
+Deep Agents 的 Backend 路径限制和 LangGraph 的检查点、超时、人工确认属于应用层控制，不能替代容器级进程、文件系统、网络和资源隔离。只有 Workflow Runner 与 Action Sandbox 均成功启用并通过安全测试后，Web 页面才可以显示“沙箱已隔离”。
+
+### 10.5 LangGraph Workflow Runner 沙箱
+
+每个单智能体、多智能体团队和可视化工作流 Run 均创建独立 Workflow Runner 容器。该容器只运行平台签名版本的 Runner 镜像和由平台 DSL 编译的不可变执行包，不接受用户上传的 Python 节点、模块路径、镜像名称或启动命令。
+
+Workflow Runner 必须满足：
+
+- 非 root、只读根文件系统、独立进程和网络命名空间；
+- 不挂载平台源码、宿主机目录、数据库数据目录或容器运行时 Socket；
+- 只通过服务身份访问 PostgreSQL Checkpoint API、Redis 事件通道、LLM Gateway、KnowledgeService、MCP Gateway 和 MinIO 成果接口；
+- 按 Run 注入短期凭据，凭据权限限定到当前单位、项目、用户、Run 和资源版本；
+- 设置 Run 级 CPU、内存、网络、持续时间和最大并发节点限制；
+- 暂停等待人工确认时持久化 LangGraph Checkpoint并停止容器，恢复时创建新容器从检查点继续；
+- Run 完成、失败或取消后销毁容器，保留 PostgreSQL 中的状态、审计以及 MinIO 中的成果；
+- LangGraph 自定义节点只能从平台预注册节点库选择，用户代码必须转换为 Action Sandbox节点执行。
+
+Workflow Runner 是编排与推理沙箱，Action Sandbox 是命令与不可信代码沙箱。二者使用不同镜像、权限和网络策略，禁止 Workflow Runner 通过任何方式自行创建容器。
 
 ## 11. 错误处理与恢复
 
@@ -292,7 +310,7 @@ Deep Agents 的 Backend 路径限制和 LangGraph 的检查点、超时、人工
 - SSE 断开不取消 Run。前端使用 Run ID 和事件序号续传；最终状态以 PostgreSQL 为准。
 - Milvus 异常时知识库进入降级状态。无法取得可靠引用时必须向用户明确提示，不生成伪造引用。
 - MinIO、Milvus 和 Redis 均需健康检查；关键依赖不可用时 API 返回结构化错误码和追踪 ID。
-- Sandbox Executor 不可用时，涉及 Shell、脚本、stdio MCP 或不可信文件处理的节点必须失败关闭，不能回退到 Agent Worker 本地执行。
+- Sandbox Executor 不可用时，所有 Deep Agents 和 LangGraph Run 均停止创建或恢复；任何节点都不能回退到平台 Worker 本地执行。
 
 ## 12. API 边界
 
@@ -322,9 +340,11 @@ Docker Compose 统一部署：
 
 - `web`：Nginx 与前端静态资源；
 - `api`：FastAPI 平台核心；
-- `worker`：Celery Agent Worker；
+- `worker`：Celery调度 Worker，只生成执行包并提交沙箱任务；
 - `sandbox-executor`：沙箱任务校验、容器生命周期和审计；
 - `sandbox-runtime`：专用 rootless 容器运行时，不管理平台主服务；
+- `workflow-runner`：由 Sandbox Executor 按 Run 动态创建的 LangGraph 与 Deep Agents 沙箱镜像；
+- `action-sandbox`：由 Sandbox Executor 按高风险步骤动态创建的命令与代码执行沙箱镜像；
 - `postgres`：业务数据库；
 - `redis`：任务、事件和缓存；
 - `milvus`：单节点向量数据库；
@@ -357,6 +377,8 @@ Docker Compose 统一部署：
 - LangGraph 检查点、并行汇合、人工中断、恢复和取消。
 - Sandbox Executor 的任务创建、超时、取消、输出限制、网络白名单和成果回收。
 - 验证沙箱无法读取宿主机、平台源码、其他 Run 工作区、Secret 和容器运行时 Socket。
+- 验证每个 LangGraph Run 使用独立 Workflow Runner，且暂停后销毁、恢复时从 PostgreSQL Checkpoint继续。
+- 验证 Workflow Runner 不能加载用户 Python节点、执行本地Shell或创建 Action Sandbox容器。
 
 ### 14.3 工作流测试
 
@@ -366,7 +388,7 @@ Docker Compose 统一部署：
 - Worker 中断后的状态恢复；
 - SSE 断线续传和页面刷新恢复；
 - 用户、Agent 或团队尝试跨项目访问时被拒绝。
-- Sandbox Executor 故障时高风险节点失败关闭，且不会回退到本地执行。
+- Sandbox Executor 故障时所有 Deep Agents 和 LangGraph Run 失败关闭，且不会回退到本地执行。
 
 ### 14.4 端到端测试
 
@@ -376,7 +398,7 @@ Docker Compose 统一部署：
 
 第一阶段完成 PostgreSQL、项目权限、真实会话与 Run 基础设施，并将现有 AI 问答页面接入 SSE。
 
-第二阶段完成 Deep Agent Runtime、虚拟 Workspace Backend、Sandbox Executor、LLM Gateway、Skill 渐进加载、MCP 工具真实调用和审计。
+第二阶段完成 Deep Agent Runtime、LangGraph Workflow Runner、虚拟 Workspace Backend、Action Sandbox、Sandbox Executor、LLM Gateway、Skill 渐进加载、MCP 工具真实调用和审计。
 
 第三阶段完成 Milvus 知识库、引用溯源、Deep Agents 临时委派以及固定团队边界下的 LangGraph 协同。
 
