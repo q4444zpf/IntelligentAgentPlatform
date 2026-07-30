@@ -29,6 +29,8 @@
 
 - FastAPI 核心负责同步业务 API、配置管理、权限校验、会话、运行建档和审计。
 - Agent Worker 负责长耗时的 LLM、RAG、多智能体编排和 MCP 工具调用。
+- Deep Agents 作为单个智能体的标准运行框架，承载提示词、`AGENTS.md`、`SKILL.md`、工具、工作空间、上下文管理和临时子智能体委派。
+- LangGraph 作为发布型多智能体团队和可视化工作流的编排运行时，承载显式节点、条件、并行、检查点、暂停和恢复。
 - API 与 Worker 使用同一代码仓库和领域模型，通过任务队列和持久化运行状态协作。
 - 小规模部署时 API 和 Worker 各运行一个实例；任务量增加时优先横向扩展 Worker。
 - 只有当负载、团队所有权或独立发布周期形成明确边界时，才将领域模块拆为独立服务。
@@ -68,8 +70,9 @@ FastAPI 按领域模块组织，而不是按页面组织：
 
 独立 Worker 包含：
 
-- 协同编排器：主管智能体规划、成员分派和结果汇总；
-- Agent Runtime：上下文组装、状态、检查点和运行限制；
+- Deep Agent Runtime：按平台配置创建智能体，加载 `AGENTS.md`、已绑定 Skill、MCP、知识库工具、运行上下文和人工确认策略；
+- LangGraph Runtime：将已发布团队或工作流版本编译为状态图，负责节点调度、检查点、暂停和恢复；
+- 协同编排器：主管 Deep Agent 规划、成员分派和结果汇总；
 - LLM Gateway：统一模型调用、流式输出、重试、计量和追踪；
 - RAG Runtime：权限过滤、查询改写、混合检索、重排和引用；
 - MCP Executor：工具授权、Schema 校验、调用、超时和结果归档；
@@ -85,6 +88,12 @@ FastAPI 按领域模块组织，而不是按页面组织：
 
 一期采用“固定团队边界 + 主管智能体动态规划”。
 
+平台同时支持三种运行模式：
+
+1. 单智能体：直接运行一个 Deep Agent，由其按需加载 Skill、调用知识库和 MCP 工具。
+2. 临时协作：主管 Deep Agent 使用 `subagents` 在授权白名单内临时委派子任务，适合开放式研判和报告生成。
+3. 发布型协同：平台使用 LangGraph 编排多个已发布 Deep Agent，适合需要固定节点、并行会商、确定性校核、人工确认和失败恢复的生产流程。
+
 团队配置固定以下内容：
 
 - 主管智能体及其版本；
@@ -97,13 +106,34 @@ FastAPI 按领域模块组织，而不是按页面组织：
 
 团队、Agent、Prompt、工具授权和模型参数均需版本化。Run 创建时保存执行快照，运行期间的配置修改不影响当前 Run。
 
-## 5. 运行数据流
+Deep Agents 内部临时委派不能替代平台团队：临时子智能体不得成为未登记的长期业务资产，且其工具、知识库和项目权限不能超过主管与发起用户权限的交集。正式团队的成员、输入输出、执行状态和失败策略均由 LangGraph 图显式管理。
+
+## 5. LangGraph 流程编排
+
+平台提供拖拽式流程设计器，但不向前端暴露 LangGraph Python 代码。设计器保存平台自有的版本化 JSON DSL，发布时由后端校验并编译为 LangGraph `CompiledStateGraph`。
+
+首版节点类型包括：
+
+- 开始、结束和成果输出；
+- Deep Agent 和多智能体团队；
+- MCP Tool 和知识库检索；
+- 条件分支、并行、汇合和循环上限；
+- 数据映射与结构化转换；
+- 人工确认和等待用户输入。
+
+流程 DSL 至少记录节点 ID、节点类型、资源版本、输入输出 Schema、节点配置、边、条件和错误策略。Agent、Skill、MCP、知识库和团队均引用发布版本，不能仅引用可变名称。
+
+发布流程依次执行：Schema 校验、图连通性检查、循环边界检查、输入输出兼容性检查、资源与项目权限检查、版本固化和 LangGraph 编译。只有发布成功的不可变版本可以在生产项目运行；草稿只能在测试环境试运行。
+
+Skill 是 Deep Agent 按需加载的行为说明和资源包，不默认作为独立可执行节点。需要在确定性流程中直接执行的 Skill，必须声明结构化输入输出和允许调用的 Tool，由平台包装为受控节点。MCP Tool 和知识库检索属于实际可执行能力。
+
+## 6. 运行数据流
 
 1. 用户在 AI 问答中选择项目、执行主体、知识库和业务资源并发送消息。
 2. API 校验用户、项目、Agent 或团队的访问权限，保存用户消息并创建 Run。
 3. API 将 Run 标识放入 Redis 任务队列，立即向前端返回 Run ID。
 4. Worker 领取任务，从 PostgreSQL 读取版本快照、权限、上下文和运行限制。
-5. 单智能体直接进入 Agent Runtime；协同团队先由主管生成受约束的执行计划。
+5. 单智能体进入 Deep Agent Runtime；临时协作由 Deep Agent 在白名单内委派；发布型团队或流程载入对应 LangGraph 版本。
 6. 成员执行 RAG、LLM 或 MCP 步骤。每个步骤建立 RunStep 并持续写入 RunEvent。
 7. MCP Executor 在调用前执行项目权限、Agent 工具权限和 JSON Schema 三重校验。
 8. Redis 发布实时事件，API 通过 SSE 向前端推送规划、成员状态、工具进度、增量回答和成果事件。
@@ -114,9 +144,9 @@ FastAPI 按领域模块组织，而不是按页面组织：
 
 Run 状态包括：`queued`、`planning`、`running`、`synthesizing`、`awaiting_input`、`succeeded`、`failed` 和 `cancelled`。
 
-## 6. 数据与存储
+## 7. 数据与存储
 
-### 6.1 PostgreSQL
+### 7.1 PostgreSQL
 
 PostgreSQL 是结构化业务数据和运行状态的权威数据源，保存：
 
@@ -128,7 +158,7 @@ PostgreSQL 是结构化业务数据和运行状态的权威数据源，保存：
 
 使用 SQLAlchemy 2 管理数据访问，使用 Alembic 管理数据库迁移。业务记录必须属于一个项目或单位级公共空间。项目数据隔离在服务层强制执行，不能仅依赖前端菜单或请求参数。
 
-### 6.2 Milvus
+### 7.2 Milvus
 
 Milvus 专门保存知识库向量和检索索引。向量实体至少携带：
 
@@ -144,7 +174,7 @@ Milvus 专门保存知识库向量和检索索引。向量实体至少携带：
 
 一期部署单节点 Milvus Standalone，通过 Docker Compose 管理，复用平台 MinIO，并部署 Milvus 所需的 etcd。后续只有在向量规模、吞吐或可用性要求达到瓶颈时才升级为 Milvus 集群。
 
-### 6.3 Redis
+### 7.3 Redis
 
 Redis 用于：
 
@@ -155,26 +185,26 @@ Redis 用于：
 
 Redis 不保存永久会话或最终运行状态。Redis 数据丢失后，系统应能依靠 PostgreSQL 恢复权威状态。
 
-### 6.4 MinIO
+### 7.4 MinIO
 
 MinIO 保存原始文档、解析产物、用户附件、报告、表格、图件和水利模型成果。PostgreSQL 保存对象键、版本、校验和、内容类型、大小、所属项目和访问策略。
 
-## 7. 技术选型
+## 8. 技术选型
 
 | 层次 | 技术 |
 | --- | --- |
 | Web | Vue 3、TypeScript、Vite、Ant Design Vue、Pinia、Vue Router |
 | API | Python 3.11+、FastAPI、Pydantic、SQLAlchemy 2、Alembic、HTTPX |
-| Agent 执行 | LangGraph、Celery、Redis、官方 MCP Python SDK |
+| Agent 执行 | Deep Agents、LangChain、LangGraph、Celery、Redis、LangChain MCP Adapter |
 | 业务数据库 | PostgreSQL |
 | 向量数据库 | Milvus Standalone，一期单节点 |
 | 对象存储 | MinIO |
 | 入口与部署 | Nginx、Docker Compose |
 | 测试 | Pytest、前后端集成测试、Playwright |
 
-LangGraph 用于有状态的协同图、检查点和受约束分支；Celery 用于任务排队、Worker 并发和长任务生命周期。业务领域对象不直接依赖 LangGraph 数据结构，避免未来替换执行框架时影响平台 API 和数据模型。
+Deep Agents 用于实例化平台配置的智能体，原生映射系统提示词、`AGENTS.md` Memory、`SKILL.md` Skills、Tool、MCP、工作空间、上下文压缩、人工确认和子智能体。LangGraph 用于有状态的发布型协同图、可视化工作流、检查点和受约束分支；Celery 只负责将一次 Run 交给 Worker，不管理图内部节点状态。业务领域对象和流程 DSL 不直接依赖 LangGraph 内部数据结构，避免执行框架升级影响平台 API 和已保存流程。
 
-## 8. 权限与安全
+## 9. 权限与安全
 
 权限模型为“用户—角色—项目成员—资源授权”：
 
@@ -183,12 +213,13 @@ LangGraph 用于有状态的协同图、检查点和受约束分支；Celery 用
 - 资源授权控制 Agent、团队、知识库、业务资源和 MCP 工具使用；
 - 服务层在查询和执行前应用项目范围，禁止先取出越权数据再在响应层隐藏；
 - Agent 权限不能超过发起用户权限，团队成员权限不能超过团队与用户权限的交集。
+- Deep Agents 的文件、代码执行和子智能体能力默认关闭，按 Agent 版本显式授权；工作空间使用受限 Backend，不能直接访问宿主机任意路径。
 
 密钥和认证头必须加密或通过外部 Secret 提供，API 响应和日志中只显示掩码。审计日志对 API Key、认证头、敏感文档内容和水利模型敏感参数进行脱敏。所有 MCP 调用记录发起用户、项目、Agent、Run、工具、脱敏参数、耗时、结果摘要和错误。
 
 一期禁止执行真实设备控制。后续引入控制能力时，必须另行设计双人复核、人工确认、指令签名、回滚策略和控制网隔离，不复用普通 MCP 自动执行策略。
 
-## 9. 错误处理与恢复
+## 10. 错误处理与恢复
 
 - LLM 限流和暂时性网络错误执行有限次数指数退避；参数、权限和业务校验错误不自动重试。
 - MCP 调用设置连接超时、执行超时、最大结果大小和幂等键。
@@ -198,7 +229,7 @@ LangGraph 用于有状态的协同图、检查点和受约束分支；Celery 用
 - Milvus 异常时知识库进入降级状态。无法取得可靠引用时必须向用户明确提示，不生成伪造引用。
 - MinIO、Milvus 和 Redis 均需健康检查；关键依赖不可用时 API 返回结构化错误码和追踪 ID。
 
-## 10. API 边界
+## 11. API 边界
 
 一期核心运行 API：
 
@@ -210,11 +241,15 @@ LangGraph 用于有状态的协同图、检查点和受约束分支；Celery 用
 - `GET /api/agent-runs/{id}/events`：订阅 SSE 事件并支持事件序号续传；
 - `POST /api/agent-runs/{id}/cancel`：请求取消运行；
 - `GET /api/agent-runs/{id}/artifacts`：查询成果；
+- `POST /api/workflows`：创建流程草稿；
+- `POST /api/workflows/{id}/validate`：校验流程 DSL；
+- `POST /api/workflows/{id}/publish`：固化资源版本并编译 LangGraph；
+- `POST /api/workflows/{id}/runs`：运行已发布流程版本；
 - `POST /api/mcp/{client_key}/tools/{tool_name}/invoke`：经授权的内部工具调用入口，不直接暴露给普通前端用户。
 
 API 统一返回业务错误码、用户可读信息和 `trace_id`。异步任务创建接口返回 `202 Accepted` 和 Run ID。
 
-## 11. 部署拓扑
+## 12. 部署拓扑
 
 Docker Compose 统一部署：
 
@@ -229,17 +264,18 @@ Docker Compose 统一部署：
 
 每个服务配置健康检查、持久化卷、资源限制和重启策略。数据库、对象存储和 Milvus 数据目录必须纳入备份。生产环境通过环境变量或 Secret 注入凭据，仓库只保留安全占位配置。
 
-## 12. 测试策略
+## 13. 测试策略
 
-### 12.1 单元测试
+### 13.1 单元测试
 
 - 项目范围与角色权限计算；
 - Agent、团队和工具授权交集；
 - 团队版本快照和运行限制；
 - MCP 参数校验、脱敏和错误分类；
 - Run 状态转换和失败策略。
+- 流程 DSL 校验、资源版本固化和 LangGraph 编译结果。
 
-### 12.2 集成测试
+### 13.2 集成测试
 
 - PostgreSQL 事务与迁移；
 - Redis 队列、取消、心跳和事件；
@@ -247,8 +283,10 @@ Docker Compose 统一部署：
 - MinIO 上传、签名访问和项目隔离；
 - 模拟 MCP 服务的发现、调用、超时、错误和幂等行为；
 - LLM Gateway 的流式响应、限流和重试。
+- Deep Agent 的 Memory、Skill 渐进加载、工具授权和临时子智能体权限继承。
+- LangGraph 检查点、并行汇合、人工中断、恢复和取消。
 
-### 12.3 工作流测试
+### 13.3 工作流测试
 
 - 单智能体问答与引用溯源；
 - 主管规划、成员协作和最终汇总；
@@ -257,18 +295,18 @@ Docker Compose 统一部署：
 - SSE 断线续传和页面刷新恢复；
 - 用户、Agent 或团队尝试跨项目访问时被拒绝。
 
-### 12.4 端到端测试
+### 13.4 端到端测试
 
-使用 Playwright 覆盖登录、选择项目、创建会话、切换单/多智能体、查看协同步骤、取消 Run、打开引用和下载成果。桌面与移动视口均验证页面无重叠、状态清晰且长内容可阅读。
+使用 Playwright 覆盖登录、选择项目、创建会话、切换单/多智能体、拖拽并发布流程、查看协同步骤、取消 Run、打开引用和下载成果。桌面与移动视口均验证页面无重叠、状态清晰且长内容可阅读。
 
-## 13. 演进路线
+## 14. 演进路线
 
 第一阶段完成 PostgreSQL、项目权限、真实会话与 Run 基础设施，并将现有 AI 问答页面接入 SSE。
 
-第二阶段完成单智能体 Runtime、LLM Gateway、MCP 工具真实调用和审计。
+第二阶段完成 Deep Agent Runtime、LLM Gateway、Skill 渐进加载、MCP 工具真实调用和审计。
 
-第三阶段完成 Milvus 知识库、引用溯源以及固定团队边界下的主管动态协同。
+第三阶段完成 Milvus 知识库、引用溯源、Deep Agents 临时委派以及固定团队边界下的 LangGraph 协同。
 
-第四阶段补齐工作流、成果管理、运行监控、备份恢复和生产压测。
+第四阶段完成可视化流程 DSL、LangGraph 编译发布、成果管理、运行监控、备份恢复和生产压测。
 
 后续根据真实负载扩展 Worker、Milvus 和数据库，不预先拆分微服务。多单位租户、桌面客户端和设备控制均作为独立设计课题推进。
