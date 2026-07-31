@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace the Web chat prototype's browser-only conversation state with project-scoped PostgreSQL conversations, messages, agent runs, and resumable SSE run events.
+**Goal:** Replace the Web chat prototype's browser-only conversation state with project-and-owner-scoped PostgreSQL conversations, messages, agent runs, and resumable SSE run events.
 
 **Architecture:** Add a new SQLAlchemy/Alembic persistence layer for the conversation and run bounded context without migrating the existing SQLite-backed configuration modules in the same change. FastAPI creates conversations, messages, runs, and append-only events; the Vue client consumes persisted state and resumable SSE. A dispatcher interface stops this phase from pretending that an Agent is already running: production runs remain `queued` until the sandbox execution plan is implemented, while tests inject a deterministic dispatcher.
 
@@ -12,7 +12,9 @@
 
 ## Scope Boundary
 
-This plan implements one testable subsystem from the approved architecture specification. It does not implement Deep Agents, LangGraph, Sandbox Executor, Tool Registry, Milvus, knowledge retrieval, multi-agent execution, Artifact renderers, or GIS. Those require separate implementation plans after this foundation is merged.
+This plan implements one testable subsystem from the approved architecture specification and the approved `docs/superpowers/specs/2026-07-31-first-prototype-ui-freeze-design.md`. It does not implement Deep Agents, LangGraph, Sandbox Executor, Tool Registry, Milvus, knowledge retrieval, multi-agent execution, Artifact renderers, GIS, or the expanded five-section Agent editor. Those require separate implementation plans after this foundation is merged.
+
+The first UI slice uses the existing Agent API as the only server-backed execution-subject directory. Team mode remains visible but disabled until the published-team directory and LangGraph execution plan are implemented. Knowledge-base and business-resource selectors remain in their frozen layout positions but are disabled with explicit unavailable text until project-scoped option APIs exist. Report, chart, file, and GIS actions are not rendered until a persisted Artifact exists. No fixed prototype option or result is submitted as production data.
 
 The implementation order after this plan is:
 
@@ -33,7 +35,7 @@ Create focused backend infrastructure and domain files:
 - `backend/app/db/base.py`: declarative model base and imported metadata.
 - `backend/app/conversations/models.py`: Conversation, Message, AgentRun, and RunEvent tables.
 - `backend/app/conversations/schemas.py`: API request and response contracts.
-- `backend/app/conversations/repository.py`: project-scoped persistence queries.
+- `backend/app/conversations/repository.py`: project-and-owner-scoped persistence queries.
 - `backend/app/conversations/service.py`: transaction and state-transition rules.
 - `backend/app/conversations/dispatcher.py`: execution-dispatch boundary.
 - `backend/app/conversations/router.py`: conversation, run, and SSE routes.
@@ -44,6 +46,7 @@ Create focused frontend files:
 
 - `frontend/src/api/conversations.ts`: conversation/run API contracts.
 - `frontend/src/api/runEvents.ts`: resumable SSE client.
+- `frontend/src/features/chat/runtimeStatus.ts`: authoritative Run status labels for the chat UI.
 - `frontend/src/stores/conversations.ts`: server-backed chat state.
 - `frontend/src/views/agent/AgentConsoleView.vue`: remove fixed sessions and simulated reply.
 
@@ -1315,8 +1318,10 @@ git commit -m "feat: add conversation and run event client"
 
 **Files:**
 - Create: `frontend/src/stores/conversations.ts`
+- Create: `frontend/src/features/chat/runtimeStatus.ts`
 - Modify: `frontend/src/views/agent/AgentConsoleView.vue`
 - Test: `frontend/src/stores/conversations.test.ts`
+- Test: `frontend/src/features/chat/runtimeStatus.test.ts`
 
 - [ ] **Step 1: Write a failing store test**
 
@@ -1348,11 +1353,34 @@ describe('conversation store', () => {
 });
 ```
 
+Add a focused status-label test:
+
+```typescript
+// frontend/src/features/chat/runtimeStatus.test.ts
+import { describe, expect, it } from 'vitest';
+import { runtimeStatusLabel } from './runtimeStatus';
+
+describe('runtimeStatusLabel', () => {
+  it('does not claim isolation while a run is only queued', () => {
+    expect(runtimeStatusLabel('queued')).toBe('等待沙箱执行服务');
+  });
+
+  it('maps all frozen run states to explicit labels', () => {
+    expect(runtimeStatusLabel('starting')).toBe('正在创建隔离运行环境');
+    expect(runtimeStatusLabel('running')).toBe('沙箱运行中');
+    expect(runtimeStatusLabel('waiting_approval')).toBe('等待人工确认');
+    expect(runtimeStatusLabel('succeeded')).toBe('运行完成');
+    expect(runtimeStatusLabel('failed')).toBe('运行失败');
+    expect(runtimeStatusLabel('cancelled')).toBe('已取消');
+  });
+});
+```
+
 - [ ] **Step 2: Run the test and verify it fails**
 
 Run: `cd frontend; npm test -- src/stores/conversations.test.ts`
 
-Expected: FAIL because the store does not exist.
+Expected: FAIL because the store and `runtimeStatusLabel` do not exist.
 
 - [ ] **Step 3: Implement the Pinia store**
 
@@ -1448,7 +1476,27 @@ export const useConversationStore = defineStore('conversations', {
 
 Do not add an assistant message until a future event contains persisted assistant content. Never use a timer to fabricate a result.
 
-- [ ] **Step 4: Refactor the chat view in small edits**
+- [ ] **Step 4: Implement the frozen Run status mapping**
+
+```typescript
+// frontend/src/features/chat/runtimeStatus.ts
+const labels: Record<string, string> = {
+  queued: '等待沙箱执行服务',
+  starting: '正在创建隔离运行环境',
+  running: '沙箱运行中',
+  waiting_approval: '等待人工确认',
+  succeeded: '运行完成',
+  failed: '运行失败',
+  cancelled: '已取消',
+};
+
+export function runtimeStatusLabel(status?: string): string {
+  if (!status) return '尚未启动运行';
+  return labels[status] ?? `运行状态：${status}`;
+}
+```
+
+- [ ] **Step 5: Refactor the chat view in small edits**
 
 In `AgentConsoleView.vue`:
 
@@ -1457,14 +1505,21 @@ In `AgentConsoleView.vue`:
 3. Replace `sendMessage` timer with `store.sendMessage` and `store.replayEvents`.
 4. Display `queued` as `等待沙箱执行服务`, not `沙箱已隔离`.
 5. Display sandbox status only when supplied by a persisted RunEvent.
-6. Keep existing responsive layout, selectors, and current user-authored styling.
-7. Preserve single/team selector payloads, but do not implement team execution in this phase.
+6. Keep the existing desktop three-column layout, mobile panel switching, and current user-authored styling.
+7. Load single-Agent options from `agentsApi.list()`; remove the fixed `agentOptions` fallback.
+8. Keep team mode visible but disabled with `发布型团队接入后可用`; remove fixed team members, online counts, and completed steps.
+9. Keep knowledge-base and business-resource selectors visible but disabled with `能力接入后可用`; remove fixed selections and do not include them in the message request.
+10. Keep attachment and `@成员` controls disabled until their server contracts exist.
+11. Render no report or GIS action from message text; later Artifact events own those actions.
+12. Show API/store errors near the work area without replacing the whole three-column layout.
 
 Replace the local session/message persistence and simulated send block with this store adapter:
 
 ```typescript
 import { computed, nextTick, onMounted, ref, useTemplateRef, watch } from 'vue';
 import { storeToRefs } from 'pinia';
+import { agentsApi } from '@/api/agents';
+import { runtimeStatusLabel } from '@/features/chat/runtimeStatus';
 import { useConversationStore } from '@/stores/conversations';
 
 const conversationStore = useConversationStore();
@@ -1496,13 +1551,11 @@ const messages = computed(() => conversationStore.messages.map((message) => ({
   content: message.content,
 })));
 
-const runtimeLabel = computed(() => {
-  const status = activeRun.value?.status;
-  if (!status) return '尚未启动运行';
-  if (status === 'queued') return '等待沙箱执行服务';
-  if (status === 'running') return '沙箱运行中';
-  return `运行状态：${status}`;
-});
+const agentOptions = ref<Array<{ value: string; label: string }>>([]);
+const selectedAgentId = ref('');
+const actorLoadError = ref('');
+const runtimeLabel = computed(() => runtimeStatusLabel(activeRun.value?.status));
+const canSend = computed(() => Boolean(input.value.trim() && selectedAgentId.value && !sending.value));
 
 async function selectSession(id: string) {
   await conversationStore.selectConversation(id);
@@ -1517,21 +1570,28 @@ function newConversation() {
 
 async function sendMessage() {
   const content = input.value.trim();
-  if (!content || sending.value) return;
+  if (!content || !selectedAgentId.value || sending.value) return;
   input.value = '';
-  await conversationStore.sendMessage(
-    content,
-    mode.value === 'team' ? 'team' : 'agent',
-    mode.value === 'team' ? selectedTeamId.value : selectedAgentId.value,
-  );
+  await conversationStore.sendMessage(content, 'agent', selectedAgentId.value);
 }
 
-onMounted(() => conversationStore.loadConversations());
+onMounted(async () => {
+  await conversationStore.loadConversations();
+  try {
+    const agents = await agentsApi.list();
+    agentOptions.value = agents
+      .filter((agent) => agent.enabled)
+      .map((agent) => ({ value: agent.id, label: agent.name }));
+    selectedAgentId.value = agentOptions.value[0]?.value ?? '';
+  } catch (error) {
+    actorLoadError.value = error instanceof Error ? error.message : '智能体列表加载失败';
+  }
+});
 ```
 
-Change the top-bar runtime text to `{{ runtimeLabel }}`. Change history keys and selections from numeric IDs to strings, format `session.updated_at` in the template or a focused formatter, and remove `chatStateKey`, `readSavedState`, `persistChatState`, `initialMessages`, the fixed `sessions` array, the message persistence watcher, and the 800ms timer. Keep the existing scroll watcher against the computed `messages`.
+Change the top-bar runtime text to `{{ runtimeLabel }}` and bind the send button to `:disabled="!canSend"`. Render `actorLoadError` beside the execution-subject selector and leave sending disabled when no enabled Agent is available. Change history keys and selections from numeric IDs to strings, format `session.updated_at` in the template or a focused formatter, and remove `chatStateKey`, `readSavedState`, `persistChatState`, `initialMessages`, fixed sessions, fixed Agent/team/knowledge/resource data, fixed team steps, the message persistence watcher, and the 800ms timer. Keep the existing scroll watcher against the computed `messages`.
 
-- [ ] **Step 5: Run tests and production build**
+- [ ] **Step 6: Run tests and production build**
 
 Run: `cd frontend; npm test`
 
@@ -1541,10 +1601,10 @@ Run: `cd frontend; npm run build`
 
 Expected: build PASS with no TypeScript errors.
 
-- [ ] **Step 6: Commit the real chat state**
+- [ ] **Step 7: Commit the real chat state**
 
 ```powershell
-git add frontend/src/stores/conversations.ts frontend/src/stores/conversations.test.ts frontend/src/views/agent/AgentConsoleView.vue
+git add frontend/src/stores/conversations.ts frontend/src/stores/conversations.test.ts frontend/src/features/chat frontend/src/views/agent/AgentConsoleView.vue
 git commit -m "feat: connect chat to persisted runs"
 ```
 
@@ -1597,7 +1657,19 @@ Run: `rg -n "沙箱已隔离|setTimeout\(resolve, 800\)|iap-prototype-chat-state
 
 Expected: no matches.
 
-- [ ] **Step 6: Commit documentation**
+- [ ] **Step 6: Verify the frozen prototype boundary in a browser**
+
+Open `/chat` at desktop and mobile viewports and verify:
+
+1. The three desktop columns and mobile `会话 / 对话 / 上下文` switching remain usable.
+2. The Run label is `尚未启动运行` before a message and `等待沙箱执行服务` after the queued response.
+3. No assistant reply, collaboration step, citation, report, GIS action, knowledge selection, or business-resource selection is fabricated.
+4. Team mode, attachment, `@成员`, knowledge-base selection, and resource selection clearly show unavailable/disabled state.
+5. Reloading restores conversations and messages from the API.
+
+Capture desktop and mobile screenshots under `output/prototype-freeze-verification/` for local evidence; do not commit generated screenshots.
+
+- [ ] **Step 7: Commit documentation**
 
 ```powershell
 git add README.md backend/README.md
@@ -1607,10 +1679,13 @@ git commit -m "docs: document conversation run foundation"
 ## Completion Criteria
 
 - Conversation and Run data persist in PostgreSQL and survive API restarts.
-- Every conversation and Run query is scoped by the request project.
+- Every private conversation and Run query is scoped by the request project and owner.
 - Posting a message atomically creates Message, AgentRun, and the first RunEvent.
 - SSE replay honors `Last-Event-ID` and emits stable event IDs.
 - The frontend uses server conversations and no longer fabricates assistant replies.
 - The UI does not claim sandbox isolation before a real sandbox event exists.
+- Fixed Agent/team/knowledge/resource options, collaboration steps, citations, report actions, and GIS actions are absent from the production state.
+- Unimplemented team, attachment, knowledge, resource, and Artifact capabilities are visibly disabled rather than silently simulated.
+- The existing desktop and mobile chat layouts remain usable.
 - Existing Agent, Skill, MCP, model-provider, and platform tests continue to pass.
 - PostgreSQL migration, backend tests, frontend tests, frontend build, and Compose health check all pass.
