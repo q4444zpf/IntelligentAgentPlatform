@@ -1,12 +1,33 @@
 name: intelligent-agent-platform
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: iap
+      POSTGRES_USER: iap
+      POSTGRES_PASSWORD: iap
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iap -d iap"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
   api:
     build:
       context: .
       dockerfile: backend/Dockerfile
     environment:
+      DATABASE_URL: postgresql+psycopg://iap:iap@postgres:5432/iap
+      IAP_ALLOW_DEV_IDENTITY: "true"
       MODEL_PROVIDER_DATABASE: /data/model-providers.db
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
       - model-provider-data:/data
     restart: unless-stopped
@@ -34,3 +55,4 @@ services:
 
 volumes:
   model-provider-data:
+  postgres-data:
