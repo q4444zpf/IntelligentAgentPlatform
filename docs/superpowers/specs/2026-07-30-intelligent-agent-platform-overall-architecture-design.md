@@ -58,7 +58,8 @@ FastAPI 按领域模块组织，而不是按页面组织：
 - `teams`：协同团队、主管、成员、职责、可用工具和运行策略；
 - `conversations`：会话、消息、附件和上下文；
 - `runs`：Run、RunStep、事件、审批、引用和成果；
-- `mcp`：MCP 服务、工具发现、Schema、白名单和授权；
+- `mcp`：MCP 服务连接、传输配置、工具发现和同步；
+- `tools`：统一工具注册、版本、Schema、风险、授权、发布、健康状态和调用策略；
 - `knowledge`：知识库、数据源、文档、分块和索引任务；
 - `workflows`：确定性流程定义与运行；
 - `model_providers`：LLM 供应商、模型发现、默认模型和路由；
@@ -76,7 +77,7 @@ FastAPI 按领域模块组织，而不是按页面组织：
 - 协同编排器：主管 Deep Agent 规划、成员分派和结果汇总；
 - LLM Gateway：统一模型调用、流式输出、重试、计量和追踪；
 - RAG Runtime：权限过滤、查询改写、混合检索、重排和引用；
-- MCP Executor：工具授权、Schema 校验、调用、超时和结果归档；
+- Tool Gateway：统一执行工具授权、Schema校验、风险策略、人工确认、限流、超时、幂等和结果归档，并通过执行适配器调用 MCP、知识库、Artifact、工作流和沙箱；
 - Artifact Manager：将报告、表格、图件和模型文件登记为成果。
 
 ### 3.4 外部能力
@@ -136,7 +137,7 @@ Skill 是 Deep Agent 按需加载的行为说明和资源包，不默认作为�
 4. Worker 领取任务，从 PostgreSQL 读取版本快照、权限、上下文和运行限制，生成不可变执行包并提交 Sandbox Executor。
 5. Sandbox Executor 为当前 Run 启动独立 Workflow Runner。单智能体在其中进入 Deep Agent Runtime；临时协作由 Deep Agent 在白名单内委派；发布型团队或流程载入对应 LangGraph 版本。
 6. 成员执行 RAG、LLM 或 MCP 步骤。每个步骤建立 RunStep 并持续写入 RunEvent。
-7. MCP Executor 在调用前执行项目权限、Agent 工具权限和 JSON Schema 三重校验。
+7. Tool Gateway 在调用前执行用户、项目、Agent或团队授权交集、Tool版本、输入Schema和风险策略校验，再通过对应执行适配器调用MCP、知识库、Artifact、工作流或沙箱。
 8. Redis 发布实时事件，API 通过 SSE 向前端推送规划、成员状态、工具进度、增量回答和成果事件。
 9. 主管或单 Agent 汇总最终结果。消息、引用、工具轨迹和成果元数据写入 PostgreSQL，文件写入 MinIO。
 10. Run 进入终态，前端显示完整执行轨迹和可追溯结果。
@@ -260,7 +261,7 @@ report.document  → 报告预览 Renderer
 PostgreSQL 是结构化业务数据和运行状态的权威数据源，保存：
 
 - 用户、角色、项目、成员和资源授权；
-- Agent、团队、Prompt、Skill、MCP 和工作流配置及版本；
+- Agent、团队、Prompt、Skill、MCP、Tool和工作流配置及版本；
 - 会话、消息、Run、RunStep、RunEvent 和审批记录；
 - 知识库、文档、分块元数据和索引状态；
 - 引用、Artifact、Artifact修订、成果元数据、模型调用与审计记录。
@@ -312,6 +313,101 @@ MinIO 保存原始文档、解析产物、用户附件、报告、表格、图�
 | 测试 | Pytest、前后端集成测试、Playwright |
 
 Deep Agents 用于实例化平台配置的智能体，原生映射系统提示词、`AGENTS.md` Memory、`SKILL.md` Skills、Tool、MCP、工作空间、上下文压缩、人工确认和子智能体。LangGraph 用于有状态的发布型协同图、可视化工作流、检查点和受约束分支；Celery 只负责将一次 Run 交给 Worker，不管理图内部节点状态。业务领域对象和流程 DSL 不直接依赖 LangGraph 内部数据结构，避免执行框架升级影响平台 API 和已保存流程。
+
+### 8.1 工具注册中心与 Tool Gateway
+
+工具注册中心是 Deep Agents、LangGraph、MCP、知识库、Artifact和沙箱之间的统一能力目录。Agent和工作流不得绕过Tool Gateway直接连接MCP Server、Milvus、Sandbox Executor或前端组件。
+
+工具来源包括：
+
+- MCP发现的水利模型、GIS、数据查询和第三方工具；
+- 平台内置业务API；
+- `knowledge_search`等知识库工具；
+- `publish_artifact`、`patch_artifact`和`request_input`等Artifact/UI工具；
+- 文件解析、受限Shell和代码执行等沙箱工具；
+- 作为Tool发布的已发布工作流。
+
+MCP管理负责Server连接、认证、传输、`tools/list`和健康检查。发现的MCP Tool同步到工具注册中心后，必须完成Schema校验、风险评估、审核、版本发布和授权，才能被Agent或LangGraph节点使用。
+
+#### 8.1.1 工具模型
+
+`ToolDefinition`表示稳定工具身份，`ToolVersion`表示不可变发布版本，至少保存：
+
+- 工具ID、名称、显示名称、描述和来源类型；
+- 来源资源ID和来源工具名称；
+- 输入JSON Schema和输出JSON Schema；
+- 风险等级、执行模式、默认超时和结果大小上限；
+- 幂等属性、重试策略、人工确认策略和审计策略；
+- 版本、状态、内容摘要、创建人、审核人和发布时间；
+- 健康状态、最后探测时间和废弃信息。
+
+`ToolAuthorization`保存Tool版本与单位、项目、角色、Agent、团队和工作流的授权关系。`ToolInvocation`保存Run、RunStep、用户、项目、Tool版本、脱敏输入摘要、输出摘要、状态、耗时、资源用量、错误和 `trace_id`。
+
+Agent、团队和工作流发布时固化Tool版本快照。已发布ToolVersion不可修改；Schema、风险等级、执行模式或安全策略变化时创建新版本，并对旧版本执行影响分析。
+
+#### 8.1.2 生命周期
+
+工具生命周期为：
+
+```text
+发现或创建
+→ Schema校验
+→ 连通性与契约测试
+→ 风险评估
+→ 管理员审核
+→ 发布
+→ Agent、团队和项目授权
+→ 运行监控
+→ 废弃
+→ 停用
+```
+
+状态包括 `draft`、`pending_review`、`published`、`deprecated` 和 `disabled`。只有 `published` 且授权有效、依赖健康的版本可以进入Run执行快照。
+
+#### 8.1.3 Tool Gateway执行链路
+
+```text
+Deep Agent或LangGraph节点
+→ Tool Gateway
+→ 用户、项目、Agent/团队授权交集
+→ Tool版本与页面能力检查
+→ 输入Schema和业务约束校验
+→ 风险策略与人工确认
+→ 限流、超时、幂等和重试
+→ 对应执行适配器
+→ 输出Schema、大小和敏感信息校验
+→ 结果与审计归档
+```
+
+执行适配器包括MCP Adapter、Knowledge Adapter、Artifact Adapter、Workflow Adapter和Sandbox Adapter。Tool Gateway实行失败关闭：注册中心、权限、策略或执行适配器不可用时，不得让Agent回退为直接调用。
+
+风险等级分为：
+
+| 风险 | 示例 | 默认策略 |
+| --- | --- | --- |
+| 低 | 知识检索、只读业务查询 | 自动执行并记录摘要 |
+| 中 | GIS计算、水利模型运行、文件生成 | 自动执行、完整审计和资源限制 |
+| 高 | Shell、代码执行、外部写操作 | Action Sandbox并按策略人工确认 |
+| 禁止 | 设备控制、宿主机访问 | 一期不发布 |
+
+#### 8.1.4 与Skill和前端组件的边界
+
+Skill说明何时、为什么以及按什么步骤使用Tool；Tool Registry提供权威工具ID、版本、Schema和风险策略；Tool Gateway负责实际执行。Skill可声明 `required_tools`，但不能覆盖Tool Schema、权限或确认策略。
+
+Artifact和UI能力同样注册为Tool，例如 `artifact.publish@1`、`artifact.patch@1` 和 `ui.request_input@1`。运行时将Agent授权与当前页面 `ui.capabilities` 取交集。Tool只产生声明式Artifact或UI请求，不注册Vue、OpenLayers或Cesium内部方法。
+
+#### 8.1.5 管理功能
+
+工具注册中心管理页面提供：
+
+- 按来源、状态、风险、项目和标签查询工具；
+- 查看输入输出Schema、版本历史和变更对比；
+- 配置风险等级、执行模式、超时、限流和确认策略；
+- 为项目、角色、Agent、团队和工作流授权；
+- 执行连通性与契约测试；
+- 查看健康状态、调用量、成功率、耗时和最近错误；
+- 执行发布、废弃、停用和影响分析；
+- 查询单次ToolInvocation的脱敏输入、输出摘要和审计轨迹。
 
 ## 9. 权限与安全
 
@@ -437,6 +533,14 @@ Workflow Runner 是编排与推理沙箱，Action Sandbox 是命令与不可信�
 - `GET /api/artifacts/{id}/revisions`：查询 Artifact 修订记录；
 - `GET /api/artifacts/{id}/layers/{layer_id}`：经项目权限校验读取GIS图层或数据服务入口；
 - `POST /api/artifacts/{id}/actions`：提交平台允许的Artifact交互动作；
+- `GET /api/tools`：查询统一工具目录；
+- `POST /api/tools`：创建平台内置或自定义工具草稿；
+- `GET /api/tools/{id}/versions`：查询工具版本；
+- `POST /api/tools/{id}/versions/{version}/validate`：执行Schema与契约校验；
+- `POST /api/tools/{id}/versions/{version}/publish`：审核并发布不可变工具版本；
+- `PUT /api/tools/{id}/versions/{version}/authorizations`：配置项目、角色、Agent和团队授权；
+- `POST /api/tools/{id}/versions/{version}/test`：在受控环境执行连通性或契约测试；
+- `GET /api/tool-invocations`：按项目、Run、工具和状态查询调用审计；
 - `POST /api/workflows`：创建流程草稿；
 - `POST /api/workflows/{id}/validate`：校验流程 DSL；
 - `POST /api/workflows/{id}/publish`：固化资源版本并编译 LangGraph；
@@ -478,6 +582,7 @@ Docker Compose 统一部署：
 - 流程 DSL 校验、资源版本固化和 LangGraph 编译结果。
 - 虚拟路径规范化、目录权限、命令策略、环境变量过滤和资源配额校验。
 - RunEvent、Artifact和GIS图层Schema校验、版本兼容与修订幂等性。
+- Tool生命周期、版本不可变性、授权交集、风险策略和输入输出Schema校验。
 
 ### 14.2 集成测试
 
@@ -495,6 +600,8 @@ Docker Compose 统一部署：
 - 验证 Workflow Runner 不能加载用户 Python节点、执行本地Shell或创建 Action Sandbox容器。
 - SSE Artifact事件续传、乱序处理、重复事件幂等和大型数据不进入事件流。
 - Artifact图层接口、MinIO签名URL和外部GIS服务的项目权限与域名白名单。
+- MCP工具同步到Tool Registry后的审核发布、版本升级、授权、调用和停用影响分析。
+- Tool Gateway各执行适配器的超时、限流、幂等、人工确认、输出校验和失败关闭。
 
 ### 14.3 工作流测试
 
@@ -506,6 +613,7 @@ Docker Compose 统一部署：
 - 用户、Agent 或团队尝试跨项目访问时被拒绝。
 - Sandbox Executor 故障时所有 Deep Agents 和 LangGraph Run 失败关闭，且不会回退到本地执行。
 - GIS Artifact 创建、图层增量更新、地图选择回传和Agent继续分析的完整闭环。
+- Skill引用Tool、Agent绑定Tool、团队权限取交集以及LangGraph节点通过Tool Gateway执行的完整闭环。
 
 ### 14.4 端到端测试
 
@@ -515,7 +623,7 @@ Docker Compose 统一部署：
 
 第一阶段完成 PostgreSQL、项目权限、真实会话与 Run 基础设施，并将现有 AI 问答页面接入 SSE。
 
-第二阶段完成 Deep Agent Runtime、LangGraph Workflow Runner、虚拟 Workspace Backend、Action Sandbox、Sandbox Executor、LLM Gateway、Skill 渐进加载、MCP 工具真实调用和审计。
+第二阶段完成Tool Registry与Tool Gateway、Deep Agent Runtime、LangGraph Workflow Runner、虚拟Workspace Backend、Action Sandbox、Sandbox Executor、LLM Gateway、Skill渐进加载、MCP工具真实调用和审计。
 
 第三阶段完成 Milvus 知识库、引用溯源、Deep Agents 临时委派以及固定团队边界下的 LangGraph 协同。
 
