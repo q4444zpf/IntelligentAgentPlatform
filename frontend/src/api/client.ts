@@ -1,4 +1,11 @@
-const baseUrl = import.meta.env.VITE_API_BASE_URL || '/api';
+export const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || '/api';
+export const identityHeaders: Record<string, string> =
+  import.meta.env.VITE_DEV_USER_ID && import.meta.env.VITE_DEV_PROJECT_ID
+    ? {
+        'X-User-ID': import.meta.env.VITE_DEV_USER_ID,
+        'X-Project-ID': import.meta.env.VITE_DEV_PROJECT_ID,
+      }
+    : {};
 
 export class ApiError extends Error {
   constructor(message: string, public readonly status: number) {
@@ -12,10 +19,10 @@ export async function request<T>(path: string, init: RequestInit = {}, timeoutMs
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetch(`${baseUrl}${path}`, {
+    const response = await fetch(`${apiBaseUrl}${path}`, {
       ...init,
       signal: init.signal || controller.signal,
-      headers: { Accept: 'application/json', ...init.headers },
+      headers: { Accept: 'application/json', ...identityHeaders, ...init.headers },
     });
     if (!response.ok) {
       const payload = await response.json().catch(() => ({}));
