@@ -5,7 +5,8 @@
 ## 当前实现
 
 - Web 管理控制台原型，包含工作台、AI 对话、资源库、智能体、Prompt、MCP、Skill / Tool、知识库、流程编排、多智能体协同、大模型配置、系统集成、用户权限、审计日志、沙箱监控和系统设置等页面。
-- FastAPI 后端服务，提供健康检查、平台运行总览和大模型供应商配置 API。
+- FastAPI 后端服务，提供健康检查、会话与运行事件、平台运行总览和大模型供应商配置 API。
+- 项目及用户范围内的会话、消息、Agent Run 和 Run Event 使用 PostgreSQL 持久化，并支持有限、可恢复的 SSE 事件回放。
 - 大模型供应商、密钥、模型参数和默认模型使用 SQLite 持久化。
 - 支持前后端分别启动，也可通过根目录脚本联合启动。
 
@@ -27,7 +28,9 @@
 - Uvicorn
 - Pydantic
 - HTTPX
-- SQLite
+- SQLAlchemy 2 / Alembic
+- PostgreSQL 16（会话和运行）
+- SQLite（大模型供应商配置）
 - Pytest
 
 ## 目录结构
@@ -45,6 +48,7 @@
 - Node.js 20 或更高版本
 - npm
 - Python 3.11 或更高版本
+- Docker Desktop 或兼容的 Docker Compose（用于 PostgreSQL 和整套容器启动）
 
 ## 快速启动
 
@@ -69,6 +73,30 @@ python -m pip install -r requirements.txt
 - Web 控制台：<http://127.0.0.1:5173>
 - 后端 API：<http://127.0.0.1:8000>
 - Swagger API 文档：<http://127.0.0.1:8000/docs>
+
+## PostgreSQL 会话基础服务
+
+先在项目根目录启动 PostgreSQL：
+
+```powershell
+docker compose up -d postgres
+$env:DATABASE_URL = "postgresql+psycopg://iap:iap@127.0.0.1:5432/iap"
+$env:IAP_ALLOW_DEV_IDENTITY = "true"
+cd backend
+python -m alembic upgrade head
+python -m uvicorn app.main:app --reload --port 8000
+```
+
+另开终端启动前端，并为本地请求提供显式的开发身份：
+
+```powershell
+cd frontend
+$env:VITE_DEV_USER_ID = "dev-user"
+$env:VITE_DEV_PROJECT_ID = "dev-project"
+npm run dev
+```
+
+`IAP_ALLOW_DEV_IDENTITY` 默认关闭。`X-User-ID`、`X-Project-ID` 及对应的 Vite 变量仅用于本地开发，不是生产认证方案；生产环境必须接入服务端认证会话并保持该开关关闭。
 
 ## 分别启动
 
@@ -100,6 +128,11 @@ npm run dev
 - `/api/models/{provider_id}/discover`：发现供应商可用模型。
 - `/api/models/{provider_id}/test`：测试供应商连接。
 - `/api/models/active`：查询或设置当前默认模型。
+- `POST/GET /api/conversations`：创建或查询当前项目、当前用户的会话。
+- `GET /api/conversations/{conversation_id}/messages`：读取持久化消息。
+- `POST /api/conversations/{conversation_id}/messages`：写入用户消息并创建等待执行的 Agent Run。
+- `GET /api/agent-runs/{run_id}`：读取 Run 状态。
+- `GET /api/agent-runs/{run_id}/events`：通过 `Last-Event-ID` 恢复读取有限 SSE 事件。
 
 运行数据默认保存在 `backend/data/model-providers.db`。可通过环境变量 `MODEL_PROVIDER_DATABASE` 指定其他 SQLite 数据库文件：
 
@@ -124,6 +157,13 @@ npm run build
 ```powershell
 cd backend
 python -m pytest
+```
+
+整套容器启动：
+
+```powershell
+docker compose up -d --build postgres api web
+Invoke-WebRequest -UseBasicParsing http://127.0.0.1/api/health
 ```
 
 ## 配置与安全
