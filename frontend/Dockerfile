@@ -1,5 +1,10 @@
 FROM node:20-alpine AS build
 
+ARG VITE_DEV_USER_ID=""
+ARG VITE_DEV_PROJECT_ID=""
+ENV VITE_DEV_USER_ID=$VITE_DEV_USER_ID
+ENV VITE_DEV_PROJECT_ID=$VITE_DEV_PROJECT_ID
+
 WORKDIR /app
 
 COPY frontend/package.json frontend/package-lock.json ./
@@ -14,4 +19,3 @@ COPY frontend/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /app/dist /usr/share/nginx/html
 
 EXPOSE 80
-

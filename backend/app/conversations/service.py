@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 from app.core.request_context import RequestContext
 
 from .dispatcher import RunDispatcher
@@ -78,10 +80,12 @@ class ConversationService:
         conversation_id: str,
         request: MessageCreate,
     ) -> MessageAccepted:
-        if self.repository.get_conversation(
+        conversation = self.repository.get_conversation(
             context.project_id, context.user_id, conversation_id
-        ) is None:
+        )
+        if conversation is None:
             raise ConversationNotFound(conversation_id)
+        conversation.updated_at = datetime.now(UTC)
         message = self.repository.add(
             Message(
                 conversation_id=conversation_id,

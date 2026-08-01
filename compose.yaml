@@ -23,7 +23,7 @@ services:
       dockerfile: backend/Dockerfile
     environment:
       DATABASE_URL: postgresql+psycopg://iap:iap@postgres:5432/iap
-      IAP_ALLOW_DEV_IDENTITY: "true"
+      IAP_ALLOW_DEV_IDENTITY: "${IAP_ALLOW_DEV_IDENTITY:-false}"
       MODEL_PROVIDER_DATABASE: /data/model-providers.db
     depends_on:
       postgres:
@@ -46,6 +46,9 @@ services:
     build:
       context: .
       dockerfile: frontend/Dockerfile
+      args:
+        VITE_DEV_USER_ID: "${VITE_DEV_USER_ID:-}"
+        VITE_DEV_PROJECT_ID: "${VITE_DEV_PROJECT_ID:-}"
     depends_on:
       api:
         condition: service_healthy

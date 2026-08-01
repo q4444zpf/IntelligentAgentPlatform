@@ -16,6 +16,8 @@ python -m uvicorn app.main:app --reload --port 8000
 
 `IAP_ALLOW_DEV_IDENTITY` 默认是 `false`。开启后，请求仍必须同时提供 `X-User-ID` 和 `X-Project-ID`；这只是本地开发适配器，不得作为生产认证。生产环境应使用可信认证会话，并保持该开关关闭。
 
+根目录 Compose 同样默认关闭开发身份。需要在容器化本机环境调试会话页面时，必须同时显式设置 `IAP_ALLOW_DEV_IDENTITY=true`、`VITE_DEV_USER_ID` 和 `VITE_DEV_PROJECT_ID` 并重新构建 Web 镜像；这些变量不得用于生产部署。
+
 ## 会话和运行接口
 
 - `POST /api/conversations`

@@ -1,7 +1,10 @@
+from datetime import datetime
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.conversations.dispatcher import RunDispatcher
+from app.conversations.models import Conversation
 from app.conversations.repository import ConversationRepository
 from app.conversations.schemas import ConversationCreate, MessageCreate
 from app.conversations.service import ConversationNotFound, ConversationService
@@ -43,6 +46,28 @@ def test_creates_message_run_and_initial_event_atomically():
         context, accepted.run.id, after_sequence=0
     )[0].payload == {"status": "queued"}
     assert dispatcher.run_ids == [accepted.run.id]
+    session.close()
+
+
+def test_message_activity_advances_conversation_recency():
+    session, _, service = build_service()
+    context = RequestContext(user_id="u1", project_id="p1")
+    conversation = service.create_conversation(
+        context, ConversationCreate(title="洪水研判")
+    )
+    stored = session.get(Conversation, conversation.id)
+    assert stored is not None
+    stored.updated_at = datetime(2020, 1, 1)
+    session.commit()
+
+    service.create_message(
+        context,
+        conversation.id,
+        MessageCreate(content="更新研判", actor_type="agent", actor_id="flood"),
+    )
+
+    session.refresh(stored)
+    assert stored.updated_at > datetime(2020, 1, 1)
     session.close()
 
 

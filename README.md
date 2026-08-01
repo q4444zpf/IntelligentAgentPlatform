@@ -166,6 +166,17 @@ docker compose up -d --build postgres api web
 Invoke-WebRequest -UseBasicParsing http://127.0.0.1/api/health
 ```
 
+上述命令使用安全默认值，开发身份适配器保持关闭。仅在本机联调会话页面时，显式设置开发身份并重新构建 Web 镜像：
+
+```powershell
+$env:IAP_ALLOW_DEV_IDENTITY = "true"
+$env:VITE_DEV_USER_ID = "dev-user"
+$env:VITE_DEV_PROJECT_ID = "dev-project"
+docker compose up -d --build postgres api web
+```
+
+不要在生产环境设置这些开发变量。前端身份值会在构建时写入静态资源，不能替代登录认证或服务端授权。
+
 ## 配置与安全
 
 - 不要提交 API Key、模型凭据、数据库密码、LLM 密钥或客户水利项目数据。
