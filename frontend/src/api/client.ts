@@ -17,12 +17,16 @@ export class ApiError extends Error {
 export async function request<T>(path: string, init: RequestInit = {}, timeoutMs = 8000): Promise<T> {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  const headers = new Headers({ Accept: 'application/json', ...identityHeaders, ...init.headers });
+  if (typeof init.body === 'string' && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json');
+  }
 
   try {
     const response = await fetch(`${apiBaseUrl}${path}`, {
       ...init,
       signal: init.signal || controller.signal,
-      headers: { Accept: 'application/json', ...identityHeaders, ...init.headers },
+      headers,
     });
     if (!response.ok) {
       const payload = await response.json().catch(() => ({}));
