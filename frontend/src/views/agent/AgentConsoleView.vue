@@ -98,7 +98,7 @@
           </article>
           <div v-if="isRunActive(conversationStore.activeRun?.status)" class="message-row agent">
             <div class="message-avatar">协</div>
-            <div class="thinking"><i /><i /><i /><span>{{ runtimeStatusLabel(conversationStore.activeRun.status) }}</span></div>
+            <div class="thinking"><i /><i /><i /><span>{{ runtimeStatusLabel(conversationStore.activeRun?.status) }}</span></div>
           </div>
         </div>
 
