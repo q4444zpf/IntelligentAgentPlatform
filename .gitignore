@@ -17,6 +17,8 @@ frontend/*.log
 .playwright-cli/
 .superpowers/
 output/
+.pydeps/
+.tmp/
 
 # Backend runtime data may contain model credentials.
 backend/data/
