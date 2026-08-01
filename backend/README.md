@@ -34,12 +34,16 @@ python -m uvicorn app.main:app --reload --port 8000
 
 ## 大模型供应商配置
 
-运行时配置默认保存在 SQLite 数据库 `data/model-providers.db`。可通过环境变量
-`MODEL_PROVIDER_DATABASE` 指定其他数据库文件。内置供应商定义位于
-`app/model_providers/registry.py`，用户密钥、额外模型、模型参数和默认模型写入数据库。
+模型供应商、智能体和 MCP 配置与会话运行数据统一保存在 `DATABASE_URL` 指定的 PostgreSQL。内置供应商定义位于 `app/model_providers/registry.py`。
 
-如果检测到旧版 `data/model-providers.json` 且数据库为空，启动时会自动导入，成功后
-将旧文件改名为 `model-providers.json.migrated`。
+旧版 SQLite 数据可通过以下命令一次性导入；默认读取 `/data/model-providers.db`、`/data/agents.db` 和 `/data/mcp.db`：
+
+```powershell
+python -m alembic upgrade head
+python -m app.migrations.sqlite_to_postgres
+```
+
+可通过 `LEGACY_SQLITE_DATA_DIR` 或三个 `LEGACY_*_DATABASE` 环境变量调整源文件路径。导入按数据域幂等执行，只导入空的 PostgreSQL 目标表，不删除 SQLite 文件。
 
 ## 测试
 

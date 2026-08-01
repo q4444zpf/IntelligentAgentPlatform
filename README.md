@@ -7,7 +7,7 @@
 - Web 管理控制台原型，包含工作台、AI 对话、资源库、智能体、Prompt、MCP、Skill / Tool、知识库、流程编排、多智能体协同、大模型配置、系统集成、用户权限、审计日志、沙箱监控和系统设置等页面。
 - FastAPI 后端服务，提供健康检查、会话与运行事件、平台运行总览和大模型供应商配置 API。
 - 项目及用户范围内的会话、消息、Agent Run 和 Run Event 使用 PostgreSQL 持久化，并支持有限、可恢复的 SSE 事件回放。
-- 大模型供应商、密钥、模型参数和默认模型使用 SQLite 持久化。
+- 会话、模型供应商、智能体和 MCP 配置统一使用 PostgreSQL 持久化。
 - 支持前后端分别启动，也可通过根目录脚本联合启动。
 
 ## 技术栈
@@ -29,8 +29,8 @@
 - Pydantic
 - HTTPX
 - SQLAlchemy 2 / Alembic
-- PostgreSQL 16（会话和运行）
-- SQLite（大模型供应商配置）
+- PostgreSQL 16（业务配置、会话和运行）
+- SQLite（仅作为旧数据一次性迁移源和单元测试适配器）
 - Pytest
 
 ## 目录结构
@@ -134,14 +134,22 @@ npm run dev
 - `GET /api/agent-runs/{run_id}`：读取 Run 状态。
 - `GET /api/agent-runs/{run_id}/events`：通过 `Last-Event-ID` 恢复读取有限 SSE 事件。
 
-运行数据默认保存在 `backend/data/model-providers.db`。可通过环境变量 `MODEL_PROVIDER_DATABASE` 指定其他 SQLite 数据库文件：
+模型供应商、智能体和 MCP 运行数据统一写入 `DATABASE_URL` 指定的 PostgreSQL。更新已有部署时，API 容器会在 Alembic 升级后检查 `/data/model-providers.db`、`/data/agents.db` 和 `/data/mcp.db`；仅当对应 PostgreSQL 表为空时执行一次性导入：
+
+旧版容器首次升级前，先把位于容器层的 Agent/MCP SQLite 数据库备份到持久卷，避免重建容器时丢失：
 
 ```powershell
-$env:MODEL_PROVIDER_DATABASE = "D:\data\model-providers.db"
+docker compose exec -T api python -c "import sqlite3; [(lambda s,d: (s.backup(d), d.close(), s.close()))(sqlite3.connect('/app/data/'+n), sqlite3.connect('/data/'+n)) for n in ('agents.db','mcp.db')]"
+```
+
+```powershell
+$env:DATABASE_URL = "postgresql+psycopg://iap:iap@127.0.0.1:5432/iap"
+python -m alembic upgrade head
+python -m app.migrations.sqlite_to_postgres
 python -m uvicorn app.main:app --reload --port 8000
 ```
 
-内置供应商定义位于 `backend/app/model_providers/registry.py`。如果启动时检测到旧版 `backend/data/model-providers.json` 且数据库为空，后端会自动导入数据，并将原文件重命名为 `model-providers.json.migrated`。
+导入命令不会删除或修改 SQLite 源文件，也不会用旧数据覆盖非空 PostgreSQL 表。内置供应商定义仍位于 `backend/app/model_providers/registry.py`。
 
 ## 构建与测试
 

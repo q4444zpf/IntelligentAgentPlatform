@@ -24,7 +24,8 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://iap:iap@postgres:5432/iap
       IAP_ALLOW_DEV_IDENTITY: "${IAP_ALLOW_DEV_IDENTITY:-false}"
-      MODEL_PROVIDER_DATABASE: /data/model-providers.db
+      LEGACY_SQLITE_DATA_DIR: /data
+      AGENT_WORKSPACE_ROOT: /data/agent-workspaces
     depends_on:
       postgres:
         condition: service_healthy

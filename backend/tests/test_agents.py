@@ -1,10 +1,13 @@
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.agents.router import create_router
 from app.agents.service import AgentService
 from app.agents.store import AgentStore
+from app.db.base import Base
 from app.skills.schemas import SkillCreateRequest
 from app.skills.service import SkillService
 
@@ -26,7 +29,10 @@ version: "1.0"
             tags=["水文"],
         )
     )
-    service = AgentService(AgentStore(tmp_path / "agents.db"), skill_service=skill_service)
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'agents.db'}")
+    Base.metadata.create_all(engine)
+    store = AgentStore(sessionmaker(bind=engine, expire_on_commit=False, class_=Session))
+    service = AgentService(store, skill_service=skill_service, workspace_root=tmp_path / "agent-workspaces")
     app = FastAPI()
     app.include_router(create_router(service), prefix="/api/agents")
     return TestClient(app)

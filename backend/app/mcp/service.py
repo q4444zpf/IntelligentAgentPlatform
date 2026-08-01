@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import sqlite3
 from datetime import UTC, datetime
 
 import httpx
+from sqlalchemy.exc import IntegrityError
 
 from .schemas import McpClientConfig, McpClientCreate, McpClientInfo, McpToolInfo
 from .store import McpStore
@@ -67,7 +67,7 @@ class McpService:
             raise McpConflictError(f"MCP client '{request.key}' already exists")
         try:
             record = self.store.create(request.key, request.model_dump(exclude={"key"}))
-        except sqlite3.IntegrityError as error:
+        except IntegrityError as error:
             raise McpConflictError(f"MCP client '{request.key}' already exists") from error
         return self._info(record)
 

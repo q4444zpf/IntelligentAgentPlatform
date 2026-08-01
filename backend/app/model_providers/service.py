@@ -5,12 +5,12 @@ import httpx
 
 from .registry import builtin_providers
 from .schemas import ActiveModel, AddModelRequest, CreateProviderRequest, DiscoverModelsResponse, ModelConfigRequest, ModelInfo, ProbeMultimodalResponse, ProviderConfigRequest, ProviderInfo, TestConnectionResponse
-from .store import SqliteStore
+from .store import ProviderStore
 
 
 class ProviderService:
-    def __init__(self, store: SqliteStore | None = None):
-        self.store = store or SqliteStore()
+    def __init__(self, store: ProviderStore | None = None):
+        self.store = store or ProviderStore()
 
     @staticmethod
     def _mask(secret: str) -> str:

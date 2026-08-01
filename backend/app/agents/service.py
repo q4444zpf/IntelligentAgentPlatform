@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import shutil
-import sqlite3
+import os
 from pathlib import Path
+
+from sqlalchemy.exc import IntegrityError
 
 from app.skills.service import SkillNotFoundError, SkillService
 
@@ -32,7 +34,8 @@ class AgentService:
     ):
         self.store = store or AgentStore()
         self.skill_service = skill_service or SkillService()
-        self.workspace_root = Path(workspace_root or self.store.path.parent / "agent-workspaces").resolve()
+        default_workspace = Path(__file__).resolve().parents[2] / "data" / "agent-workspaces"
+        self.workspace_root = Path(workspace_root or os.getenv("AGENT_WORKSPACE_ROOT", default_workspace)).resolve()
         self.workspace_root.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
@@ -78,7 +81,7 @@ class AgentService:
         workspace = self._initialize_workspace(request.id, config)
         try:
             record = self.store.create(request.id, config.model_dump(), str(workspace))
-        except sqlite3.IntegrityError as error:
+        except IntegrityError as error:
             shutil.rmtree(workspace, ignore_errors=True)
             raise AgentConflictError(f"Agent '{request.id}' already exists") from error
         return self._info(record)

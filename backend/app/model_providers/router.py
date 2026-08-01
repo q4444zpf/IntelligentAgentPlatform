@@ -2,6 +2,7 @@ from fastapi import APIRouter, Body, HTTPException, Path
 
 from .schemas import ActiveModel, AddModelRequest, CreateProviderRequest, DiscoverModelsResponse, ModelConfigRequest, ProbeMultimodalResponse, ProviderConfigRequest, ProviderInfo, TestConnectionResponse
 from .service import ProviderService
+from .store import ConcurrentProviderUpdateError
 
 router = APIRouter()
 service = ProviderService()
@@ -23,6 +24,7 @@ def create_provider(body: CreateProviderRequest):
 def configure_provider(provider_id: str, body: ProviderConfigRequest):
     try: return service.configure(provider_id, body)
     except KeyError as exc: raise not_found(exc) from exc
+    except ConcurrentProviderUpdateError as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 @router.post("/{provider_id}/models", response_model=ProviderInfo)
 def add_model(provider_id: str, body: AddModelRequest):
@@ -34,23 +36,27 @@ def add_model(provider_id: str, body: AddModelRequest):
 def configure_model(provider_id: str, model_id: str, body: ModelConfigRequest):
     try: return service.configure_model(provider_id, model_id, body)
     except KeyError as exc: raise not_found(exc) from exc
+    except ConcurrentProviderUpdateError as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 @router.delete("/{provider_id}/models/{model_id}", response_model=ProviderInfo)
 def remove_model(provider_id: str, model_id: str):
     try: return service.remove_model(provider_id, model_id)
     except KeyError as exc: raise not_found(exc) from exc
+    except ConcurrentProviderUpdateError as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc: raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 @router.post("/{provider_id}/discover", response_model=DiscoverModelsResponse)
 async def discover_models(provider_id: str, save: bool = True):
     try: return await service.discover_models(provider_id, save)
     except KeyError as exc: raise not_found(exc) from exc
+    except ConcurrentProviderUpdateError as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc: raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 @router.post("/{provider_id}/models/{model_id}/probe-multimodal", response_model=ProbeMultimodalResponse)
 async def probe_multimodal(provider_id: str, model_id: str):
     try: return await service.probe_multimodal(provider_id, model_id)
     except KeyError as exc: raise not_found(exc) from exc
+    except ConcurrentProviderUpdateError as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc: raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 @router.post("/{provider_id}/test", response_model=TestConnectionResponse)
@@ -70,4 +76,5 @@ def get_active(): return service.get_active()
 def set_active(body: ActiveModel):
     try: return service.set_active(body)
     except KeyError as exc: raise not_found(exc) from exc
+    except ConcurrentProviderUpdateError as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc: raise HTTPException(status_code=400, detail=str(exc)) from exc

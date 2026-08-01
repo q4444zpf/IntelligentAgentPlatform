@@ -1,13 +1,23 @@
 from app.model_providers.schemas import AddModelRequest, CreateProviderRequest, ProviderConfigRequest
 from app.model_providers.service import ProviderService
-from app.model_providers.store import SqliteStore
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+
+from app.db.base import Base
+from app.model_providers.store import ProviderStore
 import asyncio
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
+def provider_store(path):
+    engine = create_engine(f"sqlite+pysqlite:///{path}")
+    Base.metadata.create_all(engine)
+    return ProviderStore(sessionmaker(bind=engine, expire_on_commit=False, class_=Session))
+
+
 def test_lists_builtin_and_persists_custom_provider(tmp_path):
-    service = ProviderService(SqliteStore(tmp_path / "providers.db"))
+    service = ProviderService(provider_store(tmp_path / "providers.db"))
     assert any(provider.id == "deepseek" for provider in service.list())
     provider_names = {provider.id: provider.name for provider in service.list()}
     assert {
@@ -26,13 +36,13 @@ def test_lists_builtin_and_persists_custom_provider(tmp_path):
     assert configured.configured is True
     assert configured.masked_api_key.endswith("-key")
     service.add_model("water-model", AddModelRequest(id="reservoir-agent", name="水库调度模型"))
-    reloaded = ProviderService(SqliteStore(tmp_path / "providers.db")).get("water-model")
+    reloaded = ProviderService(provider_store(tmp_path / "providers.db")).get("water-model")
     assert reloaded.models[0].id == "reservoir-agent"
 
 
 def test_disables_and_reenables_local_provider_without_api_key(tmp_path):
     database = tmp_path / "local-provider.db"
-    service = ProviderService(SqliteStore(database))
+    service = ProviderService(provider_store(database))
 
     enabled = service.configure(
         "ollama",
@@ -53,7 +63,7 @@ def test_disables_and_reenables_local_provider_without_api_key(tmp_path):
     assert disabled.enabled is False
     assert disabled.configured is False
 
-    reloaded = ProviderService(SqliteStore(database))
+    reloaded = ProviderService(provider_store(database))
     assert reloaded.get("ollama").configured is False
 
     reenabled = reloaded.configure(
@@ -86,7 +96,7 @@ def test_ollama_connection_does_not_send_empty_authorization_header(tmp_path):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        service = ProviderService(SqliteStore(tmp_path / "ollama-test.db"))
+        service = ProviderService(provider_store(tmp_path / "ollama-test.db"))
         result = asyncio.run(
             service.test(
                 "ollama",
@@ -119,7 +129,7 @@ def test_discovers_and_removes_ollama_models(tmp_path):
     thread.start()
     try:
         database = tmp_path / "ollama-discovery.db"
-        service = ProviderService(SqliteStore(database))
+        service = ProviderService(provider_store(database))
         service.configure(
             "ollama",
             ProviderConfigRequest(
@@ -137,14 +147,14 @@ def test_discovers_and_removes_ollama_models(tmp_path):
 
         removed = service.remove_model("ollama", "qwen2.5:7b")
         assert removed.models == []
-        assert ProviderService(SqliteStore(database)).get("ollama").models == []
+        assert ProviderService(provider_store(database)).get("ollama").models == []
     finally:
         server.shutdown()
         server.server_close()
 
 
 def test_rejects_removing_builtin_model(tmp_path):
-    service = ProviderService(SqliteStore(tmp_path / "builtin.db"))
+    service = ProviderService(provider_store(tmp_path / "builtin.db"))
     try:
         service.remove_model("deepseek", "deepseek-chat")
         raise AssertionError("Expected built-in model removal to fail")
@@ -174,7 +184,7 @@ def test_probes_and_persists_multimodal_capability(tmp_path):
     thread.start()
     try:
         database = tmp_path / "multimodal.db"
-        service = ProviderService(SqliteStore(database))
+        service = ProviderService(provider_store(database))
         service.configure("ollama", ProviderConfigRequest(base_url=f"http://127.0.0.1:{server.server_port}", enabled=True))
         service.add_model("ollama", AddModelRequest(id="vision-model", name="Vision Model"))
         result = asyncio.run(service.probe_multimodal("ollama", "vision-model"))
@@ -185,7 +195,7 @@ def test_probes_and_persists_multimodal_capability(tmp_path):
         assert captured["authorization"] is None
         assert "vision-model" in captured["payload"]
 
-        persisted = next(model for model in ProviderService(SqliteStore(database)).get("ollama").models if model.id == "vision-model")
+        persisted = next(model for model in ProviderService(provider_store(database)).get("ollama").models if model.id == "vision-model")
         assert persisted.supports_image is True
         assert persisted.supports_multimodal is True
         assert persisted.probe_source == "probed"

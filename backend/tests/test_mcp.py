@@ -2,10 +2,13 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.mcp.router import create_router
 from app.mcp.service import McpService
 from app.mcp.store import McpStore
+from app.db.base import Base
 
 
 @pytest.fixture
@@ -41,8 +44,10 @@ def client(tmp_path):
             },
         )
 
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'mcp.db'}")
+    Base.metadata.create_all(engine)
     service = McpService(
-        McpStore(tmp_path / "mcp.db"),
+        McpStore(sessionmaker(bind=engine, expire_on_commit=False, class_=Session)),
         http_client=httpx.Client(transport=httpx.MockTransport(remote_handler)),
     )
     app = FastAPI()

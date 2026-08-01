@@ -17,5 +17,5 @@ USER nobody
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "python -m alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers"]
+CMD ["sh", "-c", "python -m alembic upgrade head && python -m app.migrations.sqlite_to_postgres && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers"]
 

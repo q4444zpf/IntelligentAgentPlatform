@@ -12,4 +12,14 @@ def test_upgrade_head_creates_conversation_tables():
         ["python", "-m", "alembic", "upgrade", "head"], check=True, env=env
     )
     tables = set(inspect(create_engine(env["DATABASE_URL"])).get_table_names())
-    assert {"conversations", "messages", "agent_runs", "run_events"} <= tables
+    assert {
+        "conversations",
+        "messages",
+        "agent_runs",
+        "run_events",
+        "provider_configs",
+        "custom_providers",
+        "platform_settings",
+        "managed_agents",
+        "mcp_clients",
+    } <= tables

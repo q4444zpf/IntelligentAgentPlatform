@@ -7,7 +7,8 @@
 - 发布根目录：`/opt/intelligent-agent-platform`
 - 当前版本链接：`/opt/intelligent-agent-platform/current`
 - Compose 项目名：`intelligent-agent-platform`
-- 数据卷：`intelligent-agent-platform_model-provider-data`
+- PostgreSQL 数据卷：`intelligent-agent-platform_postgres-data`
+- 工作区及旧 SQLite 迁移源卷：`intelligent-agent-platform_model-provider-data`
 
 服务器使用 Docker Compose 运行 `web` 和 `api` 两个服务。`web` 通过 TCP 80 提供前端并反向代理 `/api/`；`api` 仅在 Compose 内部网络监听 8000。
 
@@ -30,7 +31,7 @@ docker compose restart
 docker compose stop
 ```
 
-不要使用 `docker compose down -v`，该命令会删除包含 SQLite 数据库的持久化卷。
+不要使用 `docker compose down -v`，该命令会删除 PostgreSQL、Agent 工作区和旧数据迁移源卷。
 
 ## 健康检查
 
@@ -47,27 +48,34 @@ curl -fsS http://39.108.91.166/api/health
 
 ## 数据备份
 
-先查询数据卷挂载位置：
-
-```bash
-docker volume inspect intelligent-agent-platform_model-provider-data \
-  --format '{{.Mountpoint}}'
-```
-
-在应用写入较少的维护窗口内备份：
+使用 `pg_dump` 备份业务数据库：
 
 ```bash
 mkdir -p /opt/intelligent-agent-platform/backups
 cd /opt/intelligent-agent-platform/current
-docker compose stop api
+docker compose exec -T postgres pg_dump -U iap -d iap -Fc \
+  > /opt/intelligent-agent-platform/backups/iap-$(date +%Y%m%d-%H%M%S).dump
+```
+
+Agent 工作区和旧 SQLite 迁移源单独备份：
+
+```bash
 tar -C /var/lib/docker/volumes/intelligent-agent-platform_model-provider-data/_data \
-  -czf /opt/intelligent-agent-platform/backups/model-provider-data-$(date +%Y%m%d-%H%M%S).tar.gz .
-docker compose start api
+  -czf /opt/intelligent-agent-platform/backups/agent-workspaces-$(date +%Y%m%d-%H%M%S).tar.gz .
 ```
 
 备份完成后执行健康检查。生产环境应将备份复制到 ECS 之外的受控存储。
 
 ## 更新
+
+从 SQLite 版本首次升级到 PostgreSQL 统一存储前，必须在旧 API 容器仍运行时备份 Agent 和 MCP 数据库到已挂载的 `/data` 卷：
+
+```bash
+docker compose exec -T api python -c "import sqlite3; [(lambda s,d: (s.backup(d), d.close(), s.close()))(sqlite3.connect('/app/data/'+n), sqlite3.connect('/data/'+n)) for n in ('agents.db','mcp.db')]"
+docker compose exec -T api sh -c 'mkdir -p /data/agent-workspaces && cp -a /app/data/agent-workspaces/. /data/agent-workspaces/ 2>/dev/null || true'
+```
+
+完成备份后再执行新版本的 `docker compose up -d --build`。新 API 启动时先执行 Alembic，再逐主键导入三个 SQLite 数据源；PostgreSQL 已有记录不会被覆盖。
 
 每次更新使用新的时间戳目录：
 
@@ -109,12 +117,12 @@ ln -sfn "$previous" /opt/intelligent-agent-platform/current.new
 mv -Tf /opt/intelligent-agent-platform/current.new /opt/intelligent-agent-platform/current
 ```
 
-固定项目名保证更新和回滚继续使用同一个 SQLite 数据卷。
+固定项目名保证更新和回滚继续使用同一个 PostgreSQL 数据卷与 Agent 工作区卷。
 
 ## 安全注意事项
 
 - 不要在仓库、Compose 文件、镜像或命令历史中保存 SSH 密码与模型密钥。
 - 公网只需开放 SSH 管理端口和 TCP 80；不要映射后端 8000。
-- 首次部署使用全新的服务器数据库，不包含本地模型供应商密钥。
+- 首次部署使用全新的 PostgreSQL 数据库，不包含本地模型供应商密钥。
 - 应尽快更换部署时使用过的密码，并改为 SSH 密钥登录。
 - 配置域名后，应启用 HTTPS，并将 HTTP 重定向到 HTTPS。
