@@ -61,9 +61,12 @@ def test_completes_run_and_persists_assistant_message():
     PlatformAgentHarness(repository, SuccessfulGateway()).execute(run_id)
 
     run = session.get(AgentRun, run_id)
-    messages = repository.get_run_messages(run_id)
+    assert run is not None
+    messages = repository.list_messages(
+        "p1", "u1", run.conversation_id
+    )
     events = repository.list_events(run_id, 0)
-    assert run is not None and run.status == "completed"
+    assert run.status == "completed"
     assert messages[-1].role == "assistant"
     assert messages[-1].content == "研判完成"
     assert [event.event_type for event in events] == [
@@ -115,3 +118,32 @@ def test_rejects_team_run_until_multi_agent_runtime_is_available():
     assert run is not None and run.status == "failed"
     assert events[-2].payload["code"] == "unsupported_actor_type"
     assert all(event.event_type != "message.completed" for event in events)
+class CapturingGateway:
+    def __init__(self):
+        self.calls: list[list[dict[str, str]]] = []
+
+    def generate(self, messages: list[dict[str, str]]) -> ModelResult:
+        self.calls.append(messages)
+        return ModelResult(content="首次研判完成")
+
+
+def test_run_context_stops_at_its_trigger_message():
+    session, run_id = build_queued_run()
+    run = session.get(AgentRun, run_id)
+    assert run is not None
+    session.add(
+        Message(
+            conversation_id=run.conversation_id,
+            sequence=2,
+            role="user",
+            content="这是后续问题",
+        )
+    )
+    session.commit()
+    gateway = CapturingGateway()
+
+    PlatformAgentHarness(
+        ConversationRepository(session), gateway
+    ).execute(run_id)
+
+    assert gateway.calls == [[{"role": "user", "content": "分析洪峰"}]]

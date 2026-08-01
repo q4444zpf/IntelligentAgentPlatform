@@ -62,10 +62,16 @@ class ConversationRepository:
         run = self.get_run_by_id(run_id)
         if run is None:
             return []
+        trigger = self.session.get(Message, run.trigger_message_id)
+        if trigger is None:
+            return []
         query = (
             select(Message)
-            .where(Message.conversation_id == run.conversation_id)
-            .order_by(Message.created_at, Message.id)
+            .where(
+                Message.conversation_id == run.conversation_id,
+                Message.sequence <= trigger.sequence,
+            )
+            .order_by(Message.sequence)
         )
         return list(self.session.scalars(query))
 
@@ -76,6 +82,7 @@ class ConversationRepository:
         return self.add(
             Message(
                 conversation_id=run.conversation_id,
+                sequence=self.next_message_sequence(run.conversation_id),
                 role="assistant",
                 content=content,
             )
@@ -100,10 +107,15 @@ class ConversationRepository:
         query = (
             select(Message)
             .where(Message.conversation_id == conversation_id)
-            .order_by(Message.created_at, Message.id)
+            .order_by(Message.sequence)
         )
         return list(self.session.scalars(query))
 
+    def next_message_sequence(self, conversation_id: str) -> int:
+        query = select(func.coalesce(func.max(Message.sequence), 0)).where(
+            Message.conversation_id == conversation_id
+        )
+        return int(self.session.scalar(query)) + 1
     def next_event_sequence(self, run_id: str) -> int:
         query = select(func.coalesce(func.max(RunEvent.sequence), 0)).where(
             RunEvent.run_id == run_id

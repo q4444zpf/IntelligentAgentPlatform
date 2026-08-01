@@ -70,4 +70,30 @@ describe('conversation store', () => {
     expect(store.activeRun?.status).toBe('failed');
     expect(store.error).toBe('模型调用失败，请检查默认模型配置或稍后重试');
   });
-});
+
+  it('ignores an in-flight event response after switching conversations', async () => {
+    let resolveEvents!: (events: Awaited<ReturnType<typeof getRunEvents>>) => void;
+    vi.mocked(getRunEvents).mockReturnValue(new Promise((resolve) => {
+      resolveEvents = resolve;
+    }));
+    vi.mocked(conversationsApi.listMessages).mockResolvedValue([
+      { id: 'new-message', conversation_id: 'c2', role: 'user', content: '新会话', created_at: '2026-07-31T00:00:02Z' },
+    ]);
+    const store = useConversationStore();
+    store.activeConversationId = 'c1';
+    store.activeRun = structuredClone(acceptedRun.run);
+
+    const replaying = store.replayEvents(0, 1);
+    await Promise.resolve();
+    await store.selectConversation('c2');
+    resolveEvents([
+      { sequence: 2, event_type: 'run.status', payload: { status: 'completed' } },
+    ]);
+    await replaying;
+
+    expect(store.activeConversationId).toBe('c2');
+    expect(store.activeRun).toBeNull();
+    expect(store.events).toEqual([]);
+    expect(store.messages).toHaveLength(1);
+    expect(store.messages[0].conversation_id).toBe('c2');
+  });});

@@ -13,5 +13,6 @@ describe('AgentConsoleView runtime contract', () => {
     expect(source).not.toContain('setTimeout');
     expect(source).not.toContain('initialMessages');
     expect(source).not.toContain('沙箱已隔离');
+    expect(source).toContain('isRunActive(conversationStore.activeRun?.status)');
   });
 });

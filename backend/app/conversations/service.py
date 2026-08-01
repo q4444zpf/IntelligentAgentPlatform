@@ -89,6 +89,7 @@ class ConversationService:
         message = self.repository.add(
             Message(
                 conversation_id=conversation_id,
+                sequence=self.repository.next_message_sequence(conversation_id),
                 role="user",
                 content=request.content,
             )

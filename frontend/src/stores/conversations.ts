@@ -97,6 +97,11 @@ export const useConversationStore = defineStore('conversations', {
         if (token !== this.pollToken || this.activeRun?.id !== runId) return;
         const latest = this.events.at(-1)?.sequence ?? 0;
         const events = await getRunEvents(runId, latest);
+        if (
+          token !== this.pollToken
+          || this.activeRun?.id !== runId
+          || this.activeConversationId !== conversationId
+        ) return;
         this.events.push(...events);
 
         for (const event of events) {
@@ -110,7 +115,13 @@ export const useConversationStore = defineStore('conversations', {
 
         if (terminalStatuses.has(this.activeRun.status)) {
           if (this.activeRun.status === 'completed') {
-            this.messages = await conversationsApi.listMessages(conversationId);
+            const messages = await conversationsApi.listMessages(conversationId);
+            if (
+              token !== this.pollToken
+              || this.activeRun?.id !== runId
+              || this.activeConversationId !== conversationId
+            ) return;
+            this.messages = messages;
           } else if (runtimeError) {
             this.error = runtimeError;
           }

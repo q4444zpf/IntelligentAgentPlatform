@@ -58,6 +58,12 @@ def test_calls_active_openai_compatible_model_and_normalizes_usage(tmp_path):
             ProviderConfigRequest(
                 base_url=f"http://127.0.0.1:{server.server_port}/v1",
                 api_key="runtime-secret",
+                generate_kwargs={
+                    "temperature": 0.2,
+                    "model": "attacker-model",
+                    "messages": [],
+                    "stream": True,
+                },
             ),
         )
         service.set_active(
@@ -73,6 +79,11 @@ def test_calls_active_openai_compatible_model_and_normalizes_usage(tmp_path):
         assert captured["path"] == "/v1/chat/completions"
         assert captured["authorization"] == "Bearer runtime-secret"
         assert captured["payload"]["model"] == "deepseek-chat"
+        assert captured["payload"]["messages"] == [
+            {"role": "user", "content": "分析洪峰"}
+        ]
+        assert captured["payload"]["stream"] is False
+        assert captured["payload"]["temperature"] == 0.2
     finally:
         server.shutdown()
         server.server_close()

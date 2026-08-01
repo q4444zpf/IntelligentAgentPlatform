@@ -61,11 +61,11 @@ class OpenAICompatibleModelGateway:
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         payload = {
+            **provider.generate_kwargs,
+            **model.extra_config,
             "model": active.model,
             "messages": messages,
             "stream": False,
-            **provider.generate_kwargs,
-            **model.extra_config,
         }
 
         try:

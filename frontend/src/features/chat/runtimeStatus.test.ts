@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { runtimeStatusLabel } from './runtimeStatus';
+import { isRunActive, runtimeStatusLabel } from './runtimeStatus';
 
 describe('runtimeStatusLabel', () => {
   it('does not claim isolation while a run is only queued', () => {
@@ -11,7 +11,15 @@ describe('runtimeStatusLabel', () => {
     expect(runtimeStatusLabel('running')).toBe('沙箱运行中');
     expect(runtimeStatusLabel('waiting_approval')).toBe('等待人工确认');
     expect(runtimeStatusLabel('succeeded')).toBe('运行完成');
+    expect(runtimeStatusLabel('completed')).toBe('运行完成');
     expect(runtimeStatusLabel('failed')).toBe('运行失败');
     expect(runtimeStatusLabel('cancelled')).toBe('已取消');
   });
-});
+
+  it('marks only non-terminal run states as active', () => {
+    expect(isRunActive('queued')).toBe(true);
+    expect(isRunActive('running')).toBe(true);
+    expect(isRunActive('completed')).toBe(false);
+    expect(isRunActive('failed')).toBe(false);
+    expect(isRunActive('cancelled')).toBe(false);
+  });});

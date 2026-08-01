@@ -4,6 +4,7 @@ const labels: Record<string, string> = {
   running: '沙箱运行中',
   waiting_approval: '等待人工确认',
   succeeded: '运行完成',
+  completed: '运行完成',
   failed: '运行失败',
   cancelled: '已取消',
 };
@@ -11,4 +12,10 @@ const labels: Record<string, string> = {
 export function runtimeStatusLabel(status?: string): string {
   if (!status) return '尚未启动运行';
   return labels[status] ?? `运行状态：${status}`;
+}
+
+const terminalStatuses = new Set(['completed', 'succeeded', 'failed', 'cancelled']);
+
+export function isRunActive(status?: string): boolean {
+  return Boolean(status && !terminalStatuses.has(status));
 }
