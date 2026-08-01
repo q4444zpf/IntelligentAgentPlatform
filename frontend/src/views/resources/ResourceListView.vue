@@ -10,11 +10,11 @@
 
     <a-card class="section-card" :title="pageTitle">
       <div class="toolbar">
-        <a-space>
-          <a-input-search placeholder="搜索智能体、MCP、Skill、流程" style="width: 320px" />
-          <a-select value="all" style="width: 140px" :options="[{ label: '全部类型', value: 'all' }]" />
+        <a-space class="resource-filters">
+          <a-input-search class="resource-search" placeholder="搜索智能体、MCP、Skill、流程" />
+          <a-select class="resource-type" value="all" :options="[{ label: '全部类型', value: 'all' }]" />
         </a-space>
-        <a-space>
+        <a-space class="resource-actions" wrap>
           <a-button v-if="!isPublic">提交公用发布</a-button>
           <a-button v-if="isReview && permissionStore.isAdmin">批量审核</a-button>
           <a-button type="primary">{{ primaryActionText }}</a-button>
@@ -133,3 +133,17 @@ async function loadData() {
 onMounted(loadData);
 watch(() => route.fullPath, loadData);
 </script>
+
+<style scoped>
+.resource-search { width: 320px; }
+.resource-type { width: 140px; }
+@media (max-width: 760px) {
+  .resource-filters { display: grid; width: 100%; grid-template-columns: minmax(0, 1fr) 120px; }
+  .resource-search,.resource-type { width: 100%; }
+  .resource-actions { width: 100%; }
+}
+@media (max-width: 420px) {
+  .resource-filters { grid-template-columns: 1fr; }
+  .resource-actions :deep(.ant-btn) { flex: 1; }
+}
+</style>

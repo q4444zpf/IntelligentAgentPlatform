@@ -24,12 +24,12 @@
     </a-spin>
 
     <a-row :gutter="16">
-      <a-col :span="14">
+      <a-col :xs="24" :lg="14">
         <a-card class="section-card" title="平台核心闭环">
           <a-steps direction="vertical" :current="2" size="small" :items="steps" />
         </a-card>
       </a-col>
-      <a-col :span="10">
+      <a-col :xs="24" :lg="10">
         <a-card class="section-card" title="待处理事项">
           <a-list :data-source="todos">
             <template #renderItem="{ item }">
@@ -44,7 +44,7 @@
     </a-row>
 
     <a-row :gutter="16">
-      <a-col :span="12">
+      <a-col :xs="24" :xl="12">
         <a-card class="section-card" title="资源运行概览">
           <a-table :columns="resourceColumns" :data-source="resourceRows" :pagination="false" row-key="name">
             <template #bodyCell="{ column, record }">
@@ -54,7 +54,7 @@
           </a-table>
         </a-card>
       </a-col>
-      <a-col :span="12">
+      <a-col :xs="24" :xl="12">
         <a-card class="section-card" title="安全与审计">
           <a-table :columns="auditColumns" :data-source="auditRows" :pagination="false" row-key="event">
             <template #bodyCell="{ column, record }">
