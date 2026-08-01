@@ -112,6 +112,13 @@ class ConversationRepository:
         return list(self.session.scalars(query))
 
     def next_message_sequence(self, conversation_id: str) -> int:
+        conversation = self.session.scalar(
+            select(Conversation)
+            .where(Conversation.id == conversation_id)
+            .with_for_update()
+        )
+        if conversation is None:
+            raise KeyError(conversation_id)
         query = select(func.coalesce(func.max(Message.sequence), 0)).where(
             Message.conversation_id == conversation_id
         )
