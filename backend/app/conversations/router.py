@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_session
 from app.core.request_context import RequestContext, require_request_context
 
-from .dispatcher import UnavailableRunDispatcher
+from .dispatcher import ThreadRunDispatcher
 from .repository import ConversationRepository
 from .schemas import (
     AgentRunInfo,
@@ -24,10 +24,12 @@ from .service import ConversationNotFound, ConversationService, RunNotFound
 
 ServiceFactory = Callable[[Session], ConversationService]
 
+default_run_dispatcher = ThreadRunDispatcher()
+
 
 def default_service_factory(session: Session) -> ConversationService:
     return ConversationService(
-        ConversationRepository(session), UnavailableRunDispatcher()
+        ConversationRepository(session), default_run_dispatcher
     )
 
 
