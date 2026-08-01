@@ -12,6 +12,12 @@ frontend/*.log
 
 .worktrees/
 
+# Local AI and browser automation artifacts.
+.claude/
+.playwright-cli/
+.superpowers/
+output/
+
 # Backend runtime data may contain model credentials.
 backend/data/
 **/__pycache__/
