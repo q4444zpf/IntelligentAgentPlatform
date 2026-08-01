@@ -7,6 +7,12 @@ import {
 } from '@/api/conversations';
 import { getRunEvents, type RunEvent } from '@/api/runEvents';
 
+const terminalStatuses = new Set(['completed', 'failed', 'cancelled']);
+
+function wait(milliseconds: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+}
+
 export const useConversationStore = defineStore('conversations', {
   state: () => ({
     conversations: [] as ConversationInfo[],
@@ -17,6 +23,7 @@ export const useConversationStore = defineStore('conversations', {
     loading: false,
     sending: false,
     error: '',
+    pollToken: 0,
   }),
   actions: {
     async loadConversations() {
@@ -43,12 +50,14 @@ export const useConversationStore = defineStore('conversations', {
       return conversation;
     },
     async selectConversation(conversationId: string) {
+      this.pollToken += 1;
       this.activeConversationId = conversationId;
       this.messages = await conversationsApi.listMessages(conversationId);
       this.activeRun = null;
       this.events = [];
     },
     startNewConversation() {
+      this.pollToken += 1;
       this.activeConversationId = '';
       this.messages = [];
       this.activeRun = null;
@@ -68,6 +77,7 @@ export const useConversationStore = defineStore('conversations', {
         });
         this.messages.push(accepted.message);
         this.activeRun = accepted.run;
+        this.events = [];
         await this.replayEvents();
       } catch (error) {
         this.error = error instanceof Error ? error.message : '消息发送失败';
@@ -76,16 +86,40 @@ export const useConversationStore = defineStore('conversations', {
         this.sending = false;
       }
     },
-    async replayEvents() {
+    async replayEvents(pollIntervalMs = 500, maxPolls = 120) {
       if (!this.activeRun) return;
-      const latest = this.events.at(-1)?.sequence ?? 0;
-      const events = await getRunEvents(this.activeRun.id, latest);
-      this.events.push(...events);
-      for (const event of events) {
-        if (event.event_type === 'run.status' && typeof event.payload.status === 'string') {
-          this.activeRun.status = event.payload.status;
+      const runId = this.activeRun.id;
+      const conversationId = this.activeConversationId;
+      const token = ++this.pollToken;
+      let runtimeError = '';
+
+      for (let attempt = 0; attempt < maxPolls; attempt += 1) {
+        if (token !== this.pollToken || this.activeRun?.id !== runId) return;
+        const latest = this.events.at(-1)?.sequence ?? 0;
+        const events = await getRunEvents(runId, latest);
+        this.events.push(...events);
+
+        for (const event of events) {
+          if (event.event_type === 'run.error' && typeof event.payload.message === 'string') {
+            runtimeError = event.payload.message;
+          }
+          if (event.event_type === 'run.status' && typeof event.payload.status === 'string') {
+            this.activeRun.status = event.payload.status;
+          }
         }
+
+        if (terminalStatuses.has(this.activeRun.status)) {
+          if (this.activeRun.status === 'completed') {
+            this.messages = await conversationsApi.listMessages(conversationId);
+          } else if (runtimeError) {
+            this.error = runtimeError;
+          }
+          return;
+        }
+        if (attempt < maxPolls - 1) await wait(pollIntervalMs);
       }
+
+      this.error = '智能体运行等待超时，请稍后查看会话结果';
     },
   },
 });
