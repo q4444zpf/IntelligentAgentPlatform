@@ -19,9 +19,10 @@ class AgentConfig(BaseModel):
     context_prompt: str = Field(default="", max_length=20_000)
     approval_policy: ApprovalPolicy = "control_commands"
     skill_names: list[str] = Field(default_factory=list, max_length=100)
+    tool_ids: list[str] = Field(default_factory=list, max_length=100)
     enabled: bool = True
 
-    @field_validator("skill_names")
+    @field_validator("skill_names", "tool_ids")
     @classmethod
     def normalize_skills(cls, value: list[str]) -> list[str]:
         return list(dict.fromkeys(name.strip() for name in value if name.strip()))

@@ -10,7 +10,7 @@ from app.agents.schemas import AgentConfig, AgentCreateRequest, AgentDefaultRequ
 from app.agents.service import BUILTIN_AGENT_ID, AgentService
 from app.agents.store import AgentConcurrentUpdateError, DEFAULT_SETTING_KEY, AgentStore
 from app.db.base import Base
-from app.db.platform_models import PlatformSettingRecord
+from app.db.platform_models import PlatformSettingRecord, RegisteredToolRecord
 from app.skills.schemas import SkillCreateRequest
 from app.skills.service import SkillService
 
@@ -123,11 +123,145 @@ def agent_payload(**overrides):
         "context_prompt": "结合本地工程文件和客户端状态回答。",
         "approval_policy": "control_commands",
         "skill_names": ["flood-forecast"],
+        "tool_ids": [],
         "enabled": True,
     }
     payload.update(overrides)
     return payload
 
+
+BUILTIN_TOOL_IDS = [
+    "system.get_current_time",
+    "system.get_runtime_context",
+]
+
+
+def test_normalizes_agent_tool_ids_with_stable_deduplication():
+    config = AgentConfig(
+        name="工具智能体",
+        tool_ids=[" system.get_current_time ", "", "system.get_current_time"],
+    )
+
+    assert config.tool_ids == ["system.get_current_time"]
+
+
+def test_builtin_default_agent_binds_required_tools(client):
+    response = client.get(f"/api/agents/{BUILTIN_AGENT_ID}")
+
+    assert response.status_code == 200
+    assert response.json()["tool_ids"] == BUILTIN_TOOL_IDS
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+def test_rejects_unknown_tool_bindings(client, operation):
+    payload = agent_payload(tool_ids=["missing.tool"])
+    if operation == "create":
+        response = client.post("/api/agents", json=payload)
+    else:
+        assert client.post("/api/agents", json=agent_payload()).status_code == 201
+        response = client.put(
+            "/api/agents/reservoir-dispatch",
+            json={key: value for key, value in payload.items() if key != "id"},
+        )
+
+    assert response.status_code == 422
+    assert "missing.tool" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("published,enabled", [(True, False), (False, True)])
+def test_rejects_disabled_or_unpublished_tool_bindings(client, published, enabled):
+    service = client.app.state.agent_service
+    tool_id = "custom.test_tool"
+    with service.tool_service.store.session_factory.begin() as session:
+        session.add(
+            RegisteredToolRecord(
+                tool_id=tool_id,
+                version="1.0.0",
+                name="测试工具",
+                description="仅用于绑定校验",
+                source="mcp",
+                risk_level="low",
+                input_schema={},
+                output_schema={},
+                requires_approval=False,
+                published=published,
+                enabled=enabled,
+            )
+        )
+
+    response = client.post(
+        "/api/agents",
+        json=agent_payload(tool_ids=[tool_id]),
+    )
+
+    assert response.status_code == 422
+    assert tool_id in response.json()["detail"]
+
+
+def test_updates_and_copies_agent_tool_bindings(client):
+    assert client.post("/api/agents", json=agent_payload()).status_code == 201
+    updated_payload = agent_payload(
+        tool_ids=[
+            "system.get_current_time",
+            "system.get_runtime_context",
+            "system.get_current_time",
+        ]
+    )
+    updated = client.put(
+        "/api/agents/reservoir-dispatch",
+        json={key: value for key, value in updated_payload.items() if key != "id"},
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["tool_ids"] == BUILTIN_TOOL_IDS
+    copied = client.post(
+        "/api/agents/reservoir-dispatch/copy",
+        json={"id": "tool-copy", "name": "工具副本", "copy_skills": False},
+    )
+    assert copied.status_code == 201
+    assert copied.json()["tool_ids"] == BUILTIN_TOOL_IDS
+
+
+def test_disabled_tool_binding_remains_readable_but_cannot_be_resaved(client):
+    created = client.post(
+        "/api/agents",
+        json=agent_payload(tool_ids=["system.get_current_time"]),
+    )
+    assert created.status_code == 201
+    client.app.state.agent_service.tool_service.store.set_enabled(
+        "system.get_current_time",
+        False,
+    )
+
+    readable = client.get("/api/agents/reservoir-dispatch")
+    assert readable.status_code == 200
+    assert readable.json()["tool_ids"] == ["system.get_current_time"]
+    payload = {
+        key: value
+        for key, value in readable.json().items()
+        if key in AgentConfig.model_fields
+    }
+    saved = client.put("/api/agents/reservoir-dispatch", json=payload)
+    assert saved.status_code == 422
+
+
+def test_repairs_legacy_builtin_tool_bindings_without_removing_others(tmp_path):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'agents.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    store = AgentStore(session_factory)
+    service = AgentService(store, workspace_root=tmp_path / "agent-workspaces")
+    builtin = store.get(BUILTIN_AGENT_ID)
+    legacy_config = {name: builtin[name] for name in AgentConfig.model_fields}
+    legacy_config["tool_ids"] = ["legacy.external_tool"]
+    store.update(BUILTIN_AGENT_ID, legacy_config)
+
+    repaired = AgentService(
+        store,
+        workspace_root=tmp_path / "agent-workspaces",
+    ).get(BUILTIN_AGENT_ID)
+
+    assert repaired.tool_ids == ["legacy.external_tool", *BUILTIN_TOOL_IDS]
 
 def test_creates_and_lists_runtime_specific_agent(client):
     created = client.post("/api/agents", json=agent_payload())

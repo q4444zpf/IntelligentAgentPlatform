@@ -7,6 +7,8 @@ from pathlib import Path
 from sqlalchemy.exc import IntegrityError
 
 from app.skills.service import SkillNotFoundError, SkillService
+from app.tools.service import ToolNotFoundError, ToolService, ToolValidationError
+from app.tools.store import ToolStore
 
 from .schemas import AgentConfig, AgentCopyRequest, AgentCreateRequest, AgentInfo
 from .store import (
@@ -19,6 +21,10 @@ from .store import (
 
 
 BUILTIN_AGENT_ID = "platform-default-agent"
+BUILTIN_TOOL_IDS = [
+    "system.get_current_time",
+    "system.get_runtime_context",
+]
 BUILTIN_AGENT_CONFIG = AgentConfig(
     name="水利智能体平台助手",
     description="面向水利业务的通用平台智能助手",
@@ -34,6 +40,7 @@ BUILTIN_AGENT_CONFIG = AgentConfig(
     ),
     approval_policy="control_commands",
     skill_names=[],
+    tool_ids=BUILTIN_TOOL_IDS,
     enabled=True,
 )
 
@@ -60,14 +67,22 @@ class AgentService:
         store: AgentStore | None = None,
         *,
         skill_service: SkillService | None = None,
+        tool_service: ToolService | None = None,
         workspace_root: str | Path | None = None,
     ):
         self.store = store or AgentStore()
         self.skill_service = skill_service or SkillService()
+        self._tool_service = tool_service
         default_workspace = Path(__file__).resolve().parents[2] / "data" / "agent-workspaces"
         self.workspace_root = Path(workspace_root or os.getenv("AGENT_WORKSPACE_ROOT", default_workspace)).resolve()
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self._ensure_default_agent()
+
+    @property
+    def tool_service(self) -> ToolService:
+        if self._tool_service is None:
+            self._tool_service = ToolService(ToolStore(self.store.session_factory))
+        return self._tool_service
 
     @staticmethod
     def _call_store_mutation(operation):
@@ -123,10 +138,21 @@ class AgentService:
                 raise AgentConcurrentUpdateError(
                     "Built-in agent changed concurrently; retry the request"
                 )
-        elif not record["enabled"]:
-            config = {name: record[name] for name in AgentConfig.model_fields}
-            config["enabled"] = True
-            record = self.store.update(BUILTIN_AGENT_ID, config)
+        else:
+            config = AgentConfig(
+                **{
+                    name: record[name]
+                    for name in AgentConfig.model_fields
+                    if name in record
+                }
+            )
+            repaired_tool_ids = list(
+                dict.fromkeys([*config.tool_ids, *BUILTIN_TOOL_IDS])
+            )
+            if not config.enabled or repaired_tool_ids != config.tool_ids:
+                config.enabled = True
+                config.tool_ids = repaired_tool_ids
+                record = self.store.update(BUILTIN_AGENT_ID, config.model_dump())
         return record
 
     def _ensure_default_agent(self) -> None:
@@ -160,6 +186,14 @@ class AgentService:
                 missing.append(name)
         if missing:
             raise AgentValidationError(f"Unknown skills: {', '.join(missing)}")
+
+    def _validate_tools(self, tool_ids: list[str]) -> None:
+        try:
+            self.tool_service.resolve_bindable(tool_ids)
+        except ToolNotFoundError as error:
+            raise AgentValidationError(f"Unknown tool: {error}") from error
+        except ToolValidationError as error:
+            raise AgentValidationError(str(error)) from error
 
     def list(self) -> list[AgentInfo]:
         self._ensure_default_agent()
@@ -209,6 +243,7 @@ class AgentService:
         if self.store.get(request.id):
             raise AgentConflictError(f"Agent '{request.id}' already exists")
         self._validate_skills(request.skill_names)
+        self._validate_tools(request.tool_ids)
         config = AgentConfig(**request.model_dump(exclude={"id"}))
         workspace = self._initialize_workspace(request.id, config)
         try:
@@ -221,6 +256,7 @@ class AgentService:
     def update(self, agent_id: str, request: AgentConfig) -> AgentInfo:
         self._ensure_default_agent()
         self._validate_skills(request.skill_names)
+        self._validate_tools(request.tool_ids)
         record = self._call_store_mutation(
             lambda: self.store.update_agent(agent_id, request.model_dump())
         )

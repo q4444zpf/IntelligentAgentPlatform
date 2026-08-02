@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import re
 
 from .builtins import BUILTIN_TOOL_DEFINITIONS
@@ -38,6 +40,17 @@ class ToolService:
         if item is None:
             raise ToolNotFoundError(tool_id)
         return ToolInfo.model_validate(item)
+
+    def resolve_bindable(self, tool_ids: list[str]) -> list[ToolInfo]:
+        resolved = []
+        for tool_id in tool_ids:
+            tool = self.get(tool_id)
+            if not tool.published or not tool.enabled:
+                raise ToolValidationError(
+                    f"Tool '{tool_id}' is not available for binding"
+                )
+            resolved.append(tool)
+        return resolved
 
     def toggle(self, tool_id: str) -> ToolInfo:
         self._validate_tool_id(tool_id)
