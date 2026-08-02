@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
+from app.agents.service import AgentService
 from app.core.database import get_session
 from app.core.request_context import RequestContext, require_request_context
 
@@ -20,7 +21,12 @@ from .schemas import (
     MessageInfo,
     RunEventInfo,
 )
-from .service import ConversationNotFound, ConversationService, RunNotFound
+from .service import (
+    AgentSelectionError,
+    ConversationNotFound,
+    ConversationService,
+    RunNotFound,
+)
 
 ServiceFactory = Callable[[Session], ConversationService]
 
@@ -29,7 +35,9 @@ default_run_dispatcher = ThreadRunDispatcher()
 
 def default_service_factory(session: Session) -> ConversationService:
     return ConversationService(
-        ConversationRepository(session), default_run_dispatcher
+        ConversationRepository(session),
+        default_run_dispatcher,
+        agent_service=AgentService(),
     )
 
 
@@ -49,6 +57,8 @@ def create_router(
     def not_found(operation: Callable[[], Any]) -> Any:
         try:
             return operation()
+        except AgentSelectionError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
         except (ConversationNotFound, RunNotFound) as error:
             raise HTTPException(
                 status_code=404, detail="Resource was not found"
