@@ -17,9 +17,12 @@ from app.model_providers.service import ProviderService
 from app.model_providers.store import ProviderStore
 from app.runtime.model_gateway import (
     ModelConfigurationError,
+    ModelResult,
     ModelSelection,
+    ModelUpstreamError,
     OpenAICompatibleModelGateway,
 )
+from app.tools.schemas import ToolCall, ToolDefinition
 
 
 def provider_store(path) -> ProviderStore:
@@ -311,3 +314,116 @@ def test_rejects_explicit_selection_with_unsupported_protocol(tmp_path):
         )
 
     assert "runtime-secret" not in str(captured.value)
+
+
+def _configured_gateway(tmp_path, monkeypatch, response_data):
+    store = provider_store(tmp_path / "providers.db")
+    service = ProviderService(store)
+    service.configure("deepseek", ProviderConfigRequest(
+        base_url="https://api.deepseek.com/v1", api_key="runtime-secret"))
+    service.set_active(ActiveModel(provider_id="deepseek", model="deepseek-chat"))
+    captured = {}
+
+    class Response:
+        def raise_for_status(self): pass
+        def json(self): return response_data
+
+    class Client:
+        def __init__(self, **_kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *_args): return None
+        def post(self, _url, *, json, **_kwargs):
+            captured["payload"] = json
+            return Response()
+
+    monkeypatch.setattr(model_gateway.httpx, "Client", Client)
+    return OpenAICompatibleModelGateway(store), captured
+
+
+def test_omits_tool_fields_when_no_tools_are_supplied(tmp_path, monkeypatch):
+    gateway, captured = _configured_gateway(
+        tmp_path, monkeypatch, {"choices": [{"message": {"content": "ok"}}]})
+    gateway.generate([{"role": "user", "content": "hello"}])
+    assert "tools" not in captured["payload"]
+    assert "tool_choice" not in captured["payload"]
+
+
+def test_serializes_tools_as_openai_functions_with_auto_choice(tmp_path, monkeypatch):
+    gateway, captured = _configured_gateway(
+        tmp_path, monkeypatch, {"choices": [{"message": {"content": "ok"}}]})
+    tools = [ToolDefinition("system.get_current_time", "Get trusted current time",
+                            {"type": "object", "properties": {}})]
+    gateway.generate([{"role": "user", "content": "time?"}], tools=tools)
+    assert captured["payload"]["tools"] == [{"type": "function", "function": {
+        "name": "system.get_current_time", "description": "Get trusted current time",
+        "parameters": {"type": "object", "properties": {}}}}]
+    assert captured["payload"]["tool_choice"] == "auto"
+
+
+def test_parses_single_tool_call(tmp_path, monkeypatch):
+    gateway, _ = _configured_gateway(
+        tmp_path,
+        monkeypatch,
+        {
+            "choices": [{"message": {"content": None, "tool_calls": [{
+                "id": "call-time",
+                "type": "function",
+                "function": {
+                    "name": "system.get_current_time",
+                    "arguments": "{}",
+                },
+            }]}}]
+        },
+    )
+
+    result = gateway.generate([{"role": "user", "content": "time?"}])
+
+    assert result.tool_calls == (
+        ToolCall("call-time", "system.get_current_time", {}),
+    )
+
+def test_parses_multiple_tool_calls_and_preserves_ids(tmp_path, monkeypatch):
+    gateway, _ = _configured_gateway(tmp_path, monkeypatch, {"choices": [{"message": {
+        "content": None, "tool_calls": [
+            {"id": "call-time", "type": "function", "function": {
+                "name": "system.get_current_time", "arguments": "{}"}},
+            {"id": "call-context", "type": "function", "function": {
+                "name": "system.get_runtime_context", "arguments": '{"include_time": true}'}}
+        ]}}]})
+    result = gateway.generate([{"role": "user", "content": "context"}])
+    assert result == ModelResult(content=None, tool_calls=(
+        ToolCall("call-time", "system.get_current_time", {}),
+        ToolCall("call-context", "system.get_runtime_context", {"include_time": True})))
+
+
+@pytest.mark.parametrize("arguments", ["not-json", "[]", "null", "1"])
+def test_rejects_tool_call_arguments_that_are_not_json_objects(
+    tmp_path, monkeypatch, arguments
+):
+    gateway, _ = _configured_gateway(tmp_path, monkeypatch, {
+        "secret": "response-secret", "choices": [{"message": {"content": "fallback",
+        "tool_calls": [{"id": "call-1", "type": "function", "function": {
+            "name": "system.get_current_time", "arguments": arguments}}]}}]})
+    with pytest.raises(ModelUpstreamError) as captured:
+        gateway.generate([{"role": "user", "content": "time?"}])
+    assert str(captured.value) == "The model request failed"
+    assert "response-secret" not in str(captured.value)
+    assert "runtime-secret" not in str(captured.value)
+
+
+def test_rejects_empty_content_without_tool_calls(tmp_path, monkeypatch):
+    gateway, _ = _configured_gateway(
+        tmp_path, monkeypatch, {"choices": [{"message": {"content": None}}]})
+    with pytest.raises(ModelUpstreamError, match="The model request failed"):
+        gateway.generate([{"role": "user", "content": "hello"}])
+
+
+def test_preserves_tool_role_message_and_tool_call_id(tmp_path, monkeypatch):
+    gateway, captured = _configured_gateway(
+        tmp_path, monkeypatch, {"choices": [{"message": {"content": "done"}}]})
+    messages = [
+        {"role": "assistant", "content": None, "tool_calls": []},
+        {"role": "tool", "tool_call_id": "call-time", "content": '{"time":"12:00"}'},
+    ]
+    gateway.generate(messages)
+    assert captured["payload"]["messages"][1:] == messages
