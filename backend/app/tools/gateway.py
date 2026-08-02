@@ -170,6 +170,7 @@ class ToolGateway:
         result: dict[str, Any] | None = None,
         error: ToolRuntimeError | None = None,
     ) -> None:
+        invocation_id = str(invocation.id)
         try:
             invocation.status = status
             invocation.duration_ms = duration_ms
@@ -193,7 +194,7 @@ class ToolGateway:
             self._rollback_safely()
             safe_error = ToolRuntimeError("tool_execution_failed", "工具执行失败。")
             self._compensate_failed_completion(
-                invocation.id,
+                invocation_id,
                 display_name,
                 duration_ms,
                 safe_error,

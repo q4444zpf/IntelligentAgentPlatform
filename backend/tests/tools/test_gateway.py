@@ -297,3 +297,55 @@ def test_failed_compensation_event_still_closes_invocation(runtime, monkeypatch)
         assert invocation.error_code == "tool_execution_failed"
     finally:
         session.close()
+
+def test_completion_uses_preserved_invocation_id_after_rollback(
+    runtime, monkeypatch
+):
+    session, gateway = make_gateway(runtime)
+    real_commit = session.commit
+    real_rollback = gateway._rollback_safely
+    captured = {}
+    commit_count = 0
+
+    original_finish = gateway._commit_finished
+    original_compensation = gateway._compensate_failed_completion
+    compensation_ids = []
+
+    def capture_invocation(invocation, *args, **kwargs):
+        captured["invocation"] = invocation
+        captured["invocation_id"] = str(invocation.id)
+        return original_finish(invocation, *args, **kwargs)
+
+    def capture_compensation(invocation_id, *args, **kwargs):
+        compensation_ids.append(invocation_id)
+        return original_compensation(invocation_id, *args, **kwargs)
+
+    def fail_completion_once():
+        nonlocal commit_count
+        commit_count += 1
+        if commit_count == 2:
+            raise IntegrityError("commit", {}, Exception("event conflict"))
+        real_commit()
+
+    def rollback_and_detach():
+        real_rollback()
+        invocation = captured.get("invocation")
+        if invocation is not None and invocation in session:
+            session.expunge(invocation)
+
+    monkeypatch.setattr(gateway, "_commit_finished", capture_invocation)
+    monkeypatch.setattr(
+        gateway, "_compensate_failed_completion", capture_compensation
+    )
+    monkeypatch.setattr(gateway, "_rollback_safely", rollback_and_detach)
+    monkeypatch.setattr(session, "commit", fail_completion_once)
+    try:
+        with pytest.raises(ToolRuntimeError) as caught:
+            execute(gateway)
+        assert caught.value.code == "tool_execution_failed"
+        assert compensation_ids == [captured["invocation_id"]]
+        invocation = session.scalar(select(ToolInvocation))
+        assert invocation.status == "failed"
+        assert invocation.error_code == "tool_execution_failed"
+    finally:
+        session.close()
