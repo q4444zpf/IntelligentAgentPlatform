@@ -25,6 +25,64 @@ class CountingAgentStore(AgentStore):
         return super().get_default_id()
 
 
+class AtomicOperationSpyStore(AgentStore):
+    def __init__(self, session_factory):
+        super().__init__(session_factory)
+        self.atomic_calls = []
+        self.reject_legacy_mutations = False
+
+    def set_default_id(self, agent_id, expected_version):
+        if self.reject_legacy_mutations:
+            raise AssertionError("service used non-atomic set_default_id")
+        return super().set_default_id(agent_id, expected_version)
+
+    def update(self, agent_id, config):
+        if self.reject_legacy_mutations:
+            raise AssertionError("service used non-atomic update")
+        return super().update(agent_id, config)
+
+    def delete(self, agent_id):
+        if self.reject_legacy_mutations:
+            raise AssertionError("service used non-atomic delete")
+        return super().delete(agent_id)
+
+    def set_default_agent(self, agent_id, expected_version):
+        self.atomic_calls.append(("set_default_agent", agent_id))
+        self.reject_legacy_mutations = False
+        try:
+            super().set_default_id(agent_id, expected_version)
+            return super().get(agent_id)
+        finally:
+            self.reject_legacy_mutations = True
+
+    def update_agent(self, agent_id, config):
+        self.atomic_calls.append(("update_agent", agent_id))
+        self.reject_legacy_mutations = False
+        try:
+            return super().update(agent_id, config)
+        finally:
+            self.reject_legacy_mutations = True
+
+    def set_enabled_agent(self, agent_id, enabled):
+        self.atomic_calls.append(("set_enabled_agent", agent_id))
+        current = super().get(agent_id)
+        config = {name: current[name] for name in AgentConfig.model_fields}
+        config["enabled"] = enabled
+        self.reject_legacy_mutations = False
+        try:
+            return super().update(agent_id, config)
+        finally:
+            self.reject_legacy_mutations = True
+
+    def delete_agent(self, agent_id, builtin_agent_id):
+        self.atomic_calls.append(("delete_agent", agent_id))
+        self.reject_legacy_mutations = False
+        try:
+            return super().delete(agent_id)
+        finally:
+            self.reject_legacy_mutations = True
+
+
 @pytest.fixture
 def client(tmp_path):
     skill_service = SkillService(tmp_path / "skills")
@@ -243,6 +301,149 @@ def test_default_request_validates_agent_id():
         AgentDefaultRequest(agent_id="Invalid Agent ID")
 
 
+def test_service_delegates_mutations_to_atomic_store_operations(tmp_path):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'agents.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    store = AtomicOperationSpyStore(session_factory)
+    service = AgentService(store, workspace_root=tmp_path / "agent-workspaces")
+    service.create(AgentCreateRequest(**agent_payload(skill_names=[])))
+    store.reject_legacy_mutations = True
+
+    service.set_default("reservoir-dispatch")
+    service.set_default(BUILTIN_AGENT_ID)
+    service.update(
+        "reservoir-dispatch",
+        AgentConfig(
+            **agent_payload(
+                name="更新后的调度智能体",
+                skill_names=[],
+            )
+        ),
+    )
+    service.set_enabled("reservoir-dispatch", False)
+    service.set_enabled("reservoir-dispatch", True)
+    service.delete("reservoir-dispatch")
+
+    assert store.atomic_calls == [
+        ("set_default_agent", "reservoir-dispatch"),
+        ("set_default_agent", BUILTIN_AGENT_ID),
+        ("update_agent", "reservoir-dispatch"),
+        ("set_enabled_agent", "reservoir-dispatch"),
+        ("set_enabled_agent", "reservoir-dispatch"),
+        ("delete_agent", "reservoir-dispatch"),
+    ]
+
+
+def test_store_atomically_rejects_protected_default_mutations(tmp_path):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'agents.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    store = AgentStore(session_factory)
+    service = AgentService(store, workspace_root=tmp_path / "agent-workspaces")
+    service.create(AgentCreateRequest(**agent_payload(skill_names=[])))
+    pointer = store.get_default_id()
+    store.set_default_agent(
+        "reservoir-dispatch",
+        expected_version=pointer.version,
+    )
+    current = store.get("reservoir-dispatch")
+    disabled_config = {name: current[name] for name in AgentConfig.model_fields}
+    disabled_config["enabled"] = False
+
+    with pytest.raises(ValueError, match="Default agent"):
+        store.set_enabled_agent("reservoir-dispatch", False)
+    with pytest.raises(ValueError, match="Default agent"):
+        store.update_agent("reservoir-dispatch", disabled_config)
+    with pytest.raises(ValueError, match="Default agent"):
+        store.delete_agent(
+            "reservoir-dispatch",
+            builtin_agent_id=BUILTIN_AGENT_ID,
+        )
+
+    preserved = store.get("reservoir-dispatch")
+    assert preserved is not None
+    assert preserved["enabled"] is True
+    assert store.get_default_id().agent_id == "reservoir-dispatch"
+
+
+def test_store_permanently_protects_builtin_delete_in_same_transaction(tmp_path):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'agents.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    store = AgentStore(session_factory)
+    service = AgentService(store, workspace_root=tmp_path / "agent-workspaces")
+    service.create(AgentCreateRequest(**agent_payload(skill_names=[])))
+    pointer = store.get_default_id()
+    store.set_default_agent(
+        "reservoir-dispatch",
+        expected_version=pointer.version,
+    )
+
+    with pytest.raises(ValueError, match="Built-in agent"):
+        store.delete_agent(
+            BUILTIN_AGENT_ID,
+            builtin_agent_id=BUILTIN_AGENT_ID,
+        )
+
+    assert store.get(BUILTIN_AGENT_ID) is not None
+    assert store.get_default_id().agent_id == "reservoir-dispatch"
+
+
+def test_store_default_switch_validates_target_before_pointer_commit(tmp_path):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'agents.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    store = AgentStore(session_factory)
+    service = AgentService(store, workspace_root=tmp_path / "agent-workspaces")
+    service.create(
+        AgentCreateRequest(
+            **agent_payload(
+                id="disabled-agent",
+                name="停用智能体",
+                skill_names=[],
+                enabled=False,
+            )
+        )
+    )
+
+    pointer = store.get_default_id()
+    with pytest.raises(ValueError, match="Disabled agent"):
+        store.set_default_agent(
+            "disabled-agent",
+            expected_version=pointer.version,
+        )
+    with pytest.raises(ValueError, match="not found"):
+        store.set_default_agent(
+            "missing-agent",
+            expected_version=pointer.version,
+        )
+
+    assert store.get_default_id() == pointer
+
+
+def test_store_rejects_stale_default_switch_without_overwriting_winner(tmp_path):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'agents.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    store = AgentStore(session_factory)
+    service = AgentService(store, workspace_root=tmp_path / "agent-workspaces")
+    service.create(AgentCreateRequest(**agent_payload(skill_names=[])))
+    stale_pointer = store.get_default_id()
+    store.set_default_agent(
+        "reservoir-dispatch",
+        expected_version=stale_pointer.version,
+    )
+
+    with pytest.raises(AgentConcurrentUpdateError):
+        store.set_default_agent(
+            BUILTIN_AGENT_ID,
+            expected_version=stale_pointer.version,
+        )
+
+    assert store.get_default_id().agent_id == "reservoir-dispatch"
+
+
 def test_gets_effective_default_agent(client):
     response = client.get("/api/agents/default")
 
@@ -345,7 +546,7 @@ def test_maps_concurrent_default_update_to_conflict(client, monkeypatch):
 
     monkeypatch.setattr(
         client.app.state.agent_service.store,
-        "set_default_id",
+        "set_default_agent",
         reject_stale_update,
     )
     response = client.put(

@@ -9,7 +9,13 @@ from sqlalchemy.exc import IntegrityError
 from app.skills.service import SkillNotFoundError, SkillService
 
 from .schemas import AgentConfig, AgentCopyRequest, AgentCreateRequest, AgentInfo
-from .store import AgentConcurrentUpdateError, AgentStore
+from .store import (
+    AgentConcurrentUpdateError,
+    AgentStore,
+    AgentStoreNotFoundError,
+    AgentStoreProtectedError,
+    AgentStoreValidationError,
+)
 
 
 BUILTIN_AGENT_ID = "platform-default-agent"
@@ -62,6 +68,17 @@ class AgentService:
         self.workspace_root = Path(workspace_root or os.getenv("AGENT_WORKSPACE_ROOT", default_workspace)).resolve()
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self._ensure_default_agent()
+
+    @staticmethod
+    def _call_store_mutation(operation):
+        try:
+            return operation()
+        except AgentStoreNotFoundError as error:
+            raise AgentNotFoundError(error.agent_id) from error
+        except AgentStoreValidationError as error:
+            raise AgentValidationError(str(error)) from error
+        except AgentStoreProtectedError as error:
+            raise AgentProtectedError(str(error)) from error
 
     def _info(
         self,
@@ -169,17 +186,12 @@ class AgentService:
 
     def set_default(self, agent_id: str) -> AgentInfo:
         self._ensure_default_agent()
-        record = self.store.get(agent_id)
-        if record is None:
-            raise AgentNotFoundError(agent_id)
-        if not record["enabled"]:
-            raise AgentValidationError(
-                f"Disabled agent '{agent_id}' cannot be the default"
-            )
         pointer = self.store.get_default_id()
-        self.store.set_default_id(
-            agent_id,
-            expected_version=pointer.version,
+        record = self._call_store_mutation(
+            lambda: self.store.set_default_agent(
+                agent_id,
+                expected_version=pointer.version,
+            )
         )
         return self._info(record, default_id=agent_id)
 
@@ -208,16 +220,11 @@ class AgentService:
 
     def update(self, agent_id: str, request: AgentConfig) -> AgentInfo:
         self._ensure_default_agent()
-        current = self.store.get(agent_id)
-        if not current:
-            raise AgentNotFoundError(agent_id)
         self._validate_skills(request.skill_names)
-        if not request.enabled and self.store.get_default_id().agent_id == agent_id:
-            raise AgentProtectedError(
-                f"Default agent '{agent_id}' cannot be disabled"
-            )
-        record = self.store.update(agent_id, request.model_dump())
-        workspace = Path(current["workspace_dir"])
+        record = self._call_store_mutation(
+            lambda: self.store.update_agent(agent_id, request.model_dump())
+        )
+        workspace = Path(record["workspace_dir"])
         if workspace.is_dir():
             (workspace / "AGENTS.md").write_text(
                 f"# {request.name}\n\n{request.system_prompt or request.description}\n",
@@ -227,16 +234,10 @@ class AgentService:
 
     def set_enabled(self, agent_id: str, enabled: bool) -> AgentInfo:
         self._ensure_default_agent()
-        current = self.store.get(agent_id)
-        if not current:
-            raise AgentNotFoundError(agent_id)
-        if not enabled and self.store.get_default_id().agent_id == agent_id:
-            raise AgentProtectedError(
-                f"Default agent '{agent_id}' cannot be disabled"
-            )
-        config = {name: current[name] for name in AgentConfig.model_fields}
-        config["enabled"] = enabled
-        return self._info(self.store.update(agent_id, config))
+        record = self._call_store_mutation(
+            lambda: self.store.set_enabled_agent(agent_id, enabled)
+        )
+        return self._info(record)
 
     def set_pinned(self, agent_id: str, pinned: bool) -> AgentInfo:
         self._ensure_default_agent()
@@ -258,17 +259,12 @@ class AgentService:
 
     def delete(self, agent_id: str) -> None:
         self._ensure_default_agent()
-        if agent_id == BUILTIN_AGENT_ID:
-            raise AgentProtectedError(
-                f"Built-in agent '{agent_id}' cannot be deleted"
+        record = self._call_store_mutation(
+            lambda: self.store.delete_agent(
+                agent_id,
+                builtin_agent_id=BUILTIN_AGENT_ID,
             )
-        if self.store.get_default_id().agent_id == agent_id:
-            raise AgentProtectedError(
-                f"Default agent '{agent_id}' cannot be deleted"
-            )
-        record = self.store.delete(agent_id)
-        if not record:
-            raise AgentNotFoundError(agent_id)
+        )
         workspace = Path(record["workspace_dir"]).resolve()
         if workspace.parent == self.workspace_root and workspace.is_dir():
             shutil.rmtree(workspace)
