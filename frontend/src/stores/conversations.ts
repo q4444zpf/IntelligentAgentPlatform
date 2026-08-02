@@ -34,7 +34,7 @@ function mergeToolActivities(activities: ToolActivity[], events: RunEvent[]): To
       invocation_id: invocationId,
       display_name: displayName,
       tool_id: toolId,
-      status,
+      status: previous && previous.status !== 'running' && status === 'running' ? previous.status : status,
       duration_ms: typeof durationMs === 'number' ? durationMs : previous?.duration_ms ?? null,
       sequence: Math.min(previous?.sequence ?? event.sequence, event.sequence),
     });

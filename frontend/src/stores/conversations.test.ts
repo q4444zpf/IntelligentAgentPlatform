@@ -139,6 +139,20 @@ describe('conversation store', () => {
     expect(store.events.map((event) => event.sequence)).toEqual([3, 4, 8, 9, 10]);
   });
 
+  it('keeps terminal tool status sticky across polling rounds and accepts a later terminal', async () => {
+    vi.mocked(getRunEvents)
+      .mockResolvedValueOnce([{ sequence: 2, event_type: 'tool.completed', payload: { invocation_id: 'i1', tool_id: 'system.time', display_name: '当前时间', duration_ms: 5 } }])
+      .mockResolvedValueOnce([{ sequence: 3, event_type: 'tool.started', payload: { invocation_id: 'i1', tool_id: 'system.time', display_name: '当前时间' } }])
+      .mockResolvedValueOnce([{ sequence: 4, event_type: 'tool.failed', payload: { invocation_id: 'i1', tool_id: 'system.time', display_name: '当前时间', duration_ms: 8 } }]);
+    const store = useConversationStore(); store.activeConversationId = 'c1'; store.activeRun = structuredClone(acceptedRun.run);
+
+    await store.replayEvents(0, 1);
+    expect(store.toolActivities[0].status).toBe('completed');
+    await store.replayEvents(0, 1);
+    expect(store.toolActivities[0].status).toBe('completed');
+    await store.replayEvents(0, 1);
+    expect(store.toolActivities[0]).toEqual({ invocation_id: 'i1', display_name: '当前时间', tool_id: 'system.time', status: 'failed', duration_ms: 8, sequence: 2 });
+  });
   it('clears tool activity when changing or resetting conversations', async () => {
     vi.mocked(conversationsApi.listMessages).mockResolvedValue([]);
     const store = useConversationStore();
