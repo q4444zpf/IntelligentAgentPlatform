@@ -57,8 +57,13 @@ class AgentStore:
                 return DefaultAgentPointer(agent_id=None, version=0)
             value = row.value if isinstance(row.value, dict) else {}
             agent_id = value.get("agent_id")
+            is_platform_pointer = value.get("scope") == "platform"
             return DefaultAgentPointer(
-                agent_id=agent_id if isinstance(agent_id, str) else None,
+                agent_id=(
+                    agent_id
+                    if is_platform_pointer and isinstance(agent_id, str)
+                    else None
+                ),
                 version=row.version,
             )
 
