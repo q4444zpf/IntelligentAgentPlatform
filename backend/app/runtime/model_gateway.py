@@ -238,6 +238,15 @@ class OpenAICompatibleModelGateway:
             usage = data["usage"] if "usage" in data else {}
             if not isinstance(usage, dict):
                 raise ValueError("invalid model usage")
+            for field in (
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+            ):
+                if field in usage and (
+                    type(usage[field]) is not int or usage[field] < 0
+                ):
+                    raise ValueError("invalid model usage token count")
             return ModelResult(
                 content=content,
                 prompt_tokens=usage.get("prompt_tokens"),

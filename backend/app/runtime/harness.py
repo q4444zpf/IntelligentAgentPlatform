@@ -77,6 +77,12 @@ class PlatformAgentHarness:
                     self._complete(run_id, result.content, usage, usage_seen)
                     return
 
+                if iteration == MAX_MODEL_ITERATIONS - 1:
+                    raise ToolRuntimeError(
+                        "tool_iteration_limit",
+                        "工具调用次数超过平台限制",
+                    )
+
                 if total_tool_calls + len(calls) > MAX_TOOL_CALLS:
                     raise ToolRuntimeError("tool_iteration_limit", "工具调用次数超过平台限制")
 
@@ -105,8 +111,7 @@ class PlatformAgentHarness:
                         "content": json.dumps(executed.value, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
                     })
                 total_tool_calls += len(calls)
-                if iteration == MAX_MODEL_ITERATIONS - 1:
-                    raise ToolRuntimeError("tool_iteration_limit", "工具调用次数超过平台限制")
+
         except ModelRuntimeError:
             self.repository.session.rollback()
             self._fail(run_id, "model_request_failed", "模型调用失败，请检查默认模型配置或稍后重试")

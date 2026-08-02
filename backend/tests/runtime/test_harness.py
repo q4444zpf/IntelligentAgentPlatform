@@ -402,7 +402,7 @@ def test_fails_after_fourth_model_iteration_requests_more_tools():
     repo = ConversationRepository(session)
     PlatformAgentHarness(repo, model, FakeAgentService(tool_ids=["system.one"]), tool_service=FakeToolService(), tool_gateway=gateway).execute(run_id)
     assert len(model.calls) == MAX_MODEL_ITERATIONS
-    assert len(gateway.calls) == MAX_MODEL_ITERATIONS
+    assert len(gateway.calls) == MAX_MODEL_ITERATIONS - 1
     assert repo.list_events(run_id, 0)[-2].payload["code"] == "tool_iteration_limit"
 
 
@@ -521,4 +521,46 @@ def test_integrated_gateway_rejects_disabled_tool_without_invocation(tmp_path):
     assert repository.list_tool_invocations(run_id) == []
     assert not any(event.event_type.startswith("tool.") for event in repository.list_events(run_id, 0))
     assert not any(message.role == "assistant" for message in repository.get_run_messages(run_id))
+    session.close()
+
+def test_integrated_final_model_round_does_not_execute_returned_tool(tmp_path):
+    session, run_id, service, gateway, agent = build_integrated_runtime(tmp_path)
+    repository = ConversationRepository(session)
+    model = ScriptedToolModel([
+        ModelResult(
+            None,
+            tool_calls=(ToolCall(
+                f"final-round-{index}",
+                "system.get_current_time",
+                {},
+            ),),
+        )
+        for index in range(MAX_MODEL_ITERATIONS)
+    ])
+
+    PlatformAgentHarness(
+        repository,
+        model,
+        agent,
+        tool_service=service,
+        tool_gateway=gateway,
+    ).execute(run_id)
+
+    assert repository.get_run_by_id(run_id).status == "failed"
+    invocations = repository.list_tool_invocations(run_id)
+    assert {item.tool_call_id for item in invocations} == {
+        "final-round-0",
+        "final-round-1",
+        "final-round-2",
+    }
+    assert all(item.tool_call_id != "final-round-3" for item in invocations)
+    tool_events = [
+        event
+        for event in repository.list_events(run_id, 0)
+        if event.event_type.startswith("tool.")
+    ]
+    assert len(tool_events) == 2 * (MAX_MODEL_ITERATIONS - 1)
+    assert repository.list_events(run_id, 0)[-2].payload["code"] == (
+        "tool_iteration_limit"
+    )
     session.close()

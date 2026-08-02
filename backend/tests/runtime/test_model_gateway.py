@@ -618,3 +618,46 @@ def test_rejects_blank_tool_call_id_or_name(tmp_path, monkeypatch, call_id, name
 
     with pytest.raises(ModelUpstreamError, match="The model request failed"):
         gateway.generate([{"role": "user", "content": "time?"}])
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("prompt_tokens", True),
+        ("prompt_tokens", -1),
+        ("completion_tokens", "7"),
+        ("completion_tokens", {}),
+        ("total_tokens", False),
+        ("total_tokens", -1),
+    ],
+)
+def test_rejects_invalid_usage_token_values(
+    tmp_path, monkeypatch, field, value
+):
+    usage = {
+        "prompt_tokens": 3,
+        "completion_tokens": 2,
+        "total_tokens": 5,
+    }
+    usage[field] = value
+    gateway, _ = _configured_gateway(
+        tmp_path,
+        monkeypatch,
+        _tool_call_response([], content="ok", usage=usage),
+    )
+
+    with pytest.raises(ModelUpstreamError, match="The model request failed"):
+        gateway.generate([{"role": "user", "content": "usage"}])
+
+
+def test_keeps_missing_usage_fields_compatible(tmp_path, monkeypatch):
+    gateway, _ = _configured_gateway(
+        tmp_path,
+        monkeypatch,
+        _tool_call_response([], content="ok", usage={"prompt_tokens": 3}),
+    )
+
+    result = gateway.generate([{"role": "user", "content": "usage"}])
+
+    assert result.prompt_tokens == 3
+    assert result.completion_tokens is None
+    assert result.total_tokens is None
