@@ -99,3 +99,31 @@ class RunEvent(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class ToolInvocation(Base):
+    __tablename__ = "tool_invocations"
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id", "tool_call_id", name="uq_tool_invocation_run_call"
+        ),
+        Index("ix_tool_invocations_run_id", "run_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="CASCADE")
+    )
+    tool_call_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    tool_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    tool_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False)
+    arguments_summary: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    result_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
