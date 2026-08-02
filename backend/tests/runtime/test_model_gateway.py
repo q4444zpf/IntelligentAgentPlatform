@@ -418,6 +418,37 @@ def test_rejects_empty_content_without_tool_calls(tmp_path, monkeypatch):
         gateway.generate([{"role": "user", "content": "hello"}])
 
 
+def test_accepts_empty_content_with_tool_calls_and_normalizes_it(tmp_path, monkeypatch):
+    gateway, _ = _configured_gateway(
+        tmp_path,
+        monkeypatch,
+        {"choices": [{"message": {"content": "", "tool_calls": [{
+            "id": "call-time",
+            "type": "function",
+            "function": {
+                "name": "system.get_current_time",
+                "arguments": "{}",
+            },
+        }]}}]},
+    )
+
+    result = gateway.generate([{"role": "user", "content": "time?"}])
+
+    assert result.content is None
+    assert result.tool_calls == (
+        ToolCall("call-time", "system.get_current_time", {}),
+    )
+
+
+def test_rejects_empty_string_content_without_tool_calls(tmp_path, monkeypatch):
+    gateway, _ = _configured_gateway(
+        tmp_path, monkeypatch, {"choices": [{"message": {"content": ""}}]}
+    )
+
+    with pytest.raises(ModelUpstreamError, match="The model request failed"):
+        gateway.generate([{"role": "user", "content": "hello"}])
+
+
 def test_preserves_tool_role_message_and_tool_call_id(tmp_path, monkeypatch):
     gateway, captured = _configured_gateway(
         tmp_path, monkeypatch, {"choices": [{"message": {"content": "done"}}]})

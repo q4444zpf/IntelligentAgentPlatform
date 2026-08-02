@@ -173,8 +173,10 @@ class OpenAICompatibleModelGateway:
                 if not isinstance(name, str) or not name:
                     raise ValueError("tool call name is invalid")
                 tool_calls.append(ToolCall(call_id, name, arguments))
-            if content is not None and (not isinstance(content, str) or not content):
-                raise ValueError("empty model content")
+            if content is not None and not isinstance(content, str):
+                raise ValueError("invalid model content")
+            if content == "":
+                content = None
             if content is None and not tool_calls:
                 raise ValueError("empty model content")
             usage = data.get("usage") or {}
