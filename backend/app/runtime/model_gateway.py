@@ -27,31 +27,87 @@ class ModelResult:
     total_tokens: int | None = None
 
 
+@dataclass(frozen=True)
+class ModelSelection:
+    provider_id: str = ""
+    model: str = ""
+
+
 class ModelGateway(Protocol):
-    def generate(self, messages: list[dict[str, str]]) -> ModelResult: ...
+    def generate(
+        self,
+        messages: list[dict[str, str]],
+        selection: ModelSelection | None = None,
+    ) -> ModelResult: ...
+
+
+def build_runtime_messages(
+    provider_id: str,
+    model: str,
+    messages: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    identity = (
+        "Runtime model identity (authoritative platform configuration): "
+        f"provider_id={provider_id}, model={model}. "
+        "When asked about model identity, use exactly this configuration and "
+        "do not guess or claim another model."
+    )
+    return [{"role": "system", "content": identity}, *messages]
 
 
 class OpenAICompatibleModelGateway:
     def __init__(self, store: ProviderStore | None = None):
         self.store = store or ProviderStore()
 
-    def generate(self, messages: list[dict[str, str]]) -> ModelResult:
-        service = ProviderService(self.store)
-        active = service.get_active()
-        if not active.provider_id or not active.model:
-            raise ModelConfigurationError("No active model is configured")
+    @staticmethod
+    def _resolve_selection(
+        service: ProviderService,
+        selection: ModelSelection | None,
+    ):
+        if selection and selection.provider_id and selection.model:
+            provider_id = selection.provider_id
+            model_id = selection.model
+        else:
+            active = service.get_active()
+            provider_id = active.provider_id
+            model_id = active.model
 
+        if not provider_id or not model_id:
+            raise ModelConfigurationError("No active model is configured")
         try:
-            provider = service.get(active.provider_id)
+            provider = service.get(provider_id)
         except KeyError as error:
-            raise ModelConfigurationError("The active provider is unavailable") from error
+            raise ModelConfigurationError(
+                "The selected provider is unavailable"
+            ) from error
+
         model = next(
-            (item for item in provider.models if item.id == active.model), None
+            (item for item in provider.models if item.id == model_id),
+            None,
         )
-        if not provider.configured or model is None or not model.enabled:
-            raise ModelConfigurationError("The active model is unavailable")
+        if (
+            not provider.configured
+            or not provider.enabled
+            or model is None
+            or not model.enabled
+        ):
+            raise ModelConfigurationError("The selected model is unavailable")
         if provider.protocol != "OpenAIChatModel":
-            raise ModelConfigurationError("The active model protocol is unsupported")
+            raise ModelConfigurationError(
+                "The selected model protocol is unsupported"
+            )
+        return provider_id, model_id, provider, model
+
+    def generate(
+        self,
+        messages: list[dict[str, str]],
+        selection: ModelSelection | None = None,
+    ) -> ModelResult:
+        service = ProviderService(self.store)
+        provider_id, model_id, provider, model = self._resolve_selection(
+            service,
+            selection,
+        )
 
         state = self.store.load()
         bucket_name = "custom_providers" if provider.is_custom else "providers"
@@ -63,14 +119,19 @@ class OpenAICompatibleModelGateway:
         payload = {
             **provider.generate_kwargs,
             **model.extra_config,
-            "model": active.model,
-            "messages": messages,
+            "model": model_id,
+            "messages": build_runtime_messages(
+                provider_id,
+                model_id,
+                messages,
+            ),
             "stream": False,
         }
 
         try:
             with httpx.Client(
-                timeout=httpx.Timeout(60.0, connect=10.0), trust_env=False
+                timeout=httpx.Timeout(60.0, connect=10.0),
+                trust_env=False,
             ) as client:
                 response = client.post(
                     f"{provider.base_url.rstrip('/')}/chat/completions",

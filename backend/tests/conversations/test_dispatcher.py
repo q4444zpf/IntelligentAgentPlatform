@@ -1,18 +1,36 @@
+from types import SimpleNamespace
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.conversations.dispatcher import ThreadRunDispatcher
 from app.conversations.models import AgentRun, Conversation, Message, RunEvent
 from app.db.base import Base
-from app.runtime.model_gateway import ModelResult
+from app.runtime.model_gateway import ModelResult, ModelSelection
+
+
+class RecordingAgentService:
+    def get(self, agent_id: str):
+        assert agent_id == "flood"
+        return SimpleNamespace(
+            enabled=True,
+            system_prompt="",
+            context_prompt="",
+            provider_id="deepseek",
+            model="deepseek-chat",
+        )
 
 
 class RecordingGateway:
     def __init__(self):
-        self.calls: list[list[dict[str, str]]] = []
+        self.calls = []
 
-    def generate(self, messages: list[dict[str, str]]) -> ModelResult:
-        self.calls.append(messages)
+    def generate(
+        self,
+        messages: list[dict[str, str]],
+        selection: ModelSelection | None = None,
+    ) -> ModelResult:
+        self.calls.append((messages, selection))
         return ModelResult(content="后台研判完成")
 
 
@@ -58,6 +76,7 @@ def test_dispatches_run_with_an_independent_database_session(tmp_path):
         dispatcher = ThreadRunDispatcher(
             session_factory=factory,
             gateway_factory=lambda: gateway,
+            agent_service_factory=RecordingAgentService,
             max_workers=1,
         )
         dispatcher.dispatch(run_id)
@@ -68,4 +87,7 @@ def test_dispatches_run_with_an_independent_database_session(tmp_path):
     with factory() as verification_session:
         completed = verification_session.get(AgentRun, run_id)
         assert completed is not None and completed.status == "completed"
-    assert gateway.calls == [[{"role": "user", "content": "分析洪峰"}]]
+    assert gateway.calls == [(
+        [{"role": "user", "content": "分析洪峰"}],
+        ModelSelection("deepseek", "deepseek-chat"),
+    )]

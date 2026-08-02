@@ -5,6 +5,8 @@ import logging
 
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.agents.service import AgentService
+from app.agents.store import AgentStore
 from app.core.database import SessionFactory
 from app.model_providers.store import ProviderStore
 from app.runtime.harness import PlatformAgentHarness
@@ -31,6 +33,7 @@ class ThreadRunDispatcher(RunDispatcher):
         self,
         session_factory: sessionmaker[Session] = SessionFactory,
         gateway_factory: Callable[[], ModelGateway] | None = None,
+        agent_service_factory: Callable[[], AgentService] | None = None,
         max_workers: int = 4,
     ):
         self.session_factory = session_factory
@@ -38,6 +41,9 @@ class ThreadRunDispatcher(RunDispatcher):
             lambda: OpenAICompatibleModelGateway(
                 ProviderStore(self.session_factory)
             )
+        )
+        self.agent_service_factory = agent_service_factory or (
+            lambda: AgentService(AgentStore(self.session_factory))
         )
         self.executor = ThreadPoolExecutor(
             max_workers=max_workers,
@@ -53,6 +59,7 @@ class ThreadRunDispatcher(RunDispatcher):
             PlatformAgentHarness(
                 ConversationRepository(session),
                 self.gateway_factory(),
+                self.agent_service_factory(),
             ).execute(run_id)
 
     @staticmethod

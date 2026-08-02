@@ -6,12 +6,14 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+import app.runtime.model_gateway as model_gateway
 from app.db.base import Base
 from app.model_providers.schemas import ActiveModel, ProviderConfigRequest
 from app.model_providers.service import ProviderService
 from app.model_providers.store import ProviderStore
 from app.runtime.model_gateway import (
     ModelConfigurationError,
+    ModelSelection,
     OpenAICompatibleModelGateway,
 )
 
@@ -22,6 +24,21 @@ def provider_store(path) -> ProviderStore:
     factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
     return ProviderStore(factory)
 
+
+def test_builds_authoritative_runtime_model_identity_message():
+    messages = model_gateway.build_runtime_messages(
+        "deepseek",
+        "deepseek-chat",
+        [{"role": "user", "content": "identify yourself"}],
+    )
+
+    assert messages == [
+        {
+            "role": "system",
+            "content": "Runtime model identity (authoritative platform configuration): provider_id=deepseek, model=deepseek-chat. When asked about model identity, use exactly this configuration and do not guess or claim another model.",
+        },
+        {"role": "user", "content": "identify yourself"},
+    ]
 
 def test_calls_active_openai_compatible_model_and_normalizes_usage(tmp_path):
     captured: dict = {}
@@ -79,9 +96,11 @@ def test_calls_active_openai_compatible_model_and_normalizes_usage(tmp_path):
         assert captured["path"] == "/v1/chat/completions"
         assert captured["authorization"] == "Bearer runtime-secret"
         assert captured["payload"]["model"] == "deepseek-chat"
-        assert captured["payload"]["messages"] == [
-            {"role": "user", "content": "分析洪峰"}
-        ]
+        assert captured["payload"]["messages"] == model_gateway.build_runtime_messages(
+            "deepseek",
+            "deepseek-chat",
+            [{"role": "user", "content": "分析洪峰"}],
+        )
         assert captured["payload"]["stream"] is False
         assert captured["payload"]["temperature"] == 0.2
     finally:
@@ -102,6 +121,120 @@ def test_rejects_missing_active_model_without_exposing_provider_secret(tmp_path)
     with pytest.raises(ModelConfigurationError) as captured:
         OpenAICompatibleModelGateway(store).generate(
             [{"role": "user", "content": "分析洪峰"}]
+        )
+
+    assert "runtime-secret" not in str(captured.value)
+
+
+def test_explicit_selection_overrides_active_model(tmp_path, monkeypatch):
+    store = provider_store(tmp_path / "providers.db")
+    service = ProviderService(store)
+    service.configure(
+        "deepseek",
+        ProviderConfigRequest(
+            base_url="https://api.deepseek.com/v1",
+            api_key="runtime-secret",
+        ),
+    )
+    service.set_active(ActiveModel(provider_id="deepseek", model="deepseek-reasoner"))
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def post(self, _url, *, headers, json):
+            captured["headers"] = headers
+            captured["payload"] = json
+            return Response()
+
+    monkeypatch.setattr(model_gateway.httpx, "Client", Client)
+    OpenAICompatibleModelGateway(store).generate(
+        [{"role": "user", "content": "identify yourself"}],
+        ModelSelection("deepseek", "deepseek-chat"),
+    )
+
+    assert captured["payload"]["model"] == "deepseek-chat"
+    assert captured["payload"]["messages"] == model_gateway.build_runtime_messages(
+        "deepseek",
+        "deepseek-chat",
+        [{"role": "user", "content": "identify yourself"}],
+    )
+    assert "runtime-secret" not in str(captured["payload"])
+
+
+def test_partial_explicit_selection_falls_back_to_active_model(
+    tmp_path, monkeypatch
+):
+    store = provider_store(tmp_path / "providers.db")
+    service = ProviderService(store)
+    service.configure(
+        "deepseek",
+        ProviderConfigRequest(
+            base_url="https://api.deepseek.com/v1",
+            api_key="runtime-secret",
+        ),
+    )
+    service.set_active(ActiveModel(provider_id="deepseek", model="deepseek-chat"))
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def post(self, _url, *, json, **_kwargs):
+            captured["payload"] = json
+            return Response()
+
+    monkeypatch.setattr(model_gateway.httpx, "Client", Client)
+    OpenAICompatibleModelGateway(store).generate(
+        [{"role": "user", "content": "hello"}],
+        ModelSelection("deepseek", ""),
+    )
+
+    assert captured["payload"]["model"] == "deepseek-chat"
+
+
+def test_rejects_invalid_explicit_selection_without_exposing_secret(tmp_path):
+    store = provider_store(tmp_path / "providers.db")
+    ProviderService(store).configure(
+        "deepseek",
+        ProviderConfigRequest(
+            base_url="https://api.deepseek.com/v1",
+            api_key="runtime-secret",
+        ),
+    )
+
+    with pytest.raises(ModelConfigurationError) as captured:
+        OpenAICompatibleModelGateway(store).generate(
+            [{"role": "user", "content": "hello"}],
+            ModelSelection("deepseek", "missing-model"),
         )
 
     assert "runtime-secret" not in str(captured.value)

@@ -1,6 +1,9 @@
+from app.agents.service import AgentNotFoundError, AgentService
 from app.conversations.repository import ConversationRepository
 
-from .model_gateway import ModelGateway, ModelRuntimeError
+from .model_gateway import ModelGateway, ModelRuntimeError, ModelSelection
+
+MAX_CONVERSATION_MESSAGES = 100
 
 
 class PlatformAgentHarness:
@@ -8,9 +11,11 @@ class PlatformAgentHarness:
         self,
         repository: ConversationRepository,
         model_gateway: ModelGateway,
+        agent_service: AgentService,
     ):
         self.repository = repository
         self.model_gateway = model_gateway
+        self.agent_service = agent_service
 
     def execute(self, run_id: str) -> None:
         run = self.repository.get_run_by_id(run_id)
@@ -24,6 +29,23 @@ class PlatformAgentHarness:
             )
             return
 
+        try:
+            agent = self.agent_service.get(run.actor_id)
+        except AgentNotFoundError:
+            self._fail(
+                run_id,
+                "agent_unavailable",
+                "智能体不可用，请检查智能体配置",
+            )
+            return
+        if not agent.enabled:
+            self._fail(
+                run_id,
+                "agent_unavailable",
+                "智能体不可用，请检查智能体配置",
+            )
+            return
+
         run.status = "running"
         self.repository.append_event(
             run_id, "run.status", {"status": "running"}
@@ -31,12 +53,28 @@ class PlatformAgentHarness:
         self.repository.session.commit()
 
         try:
-            messages = [
+            conversation_messages = [
                 {"role": message.role, "content": message.content}
                 for message in self.repository.get_run_messages(run_id)
                 if message.role in {"user", "assistant", "system"}
+            ][-MAX_CONVERSATION_MESSAGES:]
+            messages = [
+                *(
+                    [{"role": "system", "content": agent.system_prompt}]
+                    if agent.system_prompt.strip()
+                    else []
+                ),
+                *(
+                    [{"role": "system", "content": agent.context_prompt}]
+                    if agent.context_prompt.strip()
+                    else []
+                ),
+                *conversation_messages,
             ]
-            result = self.model_gateway.generate(messages)
+            result = self.model_gateway.generate(
+                messages,
+                ModelSelection(agent.provider_id, agent.model),
+            )
             assistant_message = self.repository.add_assistant_message(
                 run_id, result.content
             )
