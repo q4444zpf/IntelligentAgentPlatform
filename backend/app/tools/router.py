@@ -1,7 +1,13 @@
 from collections.abc import Callable
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+
+from app.core.request_context import (
+    RequestContext,
+    require_admin_context,
+    require_request_context,
+)
 
 from .schemas import ToolInfo
 from .service import ToolNotFoundError, ToolService, ToolValidationError
@@ -21,15 +27,23 @@ def create_router(service: ToolService | None = None) -> APIRouter:
             raise HTTPException(status_code=422, detail=str(error)) from error
 
     @router.get("", response_model=list[ToolInfo])
-    def list_tools():
+    def list_tools(
+        _context: RequestContext = Depends(require_request_context),
+    ):
         return manager().list()
 
     @router.get("/{tool_id}", response_model=ToolInfo)
-    def get_tool(tool_id: str):
+    def get_tool(
+        tool_id: str,
+        _context: RequestContext = Depends(require_request_context),
+    ):
         return call(lambda: manager().get(tool_id))
 
     @router.patch("/{tool_id}/toggle", response_model=ToolInfo)
-    def toggle_tool(tool_id: str):
+    def toggle_tool(
+        tool_id: str,
+        _context: RequestContext = Depends(require_admin_context),
+    ):
         return call(lambda: manager().toggle(tool_id))
 
     return router

@@ -32,4 +32,6 @@ def test_accepts_explicit_dev_identity():
         "/context",
         headers={"X-User-ID": "user-1", "X-Project-ID": "project-1"},
     )
-    assert response.json() == {"user_id": "user-1", "project_id": "project-1"}
+    assert response.json() == {
+        "user_id": "user-1", "project_id": "project-1", "role": "user"
+    }

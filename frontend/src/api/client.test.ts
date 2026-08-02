@@ -50,3 +50,35 @@ describe('request headers', () => {
     expect(capturedHeaders(fetchMock.mock.calls[0]?.[1]).has('Content-Type')).toBe(false);
   });
 });
+describe('request cancellation', () => {
+  it('keeps the request timeout active when an external signal is supplied', async () => {
+    vi.useFakeTimers();
+    const external = new AbortController();
+    vi.spyOn(globalThis, 'fetch').mockImplementation((_input, init) => (
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+      })
+    ));
+
+    const pending = request('/slow', { signal: external.signal }, 20);
+    await vi.advanceTimersByTimeAsync(20);
+
+    await expect(pending).rejects.toMatchObject({ status: 408 });
+    expect(external.signal.aborted).toBe(false);
+    vi.useRealTimers();
+  });
+
+  it('preserves an external abort so callers can ignore cancellation', async () => {
+    const external = new AbortController();
+    vi.spyOn(globalThis, 'fetch').mockImplementation((_input, init) => (
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+      })
+    ));
+
+    const pending = request('/cancelled', { signal: external.signal });
+    external.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+  });
+});

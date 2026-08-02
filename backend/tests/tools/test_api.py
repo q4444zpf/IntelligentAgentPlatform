@@ -17,6 +17,10 @@ from app.tools.service import ToolService
 from app.tools.store import ToolStore
 
 
+AUTH_HEADERS = {"X-User-ID": "u1", "X-Project-ID": "p1"}
+ADMIN_HEADERS = {**AUTH_HEADERS, "X-User-Role": "admin"}
+
+
 @pytest.fixture
 def client(tmp_path):
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'tools-api.db'}")
@@ -25,13 +29,14 @@ def client(tmp_path):
         ToolStore(sessionmaker(bind=engine, expire_on_commit=False, class_=Session))
     )
     app = FastAPI()
+    app.state.allow_dev_identity = True
     app.include_router(create_router(service), prefix="/api/tools")
     with TestClient(app) as test_client:
         yield test_client
 
 
 def test_initializes_two_builtin_tools(client):
-    response = client.get("/api/tools")
+    response = client.get("/api/tools", headers=AUTH_HEADERS)
 
     assert response.status_code == 200
     tools = response.json()
@@ -45,22 +50,42 @@ def test_initializes_two_builtin_tools(client):
 
 
 def test_reads_toggles_and_returns_not_found(client):
-    read = client.get("/api/tools/system.get_current_time")
+    read = client.get("/api/tools/system.get_current_time", headers=AUTH_HEADERS)
     assert read.status_code == 200
     assert read.json()["enabled"] is True
 
-    toggled = client.patch("/api/tools/system.get_current_time/toggle")
+    toggled = client.patch("/api/tools/system.get_current_time/toggle", headers=ADMIN_HEADERS)
     assert toggled.status_code == 200
     assert toggled.json()["enabled"] is False
 
-    missing = client.get("/api/tools/system.missing")
+    missing = client.get("/api/tools/system.missing", headers=AUTH_HEADERS)
     assert missing.status_code == 404
 
 
 def test_invalid_tool_id_returns_unprocessable_entity(client):
-    response = client.get("/api/tools/invalid$id")
+    response = client.get("/api/tools/invalid$id", headers=AUTH_HEADERS)
     assert response.status_code == 422
 
+
+def test_tool_registry_requires_authentication(client):
+    assert client.get("/api/tools").status_code == 401
+    assert client.patch("/api/tools/system.get_current_time/toggle").status_code == 401
+
+
+def test_regular_user_cannot_toggle_tool(client):
+    response = client.patch(
+        "/api/tools/system.get_current_time/toggle", headers=AUTH_HEADERS
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "Administrator permission is required"}
+
+
+def test_authenticated_regular_user_can_read_tools(client):
+    assert client.get("/api/tools", headers=AUTH_HEADERS).status_code == 200
+    assert client.get(
+        "/api/tools/system.get_current_time", headers=AUTH_HEADERS
+    ).status_code == 200
 
 def build_invocation_client(tmp_path):
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'invocations-api.db'}")

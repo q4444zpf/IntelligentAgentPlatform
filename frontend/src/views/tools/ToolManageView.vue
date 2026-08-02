@@ -65,7 +65,8 @@
           <div class="tool-state">
             <a-switch
               :checked="tool.enabled"
-              :loading="busyId === tool.tool_id"
+              :loading="isToolPending(tool.tool_id)"
+              :disabled="isToolPending(tool.tool_id)"
               checked-children="启用"
               un-checked-children="停用"
               @change="toggleTool(tool)"
@@ -92,7 +93,8 @@ const query = ref('');
 const sourceFilter = ref<'all' | ToolSource>('all');
 const riskFilter = ref<'all' | ToolRisk>('all');
 const statusFilter = ref<'all' | 'enabled' | 'disabled'>('all');
-const busyId = ref('');
+const pendingToolIds = ref(new Set<string>());
+let loadRequestId = 0;
 let loadController: AbortController | undefined;
 
 const sourceLabel: Record<ToolSource, string> = {
@@ -150,35 +152,66 @@ function schemaSummary(schema: Record<string, unknown>) {
   return keys.length ? keys.slice(0, 3).join('、') + (keys.length > 3 ? ` 等 ${keys.length} 项` : '') : '无字段';
 }
 
+function isAbortError(error: unknown) {
+  return error instanceof DOMException && error.name === 'AbortError';
+}
+
 async function loadTools() {
+  const requestId = ++loadRequestId;
   loadController?.abort();
-  loadController = new AbortController();
+  const controller = new AbortController();
+  loadController = controller;
   loading.value = true;
   loadError.value = '';
   try {
-    tools.value = await toolsApi.list(loadController.signal);
+    const result = await toolsApi.list(controller.signal);
+    if (requestId !== loadRequestId) return;
+    tools.value = result;
   } catch (error) {
+    if (requestId !== loadRequestId || isAbortError(error)) return;
     loadError.value = error instanceof Error ? error.message : '加载失败';
   } finally {
-    loading.value = false;
+    if (requestId === loadRequestId) {
+      loading.value = false;
+      if (loadController === controller) loadController = undefined;
+    }
   }
 }
 
+const toggleRequests = new Map<string, symbol>();
+
+function isToolPending(toolId: string) {
+  return pendingToolIds.value.has(toolId);
+}
+
 async function toggleTool(tool: ToolInfo) {
-  busyId.value = tool.tool_id;
+  if (isToolPending(tool.tool_id)) return;
+  const requestToken = Symbol(tool.tool_id);
+  toggleRequests.set(tool.tool_id, requestToken);
+  pendingToolIds.value.add(tool.tool_id);
   try {
     const updated = await toolsApi.toggle(tool.tool_id);
+    if (toggleRequests.get(tool.tool_id) !== requestToken) return;
     tools.value = tools.value.map((item) => item.tool_id === updated.tool_id ? updated : item);
     message.success(updated.enabled ? '工具已启用' : '工具已停用');
   } catch (error) {
+    if (toggleRequests.get(tool.tool_id) !== requestToken) return;
     message.error(error instanceof Error ? error.message : '切换状态失败');
   } finally {
-    busyId.value = '';
+    if (toggleRequests.get(tool.tool_id) === requestToken) {
+      toggleRequests.delete(tool.tool_id);
+      pendingToolIds.value.delete(tool.tool_id);
+    }
   }
 }
 
 onMounted(loadTools);
-onBeforeUnmount(() => loadController?.abort());
+onBeforeUnmount(() => {
+  loadRequestId += 1;
+  loadController?.abort();
+  toggleRequests.clear();
+  pendingToolIds.value.clear();
+});
 </script>
 
 <style scoped>

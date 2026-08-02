@@ -20,6 +20,8 @@
     "vue-router": "^4.5.1"
   },
   "devDependencies": {
+    "@vue/test-utils": "^2.4.11",
+    "happy-dom": "^20.11.1",
     "typescript": "^5.9.2",
     "vitest": "^3.2.7",
     "vue-tsc": "^3.0.8"
