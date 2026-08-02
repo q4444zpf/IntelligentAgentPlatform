@@ -15,6 +15,16 @@ from app.skills.schemas import SkillCreateRequest
 from app.skills.service import SkillService
 
 
+class CountingAgentStore(AgentStore):
+    def __init__(self, session_factory):
+        super().__init__(session_factory)
+        self.default_pointer_reads = 0
+
+    def get_default_id(self):
+        self.default_pointer_reads += 1
+        return super().get_default_id()
+
+
 @pytest.fixture
 def client(tmp_path):
     skill_service = SkillService(tmp_path / "skills")
@@ -96,6 +106,31 @@ def test_initializes_one_enabled_builtin_default_agent(tmp_path):
 
     second = AgentService(store, workspace_root=tmp_path / "agent-workspaces")
     assert [agent.id for agent in second.list()] == [BUILTIN_AGENT_ID]
+
+
+def test_list_uses_one_default_pointer_snapshot_for_all_flags(tmp_path):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'agents.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    store = CountingAgentStore(session_factory)
+    service = AgentService(store, workspace_root=tmp_path / "agent-workspaces")
+    service.create(AgentCreateRequest(**agent_payload(skill_names=[])))
+    service.create(
+        AgentCreateRequest(
+            **agent_payload(
+                id="flood-analysis",
+                name="洪水分析智能体",
+                skill_names=[],
+            )
+        )
+    )
+    store.default_pointer_reads = 0
+
+    agents = service.list()
+
+    assert len(agents) == 3
+    assert sum(agent.is_default for agent in agents) == 1
+    assert store.default_pointer_reads == 2
 
 
 def test_get_default_repairs_missing_or_invalid_pointer(tmp_path):

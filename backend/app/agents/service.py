@@ -59,8 +59,13 @@ class AgentService:
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self._ensure_default_agent()
 
-    def _info(self, record: dict) -> AgentInfo:
-        default_id = self.store.get_default_id().agent_id
+    def _info(
+        self,
+        record: dict,
+        default_id: str | None = None,
+    ) -> AgentInfo:
+        if default_id is None:
+            default_id = self.store.get_default_id().agent_id
         return AgentInfo(
             **record,
             is_builtin=record["id"] == BUILTIN_AGENT_ID,
@@ -137,7 +142,11 @@ class AgentService:
 
     def list(self) -> list[AgentInfo]:
         self._ensure_default_agent()
-        return [self._info(record) for record in self.store.list()]
+        default_id = self.store.get_default_id().agent_id
+        return [
+            self._info(record, default_id=default_id)
+            for record in self.store.list()
+        ]
 
     def get(self, agent_id: str) -> AgentInfo:
         self._ensure_default_agent()
