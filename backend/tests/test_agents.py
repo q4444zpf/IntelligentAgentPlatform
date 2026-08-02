@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.agents.router import create_router
 from app.agents.schemas import AgentConfig, AgentCreateRequest, AgentDefaultRequest
 from app.agents.service import BUILTIN_AGENT_ID, AgentService
-from app.agents.store import DEFAULT_SETTING_KEY, AgentStore
+from app.agents.store import AgentConcurrentUpdateError, DEFAULT_SETTING_KEY, AgentStore
 from app.db.base import Base
 from app.db.platform_models import PlatformSettingRecord
 from app.skills.schemas import SkillCreateRequest
@@ -48,6 +48,7 @@ version: "1.0"
     service = AgentService(store, skill_service=skill_service, workspace_root=tmp_path / "agent-workspaces")
     app = FastAPI()
     app.include_router(create_router(service), prefix="/api/agents")
+    app.state.agent_service = service
     return TestClient(app)
 
 
@@ -242,6 +243,120 @@ def test_default_request_validates_agent_id():
         AgentDefaultRequest(agent_id="Invalid Agent ID")
 
 
+def test_gets_effective_default_agent(client):
+    response = client.get("/api/agents/default")
+
+    assert response.status_code == 200
+    assert response.json()["id"] == BUILTIN_AGENT_ID
+    assert response.json()["is_default"] is True
+
+
+def test_switches_default_to_enabled_agent_atomically(client):
+    assert client.post("/api/agents", json=agent_payload()).status_code == 201
+    switched = client.put(
+        "/api/agents/default",
+        json={"agent_id": "reservoir-dispatch"},
+    )
+
+    assert switched.status_code == 200
+    assert switched.json()["id"] == "reservoir-dispatch"
+    assert switched.json()["is_default"] is True
+    listed = client.get("/api/agents")
+    defaults = [agent["id"] for agent in listed.json() if agent["is_default"]]
+    assert defaults == ["reservoir-dispatch"]
+
+
+def test_rejects_disabled_or_missing_default_target(client):
+    assert client.post(
+        "/api/agents",
+        json=agent_payload(enabled=False),
+    ).status_code == 201
+
+    disabled = client.put(
+        "/api/agents/default",
+        json={"agent_id": "reservoir-dispatch"},
+    )
+    assert disabled.status_code == 422
+    missing = client.put(
+        "/api/agents/default",
+        json={"agent_id": "missing-agent"},
+    )
+    assert missing.status_code == 404
+    assert client.get("/api/agents/default").json()["id"] == BUILTIN_AGENT_ID
+
+
+def test_rejects_deleting_or_disabling_active_default(client):
+    assert client.delete(f"/api/agents/{BUILTIN_AGENT_ID}").status_code == 409
+    disabled = client.patch(
+        f"/api/agents/{BUILTIN_AGENT_ID}/toggle",
+        json={"enabled": False},
+    )
+    assert disabled.status_code == 409
+    enabled = client.patch(
+        f"/api/agents/{BUILTIN_AGENT_ID}/toggle",
+        json={"enabled": True},
+    )
+    assert enabled.status_code == 200
+    assert enabled.json()["is_default"] is True
+
+
+def test_old_ordinary_default_can_be_disabled_and_deleted_after_switch(client):
+    assert client.post("/api/agents", json=agent_payload()).status_code == 201
+    assert client.put(
+        "/api/agents/default",
+        json={"agent_id": "reservoir-dispatch"},
+    ).status_code == 200
+    assert client.patch(
+        "/api/agents/reservoir-dispatch/toggle",
+        json={"enabled": False},
+    ).status_code == 409
+
+    assert client.put(
+        "/api/agents/default",
+        json={"agent_id": BUILTIN_AGENT_ID},
+    ).status_code == 200
+    assert client.patch(
+        "/api/agents/reservoir-dispatch/toggle",
+        json={"enabled": False},
+    ).status_code == 200
+    assert client.delete("/api/agents/reservoir-dispatch").status_code == 200
+
+
+def test_builtin_agent_cannot_be_deleted_after_default_switch(client):
+    assert client.post("/api/agents", json=agent_payload()).status_code == 201
+    assert client.put(
+        "/api/agents/default",
+        json={"agent_id": "reservoir-dispatch"},
+    ).status_code == 200
+
+    deleted = client.delete(f"/api/agents/{BUILTIN_AGENT_ID}")
+
+    assert deleted.status_code == 409
+    assert client.get(f"/api/agents/{BUILTIN_AGENT_ID}").status_code == 200
+
+
+def test_maps_concurrent_default_update_to_conflict(client, monkeypatch):
+    assert client.post("/api/agents", json=agent_payload()).status_code == 201
+
+    def reject_stale_update(agent_id, expected_version):
+        raise AgentConcurrentUpdateError(
+            "Default agent changed concurrently; retry the request"
+        )
+
+    monkeypatch.setattr(
+        client.app.state.agent_service.store,
+        "set_default_id",
+        reject_stale_update,
+    )
+    response = client.put(
+        "/api/agents/default",
+        json={"agent_id": "reservoir-dispatch"},
+    )
+
+    assert response.status_code == 409
+    assert "changed concurrently" in response.json()["detail"]
+
+
 def test_rejects_unknown_skills_and_duplicate_id(client):
     missing = client.post("/api/agents", json=agent_payload(skill_names=["missing-skill"]))
     assert missing.status_code == 422
@@ -285,6 +400,8 @@ def test_copies_agent_with_independent_identity(client):
     assert copied.json()["id"] == "reservoir-dispatch-copy"
     assert copied.json()["skill_names"] == ["flood-forecast"]
     assert copied.json()["pinned"] is False
+    assert copied.json()["enabled"] is False
+    assert copied.json()["is_default"] is False
 
 
 def test_deletes_agent(client):

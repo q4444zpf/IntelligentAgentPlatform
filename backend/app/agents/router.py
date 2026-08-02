@@ -1,7 +1,22 @@
 from fastapi import APIRouter, HTTPException
 
-from .schemas import AgentConfig, AgentCopyRequest, AgentCreateRequest, AgentInfo, AgentPinRequest, AgentToggleRequest
-from .service import AgentConflictError, AgentNotFoundError, AgentService, AgentValidationError
+from .schemas import (
+    AgentConfig,
+    AgentCopyRequest,
+    AgentCreateRequest,
+    AgentDefaultRequest,
+    AgentInfo,
+    AgentPinRequest,
+    AgentToggleRequest,
+)
+from .service import (
+    AgentConflictError,
+    AgentNotFoundError,
+    AgentProtectedError,
+    AgentService,
+    AgentValidationError,
+)
+from .store import AgentConcurrentUpdateError
 
 
 def create_router(service: AgentService | None = None) -> APIRouter:
@@ -15,6 +30,8 @@ def create_router(service: AgentService | None = None) -> APIRouter:
             raise HTTPException(status_code=404, detail=f"Agent '{error}' was not found") from error
         except AgentConflictError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
+        except (AgentProtectedError, AgentConcurrentUpdateError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         except AgentValidationError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
 
@@ -25,6 +42,14 @@ def create_router(service: AgentService | None = None) -> APIRouter:
     @router.post("", response_model=AgentInfo, status_code=201)
     def create_agent(request: AgentCreateRequest):
         return call(lambda: manager.create(request))
+
+    @router.get("/default", response_model=AgentInfo)
+    def get_default_agent():
+        return call(manager.get_default)
+
+    @router.put("/default", response_model=AgentInfo)
+    def set_default_agent(request: AgentDefaultRequest):
+        return call(lambda: manager.set_default(request.agent_id))
 
     @router.get("/{agent_id}", response_model=AgentInfo)
     def get_agent(agent_id: str):

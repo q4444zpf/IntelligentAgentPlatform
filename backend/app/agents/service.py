@@ -44,6 +44,10 @@ class AgentValidationError(Exception):
     pass
 
 
+class AgentProtectedError(Exception):
+    pass
+
+
 class AgentService:
     def __init__(
         self,
@@ -163,6 +167,22 @@ class AgentService:
             raise AgentNotFoundError(pointer.agent_id or BUILTIN_AGENT_ID)
         return self._info(record)
 
+    def set_default(self, agent_id: str) -> AgentInfo:
+        self._ensure_default_agent()
+        record = self.store.get(agent_id)
+        if record is None:
+            raise AgentNotFoundError(agent_id)
+        if not record["enabled"]:
+            raise AgentValidationError(
+                f"Disabled agent '{agent_id}' cannot be the default"
+            )
+        pointer = self.store.get_default_id()
+        self.store.set_default_id(
+            agent_id,
+            expected_version=pointer.version,
+        )
+        return self._info(record, default_id=agent_id)
+
     def _initialize_workspace(self, agent_id: str, config: AgentConfig) -> Path:
         workspace = self.workspace_root / agent_id
         workspace.mkdir()
@@ -192,6 +212,10 @@ class AgentService:
         if not current:
             raise AgentNotFoundError(agent_id)
         self._validate_skills(request.skill_names)
+        if not request.enabled and self.store.get_default_id().agent_id == agent_id:
+            raise AgentProtectedError(
+                f"Default agent '{agent_id}' cannot be disabled"
+            )
         record = self.store.update(agent_id, request.model_dump())
         workspace = Path(current["workspace_dir"])
         if workspace.is_dir():
@@ -206,6 +230,10 @@ class AgentService:
         current = self.store.get(agent_id)
         if not current:
             raise AgentNotFoundError(agent_id)
+        if not enabled and self.store.get_default_id().agent_id == agent_id:
+            raise AgentProtectedError(
+                f"Default agent '{agent_id}' cannot be disabled"
+            )
         config = {name: current[name] for name in AgentConfig.model_fields}
         config["enabled"] = enabled
         return self._info(self.store.update(agent_id, config))
@@ -230,6 +258,14 @@ class AgentService:
 
     def delete(self, agent_id: str) -> None:
         self._ensure_default_agent()
+        if agent_id == BUILTIN_AGENT_ID:
+            raise AgentProtectedError(
+                f"Built-in agent '{agent_id}' cannot be deleted"
+            )
+        if self.store.get_default_id().agent_id == agent_id:
+            raise AgentProtectedError(
+                f"Default agent '{agent_id}' cannot be deleted"
+            )
         record = self.store.delete(agent_id)
         if not record:
             raise AgentNotFoundError(agent_id)
