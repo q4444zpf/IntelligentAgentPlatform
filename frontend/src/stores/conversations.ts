@@ -63,7 +63,7 @@ export const useConversationStore = defineStore('conversations', {
       this.activeRun = null;
       this.events = [];
     },
-    async sendMessage(content: string, actorType: 'agent' | 'team', actorId: string) {
+    async sendMessage(content: string, actorType: 'agent' | 'team', actorId?: string) {
       this.sending = true;
       this.error = '';
       try {
@@ -73,7 +73,7 @@ export const useConversationStore = defineStore('conversations', {
         const accepted = await conversationsApi.sendMessage(this.activeConversationId, {
           content,
           actor_type: actorType,
-          actor_id: actorId,
+          ...(actorId ? { actor_id: actorId } : {}),
         });
         this.messages.push(accepted.message);
         this.activeRun = accepted.run;

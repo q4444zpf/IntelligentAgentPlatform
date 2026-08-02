@@ -59,12 +59,12 @@
         <div class="chat-toolbar">
           <div class="mode-switch" aria-label="协作模式">
             <button :class="{ active: mode === 'single' }" @click="setMode('single')"><UserOutlined /> 单智能体</button>
-            <button :class="{ active: mode === 'team' }" @click="setMode('team')"><TeamOutlined /> 多智能体协同</button>
+            <button :class="{ active: mode === 'team' }" title="多智能体运行时开发中" disabled><TeamOutlined /> 多智能体协同</button>
           </div>
           <div class="toolbar-selectors">
             <label class="selector-field actor-field">
               <span>执行主体</span>
-              <a-select v-if="mode === 'single'" v-model:value="selectedAgentId" class="actor-select" :options="agentOptions" />
+              <a-select v-if="mode === 'single'" v-model:value="selectedAgentId" class="actor-select" :options="agentOptions" placeholder="平台默认智能体" @change="selectAgent" />
               <a-select v-else v-model:value="selectedTeamId" class="actor-select" :options="teamOptions" />
             </label>
             <label class="selector-field knowledge-field">
@@ -175,6 +175,7 @@ import {
 } from '@ant-design/icons-vue';
 import { computed, nextTick, onMounted, ref, useTemplateRef, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
+import { agentsApi, type AgentInfo } from '@/api/agents';
 import { isRunActive, runtimeStatusLabel } from '@/features/chat/runtimeStatus';
 import { useConversationStore } from '@/stores/conversations';
 
@@ -186,8 +187,10 @@ const router = useRouter();
 const conversationStore = useConversationStore();
 const isFocusMode = computed(() => route.meta.focus === true);
 const mobilePanel = ref<'history' | 'chat' | 'context'>('chat');
-const mode = ref<ChatMode>('team');
-const selectedAgentId = ref('flood');
+const mode = ref<ChatMode>('single');
+const availableAgents = ref<AgentInfo[]>([]);
+const selectedAgentId = ref('');
+const hasExplicitAgentSelection = ref(false);
 const selectedTeamId = ref('flood-team');
 const selectedKnowledgeIds = ref<string[]>(['dispatch', 'regulation']);
 const selectedResourceIds = ref<string[]>(['beijiang-topology', 'qingyuan-dem']);
@@ -195,9 +198,7 @@ const historySearch = ref('');
 const input = ref('');
 const messageList = useTemplateRef<HTMLElement>('message-list');
 
-const agentOptions = [
-  { value: 'flood', label: '防洪调度智能体' }, { value: 'forecast', label: '洪水预报智能体' }, { value: 'gis', label: 'GIS 空间分析智能体' },
-];
+const agentOptions = computed(() => availableAgents.value.map((agent) => ({ value: agent.id, label: agent.name })));
 const teamOptions = [
   { value: 'flood-team', label: '北江防洪协同团队' }, { value: 'reservoir-team', label: '水库群调度团队' }, { value: 'temporary', label: '临时研判团队' },
 ];
@@ -213,7 +214,7 @@ const resourceOptions = [
 ];
 const selectedKnowledge = computed(() => knowledgeOptions.filter((item) => selectedKnowledgeIds.value.includes(item.value)));
 const selectedResources = computed(() => resourceOptions.filter((item) => selectedResourceIds.value.includes(item.value)));
-const activeActorName = computed(() => (mode.value === 'team' ? teamOptions : agentOptions).find((item) => item.value === (mode.value === 'team' ? selectedTeamId.value : selectedAgentId.value))?.label || '智能体');
+const activeActorName = computed(() => (mode.value === 'team' ? teamOptions : agentOptions.value).find((item) => item.value === (mode.value === 'team' ? selectedTeamId.value : selectedAgentId.value))?.label || '智能体');
 const filteredSessions = computed(() => conversationStore.conversations
   .map((item) => ({ id: item.id, title: item.title, summary: '项目会话', time: formatTime(item.updated_at), mode: '持久化' }))
   .filter((item) => `${item.title}${item.summary}`.includes(historySearch.value.trim())));
@@ -234,8 +235,27 @@ const messages = computed<ChatMessage[]>(() => conversationStore.messages.map((m
 })));
 
 watch(messages, async () => { await nextTick(); messageList.value?.scrollTo({ top: messageList.value.scrollHeight, behavior: 'smooth' }); }, { deep: true });
-onMounted(() => conversationStore.loadConversations());
+onMounted(() => {
+  void conversationStore.loadConversations();
+  void loadAgents();
+});
 
+async function loadAgents() {
+  try {
+    const agents = await agentsApi.list();
+    availableAgents.value = agents.filter((agent) => agent.enabled && (agent.runtime_form === 'web' || agent.runtime_form === 'common'));
+    if (hasExplicitAgentSelection.value && availableAgents.value.some((agent) => agent.id === selectedAgentId.value)) return;
+    hasExplicitAgentSelection.value = false;
+    selectedAgentId.value = availableAgents.value.find((agent) => agent.is_default)?.id || '';
+  } catch {
+    availableAgents.value = [];
+    if (!hasExplicitAgentSelection.value) selectedAgentId.value = '';
+  }
+}
+function selectAgent(agentId: string) {
+  selectedAgentId.value = agentId;
+  hasExplicitAgentSelection.value = true;
+}
 function formatTime(value: string) {
   return new Date(value).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
@@ -246,7 +266,7 @@ async function sendMessage() {
   const content = input.value.trim();
   if (!content || conversationStore.sending) return;
   const actorType = mode.value === 'team' ? 'team' : 'agent';
-  const actorId = mode.value === 'team' ? selectedTeamId.value : selectedAgentId.value;
+  const actorId = mode.value === 'team' ? selectedTeamId.value : selectedAgentId.value || undefined;
   await conversationStore.sendMessage(content, actorType, actorId);
   input.value = '';
 }

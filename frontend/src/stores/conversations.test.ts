@@ -26,6 +26,23 @@ describe('conversation store', () => {
     vi.useRealTimers();
   });
 
+  it('omits actor_id when the backend should resolve the default agent', async () => {
+    vi.mocked(conversationsApi.sendMessage).mockResolvedValue(structuredClone(acceptedRun));
+    vi.mocked(getRunEvents).mockResolvedValue([
+      { sequence: 2, event_type: 'run.status', payload: { status: 'completed' } },
+    ]);
+    vi.mocked(conversationsApi.listMessages).mockResolvedValue([acceptedRun.message]);
+    const store = useConversationStore();
+    store.activeConversationId = 'c1';
+
+    await store.sendMessage('分析洪峰', 'agent');
+
+    expect(conversationsApi.sendMessage).toHaveBeenCalledWith('c1', {
+      content: '分析洪峰',
+      actor_type: 'agent',
+    });
+  });
+
   it('polls incrementally and reloads messages after completion', async () => {
     vi.useFakeTimers();
     vi.mocked(conversationsApi.sendMessage).mockResolvedValue(structuredClone(acceptedRun));

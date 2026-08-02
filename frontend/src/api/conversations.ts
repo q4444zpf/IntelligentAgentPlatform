@@ -46,7 +46,7 @@ export const conversationsApi = {
     }),
   sendMessage: (
     conversationId: string,
-    body: { content: string; actor_type: 'agent' | 'team'; actor_id: string },
+    body: { content: string; actor_type: 'agent' | 'team'; actor_id?: string },
   ) =>
     request<MessageAccepted>(`/conversations/${encodeURIComponent(conversationId)}/messages`, {
       method: 'POST',
