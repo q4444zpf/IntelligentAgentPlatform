@@ -18,6 +18,7 @@ class RecordingAgentService:
             context_prompt="",
             provider_id="deepseek",
             model="deepseek-chat",
+            tool_ids=[],
         )
 
 
@@ -29,6 +30,7 @@ class RecordingGateway:
         self,
         messages: list[dict[str, str]],
         selection: ModelSelection | None = None,
+        tools=None,
     ) -> ModelResult:
         self.calls.append((messages, selection))
         return ModelResult(content="后台研判完成")

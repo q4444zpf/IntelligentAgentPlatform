@@ -7,12 +7,13 @@ from app.agents.service import AgentNotFoundError
 from app.conversations.models import AgentRun, Conversation, Message, RunEvent
 from app.conversations.repository import ConversationRepository
 from app.db.base import Base
-from app.runtime.harness import PlatformAgentHarness
+from app.runtime.harness import MAX_MODEL_ITERATIONS, MAX_TOOL_CALLS, PlatformAgentHarness
 from app.runtime.model_gateway import (
     ModelResult,
     ModelSelection,
     ModelUpstreamError,
 )
+from app.tools.schemas import ToolCall, ToolDefinition, ToolExecutionResult, ToolRuntimeError
 
 
 class FakeAgentService:
@@ -25,6 +26,7 @@ class FakeAgentService:
         provider_id="deepseek",
         model="deepseek-chat",
         missing=False,
+        tool_ids=None,
     ):
         self.agent = SimpleNamespace(
             enabled=enabled,
@@ -32,6 +34,7 @@ class FakeAgentService:
             context_prompt=context_prompt,
             provider_id=provider_id,
             model=model,
+            tool_ids=tool_ids or [],
         )
         self.missing = missing
 
@@ -47,6 +50,7 @@ class SuccessfulGateway:
         self,
         messages: list[dict[str, str]],
         selection: ModelSelection | None = None,
+        tools=None,
     ) -> ModelResult:
         assert messages == [
             {"role": "system", "content": "你是洪水研判智能体"},
@@ -132,6 +136,7 @@ class FailingGateway:
         self,
         messages: list[dict[str, str]],
         selection: ModelSelection | None = None,
+        tools=None,
     ) -> ModelResult:
         raise ModelUpstreamError("upstream rejected runtime-secret")
 
@@ -181,6 +186,7 @@ class CapturingGateway:
         self,
         messages: list[dict[str, str]],
         selection: ModelSelection | None = None,
+        tools=None,
     ) -> ModelResult:
         self.calls.append((messages, selection))
         return ModelResult(content="首次研判完成")
@@ -302,3 +308,106 @@ def test_fails_safely_when_agent_is_disabled():
     assert run is not None and run.status == "failed"
     assert events[-2].payload["code"] == "agent_unavailable"
     assert gateway.calls == []
+class ScriptedToolModel:
+    def __init__(self, results):
+        self.results = list(results)
+        self.calls = []
+
+    def generate(self, messages, selection=None, tools=None):
+        self.calls.append((list(messages), selection, list(tools or [])))
+        return self.results.pop(0)
+
+
+class RecordingToolGateway:
+    def __init__(self, fail=None):
+        self.calls = []
+        self.fail = fail
+
+    def execute(self, call, context, authorized_tool_ids):
+        self.calls.append((call, context, set(authorized_tool_ids)))
+        if self.fail:
+            raise self.fail
+        return ToolExecutionResult(invocation_id=f"inv-{call.id}", value={"name": call.name})
+
+
+class FakeToolService:
+    def get(self, tool_id):
+        return SimpleNamespace(
+            tool_id=tool_id,
+            description=tool_id,
+            input_schema={"type": "object"},
+            published=True,
+            enabled=True,
+        )
+
+
+def test_executes_tool_then_persists_final_answer_with_aggregated_usage():
+    session, run_id = build_queued_run()
+    repository = ConversationRepository(session)
+    model = ScriptedToolModel([
+        ModelResult(None, 3, 2, 5, (ToolCall("call-1", "system.get_current_time", {}),)),
+        ModelResult("今天是星期日", 4, 5, 9),
+    ])
+    tool_gateway = RecordingToolGateway()
+    PlatformAgentHarness(repository, model, FakeAgentService(tool_ids=["system.get_current_time"]), tool_service=FakeToolService(), tool_gateway=tool_gateway).execute(run_id)
+
+    run = repository.get_run_by_id(run_id)
+    assert run.status == "completed"
+    assert len(model.calls) == 2
+    assert model.calls[1][0][-2] == {
+        "role": "assistant", "content": None,
+        "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "system.get_current_time", "arguments": "{}"}}],
+    }
+    assert model.calls[1][0][-1] == {"role": "tool", "tool_call_id": "call-1", "content": '{"name":"system.get_current_time"}'}
+    context = tool_gateway.calls[0][1]
+    assert (context.user_id, context.project_id, context.conversation_id, context.run_id) == ("u1", "p1", run.conversation_id, run_id)
+    events = repository.list_events(run_id, 0)
+    assert events[-2].payload == {"prompt_tokens": 7, "completion_tokens": 7, "total_tokens": 14}
+
+
+def test_executes_multiple_tool_calls_in_order():
+    session, run_id = build_queued_run()
+    calls = (ToolCall("c1", "system.one", {"b": 1, "a": 2}), ToolCall("c2", "system.two", {}))
+    model = ScriptedToolModel([ModelResult(None, tool_calls=calls), ModelResult("完成")])
+    gateway = RecordingToolGateway()
+    PlatformAgentHarness(ConversationRepository(session), model, FakeAgentService(tool_ids=["system.one", "system.two"]), tool_service=FakeToolService(), tool_gateway=gateway).execute(run_id)
+    assert [item[0].id for item in gateway.calls] == ["c1", "c2"]
+    assert model.calls[1][0][-2:] == [
+        {"role": "tool", "tool_call_id": "c1", "content": '{"name":"system.one"}'},
+        {"role": "tool", "tool_call_id": "c2", "content": '{"name":"system.two"}'},
+    ]
+
+
+def test_rejects_batch_exceeding_total_limit_before_any_execution():
+    session, run_id = build_queued_run()
+    first = tuple(ToolCall(f"c{i}", "system.one", {}) for i in range(MAX_TOOL_CALLS - 1))
+    second = (ToolCall("last-1", "system.one", {}), ToolCall("last-2", "system.one", {}))
+    model = ScriptedToolModel([ModelResult(None, tool_calls=first), ModelResult(None, tool_calls=second)])
+    gateway = RecordingToolGateway()
+    repo = ConversationRepository(session)
+    PlatformAgentHarness(repo, model, FakeAgentService(tool_ids=["system.one"]), tool_service=FakeToolService(), tool_gateway=gateway).execute(run_id)
+    assert len(gateway.calls) == MAX_TOOL_CALLS - 1
+    assert repo.list_events(run_id, 0)[-2].payload == {"code": "tool_iteration_limit", "message": "工具调用次数超过平台限制"}
+    assert not any(message.role == "assistant" for message in repo.get_run_messages(run_id))
+
+
+def test_fails_after_fourth_model_iteration_requests_more_tools():
+    session, run_id = build_queued_run()
+    model = ScriptedToolModel([ModelResult(None, tool_calls=(ToolCall(f"c{i}", "system.one", {}),)) for i in range(MAX_MODEL_ITERATIONS)])
+    gateway = RecordingToolGateway()
+    repo = ConversationRepository(session)
+    PlatformAgentHarness(repo, model, FakeAgentService(tool_ids=["system.one"]), tool_service=FakeToolService(), tool_gateway=gateway).execute(run_id)
+    assert len(model.calls) == MAX_MODEL_ITERATIONS
+    assert len(gateway.calls) == MAX_MODEL_ITERATIONS
+    assert repo.list_events(run_id, 0)[-2].payload["code"] == "tool_iteration_limit"
+
+
+def test_tool_runtime_error_fails_safely_without_assistant_message():
+    session, run_id = build_queued_run()
+    repo = ConversationRepository(session)
+    model = ScriptedToolModel([ModelResult(None, tool_calls=(ToolCall("c1", "system.one", {}),))])
+    error = ToolRuntimeError("tool_not_authorized", "该工具当前不可用。")
+    PlatformAgentHarness(repo, model, FakeAgentService(tool_ids=["system.one"]), tool_service=FakeToolService(), tool_gateway=RecordingToolGateway(error)).execute(run_id)
+    assert repo.get_run_by_id(run_id).status == "failed"
+    assert repo.list_events(run_id, 0)[-2].payload == {"code": "tool_not_authorized", "message": "该工具当前不可用。"}
+    assert not any(message.role == "assistant" for message in repo.get_run_messages(run_id))

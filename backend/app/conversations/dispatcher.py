@@ -11,6 +11,9 @@ from app.core.database import SessionFactory
 from app.model_providers.store import ProviderStore
 from app.runtime.harness import PlatformAgentHarness
 from app.runtime.model_gateway import ModelGateway, OpenAICompatibleModelGateway
+from app.tools.gateway import ToolGateway
+from app.tools.service import ToolService
+from app.tools.store import ToolStore
 
 from .repository import ConversationRepository
 
@@ -56,10 +59,26 @@ class ThreadRunDispatcher(RunDispatcher):
 
     def _execute(self, run_id: str) -> None:
         with self.session_factory() as session:
+            repository = ConversationRepository(session)
+            tool_store = ToolStore(self.session_factory)
+            tool_service = ToolService(tool_store)
+            agent_service = (
+                self.agent_service_factory()
+                if self.agent_service_factory is not None
+                else AgentService(
+                    AgentStore(self.session_factory),
+                    tool_service=tool_service,
+                )
+            )
             PlatformAgentHarness(
-                ConversationRepository(session),
+                repository,
                 self.gateway_factory(),
-                self.agent_service_factory(),
+                agent_service,
+                tool_service=tool_service,
+                tool_gateway=ToolGateway(
+                    tool_store=tool_store,
+                    repository=repository,
+                ),
             ).execute(run_id)
 
     @staticmethod

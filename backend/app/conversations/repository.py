@@ -58,6 +58,19 @@ class ConversationRepository:
     def get_run_by_id(self, run_id: str) -> AgentRun | None:
         return self.session.get(AgentRun, run_id)
 
+    def get_run_execution_context(self, run_id: str) -> dict[str, str] | None:
+        row = self.session.execute(
+            select(
+                AgentRun.id.label("run_id"),
+                Conversation.id.label("conversation_id"),
+                Conversation.project_id,
+                Conversation.owner_id.label("user_id"),
+            )
+            .join(Conversation, Conversation.id == AgentRun.conversation_id)
+            .where(AgentRun.id == run_id)
+        ).mappings().one_or_none()
+        return dict(row) if row is not None else None
+
     def get_run_messages(self, run_id: str) -> list[Message]:
         run = self.get_run_by_id(run_id)
         if run is None:
