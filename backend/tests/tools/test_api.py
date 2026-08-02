@@ -1,9 +1,16 @@
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.conversations.dispatcher import UnavailableRunDispatcher
+from app.conversations.models import ToolInvocation
+from app.conversations.repository import ConversationRepository
+from app.conversations.router import create_router as create_conversation_router
+from app.conversations.service import ConversationService
 from app.db.base import Base
 from app.tools.router import create_router
 from app.tools.service import ToolService
@@ -53,3 +60,92 @@ def test_reads_toggles_and_returns_not_found(client):
 def test_invalid_tool_id_returns_unprocessable_entity(client):
     response = client.get("/api/tools/invalid$id")
     assert response.status_code == 422
+
+
+def build_invocation_client(tmp_path):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'invocations-api.db'}")
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    service = ConversationService(
+        ConversationRepository(session), UnavailableRunDispatcher()
+    )
+    app = FastAPI()
+    app.state.allow_dev_identity = True
+    app.state.conversation_session = session
+    app.include_router(
+        create_conversation_router(lambda _session: service), prefix="/api"
+    )
+    return TestClient(app), session
+
+
+def create_run(client, headers):
+    conversation = client.post(
+        "/api/conversations", json={"title": "工具审计"}, headers=headers
+    ).json()
+    accepted = client.post(
+        f"/api/conversations/{conversation['id']}/messages",
+        json={"content": "现在几点", "actor_type": "agent"},
+        headers=headers,
+    ).json()
+    return accepted["run"]["id"]
+
+
+def test_lists_scoped_tool_invocations_in_creation_order(tmp_path):
+    client, session = build_invocation_client(tmp_path)
+    headers = {"X-User-ID": "u1", "X-Project-ID": "p1"}
+    run_id = create_run(client, headers)
+    session.add_all(
+        [
+            ToolInvocation(
+                id="invocation-2", run_id=run_id, tool_call_id="call-2",
+                tool_id="system.get_runtime_context", tool_version="1.0.0",
+                status="completed", arguments_summary={"fields": ["timezone"]},
+                result_summary={"keys": ["timezone"]}, duration_ms=9,
+                created_at=datetime(2026, 8, 2, tzinfo=UTC),
+            ),
+            ToolInvocation(
+                id="invocation-1", run_id=run_id, tool_call_id="call-1",
+                tool_id="system.get_current_time", tool_version="1.0.0",
+                status="failed", arguments_summary={"keys": []},
+                result_summary=None, duration_ms=3, error_code="TOOL_FAILED",
+                created_at=datetime(2026, 8, 2, tzinfo=UTC) + timedelta(seconds=1),
+            ),
+        ]
+    )
+    session.commit()
+
+    response = client.get(f"/api/agent-runs/{run_id}/tool-invocations", headers=headers)
+
+    assert response.status_code == 200
+    items = response.json()
+    assert [item["id"] for item in items] == ["invocation-2", "invocation-1"]
+    assert items[0]["arguments_summary"] == {"fields": ["timezone"]}
+    assert items[0]["result_summary"] == {"keys": ["timezone"]}
+    assert items[0]["duration_ms"] == 9
+    assert "arguments" not in items[0]
+    assert "result" not in items[0]
+
+
+@pytest.mark.parametrize("headers", [
+    {"X-User-ID": "other", "X-Project-ID": "p1"},
+    {"X-User-ID": "u1", "X-Project-ID": "other"},
+])
+def test_tool_invocations_hide_runs_outside_request_scope(tmp_path, headers):
+    client, _session = build_invocation_client(tmp_path)
+    run_id = create_run(client, {"X-User-ID": "u1", "X-Project-ID": "p1"})
+
+    response = client.get(f"/api/agent-runs/{run_id}/tool-invocations", headers=headers)
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Resource was not found"}
+
+
+def test_tool_invocations_return_not_found_for_missing_run(tmp_path):
+    client, _session = build_invocation_client(tmp_path)
+
+    response = client.get(
+        "/api/agent-runs/missing/tool-invocations",
+        headers={"X-User-ID": "u1", "X-Project-ID": "p1"},
+    )
+
+    assert response.status_code == 404

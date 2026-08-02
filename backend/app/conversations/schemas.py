@@ -56,6 +56,23 @@ class MessageAccepted(BaseModel):
     run: AgentRunInfo
 
 
+class ToolInvocationInfo(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    run_id: str
+    tool_call_id: str
+    tool_id: str
+    tool_version: str
+    status: str
+    arguments_summary: dict[str, Any]
+    result_summary: dict[str, Any] | None
+    duration_ms: int | None
+    error_code: str | None
+    created_at: datetime
+    completed_at: datetime | None
+
+
 class RunEventInfo(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

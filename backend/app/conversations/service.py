@@ -14,6 +14,7 @@ from .schemas import (
     MessageCreate,
     MessageInfo,
     RunEventInfo,
+    ToolInvocationInfo,
 )
 
 
@@ -157,6 +158,16 @@ class ConversationService:
         if value is None:
             raise RunNotFound(run_id)
         return AgentRunInfo.model_validate(value)
+
+    def list_tool_invocations(
+        self, context: RequestContext, run_id: str
+    ) -> list[ToolInvocationInfo]:
+        if self.repository.get_run(
+            context.project_id, context.user_id, run_id
+        ) is None:
+            raise RunNotFound(run_id)
+        values = self.repository.list_tool_invocations(run_id)
+        return [ToolInvocationInfo.model_validate(value) for value in values]
 
     def list_events(
         self, context: RequestContext, run_id: str, after_sequence: int

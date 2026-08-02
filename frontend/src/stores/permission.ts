@@ -19,6 +19,7 @@ const adminPermissions = [
   'prompt:view',
   'mcp:view',
   'skill:view',
+  'tool:view',
   'knowledge:view',
   'workflow:view',
   'collaboration:view',

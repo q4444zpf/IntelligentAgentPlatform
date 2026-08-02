@@ -20,6 +20,7 @@ from .schemas import (
     MessageCreate,
     MessageInfo,
     RunEventInfo,
+    ToolInvocationInfo,
 )
 from .service import (
     AgentSelectionError,
@@ -119,6 +120,17 @@ def create_router(
         manager: ConversationService = Depends(service),
     ):
         return not_found(lambda: manager.get_run(context, run_id))
+
+    @router.get(
+        "/agent-runs/{run_id}/tool-invocations",
+        response_model=list[ToolInvocationInfo],
+    )
+    def list_tool_invocations(
+        run_id: str,
+        context: RequestContext = Depends(require_request_context),
+        manager: ConversationService = Depends(service),
+    ):
+        return not_found(lambda: manager.list_tool_invocations(context, run_id))
 
     @router.get("/agent-runs/{run_id}/events")
     def get_events(

@@ -35,7 +35,8 @@ export const appMenus: AppMenuItem[] = [
     children: [
       { key: 'llm', title: '大模型管理', path: '/llm', permission: 'platform:llm' },
       { key: 'mcp', title: 'MCP 管理', path: '/mcp', permission: 'mcp:view' },
-      { key: 'skill', title: 'Skill / Tool 管理', path: '/skill', permission: 'skill:view' },
+      { key: 'skill', title: 'Skill 管理', path: '/skill', permission: 'skill:view' },
+      { key: 'tools', title: '工具注册中心', path: '/tools', permission: 'tool:view' },
       { key: 'knowledge', title: '知识库管理', path: '/knowledge', permission: 'knowledge:view' },
       { key: 'prompt', title: 'Prompt 管理', path: '/prompt', permission: 'prompt:view' },
       { key: 'external-agents', title: '外部智能体管理', path: '/external-agents', permission: 'integration:view' },
@@ -123,6 +124,7 @@ export const routes: RouteRecordRaw[] = [
       { path: 'prompt', name: 'PromptManage', component: genericView, meta: { title: 'Prompt 管理', module: 'prompt', permission: 'prompt:view' } },
       { path: 'mcp', name: 'McpManage', component: () => import('@/views/mcp/McpManageView.vue'), meta: { title: 'MCP 管理', permission: 'mcp:view' } },
       { path: 'skill', name: 'SkillManage', component: () => import('@/views/skills/SkillManageView.vue'), meta: { title: 'Skill 管理', permission: 'skill:view' } },
+      { path: 'tools', name: 'ToolManage', component: () => import('@/views/tools/ToolManageView.vue'), meta: { title: '工具注册中心', permission: 'tool:view' } },
       { path: 'knowledge', name: 'KnowledgeManage', component: genericView, meta: { title: '知识库管理', module: 'knowledge', permission: 'knowledge:view' } },
       { path: 'workflow', name: 'WorkflowManage', component: genericView, meta: { title: '流程编排', module: 'workflow', permission: 'workflow:view' } },
       { path: 'collaboration', name: 'CollaborationManage', component: genericView, meta: { title: '多智能体协同', module: 'collaboration', permission: 'collaboration:view' } },
