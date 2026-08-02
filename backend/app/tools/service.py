@@ -40,8 +40,8 @@ class ToolService:
         return ToolInfo.model_validate(item)
 
     def toggle(self, tool_id: str) -> ToolInfo:
-        tool = self.get(tool_id)
-        updated = self.store.set_enabled(tool_id, not tool.enabled)
+        self._validate_tool_id(tool_id)
+        updated = self.store.toggle(tool_id)
         if updated is None:
             raise ToolNotFoundError(tool_id)
         return ToolInfo.model_validate(updated)

@@ -1,5 +1,5 @@
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.base import Base
@@ -75,3 +75,48 @@ def test_builtin_tools_cannot_be_deleted(tool_store):
 
     with pytest.raises(ToolValidationError, match="cannot be deleted"):
         service.delete("system.get_current_time")
+
+def test_builtin_upsert_uses_database_conflict_handling_and_preserves_enabled(tool_store):
+    store, factory = tool_store
+    definition = BUILTIN_TOOL_DEFINITIONS[0]
+    store.upsert_builtin(definition)
+    store.set_enabled(definition["tool_id"], False)
+    statements = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement)
+
+    event.listen(factory.kw["bind"], "before_cursor_execute", capture)
+    try:
+        repaired = store.upsert_builtin({**definition, "name": "修复后的名称"})
+    finally:
+        event.remove(factory.kw["bind"], "before_cursor_execute", capture)
+
+    writes = [statement.upper() for statement in statements if statement.lstrip().upper().startswith("INSERT")]
+    assert len(writes) == 1
+    assert "ON CONFLICT" in writes[0]
+    assert repaired["name"] == "修复后的名称"
+    assert repaired["enabled"] is False
+
+
+def test_toggle_is_one_atomic_database_update(tool_store):
+    store, factory = tool_store
+    service = ToolService(store)
+    statements = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement)
+
+    event.listen(factory.kw["bind"], "before_cursor_execute", capture)
+    try:
+        first = service.toggle("system.get_current_time")
+        second = service.toggle("system.get_current_time")
+    finally:
+        event.remove(factory.kw["bind"], "before_cursor_execute", capture)
+
+    updates = [statement.upper() for statement in statements if statement.lstrip().upper().startswith("UPDATE")]
+    assert len(updates) == 2
+    assert all("REGISTERED_TOOLS.ENABLED" in statement and "RETURNING" in statement for statement in updates)
+    assert not any(statement.lstrip().upper().startswith("SELECT") for statement in statements)
+    assert first.enabled is False
+    assert second.enabled is True

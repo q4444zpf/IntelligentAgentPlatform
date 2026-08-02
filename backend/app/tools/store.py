@@ -1,6 +1,8 @@
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, not_, select, update
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.database import SessionFactory
@@ -34,15 +36,27 @@ class ToolStore:
             return self._decode(session.get(RegisteredToolRecord, tool_id))
 
     def upsert_builtin(self, definition: dict[str, Any]) -> dict[str, Any]:
-        contract_fields = ("version", "name", "description", "source", "risk_level", "input_schema", "output_schema", "requires_approval", "published")
+        contract_fields = (
+            "version", "name", "description", "source", "risk_level",
+            "input_schema", "output_schema", "requires_approval", "published",
+        )
         with self.session_factory.begin() as session:
-            row = session.get(RegisteredToolRecord, definition["tool_id"])
-            if row is None:
-                session.add(RegisteredToolRecord(**definition))
+            dialect = session.get_bind().dialect.name
+            if dialect == "postgresql":
+                statement = postgresql_insert(RegisteredToolRecord).values(**definition)
+            elif dialect == "sqlite":
+                statement = sqlite_insert(RegisteredToolRecord).values(**definition)
             else:
-                for field in contract_fields:
-                    setattr(row, field, definition[field])
-        return self.get(definition["tool_id"])
+                raise RuntimeError(f"Unsupported tool registry dialect: {dialect}")
+            statement = statement.on_conflict_do_update(
+                index_elements=[RegisteredToolRecord.tool_id],
+                set_={
+                    **{field: getattr(statement.excluded, field) for field in contract_fields},
+                    "updated_at": func.now(),
+                },
+            ).returning(RegisteredToolRecord)
+            row = session.execute(statement).scalar_one()
+            return self._decode(row)
 
     def set_enabled(self, tool_id: str, enabled: bool) -> dict[str, Any] | None:
         with self.session_factory.begin() as session:
@@ -51,3 +65,14 @@ class ToolStore:
                 return None
             row.enabled = enabled
         return self.get(tool_id)
+
+    def toggle(self, tool_id: str) -> dict[str, Any] | None:
+        with self.session_factory.begin() as session:
+            statement = (
+                update(RegisteredToolRecord)
+                .where(RegisteredToolRecord.tool_id == tool_id)
+                .values(enabled=not_(RegisteredToolRecord.enabled), updated_at=func.now())
+                .returning(RegisteredToolRecord)
+            )
+            row = session.execute(statement).scalar_one_or_none()
+            return self._decode(row)
