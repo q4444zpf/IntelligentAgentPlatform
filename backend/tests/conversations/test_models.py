@@ -79,6 +79,7 @@ def test_persists_tool_invocation_for_agent_run():
                 status="started",
                 arguments_summary={"timezone": "Asia/Shanghai"},
                 result_summary={"started": True},
+                error_code="tool_execution_failed",
             )
         )
         session.commit()
@@ -87,3 +88,4 @@ def test_persists_tool_invocation_for_agent_run():
         assert invocation is not None
         assert invocation.tool_id == "system.get_current_time"
         assert invocation.status == "started"
+        assert invocation.error_code == "tool_execution_failed"

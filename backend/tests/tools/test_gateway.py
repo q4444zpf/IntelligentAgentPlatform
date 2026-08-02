@@ -137,6 +137,7 @@ def test_success_persists_invocation_and_ordered_safe_events(runtime):
         events = list(session.scalars(select(RunEvent).order_by(RunEvent.sequence)))
         invocation = session.scalar(select(ToolInvocation))
         assert invocation.id == result.invocation_id and invocation.status == "completed"
+        assert invocation.error_code is None
         assert invocation.result_summary["timezone"] == "Asia/Shanghai"
         assert [event.event_type for event in events] == ["tool.started", "tool.completed"]
         assert events[0].payload == {"invocation_id": invocation.id, "tool_id": invocation.tool_id, "display_name": "获取当前时间"}
@@ -153,6 +154,7 @@ def test_failure_closes_invocation_and_emits_safe_failed_event(runtime):
         invocation = session.scalar(select(ToolInvocation))
         events = list(session.scalars(select(RunEvent).order_by(RunEvent.sequence)))
         assert invocation.status == "failed"
+        assert invocation.error_code == "tool_invalid_arguments"
         assert [event.event_type for event in events] == ["tool.started", "tool.failed"]
         assert events[-1].payload["code"] == "tool_invalid_arguments"
         assert events[-1].payload["message"] == "工具参数无效。"

@@ -69,6 +69,7 @@ def upgrade() -> None:
         sa.Column("status", sa.String(30), nullable=False),
         sa.Column("arguments_summary", sa.JSON(), nullable=False),
         sa.Column("result_summary", sa.JSON(), nullable=True),
+        sa.Column("error_code", sa.String(120), nullable=True),
         sa.Column("duration_ms", sa.Integer(), nullable=True),
         sa.Column(
             "created_at",

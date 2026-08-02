@@ -120,6 +120,7 @@ class ToolInvocation(Base):
     status: Mapped[str] = mapped_column(String(30), nullable=False)
     arguments_summary: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     result_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(120), nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

@@ -26,6 +26,11 @@ def test_upgrade_head_creates_conversation_tables():
         "registered_tools",
         "tool_invocations",
     } <= tables
+    invocation_columns = {
+        column["name"]: column
+        for column in inspector.get_columns("tool_invocations")
+    }
+    assert invocation_columns["error_code"]["nullable"] is True
     invocation_indexes = {
         index["name"] for index in inspector.get_indexes("tool_invocations")
     }

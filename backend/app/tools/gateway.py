@@ -123,6 +123,7 @@ class ToolGateway:
             "duration_ms": duration_ms,
         }
         event_type = "tool.completed"
+        invocation.error_code = error.code if error is not None else None
         if error is not None:
             event_type = "tool.failed"
             payload.update(code=error.code, message=error.safe_message)
