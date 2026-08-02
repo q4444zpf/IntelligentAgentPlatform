@@ -76,6 +76,66 @@ def build_tool_wire_name(tool_id: str) -> str:
     return f"{slug[:slug_limit]}_{suffix}"
 
 
+def _encode_tool_history_messages(
+    messages: list[dict[str, Any]],
+    internal_to_wire: dict[str, str],
+) -> list[dict[str, Any]]:
+    encoded_messages = []
+    for message in messages:
+        if not isinstance(message, dict):
+            raise ModelConfigurationError("Invalid model message history")
+        role = message.get("role")
+        content = message.get("content")
+        if not isinstance(role, str):
+            raise ModelConfigurationError("Invalid model message history")
+        if content is not None and not isinstance(content, str):
+            raise ModelConfigurationError("Invalid model message history")
+
+        encoded_message = dict(message)
+        if role == "assistant" and "tool_calls" in message:
+            raw_calls = message["tool_calls"]
+            if not isinstance(raw_calls, list):
+                raise ModelConfigurationError("Invalid tool call history")
+            encoded_calls = []
+            for raw_call in raw_calls:
+                if not isinstance(raw_call, dict):
+                    raise ModelConfigurationError("Invalid tool call history")
+                call_id = raw_call.get("id")
+                if not isinstance(call_id, str) or not call_id.strip():
+                    raise ModelConfigurationError("Invalid tool call history")
+                if raw_call.get("type") != "function":
+                    raise ModelConfigurationError("Invalid tool call history")
+                function = raw_call.get("function")
+                if not isinstance(function, dict):
+                    raise ModelConfigurationError("Invalid tool call history")
+                internal_name = function.get("name")
+                arguments = function.get("arguments")
+                if not isinstance(internal_name, str) or not internal_name.strip():
+                    raise ModelConfigurationError("Invalid tool call history")
+                if not isinstance(arguments, str):
+                    raise ModelConfigurationError("Invalid tool call history")
+                wire_name = internal_to_wire.get(internal_name)
+                if wire_name is None:
+                    raise ModelConfigurationError(
+                        "Historical tool is unavailable"
+                    )
+                encoded_function = dict(function)
+                encoded_function["name"] = wire_name
+                encoded_call = dict(raw_call)
+                encoded_call["function"] = encoded_function
+                encoded_calls.append(encoded_call)
+            encoded_message["tool_calls"] = encoded_calls
+        elif role == "tool":
+            tool_call_id = message.get("tool_call_id")
+            if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+                raise ModelConfigurationError("Invalid tool message history")
+            if not isinstance(content, str):
+                raise ModelConfigurationError("Invalid tool message history")
+
+        encoded_messages.append(encoded_message)
+    return encoded_messages
+
+
 def _validate_argument_depth(value: dict[str, Any]) -> None:
     stack: list[tuple[Any, int]] = [(value, 0)]
     while stack:
@@ -154,6 +214,31 @@ class OpenAICompatibleModelGateway:
         headers = {"Content-Type": "application/json", **provider.custom_headers}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+        wire_to_internal: dict[str, str] = {}
+        internal_to_wire: dict[str, str] = {}
+        payload_tools: list[dict[str, Any]] = []
+        for tool in tools or []:
+            wire_name = build_tool_wire_name(tool.tool_id)
+            mapped_id = wire_to_internal.get(wire_name)
+            if mapped_id is not None and mapped_id != tool.tool_id:
+                raise ModelConfigurationError("Tool names conflict")
+            wire_to_internal[wire_name] = tool.tool_id
+            internal_to_wire[tool.tool_id] = wire_name
+            payload_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": wire_name,
+                        "description": tool.description,
+                        "parameters": tool.input_schema,
+                    },
+                }
+            )
+
+        encoded_messages = _encode_tool_history_messages(
+            messages,
+            internal_to_wire,
+        )
         payload = {
             **provider.generate_kwargs,
             **model.extra_config,
@@ -161,29 +246,11 @@ class OpenAICompatibleModelGateway:
             "messages": build_runtime_messages(
                 provider_id,
                 model_id,
-                messages,
+                encoded_messages,
             ),
             "stream": False,
         }
-        wire_to_internal: dict[str, str] = {}
-        if tools:
-            payload_tools: list[dict[str, Any]] = []
-            for tool in tools:
-                wire_name = build_tool_wire_name(tool.tool_id)
-                mapped_id = wire_to_internal.get(wire_name)
-                if mapped_id is not None and mapped_id != tool.tool_id:
-                    raise ModelConfigurationError("Tool names conflict")
-                wire_to_internal[wire_name] = tool.tool_id
-                payload_tools.append(
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": wire_name,
-                            "description": tool.description,
-                            "parameters": tool.input_schema,
-                        },
-                    }
-                )
+        if payload_tools:
             payload["tools"] = payload_tools
             payload["tool_choice"] = "auto"
 

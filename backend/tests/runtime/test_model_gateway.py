@@ -789,3 +789,120 @@ def test_rejects_tool_calls_when_no_tools_were_sent(tmp_path, monkeypatch):
 
     with pytest.raises(ModelUpstreamError, match="The model request failed"):
         gateway.generate([{"role": "user", "content": "time?"}])
+
+def _configured_sequence_gateway(tmp_path, monkeypatch, responses):
+    store = provider_store(tmp_path / "sequence-providers.db")
+    service = ProviderService(store)
+    service.configure("deepseek", ProviderConfigRequest(
+        base_url="https://api.deepseek.com/v1", api_key="runtime-secret"
+    ))
+    service.set_active(ActiveModel(provider_id="deepseek", model="deepseek-chat"))
+    captured_payloads = []
+
+    class Response:
+        def __init__(self, data):
+            self.data = data
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.data
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def post(self, _url, *, json, **_kwargs):
+            captured_payloads.append(json)
+            return Response(responses.pop(0))
+
+    monkeypatch.setattr(model_gateway.httpx, "Client", Client)
+    return OpenAICompatibleModelGateway(store), captured_payloads
+
+
+def test_encodes_internal_tool_names_in_second_round_history(
+    tmp_path, monkeypatch
+):
+    internal_id = "system.get_current_time"
+    wire_name = model_gateway.build_tool_wire_name(internal_id)
+    gateway, payloads = _configured_sequence_gateway(
+        tmp_path,
+        monkeypatch,
+        [
+            _tool_call_response([_tool_call(name=wire_name)]),
+            {"choices": [{"message": {"content": "done"}}]},
+        ],
+    )
+    tools = _tool_definitions(internal_id)
+
+    first_result = gateway.generate(
+        [{"role": "user", "content": "time?"}], tools=tools
+    )
+    history = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": first_result.tool_calls[0].id,
+                "type": "function",
+                "function": {
+                    "name": first_result.tool_calls[0].name,
+                    "arguments": "{}",
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": first_result.tool_calls[0].id,
+            "content": '{"time":"12:00"}',
+        },
+    ]
+    original_history = json.loads(json.dumps(history))
+
+    second_result = gateway.generate(history, tools=tools)
+
+    second_payload = payloads[1]
+    assistant_history = second_payload["messages"][1]
+    tool_history = second_payload["messages"][2]
+    declared_wire = second_payload["tools"][0]["function"]["name"]
+    assert first_result.tool_calls[0].name == internal_id
+    assert second_result.content == "done"
+    assert assistant_history["tool_calls"][0]["function"]["name"] == wire_name
+    assert assistant_history["tool_calls"][0]["function"]["name"] == declared_wire
+    assert tool_history == history[1]
+    assert history == original_history
+
+
+def test_rejects_unauthorized_internal_tool_name_in_history(
+    tmp_path, monkeypatch
+):
+    gateway, captured = _configured_gateway(
+        tmp_path, monkeypatch, {"choices": [{"message": {"content": "done"}}]}
+    )
+    history = [{
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call-unauthorized",
+            "type": "function",
+            "function": {
+                "name": "system.unauthorized",
+                "arguments": "{}",
+            },
+        }],
+    }]
+
+    with pytest.raises(ModelConfigurationError, match="unavailable"):
+        gateway.generate(
+            history,
+            tools=_tool_definitions("system.get_current_time"),
+        )
+
+    assert captured == {}
