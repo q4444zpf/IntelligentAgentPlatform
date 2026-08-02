@@ -9,7 +9,27 @@ from sqlalchemy.exc import IntegrityError
 from app.skills.service import SkillNotFoundError, SkillService
 
 from .schemas import AgentConfig, AgentCopyRequest, AgentCreateRequest, AgentInfo
-from .store import AgentStore
+from .store import AgentConcurrentUpdateError, AgentStore
+
+
+BUILTIN_AGENT_ID = "platform-default-agent"
+BUILTIN_AGENT_CONFIG = AgentConfig(
+    name="水利智能体平台助手",
+    description="面向水利业务的通用平台智能助手",
+    runtime_form="web",
+    language="zh-CN",
+    system_prompt=(
+        "你是水利智能体平台助手。请基于用户提供的信息提供准确、审慎的帮助；"
+        "不确定时明确说明，不编造数据或执行结果。"
+    ),
+    context_prompt=(
+        "结合当前平台页面、业务对象和会话上下文回答。涉及控制命令时，"
+        "仅提供建议并等待用户确认。"
+    ),
+    approval_policy="control_commands",
+    skill_names=[],
+    enabled=True,
+)
 
 
 class AgentNotFoundError(Exception):
@@ -37,13 +57,73 @@ class AgentService:
         default_workspace = Path(__file__).resolve().parents[2] / "data" / "agent-workspaces"
         self.workspace_root = Path(workspace_root or os.getenv("AGENT_WORKSPACE_ROOT", default_workspace)).resolve()
         self.workspace_root.mkdir(parents=True, exist_ok=True)
+        self._ensure_default_agent()
 
-    @staticmethod
-    def _info(record: dict) -> AgentInfo:
+    def _info(self, record: dict) -> AgentInfo:
+        default_id = self.store.get_default_id().agent_id
         return AgentInfo(
             **record,
+            is_builtin=record["id"] == BUILTIN_AGENT_ID,
+            is_default=record["id"] == default_id,
             startup_status="ready" if record["enabled"] else "disabled",
         )
+
+    @staticmethod
+    def _workspace_content(config: AgentConfig) -> str:
+        return f"# {config.name}\n\n{config.system_prompt or config.description}\n"
+
+
+    def _ensure_builtin_record(self) -> dict:
+        workspace = self.workspace_root / BUILTIN_AGENT_ID
+        workspace.mkdir(parents=True, exist_ok=True)
+        agents_file = workspace / "AGENTS.md"
+        if not agents_file.is_file():
+            agents_file.write_text(
+                self._workspace_content(BUILTIN_AGENT_CONFIG),
+                encoding="utf-8",
+            )
+
+        record = self.store.get(BUILTIN_AGENT_ID)
+        if record is None:
+            try:
+                record = self.store.create(
+                    BUILTIN_AGENT_ID,
+                    BUILTIN_AGENT_CONFIG.model_dump(),
+                    str(workspace),
+                )
+            except IntegrityError:
+                record = self.store.get(BUILTIN_AGENT_ID)
+            if record is None:
+                raise AgentConcurrentUpdateError(
+                    "Built-in agent changed concurrently; retry the request"
+                )
+        elif not record["enabled"]:
+            config = {name: record[name] for name in AgentConfig.model_fields}
+            config["enabled"] = True
+            record = self.store.update(BUILTIN_AGENT_ID, config)
+        return record
+
+    def _ensure_default_agent(self) -> None:
+        builtin = self._ensure_builtin_record()
+        for _ in range(3):
+            pointer = self.store.get_default_id()
+            selected = self.store.get(pointer.agent_id) if pointer.agent_id else None
+            if selected is not None and selected["enabled"]:
+                return
+            try:
+                self.store.set_default_id(
+                    builtin["id"],
+                    expected_version=pointer.version,
+                )
+                return
+            except AgentConcurrentUpdateError:
+                continue
+        pointer = self.store.get_default_id()
+        selected = self.store.get(pointer.agent_id) if pointer.agent_id else None
+        if selected is None or not selected["enabled"]:
+            raise AgentConcurrentUpdateError(
+                "Default agent changed concurrently; retry the request"
+            )
 
     def _validate_skills(self, names: list[str]) -> None:
         missing = []
@@ -56,12 +136,22 @@ class AgentService:
             raise AgentValidationError(f"Unknown skills: {', '.join(missing)}")
 
     def list(self) -> list[AgentInfo]:
+        self._ensure_default_agent()
         return [self._info(record) for record in self.store.list()]
 
     def get(self, agent_id: str) -> AgentInfo:
+        self._ensure_default_agent()
         record = self.store.get(agent_id)
         if not record:
             raise AgentNotFoundError(agent_id)
+        return self._info(record)
+
+    def get_default(self) -> AgentInfo:
+        self._ensure_default_agent()
+        pointer = self.store.get_default_id()
+        record = self.store.get(pointer.agent_id) if pointer.agent_id else None
+        if record is None:
+            raise AgentNotFoundError(pointer.agent_id or BUILTIN_AGENT_ID)
         return self._info(record)
 
     def _initialize_workspace(self, agent_id: str, config: AgentConfig) -> Path:
@@ -74,6 +164,7 @@ class AgentService:
         return workspace
 
     def create(self, request: AgentCreateRequest) -> AgentInfo:
+        self._ensure_default_agent()
         if self.store.get(request.id):
             raise AgentConflictError(f"Agent '{request.id}' already exists")
         self._validate_skills(request.skill_names)
@@ -87,6 +178,7 @@ class AgentService:
         return self._info(record)
 
     def update(self, agent_id: str, request: AgentConfig) -> AgentInfo:
+        self._ensure_default_agent()
         current = self.store.get(agent_id)
         if not current:
             raise AgentNotFoundError(agent_id)
@@ -101,6 +193,7 @@ class AgentService:
         return self._info(record)
 
     def set_enabled(self, agent_id: str, enabled: bool) -> AgentInfo:
+        self._ensure_default_agent()
         current = self.store.get(agent_id)
         if not current:
             raise AgentNotFoundError(agent_id)
@@ -109,12 +202,14 @@ class AgentService:
         return self._info(self.store.update(agent_id, config))
 
     def set_pinned(self, agent_id: str, pinned: bool) -> AgentInfo:
+        self._ensure_default_agent()
         record = self.store.set_pinned(agent_id, pinned)
         if not record:
             raise AgentNotFoundError(agent_id)
         return self._info(record)
 
     def copy(self, source_id: str, request: AgentCopyRequest) -> AgentInfo:
+        self._ensure_default_agent()
         source = self.store.get(source_id)
         if not source:
             raise AgentNotFoundError(source_id)
@@ -125,6 +220,7 @@ class AgentService:
         return self.create(AgentCreateRequest(id=request.id, **config))
 
     def delete(self, agent_id: str) -> None:
+        self._ensure_default_agent()
         record = self.store.delete(agent_id)
         if not record:
             raise AgentNotFoundError(agent_id)

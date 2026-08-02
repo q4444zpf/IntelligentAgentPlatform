@@ -1,12 +1,27 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.database import SessionFactory
-from app.db.platform_models import ManagedAgentRecord
+from app.db.platform_models import ManagedAgentRecord, PlatformSettingRecord
+
+
+DEFAULT_SETTING_KEY = "default_agent"
+
+
+class AgentConcurrentUpdateError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class DefaultAgentPointer:
+    agent_id: str | None
+    version: int
 
 
 class AgentStore:
@@ -34,6 +49,55 @@ class AgentStore:
     def get(self, agent_id: str) -> dict[str, Any] | None:
         with self.session_factory() as session:
             return self._decode(session.get(ManagedAgentRecord, agent_id))
+
+    def get_default_id(self) -> DefaultAgentPointer:
+        with self.session_factory() as session:
+            row = session.get(PlatformSettingRecord, DEFAULT_SETTING_KEY)
+            if row is None:
+                return DefaultAgentPointer(agent_id=None, version=0)
+            value = row.value if isinstance(row.value, dict) else {}
+            agent_id = value.get("agent_id")
+            return DefaultAgentPointer(
+                agent_id=agent_id if isinstance(agent_id, str) else None,
+                version=row.version,
+            )
+
+    def set_default_id(
+        self,
+        agent_id: str,
+        expected_version: int,
+    ) -> DefaultAgentPointer:
+        value = {"agent_id": agent_id, "scope": "platform"}
+        try:
+            with self.session_factory.begin() as session:
+                if expected_version:
+                    result = session.execute(
+                        update(PlatformSettingRecord)
+                        .where(
+                            PlatformSettingRecord.setting_key == DEFAULT_SETTING_KEY,
+                            PlatformSettingRecord.version == expected_version,
+                        )
+                        .values(value=value, version=expected_version + 1)
+                    )
+                    if result.rowcount != 1:
+                        raise AgentConcurrentUpdateError(
+                            "Default agent changed concurrently; retry the request"
+                        )
+                else:
+                    session.add(
+                        PlatformSettingRecord(
+                            setting_key=DEFAULT_SETTING_KEY,
+                            value=value,
+                        )
+                    )
+        except IntegrityError as error:
+            raise AgentConcurrentUpdateError(
+                "Default agent changed concurrently; retry the request"
+            ) from error
+        return DefaultAgentPointer(
+            agent_id=agent_id,
+            version=expected_version + 1,
+        )
 
     def create(self, agent_id: str, config: dict[str, Any], workspace_dir: str) -> dict[str, Any]:
         with self.session_factory.begin() as session:

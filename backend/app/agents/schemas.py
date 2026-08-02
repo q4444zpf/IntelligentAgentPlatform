@@ -45,9 +45,15 @@ class AgentPinRequest(BaseModel):
     pinned: bool
 
 
+class AgentDefaultRequest(BaseModel):
+    agent_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+
+
 class AgentInfo(AgentConfig):
     id: str
     pinned: bool = False
+    is_builtin: bool
+    is_default: bool
     startup_status: Literal["ready", "disabled"]
     workspace_dir: str
     created_at: datetime

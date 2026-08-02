@@ -1,13 +1,16 @@
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from pydantic import ValidationError
+from sqlalchemy import create_engine, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.agents.router import create_router
-from app.agents.service import AgentService
-from app.agents.store import AgentStore
+from app.agents.schemas import AgentConfig, AgentCreateRequest, AgentDefaultRequest
+from app.agents.service import BUILTIN_AGENT_ID, AgentService
+from app.agents.store import DEFAULT_SETTING_KEY, AgentStore
 from app.db.base import Base
+from app.db.platform_models import PlatformSettingRecord
 from app.skills.schemas import SkillCreateRequest
 from app.skills.service import SkillService
 
@@ -70,7 +73,101 @@ def test_creates_and_lists_runtime_specific_agent(client):
 
     listed = client.get("/api/agents")
     assert listed.status_code == 200
-    assert listed.json() == [body]
+    assert {agent["id"] for agent in listed.json()} == {
+        BUILTIN_AGENT_ID,
+        body["id"],
+    }
+
+
+def test_initializes_one_enabled_builtin_default_agent(tmp_path):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'agents.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    store = AgentStore(session_factory)
+
+    first = AgentService(store, workspace_root=tmp_path / "agent-workspaces")
+    agents = first.list()
+
+    assert len(agents) == 1
+    assert agents[0].id == BUILTIN_AGENT_ID
+    assert agents[0].is_builtin is True
+    assert agents[0].is_default is True
+    assert agents[0].enabled is True
+
+    second = AgentService(store, workspace_root=tmp_path / "agent-workspaces")
+    assert [agent.id for agent in second.list()] == [BUILTIN_AGENT_ID]
+
+
+def test_get_default_repairs_missing_or_invalid_pointer(tmp_path):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'agents.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    store = AgentStore(session_factory)
+    service = AgentService(store, workspace_root=tmp_path / "agent-workspaces")
+
+    with session_factory.begin() as session:
+        session.execute(
+            update(PlatformSettingRecord)
+            .where(PlatformSettingRecord.setting_key == DEFAULT_SETTING_KEY)
+            .values(value={"agent_id": "missing-agent", "scope": "platform"})
+        )
+
+    assert service.get_default().id == BUILTIN_AGENT_ID
+    pointer = store.get_default_id()
+    assert pointer.agent_id == BUILTIN_AGENT_ID
+
+    with session_factory.begin() as session:
+        session.delete(session.get(PlatformSettingRecord, DEFAULT_SETTING_KEY))
+
+    assert service.get_default().id == BUILTIN_AGENT_ID
+    assert store.get_default_id().agent_id == BUILTIN_AGENT_ID
+
+
+def test_get_default_falls_back_when_configured_agent_is_disabled(tmp_path):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'agents.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    store = AgentStore(session_factory)
+    service = AgentService(store, workspace_root=tmp_path / "agent-workspaces")
+    service.create(AgentCreateRequest(**agent_payload(skill_names=[])))
+    service.set_enabled("reservoir-dispatch", False)
+    pointer = store.get_default_id()
+    store.set_default_id("reservoir-dispatch", expected_version=pointer.version)
+
+    default = service.get_default()
+
+    assert default.id == BUILTIN_AGENT_ID
+    assert default.is_default is True
+    assert store.get_default_id().agent_id == BUILTIN_AGENT_ID
+
+
+def test_restores_historically_disabled_builtin_agent(tmp_path):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'agents.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    store = AgentStore(session_factory)
+    service = AgentService(store, workspace_root=tmp_path / "agent-workspaces")
+    builtin = store.get(BUILTIN_AGENT_ID)
+    config = {name: builtin[name] for name in AgentConfig.model_fields}
+    config["enabled"] = False
+    store.update(BUILTIN_AGENT_ID, config)
+
+    restored = AgentService(
+        store,
+        workspace_root=tmp_path / "agent-workspaces",
+    ).get(BUILTIN_AGENT_ID)
+
+    assert restored.enabled is True
+    assert restored.is_builtin is True
+    assert restored.is_default is True
+
+
+def test_default_request_validates_agent_id():
+    assert AgentDefaultRequest(agent_id="reservoir-dispatch").agent_id == (
+        "reservoir-dispatch"
+    )
+    with pytest.raises(ValidationError):
+        AgentDefaultRequest(agent_id="Invalid Agent ID")
 
 
 def test_rejects_unknown_skills_and_duplicate_id(client):
