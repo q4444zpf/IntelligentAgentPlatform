@@ -1,4 +1,6 @@
+import hashlib
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -12,6 +14,8 @@ MAX_MODEL_TOOL_CALLS = 8
 MAX_TOOL_ARGUMENT_BYTES = 64 * 1024
 MAX_TOOL_ARGUMENT_DEPTH = 20
 MAX_TOOL_CALL_ID_LENGTH = 128
+MAX_TOOL_WIRE_NAME_LENGTH = 64
+TOOL_WIRE_HASH_LENGTH = 16
 
 
 class ModelRuntimeError(Exception):
@@ -62,6 +66,14 @@ def build_runtime_messages(
         "do not guess or claim another model."
     )
     return [{"role": "system", "content": identity}, *messages]
+
+
+def build_tool_wire_name(tool_id: str) -> str:
+    digest = hashlib.sha256(tool_id.encode("utf-8")).hexdigest()
+    suffix = digest[:TOOL_WIRE_HASH_LENGTH]
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "_", tool_id).strip("_") or "tool"
+    slug_limit = MAX_TOOL_WIRE_NAME_LENGTH - TOOL_WIRE_HASH_LENGTH - 1
+    return f"{slug[:slug_limit]}_{suffix}"
 
 
 def _validate_argument_depth(value: dict[str, Any]) -> None:
@@ -153,18 +165,26 @@ class OpenAICompatibleModelGateway:
             ),
             "stream": False,
         }
+        wire_to_internal: dict[str, str] = {}
         if tools:
-            payload["tools"] = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": tool.tool_id,
-                        "description": tool.description,
-                        "parameters": tool.input_schema,
-                    },
-                }
-                for tool in tools
-            ]
+            payload_tools: list[dict[str, Any]] = []
+            for tool in tools:
+                wire_name = build_tool_wire_name(tool.tool_id)
+                mapped_id = wire_to_internal.get(wire_name)
+                if mapped_id is not None and mapped_id != tool.tool_id:
+                    raise ModelConfigurationError("Tool names conflict")
+                wire_to_internal[wire_name] = tool.tool_id
+                payload_tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": wire_name,
+                            "description": tool.description,
+                            "parameters": tool.input_schema,
+                        },
+                    }
+                )
+            payload["tools"] = payload_tools
             payload["tool_choice"] = "auto"
 
         try:
@@ -218,17 +238,20 @@ class OpenAICompatibleModelGateway:
                 _validate_argument_depth(arguments)
 
                 call_id = raw_call.get("id")
-                name = function.get("name")
+                wire_name = function.get("name")
                 if not isinstance(call_id, str) or not call_id.strip():
                     raise ValueError("tool call id is invalid")
                 if len(call_id) > MAX_TOOL_CALL_ID_LENGTH:
                     raise ValueError("tool call id is too long")
                 if call_id in seen_call_ids:
                     raise ValueError("duplicate tool call id")
-                if not isinstance(name, str) or not name.strip():
+                if not isinstance(wire_name, str) or not wire_name.strip():
                     raise ValueError("tool call name is invalid")
+                internal_name = wire_to_internal.get(wire_name)
+                if internal_name is None:
+                    raise ValueError("unknown tool call name")
                 seen_call_ids.add(call_id)
-                tool_calls.append(ToolCall(call_id, name, arguments))
+                tool_calls.append(ToolCall(call_id, internal_name, arguments))
 
             content = message.get("content")
             if content is not None and not isinstance(content, str):

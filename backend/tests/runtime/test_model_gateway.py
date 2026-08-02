@@ -355,7 +355,8 @@ def test_serializes_tools_as_openai_functions_with_auto_choice(tmp_path, monkeyp
                             {"type": "object", "properties": {}})]
     gateway.generate([{"role": "user", "content": "time?"}], tools=tools)
     assert captured["payload"]["tools"] == [{"type": "function", "function": {
-        "name": "system.get_current_time", "description": "Get trusted current time",
+        "name": model_gateway.build_tool_wire_name("system.get_current_time"),
+        "description": "Get trusted current time",
         "parameters": {"type": "object", "properties": {}}}}]
     assert captured["payload"]["tool_choice"] == "auto"
 
@@ -369,14 +370,14 @@ def test_parses_single_tool_call(tmp_path, monkeypatch):
                 "id": "call-time",
                 "type": "function",
                 "function": {
-                    "name": "system.get_current_time",
+                    "name": model_gateway.build_tool_wire_name("system.get_current_time"),
                     "arguments": "{}",
                 },
             }]}}]
         },
     )
 
-    result = gateway.generate([{"role": "user", "content": "time?"}])
+    result = gateway.generate([{"role": "user", "content": "time?"}], tools=_tool_definitions("system.get_current_time"))
 
     assert result.tool_calls == (
         ToolCall("call-time", "system.get_current_time", {}),
@@ -386,11 +387,11 @@ def test_parses_multiple_tool_calls_and_preserves_ids(tmp_path, monkeypatch):
     gateway, _ = _configured_gateway(tmp_path, monkeypatch, {"choices": [{"message": {
         "content": None, "tool_calls": [
             {"id": "call-time", "type": "function", "function": {
-                "name": "system.get_current_time", "arguments": "{}"}},
+                "name": model_gateway.build_tool_wire_name("system.get_current_time"), "arguments": "{}"}},
             {"id": "call-context", "type": "function", "function": {
-                "name": "system.get_runtime_context", "arguments": '{"include_time": true}'}}
+                "name": model_gateway.build_tool_wire_name("system.get_runtime_context"), "arguments": '{"include_time": true}'}}
         ]}}]})
-    result = gateway.generate([{"role": "user", "content": "context"}])
+    result = gateway.generate([{"role": "user", "content": "context"}], tools=_tool_definitions("system.get_current_time", "system.get_runtime_context"))
     assert result == ModelResult(content=None, tool_calls=(
         ToolCall("call-time", "system.get_current_time", {}),
         ToolCall("call-context", "system.get_runtime_context", {"include_time": True})))
@@ -403,9 +404,9 @@ def test_rejects_tool_call_arguments_that_are_not_json_objects(
     gateway, _ = _configured_gateway(tmp_path, monkeypatch, {
         "secret": "response-secret", "choices": [{"message": {"content": "fallback",
         "tool_calls": [{"id": "call-1", "type": "function", "function": {
-            "name": "system.get_current_time", "arguments": arguments}}]}}]})
+            "name": model_gateway.build_tool_wire_name("system.get_current_time"), "arguments": arguments}}]}}]})
     with pytest.raises(ModelUpstreamError) as captured:
-        gateway.generate([{"role": "user", "content": "time?"}])
+        gateway.generate([{"role": "user", "content": "time?"}], tools=_tool_definitions("system.get_current_time"))
     assert str(captured.value) == "The model request failed"
     assert "response-secret" not in str(captured.value)
     assert "runtime-secret" not in str(captured.value)
@@ -426,13 +427,13 @@ def test_accepts_empty_content_with_tool_calls_and_normalizes_it(tmp_path, monke
             "id": "call-time",
             "type": "function",
             "function": {
-                "name": "system.get_current_time",
+                "name": model_gateway.build_tool_wire_name("system.get_current_time"),
                 "arguments": "{}",
             },
         }]}}]},
     )
 
-    result = gateway.generate([{"role": "user", "content": "time?"}])
+    result = gateway.generate([{"role": "user", "content": "time?"}], tools=_tool_definitions("system.get_current_time"))
 
     assert result.content is None
     assert result.tool_calls == (
@@ -460,11 +461,23 @@ def test_preserves_tool_role_message_and_tool_call_id(tmp_path, monkeypatch):
     assert captured["payload"]["messages"][1:] == messages
 
 
-def _tool_call(call_id="call-1", name="system.get_current_time", arguments="{}"):
+def _tool_definitions(*tool_ids):
+    return [
+        ToolDefinition(tool_id, f"Invoke {tool_id}", {"type": "object"})
+        for tool_id in tool_ids
+    ]
+
+
+def _tool_call(call_id="call-1", name=None, arguments="{}"):
+    wire_name = name
+    if wire_name is None:
+        wire_name = model_gateway.build_tool_wire_name(
+            "system.get_current_time"
+        )
     return {
         "id": call_id,
         "type": "function",
-        "function": {"name": name, "arguments": arguments},
+        "function": {"name": wire_name, "arguments": arguments},
     }
 
 
@@ -484,7 +497,7 @@ def test_rejects_more_than_maximum_tool_calls(tmp_path, monkeypatch):
     )
 
     with pytest.raises(ModelUpstreamError, match="The model request failed"):
-        gateway.generate([{"role": "user", "content": "time?"}])
+        gateway.generate([{"role": "user", "content": "time?"}], tools=_tool_definitions("system.get_current_time"))
 
 
 def test_accepts_tool_arguments_at_utf8_byte_limit(tmp_path, monkeypatch):
@@ -500,7 +513,7 @@ def test_accepts_tool_arguments_at_utf8_byte_limit(tmp_path, monkeypatch):
         _tool_call_response([_tool_call(arguments=arguments)]),
     )
 
-    result = gateway.generate([{"role": "user", "content": "bounded"}])
+    result = gateway.generate([{"role": "user", "content": "bounded"}], tools=_tool_definitions("system.get_current_time"))
 
     assert len(result.tool_calls[0].arguments["value"]) > 0
 
@@ -531,7 +544,7 @@ def test_accepts_tool_arguments_at_json_depth_limit(tmp_path, monkeypatch):
         _tool_call_response([_tool_call(arguments=arguments)]),
     )
 
-    result = gateway.generate([{"role": "user", "content": "nested"}])
+    result = gateway.generate([{"role": "user", "content": "nested"}], tools=_tool_definitions("system.get_current_time"))
 
     assert result.tool_calls[0].id == "call-1"
 
@@ -603,7 +616,7 @@ def test_accepts_tool_call_id_at_length_limit(tmp_path, monkeypatch):
         _tool_call_response([_tool_call(call_id=call_id)]),
     )
 
-    result = gateway.generate([{"role": "user", "content": "time?"}])
+    result = gateway.generate([{"role": "user", "content": "time?"}], tools=_tool_definitions("system.get_current_time"))
 
     assert result.tool_calls[0].id == call_id
 
@@ -616,7 +629,7 @@ def test_rejects_tool_call_id_over_length_limit(tmp_path, monkeypatch):
     )
 
     with pytest.raises(ModelUpstreamError, match="The model request failed"):
-        gateway.generate([{"role": "user", "content": "time?"}])
+        gateway.generate([{"role": "user", "content": "time?"}], tools=_tool_definitions("system.get_current_time"))
 
 
 def test_rejects_duplicate_tool_call_ids(tmp_path, monkeypatch):
@@ -630,7 +643,7 @@ def test_rejects_duplicate_tool_call_ids(tmp_path, monkeypatch):
     )
 
     with pytest.raises(ModelUpstreamError, match="The model request failed"):
-        gateway.generate([{"role": "user", "content": "time?"}])
+        gateway.generate([{"role": "user", "content": "time?"}], tools=_tool_definitions("system.get_current_time"))
 
 
 @pytest.mark.parametrize(
@@ -646,7 +659,7 @@ def test_rejects_blank_tool_call_id_or_name(tmp_path, monkeypatch, call_id, name
     )
 
     with pytest.raises(ModelUpstreamError, match="The model request failed"):
-        gateway.generate([{"role": "user", "content": "time?"}])
+        gateway.generate([{"role": "user", "content": "time?"}], tools=_tool_definitions("system.get_current_time"))
 
 @pytest.mark.parametrize(
     ("field", "value"),
@@ -690,3 +703,89 @@ def test_keeps_missing_usage_fields_compatible(tmp_path, monkeypatch):
     assert result.prompt_tokens == 3
     assert result.completion_tokens is None
     assert result.total_tokens is None
+
+
+def test_serializes_protocol_safe_tool_wire_name(tmp_path, monkeypatch):
+    gateway, captured = _configured_gateway(
+        tmp_path, monkeypatch, {"choices": [{"message": {"content": "ok"}}]}
+    )
+    tools = [ToolDefinition(
+        "system.get_current_time",
+        "Get trusted current time",
+        {"type": "object", "properties": {}},
+    )]
+
+    gateway.generate([{"role": "user", "content": "time?"}], tools=tools)
+
+    wire_name = captured["payload"]["tools"][0]["function"]["name"]
+    assert "." not in wire_name
+    assert len(wire_name) <= 64
+    assert wire_name
+    assert all(character.isascii() and (
+        character.isalnum() or character in "_-"
+    ) for character in wire_name)
+
+
+def test_restores_internal_tool_id_from_wire_name(tmp_path, monkeypatch):
+    internal_id = "system.get_current_time"
+    wire_name = model_gateway.build_tool_wire_name(internal_id)
+    gateway, _ = _configured_gateway(
+        tmp_path,
+        monkeypatch,
+        _tool_call_response([_tool_call(name=wire_name)]),
+    )
+    tools = [ToolDefinition(internal_id, "Get time", {"type": "object"})]
+
+    result = gateway.generate(
+        [{"role": "user", "content": "time?"}], tools=tools
+    )
+
+    assert result.tool_calls[0].name == internal_id
+
+
+def test_wire_names_remain_unique_when_readable_slugs_collide(tmp_path, monkeypatch):
+    gateway, captured = _configured_gateway(
+        tmp_path, monkeypatch, {"choices": [{"message": {"content": "ok"}}]}
+    )
+    tools = [
+        ToolDefinition("system.a.b", "First", {"type": "object"}),
+        ToolDefinition("system_a_b", "Second", {"type": "object"}),
+    ]
+
+    gateway.generate([{"role": "user", "content": "run"}], tools=tools)
+
+    wire_names = [
+        item["function"]["name"] for item in captured["payload"]["tools"]
+    ]
+    assert len(set(wire_names)) == 2
+
+
+@pytest.mark.parametrize("response_name", ["unknown_wire", "system.get_current_time"])
+def test_rejects_unknown_or_internal_tool_name_from_model(
+    tmp_path, monkeypatch, response_name
+):
+    gateway, _ = _configured_gateway(
+        tmp_path,
+        monkeypatch,
+        _tool_call_response([_tool_call(name=response_name)]),
+    )
+    tools = [ToolDefinition(
+        "system.get_current_time", "Get time", {"type": "object"}
+    )]
+
+    with pytest.raises(ModelUpstreamError, match="The model request failed"):
+        gateway.generate(
+            [{"role": "user", "content": "time?"}], tools=tools
+        )
+
+
+def test_rejects_tool_calls_when_no_tools_were_sent(tmp_path, monkeypatch):
+    wire_name = model_gateway.build_tool_wire_name("system.get_current_time")
+    gateway, _ = _configured_gateway(
+        tmp_path,
+        monkeypatch,
+        _tool_call_response([_tool_call(name=wire_name)]),
+    )
+
+    with pytest.raises(ModelUpstreamError, match="The model request failed"):
+        gateway.generate([{"role": "user", "content": "time?"}])
