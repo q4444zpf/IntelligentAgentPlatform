@@ -19,6 +19,8 @@ export interface AgentInput {
 
 export interface AgentInfo extends AgentInput {
   id: string;
+  is_builtin: boolean;
+  is_default: boolean;
   pinned: boolean;
   startup_status: 'ready' | 'disabled';
   workspace_dir: string;
@@ -33,6 +35,8 @@ const json = (body: unknown): RequestInit => ({
 
 export const agentsApi = {
   list: (signal?: AbortSignal) => request<AgentInfo[]>('/agents', { signal }),
+  getDefault: () => request<AgentInfo>('/agents/default'),
+  setDefault: (agentId: string) => request<AgentInfo>('/agents/default', { method: 'PUT', ...json({ agent_id: agentId }) }),
   create: (body: AgentInput & { id: string }) => request<AgentInfo>('/agents', { method: 'POST', ...json(body) }),
   update: (id: string, body: AgentInput) => request<AgentInfo>(`/agents/${encodeURIComponent(id)}`, { method: 'PUT', ...json(body) }),
   toggle: (id: string, enabled: boolean) => request<AgentInfo>(`/agents/${encodeURIComponent(id)}/toggle`, { method: 'PATCH', ...json({ enabled }) }),

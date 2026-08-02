@@ -24,7 +24,7 @@
           <button class="pin-button" type="button" :aria-label="agent.pinned ? '取消置顶' : '置顶智能体'" :class="{ active: agent.pinned }" @click="pinAgent(agent)"><PushpinFilled v-if="agent.pinned" /><PushpinOutlined v-else /></button>
           <div class="runtime-icon" :class="agent.runtime_form"><DesktopOutlined v-if="agent.runtime_form === 'desktop'" /><GlobalOutlined v-else-if="agent.runtime_form === 'web'" /><RobotOutlined v-else /></div>
           <div class="agent-main">
-            <div class="agent-title"><strong>{{ agent.name }}</strong><a-tag :color="runtimeColor(agent.runtime_form)">{{ runtimeLabel(agent.runtime_form) }}</a-tag><code>{{ agent.id }}</code></div>
+            <div class="agent-title"><strong>{{ agent.name }}</strong><a-tag v-if="agent.is_default" color="green">平台默认</a-tag><a-tag v-if="agent.is_builtin">系统内置</a-tag><a-tag :color="runtimeColor(agent.runtime_form)">{{ runtimeLabel(agent.runtime_form) }}</a-tag><code>{{ agent.id }}</code></div>
             <p>{{ agent.description || '暂无说明' }}</p>
             <div class="binding-line"><span><ApiOutlined /> {{ modelLabel(agent) }}</span><span><ToolOutlined /> {{ agent.skill_names.length }} 个 Skill</span><span><FolderOutlined /> {{ compactPath(agent.workspace_dir) }}</span></div>
           </div>
@@ -32,9 +32,10 @@
           <div class="agent-state"><span :class="['state-dot', { ready: agent.enabled }]" /><strong>{{ agent.enabled ? '可用' : '停用' }}</strong><span>{{ formatTime(agent.updated_at) }}</span></div>
           <div class="row-actions">
             <a-tooltip title="复制智能体"><a-button aria-label="复制智能体" @click="openCopy(agent)"><template #icon><CopyOutlined /></template></a-button></a-tooltip>
+            <a-tooltip v-if="agent.enabled && !agent.is_default" title="设为平台默认智能体"><a-button size="small" :loading="busyId === agent.id" @click="setDefaultAgent(agent)">设为默认</a-button></a-tooltip>
             <a-tooltip title="编辑配置"><a-button aria-label="编辑智能体" @click="openEdit(agent)"><template #icon><SettingOutlined /></template></a-button></a-tooltip>
-            <a-switch :checked="agent.enabled" :loading="busyId === agent.id" checked-children="开" un-checked-children="关" @change="toggleAgent(agent)" />
-            <a-popconfirm title="删除后将同时移除智能体工作空间，确定继续？" ok-text="删除" cancel-text="取消" @confirm="deleteAgent(agent)"><a-button danger aria-label="删除智能体"><template #icon><DeleteOutlined /></template></a-button></a-popconfirm>
+            <a-tooltip :title="agent.is_default ? '平台默认智能体不能停用或删除' : '切换启用状态'"><a-switch :checked="agent.enabled" :disabled="agent.is_default" :loading="busyId === agent.id" checked-children="开" un-checked-children="关" @change="toggleAgent(agent)" /></a-tooltip>
+            <a-tooltip :title="agent.is_builtin ? '系统内置智能体不能删除' : agent.is_default ? '平台默认智能体不能停用或删除' : '删除智能体'"><a-popconfirm :disabled="agent.is_builtin || agent.is_default" title="删除后将同时移除智能体工作空间，确定继续？" ok-text="删除" cancel-text="取消" @confirm="deleteAgent(agent)"><a-button danger aria-label="删除智能体" :disabled="agent.is_builtin || agent.is_default"><template #icon><DeleteOutlined /></template></a-button></a-popconfirm></a-tooltip>
           </div>
         </article>
       </div>
@@ -116,7 +117,8 @@ function openCreate() { resetForm(); editingId.value = ''; editorTab.value = 'ba
 function openEdit(agent: AgentInfo) { resetForm(); editingId.value = agent.id; Object.assign(form, agent); editorTab.value = 'basic'; editorOpen.value = true; }
 function validateForm() { Object.assign(formErrors, { id: '', name: '' }); if (!/^[a-z][a-z0-9_-]{0,63}$/.test(form.id)) formErrors.id = '请输入有效的智能体 ID'; if (!form.name.trim()) formErrors.name = '请输入显示名称'; if (formErrors.id || formErrors.name) editorTab.value = 'basic'; return !formErrors.id && !formErrors.name; }
 async function saveAgent() { if (!validateForm()) return; saving.value = true; try { const { id, ...payload } = form; if (editingId.value) await agentsApi.update(editingId.value, payload); else await agentsApi.create({ id, ...payload }); message.success(editingId.value ? '智能体配置已更新' : '智能体已创建'); editorOpen.value = false; await loadAgents(); } catch (error) { message.error(error instanceof Error ? error.message : '保存失败'); } finally { saving.value = false; } }
-async function toggleAgent(agent: AgentInfo) { busyId.value = agent.id; try { await agentsApi.toggle(agent.id, !agent.enabled); await loadAgents(); } catch (error) { message.error(error instanceof Error ? error.message : '切换状态失败'); } finally { busyId.value = ''; } }
+async function setDefaultAgent(agent: AgentInfo) { busyId.value = agent.id; try { await agentsApi.setDefault(agent.id); message.success('平台默认智能体已更新'); await loadAgents(); } catch (error) { message.error(error instanceof Error ? error.message : '设置默认智能体失败'); } finally { busyId.value = ''; } }
+async function toggleAgent(agent: AgentInfo) { if (agent.is_default) return; busyId.value = agent.id; try { await agentsApi.toggle(agent.id, !agent.enabled); await loadAgents(); } catch (error) { message.error(error instanceof Error ? error.message : '切换状态失败'); } finally { busyId.value = ''; } }
 async function pinAgent(agent: AgentInfo) { try { await agentsApi.pin(agent.id, !agent.pinned); await loadAgents(); } catch (error) { message.error(error instanceof Error ? error.message : '置顶失败'); } }
 async function deleteAgent(agent: AgentInfo) { try { await agentsApi.remove(agent.id); message.success('智能体已删除'); await loadAgents(); } catch (error) { message.error(error instanceof Error ? error.message : '删除失败'); } }
 function openCopy(agent: AgentInfo) { copySource.value = agent; Object.assign(copyForm, { id: `${agent.id}-copy`, name: `${agent.name}副本`, copy_skills: true }); copyOpen.value = true; }
