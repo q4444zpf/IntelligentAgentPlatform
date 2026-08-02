@@ -8,6 +8,10 @@ from app.model_providers.service import ProviderService
 from app.model_providers.store import ProviderStore
 from app.tools.schemas import ToolCall, ToolDefinition
 
+MAX_MODEL_TOOL_CALLS = 8
+MAX_TOOL_ARGUMENT_BYTES = 64 * 1024
+MAX_TOOL_ARGUMENT_DEPTH = 20
+
 
 class ModelRuntimeError(Exception):
     pass
@@ -57,6 +61,22 @@ def build_runtime_messages(
         "do not guess or claim another model."
     )
     return [{"role": "system", "content": identity}, *messages]
+
+
+def _validate_argument_depth(value: dict[str, Any]) -> None:
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    while stack:
+        item, parent_depth = stack.pop()
+        if isinstance(item, dict):
+            depth = parent_depth + 1
+            if depth > MAX_TOOL_ARGUMENT_DEPTH:
+                raise ValueError("tool arguments are too deeply nested")
+            stack.extend((child, depth) for child in item.values())
+        elif isinstance(item, list):
+            depth = parent_depth + 1
+            if depth > MAX_TOOL_ARGUMENT_DEPTH:
+                raise ValueError("tool arguments are too deeply nested")
+            stack.extend((child, depth) for child in item)
 
 
 class OpenAICompatibleModelGateway:
@@ -158,28 +178,66 @@ class OpenAICompatibleModelGateway:
                 )
             response.raise_for_status()
             data = response.json()
-            message = data["choices"][0]["message"]
-            content = message.get("content")
-            tool_calls = []
-            for raw_call in message.get("tool_calls") or []:
-                function = raw_call["function"]
-                arguments = json.loads(function["arguments"])
+            if not isinstance(data, dict):
+                raise ValueError("invalid model response")
+            choices = data.get("choices")
+            if not isinstance(choices, list) or not choices:
+                raise ValueError("invalid model choices")
+            choice = choices[0]
+            if not isinstance(choice, dict):
+                raise ValueError("invalid model choice")
+            message = choice.get("message")
+            if not isinstance(message, dict):
+                raise ValueError("invalid model message")
+
+            raw_tool_calls = message.get("tool_calls", [])
+            if not isinstance(raw_tool_calls, list):
+                raise ValueError("invalid model tool calls")
+            if len(raw_tool_calls) > MAX_MODEL_TOOL_CALLS:
+                raise ValueError("too many model tool calls")
+
+            tool_calls: list[ToolCall] = []
+            seen_call_ids: set[str] = set()
+            for raw_call in raw_tool_calls:
+                if not isinstance(raw_call, dict):
+                    raise ValueError("invalid model tool call")
+                if raw_call.get("type") != "function":
+                    raise ValueError("invalid model tool call type")
+                function = raw_call.get("function")
+                if not isinstance(function, dict):
+                    raise ValueError("invalid model tool function")
+                raw_arguments = function.get("arguments")
+                if not isinstance(raw_arguments, str):
+                    raise ValueError("invalid model tool arguments")
+                if len(raw_arguments.encode("utf-8")) > MAX_TOOL_ARGUMENT_BYTES:
+                    raise ValueError("model tool arguments are too large")
+                arguments = json.loads(raw_arguments)
                 if not isinstance(arguments, dict):
                     raise ValueError("tool arguments must be an object")
-                call_id = raw_call["id"]
-                name = function["name"]
-                if not isinstance(call_id, str) or not call_id:
+                _validate_argument_depth(arguments)
+
+                call_id = raw_call.get("id")
+                name = function.get("name")
+                if not isinstance(call_id, str) or not call_id.strip():
                     raise ValueError("tool call id is invalid")
-                if not isinstance(name, str) or not name:
+                if call_id in seen_call_ids:
+                    raise ValueError("duplicate tool call id")
+                if not isinstance(name, str) or not name.strip():
                     raise ValueError("tool call name is invalid")
+                seen_call_ids.add(call_id)
                 tool_calls.append(ToolCall(call_id, name, arguments))
+
+            content = message.get("content")
             if content is not None and not isinstance(content, str):
                 raise ValueError("invalid model content")
             if content == "":
                 content = None
             if content is None and not tool_calls:
                 raise ValueError("empty model content")
-            usage = data.get("usage") or {}
+
+            usage = data["usage"] if "usage" in data else {}
+            if not isinstance(usage, dict):
+                raise ValueError("invalid model usage")
             return ModelResult(
                 content=content,
                 prompt_tokens=usage.get("prompt_tokens"),
@@ -187,5 +245,13 @@ class OpenAICompatibleModelGateway:
                 total_tokens=usage.get("total_tokens"),
                 tool_calls=tuple(tool_calls),
             )
-        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as error:
+        except (
+            httpx.HTTPError,
+            KeyError,
+            IndexError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+            RecursionError,
+        ) as error:
             raise ModelUpstreamError("The model request failed") from error

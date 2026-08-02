@@ -458,3 +458,163 @@ def test_preserves_tool_role_message_and_tool_call_id(tmp_path, monkeypatch):
     ]
     gateway.generate(messages)
     assert captured["payload"]["messages"][1:] == messages
+
+
+def _tool_call(call_id="call-1", name="system.get_current_time", arguments="{}"):
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": arguments},
+    }
+
+
+def _tool_call_response(tool_calls, *, content=None, usage=None):
+    response = {
+        "choices": [{"message": {"content": content, "tool_calls": tool_calls}}]
+    }
+    if usage is not None:
+        response["usage"] = usage
+    return response
+
+
+def test_rejects_more_than_maximum_tool_calls(tmp_path, monkeypatch):
+    calls = [_tool_call(call_id=f"call-{index}") for index in range(9)]
+    gateway, _ = _configured_gateway(
+        tmp_path, monkeypatch, _tool_call_response(calls)
+    )
+
+    with pytest.raises(ModelUpstreamError, match="The model request failed"):
+        gateway.generate([{"role": "user", "content": "time?"}])
+
+
+def test_accepts_tool_arguments_at_utf8_byte_limit(tmp_path, monkeypatch):
+    prefix = '{"value":"'
+    suffix = '"}'
+    arguments = prefix + "a" * (
+        model_gateway.MAX_TOOL_ARGUMENT_BYTES - len(prefix) - len(suffix)
+    ) + suffix
+    assert len(arguments.encode("utf-8")) == model_gateway.MAX_TOOL_ARGUMENT_BYTES
+    gateway, _ = _configured_gateway(
+        tmp_path,
+        monkeypatch,
+        _tool_call_response([_tool_call(arguments=arguments)]),
+    )
+
+    result = gateway.generate([{"role": "user", "content": "bounded"}])
+
+    assert len(result.tool_calls[0].arguments["value"]) > 0
+
+
+def test_rejects_tool_arguments_over_utf8_byte_limit(tmp_path, monkeypatch):
+    prefix = '{"value":"'
+    suffix = '"}'
+    arguments = prefix + "a" * (
+        model_gateway.MAX_TOOL_ARGUMENT_BYTES - len(prefix) - len(suffix) + 1
+    ) + suffix
+    assert len(arguments.encode("utf-8")) == model_gateway.MAX_TOOL_ARGUMENT_BYTES + 1
+    gateway, _ = _configured_gateway(
+        tmp_path,
+        monkeypatch,
+        _tool_call_response([_tool_call(arguments=arguments)]),
+    )
+
+    with pytest.raises(ModelUpstreamError, match="The model request failed"):
+        gateway.generate([{"role": "user", "content": "oversized"}])
+
+
+def test_accepts_tool_arguments_at_json_depth_limit(tmp_path, monkeypatch):
+    arguments = '{"nested":' * model_gateway.MAX_TOOL_ARGUMENT_DEPTH
+    arguments += "0" + "}" * model_gateway.MAX_TOOL_ARGUMENT_DEPTH
+    gateway, _ = _configured_gateway(
+        tmp_path,
+        monkeypatch,
+        _tool_call_response([_tool_call(arguments=arguments)]),
+    )
+
+    result = gateway.generate([{"role": "user", "content": "nested"}])
+
+    assert result.tool_calls[0].id == "call-1"
+
+
+def test_rejects_tool_arguments_over_json_depth_limit(tmp_path, monkeypatch):
+    depth = model_gateway.MAX_TOOL_ARGUMENT_DEPTH + 1
+    arguments = '{"nested":' * depth + "0" + "}" * depth
+    gateway, _ = _configured_gateway(
+        tmp_path,
+        monkeypatch,
+        _tool_call_response([_tool_call(arguments=arguments)]),
+    )
+
+    with pytest.raises(ModelUpstreamError, match="The model request failed"):
+        gateway.generate([{"role": "user", "content": "too deep"}])
+
+
+@pytest.mark.parametrize(
+    "response_data",
+    [
+        {"choices": [{"message": None}]},
+        {"choices": [{"message": []}]},
+        _tool_call_response([None]),
+        _tool_call_response([[]]),
+        _tool_call_response([], content="ok", usage=[]),
+    ],
+)
+def test_rejects_invalid_upstream_structures_safely(
+    tmp_path, monkeypatch, response_data
+):
+    response_data["secret"] = "response-secret"
+    gateway, _ = _configured_gateway(tmp_path, monkeypatch, response_data)
+
+    with pytest.raises(ModelUpstreamError) as captured:
+        gateway.generate([{"role": "user", "content": "hello"}])
+
+    assert str(captured.value) == "The model request failed"
+    assert "response-secret" not in str(captured.value)
+
+
+def test_wraps_json_parser_recursion_error_safely(tmp_path, monkeypatch):
+    gateway, _ = _configured_gateway(
+        tmp_path,
+        monkeypatch,
+        _tool_call_response([_tool_call()]),
+    )
+
+    def raise_recursion_error(_value):
+        raise RecursionError("response-secret")
+
+    monkeypatch.setattr(model_gateway.json, "loads", raise_recursion_error)
+
+    with pytest.raises(ModelUpstreamError) as captured:
+        gateway.generate([{"role": "user", "content": "nested"}])
+
+    assert str(captured.value) == "The model request failed"
+    assert "response-secret" not in str(captured.value)
+
+def test_rejects_duplicate_tool_call_ids(tmp_path, monkeypatch):
+    gateway, _ = _configured_gateway(
+        tmp_path,
+        monkeypatch,
+        _tool_call_response([
+            _tool_call(call_id="duplicate"),
+            _tool_call(call_id="duplicate"),
+        ]),
+    )
+
+    with pytest.raises(ModelUpstreamError, match="The model request failed"):
+        gateway.generate([{"role": "user", "content": "time?"}])
+
+
+@pytest.mark.parametrize(
+    ("call_id", "name"),
+    [("", "system.get_current_time"), ("   ", "system.get_current_time"),
+     ("call-1", ""), ("call-1", "\t")],
+)
+def test_rejects_blank_tool_call_id_or_name(tmp_path, monkeypatch, call_id, name):
+    gateway, _ = _configured_gateway(
+        tmp_path,
+        monkeypatch,
+        _tool_call_response([_tool_call(call_id=call_id, name=name)]),
+    )
+
+    with pytest.raises(ModelUpstreamError, match="The model request failed"):
+        gateway.generate([{"role": "user", "content": "time?"}])
