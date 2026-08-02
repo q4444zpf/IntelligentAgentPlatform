@@ -39,8 +39,11 @@ class ToolGateway:
     def _validate(schema: dict[str, Any], value: Any, code: str, message: str) -> None:
         try:
             Draft202012Validator.check_schema(schema)
+        except SchemaError as error:
+            raise ToolRuntimeError("tool_execution_failed", "工具执行失败。") from error
+        try:
             Draft202012Validator(schema).validate(value)
-        except (SchemaError, ValidationError) as error:
+        except ValidationError as error:
             raise ToolRuntimeError(code, message) from error
 
     @classmethod
@@ -101,6 +104,62 @@ class ToolGateway:
         )
         self.repository.session.commit()
 
+    @staticmethod
+    def _apply_failed_state(
+        invocation: ToolInvocation,
+        error: ToolRuntimeError,
+        duration_ms: int,
+    ) -> None:
+        invocation.status = "failed"
+        invocation.error_code = error.code
+        invocation.duration_ms = duration_ms
+        invocation.completed_at = datetime.now(timezone.utc)
+
+    def _rollback_safely(self) -> None:
+        try:
+            self.repository.session.rollback()
+        except Exception:
+            pass
+
+    def _compensate_failed_completion(
+        self,
+        invocation_id: str,
+        display_name: str,
+        duration_ms: int,
+        error: ToolRuntimeError,
+    ) -> None:
+        try:
+            invocation = self.repository.session.get(ToolInvocation, invocation_id)
+            if invocation is None:
+                return
+            self._apply_failed_state(invocation, error, duration_ms)
+            self.repository.append_event(
+                invocation.run_id,
+                "tool.failed",
+                {
+                    "invocation_id": invocation.id,
+                    "tool_id": invocation.tool_id,
+                    "display_name": display_name,
+                    "duration_ms": duration_ms,
+                    "code": error.code,
+                    "message": error.safe_message,
+                },
+            )
+            self.repository.session.commit()
+            return
+        except Exception:
+            self._rollback_safely()
+
+        # If event persistence is unavailable, close the invocation on its own.
+        try:
+            invocation = self.repository.session.get(ToolInvocation, invocation_id)
+            if invocation is None:
+                return
+            self._apply_failed_state(invocation, error, duration_ms)
+            self.repository.session.commit()
+        except Exception:
+            self._rollback_safely()
+
     def _commit_finished(
         self,
         invocation: ToolInvocation,
@@ -111,25 +170,35 @@ class ToolGateway:
         result: dict[str, Any] | None = None,
         error: ToolRuntimeError | None = None,
     ) -> None:
-        invocation.status = status
-        invocation.duration_ms = duration_ms
-        invocation.completed_at = datetime.now(timezone.utc)
-        if result is not None:
-            invocation.result_summary = self.summarize(result)
-        payload: dict[str, Any] = {
-            "invocation_id": invocation.id,
-            "tool_id": invocation.tool_id,
-            "display_name": display_name,
-            "duration_ms": duration_ms,
-        }
-        event_type = "tool.completed"
-        invocation.error_code = error.code if error is not None else None
-        if error is not None:
-            event_type = "tool.failed"
-            payload.update(code=error.code, message=error.safe_message)
-        self.repository.append_event(invocation.run_id, event_type, payload)
-        self.repository.session.commit()
-
+        try:
+            invocation.status = status
+            invocation.duration_ms = duration_ms
+            invocation.completed_at = datetime.now(timezone.utc)
+            if result is not None:
+                invocation.result_summary = self.summarize(result)
+            payload: dict[str, Any] = {
+                "invocation_id": invocation.id,
+                "tool_id": invocation.tool_id,
+                "display_name": display_name,
+                "duration_ms": duration_ms,
+            }
+            event_type = "tool.completed"
+            invocation.error_code = error.code if error is not None else None
+            if error is not None:
+                event_type = "tool.failed"
+                payload.update(code=error.code, message=error.safe_message)
+            self.repository.append_event(invocation.run_id, event_type, payload)
+            self.repository.session.commit()
+        except Exception as database_error:
+            self._rollback_safely()
+            safe_error = ToolRuntimeError("tool_execution_failed", "工具执行失败。")
+            self._compensate_failed_completion(
+                invocation.id,
+                display_name,
+                duration_ms,
+                safe_error,
+            )
+            raise safe_error from database_error
     def execute(
         self,
         call: ToolCall,
@@ -139,9 +208,11 @@ class ToolGateway:
         if call.name not in authorized_tool_ids:
             raise ToolRuntimeError("tool_not_authorized", "该工具当前不可用。")
         tool = self.tool_store.get_executable(call.name)
-        executor = BUILTIN_EXECUTORS.get(call.name)
-        if tool is None or executor is None or tool["source"] != "builtin":
+        if tool is None:
             raise ToolRuntimeError("tool_not_authorized", "该工具当前不可用。")
+        executor = BUILTIN_EXECUTORS.get(call.name)
+        if executor is None or tool["source"] != "builtin":
+            raise ToolRuntimeError("tool_execution_failed", "工具执行失败。")
         if self.repository.get_tool_invocation(context.run_id, call.id) is not None:
             raise ToolRuntimeError("tool_duplicate_call", "工具调用标识重复。")
 
@@ -156,9 +227,23 @@ class ToolGateway:
         )
         try:
             self._commit_started(invocation, tool["name"])
-        except IntegrityError as error:
-            self.repository.session.rollback()
-            raise ToolRuntimeError("tool_duplicate_call", "工具调用标识重复。") from error
+        except Exception as database_error:
+            self._rollback_safely()
+            if isinstance(database_error, IntegrityError):
+                try:
+                    duplicate = self.repository.get_tool_invocation(
+                        context.run_id, call.id
+                    )
+                except Exception:
+                    self._rollback_safely()
+                    duplicate = None
+                if duplicate is not None:
+                    raise ToolRuntimeError(
+                        "tool_duplicate_call", "工具调用标识重复。"
+                    ) from database_error
+            raise ToolRuntimeError(
+                "tool_execution_failed", "工具执行失败。"
+            ) from database_error
 
         started_at = time.perf_counter()
         try:

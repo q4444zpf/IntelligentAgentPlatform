@@ -2,13 +2,14 @@ from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import create_engine, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.conversations.models import AgentRun, Conversation, Message, RunEvent, ToolInvocation
 from app.conversations.repository import ConversationRepository
 from app.db.base import Base
 from app.db.platform_models import RegisteredToolRecord
-from app.tools.builtins import BUILTIN_TOOL_DEFINITIONS
+from app.tools.builtins import BUILTIN_EXECUTORS, BUILTIN_TOOL_DEFINITIONS
 from app.tools.gateway import ToolGateway
 from app.tools.schemas import ToolCall, ToolExecutionContext, ToolRuntimeError
 from app.tools.store import ToolStore
@@ -173,5 +174,126 @@ def test_duplicate_call_id_is_rejected_without_second_audit(runtime):
         assert session.query(ToolInvocation).count() == 1
         assert session.query(RunEvent).count() == 2
         assert first.invocation_id
+    finally:
+        session.close()
+
+def test_invalid_registered_input_schema_is_execution_failure(runtime):
+    factory, _ = runtime
+    with factory.begin() as db:
+        db.get(RegisteredToolRecord, "system.get_current_time").input_schema = {
+            "type": "not-a-json-schema-type"
+        }
+    session, gateway = make_gateway(runtime)
+    try:
+        with pytest.raises(ToolRuntimeError) as caught:
+            execute(gateway)
+        assert caught.value.code == "tool_execution_failed"
+        assert session.query(ToolInvocation).count() == 0
+    finally:
+        session.close()
+
+
+def test_missing_builtin_executor_is_execution_failure(runtime, monkeypatch):
+    session, gateway = make_gateway(runtime)
+    monkeypatch.delitem(BUILTIN_EXECUTORS, "system.get_current_time")
+    try:
+        with pytest.raises(ToolRuntimeError) as caught:
+            execute(gateway)
+        assert caught.value.code == "tool_execution_failed"
+        assert session.query(ToolInvocation).count() == 0
+    finally:
+        session.close()
+
+
+def test_nonduplicate_integrity_error_when_starting_is_execution_failure(
+    runtime, monkeypatch
+):
+    session, gateway = make_gateway(runtime)
+    monkeypatch.setattr(
+        gateway,
+        "_commit_started",
+        lambda *_args: (_ for _ in ()).throw(
+            IntegrityError("insert", {}, Exception("foreign key"))
+        ),
+    )
+    try:
+        with pytest.raises(ToolRuntimeError) as caught:
+            execute(gateway)
+        assert caught.value.code == "tool_execution_failed"
+    finally:
+        session.close()
+
+
+def test_started_integrity_error_is_duplicate_only_when_call_exists(
+    runtime, monkeypatch
+):
+    session, gateway = make_gateway(runtime)
+    checks = iter([None, ToolInvocation(run_id="run-1", tool_call_id="call-1")])
+    monkeypatch.setattr(gateway.repository, "get_tool_invocation", lambda *_: next(checks))
+    monkeypatch.setattr(
+        gateway,
+        "_commit_started",
+        lambda *_args: (_ for _ in ()).throw(
+            IntegrityError("insert", {}, Exception("unique"))
+        ),
+    )
+    try:
+        with pytest.raises(ToolRuntimeError) as caught:
+            execute(gateway)
+        assert caught.value.code == "tool_duplicate_call"
+    finally:
+        session.close()
+
+
+def test_completion_commit_failure_compensates_started_invocation(
+    runtime, monkeypatch
+):
+    session, gateway = make_gateway(runtime)
+    real_commit = session.commit
+    commit_count = 0
+
+    def fail_completion_once():
+        nonlocal commit_count
+        commit_count += 1
+        if commit_count == 2:
+            raise IntegrityError("commit", {}, Exception("event conflict"))
+        real_commit()
+
+    monkeypatch.setattr(session, "commit", fail_completion_once)
+    try:
+        with pytest.raises(ToolRuntimeError) as caught:
+            execute(gateway)
+        assert caught.value.code == "tool_execution_failed"
+        invocation = session.scalar(select(ToolInvocation))
+        assert invocation.status == "failed"
+        assert invocation.error_code == "tool_execution_failed"
+        assert [
+            event.event_type
+            for event in session.scalars(select(RunEvent).order_by(RunEvent.sequence))
+        ] == ["tool.started", "tool.failed"]
+    finally:
+        session.close()
+
+
+def test_failed_compensation_event_still_closes_invocation(runtime, monkeypatch):
+    session, gateway = make_gateway(runtime)
+    real_commit = session.commit
+    commit_count = 0
+
+    def fail_completion_and_compensation_event():
+        nonlocal commit_count
+        commit_count += 1
+        if commit_count in {2, 3}:
+            raise IntegrityError("commit", {}, Exception("event conflict"))
+        real_commit()
+
+    monkeypatch.setattr(session, "commit", fail_completion_and_compensation_event)
+    try:
+        with pytest.raises(ToolRuntimeError) as caught:
+            execute(gateway)
+        assert caught.value.code == "tool_execution_failed"
+        invocation = session.scalar(select(ToolInvocation))
+        assert invocation.status == "failed"
+        assert invocation.error_code == "tool_execution_failed"
     finally:
         session.close()

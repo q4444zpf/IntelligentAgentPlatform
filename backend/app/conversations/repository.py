@@ -143,6 +143,11 @@ class ConversationRepository:
         )
         return int(self.session.scalar(query)) + 1
     def next_event_sequence(self, run_id: str) -> int:
+        run = self.session.scalar(
+            select(AgentRun).where(AgentRun.id == run_id).with_for_update()
+        )
+        if run is None:
+            raise KeyError(run_id)
         query = select(func.coalesce(func.max(RunEvent.sequence), 0)).where(
             RunEvent.run_id == run_id
         )

@@ -4,7 +4,7 @@ from typing import cast
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Session
 
-from app.conversations.models import Conversation, ToolInvocation
+from app.conversations.models import AgentRun, Conversation, ToolInvocation
 from app.conversations.repository import ConversationRepository
 
 
@@ -53,3 +53,32 @@ def test_repository_lists_invocations_in_creation_order(tmp_path):
         repository.add_tool_invocation(ToolInvocation(run_id="r1", tool_call_id="b", tool_id="system.get_current_time", tool_version="1.0.0", status="started", arguments_summary={}, created_at=datetime(2026, 1, 1, tzinfo=timezone.utc)))
         repository.add_tool_invocation(ToolInvocation(run_id="r1", tool_call_id="a", tool_id="system.get_current_time", tool_version="1.0.0", status="started", arguments_summary={}, created_at=datetime(2026, 1, 2, tzinfo=timezone.utc)))
         assert [item.tool_call_id for item in repository.list_tool_invocations("r1")] == ["b", "a"]
+
+class EventSequenceRecordingSession:
+    def __init__(self):
+        self.statements = []
+
+    def scalar(self, statement):
+        self.statements.append(statement)
+        if len(self.statements) == 1:
+            return AgentRun(
+                id="r1",
+                conversation_id="c1",
+                trigger_message_id="m1",
+                actor_type="agent",
+                actor_id="a1",
+                status="running",
+            )
+        return 4
+
+
+def test_event_sequence_locks_run_before_allocating():
+    session = EventSequenceRecordingSession()
+    repository = ConversationRepository(cast(Session, session))
+
+    sequence = repository.next_event_sequence("r1")
+
+    lock_sql = str(session.statements[0].compile(dialect=postgresql.dialect()))
+    assert "agent_runs" in lock_sql
+    assert "FOR UPDATE" in lock_sql
+    assert sequence == 5
