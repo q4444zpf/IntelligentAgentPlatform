@@ -138,22 +138,15 @@ class AgentService:
                 raise AgentConcurrentUpdateError(
                     "Built-in agent changed concurrently; retry the request"
                 )
-        else:
-            config = AgentConfig(
-                **{
-                    name: record[name]
-                    for name in AgentConfig.model_fields
-                    if name in record
-                }
+        try:
+            return self.store.repair_builtin_agent(
+                BUILTIN_AGENT_ID,
+                BUILTIN_TOOL_IDS,
             )
-            repaired_tool_ids = list(
-                dict.fromkeys([*config.tool_ids, *BUILTIN_TOOL_IDS])
-            )
-            if not config.enabled or repaired_tool_ids != config.tool_ids:
-                config.enabled = True
-                config.tool_ids = repaired_tool_ids
-                record = self.store.update(BUILTIN_AGENT_ID, config.model_dump())
-        return record
+        except AgentStoreNotFoundError as error:
+            raise AgentConcurrentUpdateError(
+                "Built-in agent changed concurrently; retry the request"
+            ) from error
 
     def _ensure_default_agent(self) -> None:
         builtin = self._ensure_builtin_record()

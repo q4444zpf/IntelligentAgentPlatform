@@ -25,6 +25,19 @@ class CountingAgentStore(AgentStore):
         return super().get_default_id()
 
 
+class StaleBuiltinSnapshotStore(AgentStore):
+    def __init__(self, session_factory, stale_record):
+        super().__init__(session_factory)
+        self.stale_record = stale_record
+        self.return_stale_once = True
+
+    def get(self, agent_id):
+        if agent_id == BUILTIN_AGENT_ID and self.return_stale_once:
+            self.return_stale_once = False
+            return dict(self.stale_record)
+        return super().get(agent_id)
+
+
 class AtomicOperationSpyStore(AgentStore):
     def __init__(self, session_factory):
         super().__init__(session_factory)
@@ -243,6 +256,41 @@ def test_disabled_tool_binding_remains_readable_but_cannot_be_resaved(client):
     }
     saved = client.put("/api/agents/reservoir-dispatch", json=payload)
     assert saved.status_code == 422
+
+
+def test_builtin_repair_uses_locked_latest_config_during_concurrent_update(tmp_path):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'agents.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    store = AgentStore(session_factory)
+    AgentService(store, workspace_root=tmp_path / "agent-workspaces")
+
+    stale = store.get(BUILTIN_AGENT_ID)
+    stale["system_prompt"] = "过期提示词"
+    stale["model"] = "stale-model"
+    stale["skill_names"] = []
+    stale["tool_ids"] = []
+
+    latest_config = {
+        name: store.get(BUILTIN_AGENT_ID)[name]
+        for name in AgentConfig.model_fields
+    }
+    latest_config["system_prompt"] = "管理员最新提示词"
+    latest_config["model"] = "latest-model"
+    latest_config["skill_names"] = ["concurrently-added-skill"]
+    latest_config["tool_ids"] = []
+    store.update(BUILTIN_AGENT_ID, latest_config)
+
+    repaired = AgentService(
+        StaleBuiltinSnapshotStore(session_factory, stale),
+        workspace_root=tmp_path / "agent-workspaces",
+    ).get(BUILTIN_AGENT_ID)
+
+    assert repaired.system_prompt == "管理员最新提示词"
+    assert repaired.model == "latest-model"
+    assert repaired.skill_names == ["concurrently-added-skill"]
+    assert repaired.tool_ids == BUILTIN_TOOL_IDS
+    assert repaired.enabled is True
 
 
 def test_repairs_legacy_builtin_tool_bindings_without_removing_others(tmp_path):

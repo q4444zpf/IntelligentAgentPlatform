@@ -213,6 +213,35 @@ class AgentStore:
             session.refresh(target)
             return self._decode(target)
 
+    def repair_builtin_agent(
+        self,
+        agent_id: str,
+        required_tool_ids: list[str],
+    ) -> dict[str, Any]:
+        with self.session_factory.begin() as session:
+            target = self._lock_agent(session, agent_id)
+            if target is None:
+                raise AgentStoreNotFoundError(agent_id)
+
+            config = dict(target.config)
+            existing_tool_ids = config.get("tool_ids", [])
+            if not isinstance(existing_tool_ids, list):
+                existing_tool_ids = []
+            repaired_tool_ids = list(
+                dict.fromkeys([*existing_tool_ids, *required_tool_ids])
+            )
+            if (
+                not config.get("enabled", False)
+                or repaired_tool_ids != existing_tool_ids
+            ):
+                config["enabled"] = True
+                config["tool_ids"] = repaired_tool_ids
+                target.config = config
+                session.flush()
+
+            session.refresh(target)
+            return self._decode(target)
+
     def set_enabled_agent(
         self,
         agent_id: str,
