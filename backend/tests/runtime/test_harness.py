@@ -215,6 +215,41 @@ def test_run_context_stops_at_its_trigger_message():
     )]
 
 
+def test_bounds_conversation_context_to_latest_100_eligible_messages():
+    session, run_id = build_queued_run()
+    run = session.get(AgentRun, run_id)
+    assert run is not None
+
+    history = [
+        Message(
+            conversation_id=run.conversation_id,
+            sequence=index + 2,
+            role="user" if index % 2 == 0 else "assistant",
+            content=f"历史-{index}",
+        )
+        for index in range(105)
+    ]
+    session.add_all(history)
+    session.flush()
+    run.trigger_message_id = history[-1].id
+    session.commit()
+    gateway = CapturingGateway()
+
+    PlatformAgentHarness(
+        ConversationRepository(session), gateway, FakeAgentService()
+    ).execute(run_id)
+
+    messages, selection = gateway.calls[0]
+    assert messages[:2] == [
+        {"role": "system", "content": "你是洪水研判智能体"},
+        {"role": "system", "content": "结合当前流域上下文"},
+    ]
+    assert len(messages[2:]) == 100
+    assert messages[2]["content"] == "历史-5"
+    assert messages[-1]["content"] == "历史-104"
+    assert selection == ModelSelection("deepseek", "deepseek-chat")
+
+
 def test_omits_blank_agent_prompts_and_passes_empty_model_selection():
     session, run_id = build_queued_run()
     gateway = CapturingGateway()

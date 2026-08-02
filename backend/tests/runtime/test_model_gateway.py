@@ -8,7 +8,11 @@ from sqlalchemy.orm import Session, sessionmaker
 
 import app.runtime.model_gateway as model_gateway
 from app.db.base import Base
-from app.model_providers.schemas import ActiveModel, ProviderConfigRequest
+from app.model_providers.schemas import (
+    ActiveModel,
+    ModelConfigRequest,
+    ProviderConfigRequest,
+)
 from app.model_providers.service import ProviderService
 from app.model_providers.store import ProviderStore
 from app.runtime.model_gateway import (
@@ -235,6 +239,75 @@ def test_rejects_invalid_explicit_selection_without_exposing_secret(tmp_path):
         OpenAICompatibleModelGateway(store).generate(
             [{"role": "user", "content": "hello"}],
             ModelSelection("deepseek", "missing-model"),
+        )
+
+    assert "runtime-secret" not in str(captured.value)
+
+
+def test_rejects_explicit_selection_when_provider_is_disabled(tmp_path):
+    store = provider_store(tmp_path / "providers.db")
+    ProviderService(store).configure(
+        "deepseek",
+        ProviderConfigRequest(
+            base_url="https://api.deepseek.com/v1",
+            api_key="runtime-secret",
+            enabled=False,
+        ),
+    )
+
+    with pytest.raises(ModelConfigurationError) as captured:
+        OpenAICompatibleModelGateway(store).generate(
+            [{"role": "user", "content": "hello"}],
+            ModelSelection("deepseek", "deepseek-chat"),
+        )
+
+    assert "runtime-secret" not in str(captured.value)
+
+
+def test_rejects_explicit_selection_when_model_is_disabled(tmp_path):
+    store = provider_store(tmp_path / "providers.db")
+    service = ProviderService(store)
+    service.configure(
+        "deepseek",
+        ProviderConfigRequest(
+            base_url="https://api.deepseek.com/v1",
+            api_key="runtime-secret",
+        ),
+    )
+    service.configure_model(
+        "deepseek",
+        "deepseek-chat",
+        ModelConfigRequest(
+            max_tokens=8192,
+            context_window=128000,
+            enabled=False,
+        ),
+    )
+
+    with pytest.raises(ModelConfigurationError) as captured:
+        OpenAICompatibleModelGateway(store).generate(
+            [{"role": "user", "content": "hello"}],
+            ModelSelection("deepseek", "deepseek-chat"),
+        )
+
+    assert "runtime-secret" not in str(captured.value)
+
+
+def test_rejects_explicit_selection_with_unsupported_protocol(tmp_path):
+    store = provider_store(tmp_path / "providers.db")
+    ProviderService(store).configure(
+        "deepseek",
+        ProviderConfigRequest(
+            base_url="https://api.deepseek.com/v1",
+            api_key="runtime-secret",
+            protocol="AnthropicChatModel",
+        ),
+    )
+
+    with pytest.raises(ModelConfigurationError) as captured:
+        OpenAICompatibleModelGateway(store).generate(
+            [{"role": "user", "content": "hello"}],
+            ModelSelection("deepseek", "deepseek-chat"),
         )
 
     assert "runtime-secret" not in str(captured.value)
