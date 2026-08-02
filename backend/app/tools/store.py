@@ -35,6 +35,12 @@ class ToolStore:
         with self.session_factory() as session:
             return self._decode(session.get(RegisteredToolRecord, tool_id))
 
+    def get_executable(self, tool_id: str) -> dict[str, Any] | None:
+        item = self.get(tool_id)
+        if item is None or not item["published"] or not item["enabled"]:
+            return None
+        return item
+
     def upsert_builtin(self, definition: dict[str, Any]) -> dict[str, Any]:
         contract_fields = (
             "version", "name", "description", "source", "risk_level",

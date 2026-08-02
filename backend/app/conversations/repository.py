@@ -3,9 +3,9 @@ from typing import TypeVar
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .models import AgentRun, Conversation, Message, RunEvent
+from .models import AgentRun, Conversation, Message, RunEvent, ToolInvocation
 
-ModelT = TypeVar("ModelT", Conversation, Message, AgentRun, RunEvent)
+ModelT = TypeVar("ModelT", Conversation, Message, AgentRun, RunEvent, ToolInvocation)
 
 
 class ConversationRepository:
@@ -99,6 +99,25 @@ class ConversationRepository:
                 payload=payload,
             )
         )
+    def add_tool_invocation(self, invocation: ToolInvocation) -> ToolInvocation:
+        return self.add(invocation)
+
+    def get_tool_invocation(self, run_id: str, tool_call_id: str) -> ToolInvocation | None:
+        return self.session.scalar(
+            select(ToolInvocation).where(
+                ToolInvocation.run_id == run_id,
+                ToolInvocation.tool_call_id == tool_call_id,
+            )
+        )
+
+    def list_tool_invocations(self, run_id: str) -> list[ToolInvocation]:
+        query = (
+            select(ToolInvocation)
+            .where(ToolInvocation.run_id == run_id)
+            .order_by(ToolInvocation.created_at, ToolInvocation.id)
+        )
+        return list(self.session.scalars(query))
+
     def list_messages(
         self, project_id: str, owner_id: str, conversation_id: str
     ) -> list[Message]:

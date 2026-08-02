@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
@@ -23,3 +24,38 @@ class ToolInfo(BaseModel):
     is_builtin: bool
     created_at: datetime
     updated_at: datetime
+
+@dataclass(frozen=True)
+class ToolDefinition:
+    tool_id: str
+    description: str
+    input_schema: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ToolExecutionContext:
+    run_id: str
+    conversation_id: str
+    project_id: str
+    user_id: str
+    timezone: str = "Asia/Shanghai"
+
+
+@dataclass(frozen=True)
+class ToolExecutionResult:
+    invocation_id: str
+    value: dict[str, Any]
+
+
+class ToolRuntimeError(Exception):
+    def __init__(self, code: str, safe_message: str):
+        self.code = code
+        self.safe_message = safe_message
+        super().__init__(safe_message)
