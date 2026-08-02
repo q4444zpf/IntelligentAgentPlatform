@@ -590,6 +590,35 @@ def test_wraps_json_parser_recursion_error_safely(tmp_path, monkeypatch):
     assert str(captured.value) == "The model request failed"
     assert "response-secret" not in str(captured.value)
 
+
+def test_tool_call_id_limit_matches_persistence_contract():
+    assert model_gateway.MAX_TOOL_CALL_ID_LENGTH == 128
+
+
+def test_accepts_tool_call_id_at_length_limit(tmp_path, monkeypatch):
+    call_id = "a" * 128
+    gateway, _ = _configured_gateway(
+        tmp_path,
+        monkeypatch,
+        _tool_call_response([_tool_call(call_id=call_id)]),
+    )
+
+    result = gateway.generate([{"role": "user", "content": "time?"}])
+
+    assert result.tool_calls[0].id == call_id
+
+
+def test_rejects_tool_call_id_over_length_limit(tmp_path, monkeypatch):
+    gateway, _ = _configured_gateway(
+        tmp_path,
+        monkeypatch,
+        _tool_call_response([_tool_call(call_id="a" * 129)]),
+    )
+
+    with pytest.raises(ModelUpstreamError, match="The model request failed"):
+        gateway.generate([{"role": "user", "content": "time?"}])
+
+
 def test_rejects_duplicate_tool_call_ids(tmp_path, monkeypatch):
     gateway, _ = _configured_gateway(
         tmp_path,

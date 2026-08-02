@@ -11,6 +11,7 @@ from app.tools.schemas import ToolCall, ToolDefinition
 MAX_MODEL_TOOL_CALLS = 8
 MAX_TOOL_ARGUMENT_BYTES = 64 * 1024
 MAX_TOOL_ARGUMENT_DEPTH = 20
+MAX_TOOL_CALL_ID_LENGTH = 128
 
 
 class ModelRuntimeError(Exception):
@@ -220,6 +221,8 @@ class OpenAICompatibleModelGateway:
                 name = function.get("name")
                 if not isinstance(call_id, str) or not call_id.strip():
                     raise ValueError("tool call id is invalid")
+                if len(call_id) > MAX_TOOL_CALL_ID_LENGTH:
+                    raise ValueError("tool call id is too long")
                 if call_id in seen_call_ids:
                     raise ValueError("duplicate tool call id")
                 if not isinstance(name, str) or not name.strip():
