@@ -1,7 +1,8 @@
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from sqlalchemy import create_engine
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.agents.service import AgentNotFoundError
 from app.conversations.models import AgentRun, Conversation, Message, RunEvent
@@ -13,7 +14,10 @@ from app.runtime.model_gateway import (
     ModelSelection,
     ModelUpstreamError,
 )
+from app.tools.gateway import ToolGateway
 from app.tools.schemas import ToolCall, ToolDefinition, ToolExecutionResult, ToolRuntimeError
+from app.tools.service import ToolService
+from app.tools.store import ToolStore
 
 
 class FakeAgentService:
@@ -411,3 +415,110 @@ def test_tool_runtime_error_fails_safely_without_assistant_message():
     assert repo.get_run_by_id(run_id).status == "failed"
     assert repo.list_events(run_id, 0)[-2].payload == {"code": "tool_not_authorized", "message": "该工具当前不可用。"}
     assert not any(message.role == "assistant" for message in repo.get_run_messages(run_id))
+
+
+def build_integrated_runtime(tmp_path, *, enabled=True, bound=True):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'integrated-runtime.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    store = ToolStore(factory)
+    service = ToolService(store)
+    if not enabled:
+        store.set_enabled("system.get_current_time", False)
+    session = factory()
+    conversation = Conversation(project_id="trusted-project", owner_id="trusted-user", title="时间")
+    session.add(conversation)
+    session.flush()
+    message = Message(conversation_id=conversation.id, role="user", content="今天星期几？")
+    session.add(message)
+    session.flush()
+    run = AgentRun(
+        conversation_id=conversation.id,
+        trigger_message_id=message.id,
+        actor_type="agent",
+        actor_id="flood",
+        status="queued",
+    )
+    session.add(run)
+    session.flush()
+    session.add(RunEvent(run_id=run.id, sequence=1, event_type="run.status", payload={"status": "queued"}))
+    session.commit()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: datetime(2026, 8, 2, 0, 0, tzinfo=timezone.utc),
+    )
+    agent = FakeAgentService(tool_ids=["system.get_current_time"] if bound else [])
+    return session, run.id, service, gateway, agent
+
+
+def test_integrated_time_tool_loop_persists_events_and_trusted_context(tmp_path):
+    session, run_id, service, gateway, agent = build_integrated_runtime(tmp_path)
+    repository = ConversationRepository(session)
+    model = ScriptedToolModel([
+        ModelResult(None, 3, 1, 4, (ToolCall("time-1", "system.get_current_time", {}),)),
+        ModelResult("今天是星期日", 5, 2, 7),
+    ])
+
+    PlatformAgentHarness(
+        repository,
+        model,
+        agent,
+        tool_service=service,
+        tool_gateway=gateway,
+    ).execute(run_id)
+
+    tool_message = model.calls[1][0][-1]
+    assert tool_message["role"] == "tool"
+    assert tool_message["tool_call_id"] == "time-1"
+    assert '"timezone":"Asia/Shanghai"' in tool_message["content"]
+    assert '"weekday_zh":"星期日"' in tool_message["content"]
+    assert [event.event_type for event in repository.list_events(run_id, 0)] == [
+        "run.status",
+        "run.status",
+        "tool.started",
+        "tool.completed",
+        "message.completed",
+        "run.usage",
+        "run.status",
+    ]
+    invocation = repository.list_tool_invocations(run_id)[0]
+    assert invocation.status == "completed"
+    assert invocation.tool_id == "system.get_current_time"
+    context = repository.get_run_execution_context(run_id)
+    assert context == {
+        "run_id": run_id,
+        "conversation_id": repository.get_run_by_id(run_id).conversation_id,
+        "project_id": "trusted-project",
+        "user_id": "trusted-user",
+    }
+    session.close()
+
+
+def test_integrated_gateway_rejects_unbound_tool_without_invocation(tmp_path):
+    session, run_id, service, gateway, agent = build_integrated_runtime(tmp_path, bound=False)
+    repository = ConversationRepository(session)
+    model = ScriptedToolModel([
+        ModelResult(None, tool_calls=(ToolCall("time-unbound", "system.get_current_time", {}),)),
+    ])
+    PlatformAgentHarness(repository, model, agent, tool_service=service, tool_gateway=gateway).execute(run_id)
+    assert repository.get_run_by_id(run_id).status == "failed"
+    assert repository.list_tool_invocations(run_id) == []
+    assert not any(event.event_type.startswith("tool.") for event in repository.list_events(run_id, 0))
+    assert not any(message.role == "assistant" for message in repository.get_run_messages(run_id))
+    session.close()
+
+
+def test_integrated_gateway_rejects_disabled_tool_without_invocation(tmp_path):
+    session, run_id, service, gateway, agent = build_integrated_runtime(tmp_path, enabled=False)
+    repository = ConversationRepository(session)
+    model = ScriptedToolModel([
+        ModelResult(None, tool_calls=(ToolCall("time-disabled", "system.get_current_time", {}),)),
+    ])
+    PlatformAgentHarness(repository, model, agent, tool_service=service, tool_gateway=gateway).execute(run_id)
+    assert repository.get_run_by_id(run_id).status == "failed"
+    assert repository.list_events(run_id, 0)[-2].payload["code"] == "tool_not_authorized"
+    assert repository.list_tool_invocations(run_id) == []
+    assert not any(event.event_type.startswith("tool.") for event in repository.list_events(run_id, 0))
+    assert not any(message.role == "assistant" for message in repository.get_run_messages(run_id))
+    session.close()
