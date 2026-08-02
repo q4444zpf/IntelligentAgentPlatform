@@ -14,6 +14,7 @@ export interface AgentInput {
   context_prompt: string;
   approval_policy: AgentApprovalPolicy;
   skill_names: string[];
+  tool_ids: string[];
   enabled: boolean;
 }
 

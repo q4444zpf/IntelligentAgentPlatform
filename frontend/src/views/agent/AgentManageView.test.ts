@@ -29,4 +29,21 @@ describe('AgentManageView default-agent contract', () => {
     expect(source).toContain('平台默认智能体不能停用或删除');
     expect(source).toContain('系统内置智能体不能删除');
   });
+
+  it('loads tools with the other editor dependencies and submits tool bindings', () => {
+    expect(apiSource).toContain('tool_ids: string[]');
+    expect(source).toContain('toolsApi.list()');
+    expect(source).toContain('toolData');
+    expect(source).toContain('tool_ids: [] as string[]');
+    expect(source).toContain('const { id, ...payload } = form');
+  });
+
+  it('offers only published enabled tools while retaining unavailable bindings', () => {
+    expect(source).toContain('授权工具');
+    expect(source).toContain('tool.published && tool.enabled');
+    expect(source).toContain('form.tool_ids.includes(tool.tool_id)');
+    expect(source).toContain('已停用，仅保留现有绑定');
+    expect(source).toContain('tool.risk_level');
+    expect(source).toContain('tool.source');
+  });
 });

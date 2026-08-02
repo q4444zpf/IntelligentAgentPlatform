@@ -113,4 +113,41 @@ describe('conversation store', () => {
     expect(store.events).toEqual([]);
     expect(store.messages).toHaveLength(1);
     expect(store.messages[0].conversation_id).toBe('c2');
-  });});
+  });
+
+  it('merges out-of-order duplicate tool events by invocation and first sequence', async () => {
+    vi.mocked(getRunEvents).mockResolvedValue([
+      { sequence: 8, event_type: 'tool.completed', payload: { invocation_id: 'i1', tool_id: 'system.time', display_name: '当前时间', duration_ms: 12, result_summary: 'SECRET_RESULT' } },
+      { sequence: 4, event_type: 'tool.started', payload: { invocation_id: 'i2', tool_id: 'system.context', display_name: '运行上下文', arguments_summary: 'SECRET_ARGUMENT' } },
+      { sequence: 3, event_type: 'tool.started', payload: { invocation_id: 'i1', tool_id: 'system.time', display_name: '当前时间' } },
+      { sequence: 9, event_type: 'tool.failed', payload: { invocation_id: 'i2', tool_id: 'system.context', display_name: '运行上下文', duration_ms: 7, secret: 'SECRET_TOKEN' } },
+      { sequence: 9, event_type: 'tool.failed', payload: { invocation_id: 'i2', tool_id: 'system.context', display_name: '运行上下文', duration_ms: 7 } },
+      { sequence: 10, event_type: 'run.status', payload: { status: 'failed' } },
+    ]);
+    const store = useConversationStore();
+    store.activeConversationId = 'c1';
+    store.activeRun = structuredClone(acceptedRun.run);
+
+    await store.replayEvents(0, 1);
+
+    expect(store.toolActivities).toEqual([
+      { invocation_id: 'i1', display_name: '当前时间', tool_id: 'system.time', status: 'completed', duration_ms: 12, sequence: 3 },
+      { invocation_id: 'i2', display_name: '运行上下文', tool_id: 'system.context', status: 'failed', duration_ms: 7, sequence: 4 },
+    ]);
+    expect(JSON.stringify(store.toolActivities)).not.toContain('SECRET_');
+    expect(JSON.stringify(store.events)).not.toContain('SECRET_');
+    expect(store.events.map((event) => event.sequence)).toEqual([3, 4, 8, 9, 10]);
+  });
+
+  it('clears tool activity when changing or resetting conversations', async () => {
+    vi.mocked(conversationsApi.listMessages).mockResolvedValue([]);
+    const store = useConversationStore();
+    store.toolActivities = [{ invocation_id: 'i1', display_name: '当前时间', tool_id: 'system.time', status: 'running', duration_ms: null, sequence: 1 }];
+
+    await store.selectConversation('c2');
+    expect(store.toolActivities).toEqual([]);
+    store.toolActivities.push({ invocation_id: 'i2', display_name: '上下文', tool_id: 'system.context', status: 'running', duration_ms: null, sequence: 2 });
+    store.startNewConversation();
+    expect(store.toolActivities).toEqual([]);
+  });
+});

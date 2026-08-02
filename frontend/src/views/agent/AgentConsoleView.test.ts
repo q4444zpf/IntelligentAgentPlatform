@@ -32,4 +32,17 @@ describe('AgentConsoleView runtime contract', () => {
     expect(source).toContain('hasExplicitAgentSelection');
     expect(source).toContain('selectedAgentId.value || undefined');
   });
+
+  it('renders compact safe tool activity near the running state', () => {
+    expect(source).toContain('conversationStore.toolActivities');
+    expect(source).toContain('activity.display_name');
+    expect(source).toContain("activity.status === 'running'");
+    expect(source).toContain('activity.duration_ms');
+    expect(source).toContain('执行中');
+    expect(source).toContain('完成');
+    expect(source).toContain('失败');
+    expect(source).not.toContain('arguments_summary');
+    expect(source).not.toContain('result_summary');
+    expect(source).not.toContain('SECRET_SENTINEL');
+  });
 });

@@ -7,7 +7,40 @@ import {
 } from '@/api/conversations';
 import { getRunEvents, type RunEvent } from '@/api/runEvents';
 
+export interface ToolActivity {
+  invocation_id: string;
+  display_name: string;
+  tool_id: string;
+  status: 'running' | 'completed' | 'failed';
+  duration_ms: number | null;
+  sequence: number;
+}
+
 const terminalStatuses = new Set(['completed', 'failed', 'cancelled']);
+const toolEventStatuses = {
+  'tool.started': 'running',
+  'tool.completed': 'completed',
+  'tool.failed': 'failed',
+} as const;
+
+function mergeToolActivities(activities: ToolActivity[], events: RunEvent[]): ToolActivity[] {
+  const merged = new Map(activities.map((activity) => [activity.invocation_id, activity]));
+  for (const event of [...events].sort((left, right) => left.sequence - right.sequence)) {
+    const status = toolEventStatuses[event.event_type as keyof typeof toolEventStatuses];
+    const { invocation_id: invocationId, display_name: displayName, tool_id: toolId, duration_ms: durationMs } = event.payload;
+    if (!status || typeof invocationId !== 'string' || typeof displayName !== 'string' || typeof toolId !== 'string') continue;
+    const previous = merged.get(invocationId);
+    merged.set(invocationId, {
+      invocation_id: invocationId,
+      display_name: displayName,
+      tool_id: toolId,
+      status,
+      duration_ms: typeof durationMs === 'number' ? durationMs : previous?.duration_ms ?? null,
+      sequence: Math.min(previous?.sequence ?? event.sequence, event.sequence),
+    });
+  }
+  return [...merged.values()].sort((left, right) => left.sequence - right.sequence);
+}
 
 function wait(milliseconds: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
@@ -20,6 +53,7 @@ export const useConversationStore = defineStore('conversations', {
     messages: [] as MessageInfo[],
     activeRun: null as AgentRunInfo | null,
     events: [] as RunEvent[],
+    toolActivities: [] as ToolActivity[],
     loading: false,
     sending: false,
     error: '',
@@ -47,6 +81,7 @@ export const useConversationStore = defineStore('conversations', {
       this.messages = [];
       this.activeRun = null;
       this.events = [];
+      this.toolActivities = [];
       return conversation;
     },
     async selectConversation(conversationId: string) {
@@ -55,6 +90,7 @@ export const useConversationStore = defineStore('conversations', {
       this.messages = await conversationsApi.listMessages(conversationId);
       this.activeRun = null;
       this.events = [];
+      this.toolActivities = [];
     },
     startNewConversation() {
       this.pollToken += 1;
@@ -62,6 +98,7 @@ export const useConversationStore = defineStore('conversations', {
       this.messages = [];
       this.activeRun = null;
       this.events = [];
+      this.toolActivities = [];
     },
     async sendMessage(content: string, actorType: 'agent' | 'team', actorId?: string) {
       this.sending = true;
@@ -78,6 +115,7 @@ export const useConversationStore = defineStore('conversations', {
         this.messages.push(accepted.message);
         this.activeRun = accepted.run;
         this.events = [];
+        this.toolActivities = [];
         await this.replayEvents();
       } catch (error) {
         this.error = error instanceof Error ? error.message : '消息发送失败';
@@ -102,7 +140,13 @@ export const useConversationStore = defineStore('conversations', {
           || this.activeRun?.id !== runId
           || this.activeConversationId !== conversationId
         ) return;
-        this.events.push(...events);
+        const storedEvents = events.map((event) => (
+          event.event_type in toolEventStatuses ? { ...event, payload: {} } : event
+        ));
+        this.events = [...new Map(
+          [...this.events, ...storedEvents].map((event) => [event.sequence, event]),
+        ).values()].sort((left, right) => left.sequence - right.sequence);
+        this.toolActivities = mergeToolActivities(this.toolActivities, events);
 
         for (const event of events) {
           if (event.event_type === 'run.error' && typeof event.payload.message === 'string') {
