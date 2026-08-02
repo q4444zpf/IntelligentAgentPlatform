@@ -31,5 +31,8 @@ describe('AgentConsoleView runtime contract', () => {
     expect(source).toContain('class="conversation-page"'); expect(source).toContain('useConversationStore');
     expect(source).toContain('hasExplicitAgentSelection'); expect(source).toContain('selectedAgentId.value || undefined');
     expect(source).not.toContain('arguments_summary'); expect(source).not.toContain('result_summary');
+    expect(source).not.toContain('setTimeout'); expect(source).not.toContain('initialMessages'); expect(source).not.toContain('沙箱已隔离');
+    expect(source).toContain("const mode = ref<ChatMode>('single')"); expect(source).toContain('title="多智能体运行时开发中" disabled');
+    expect(source).toContain("agent.enabled && (agent.runtime_form === 'web' || agent.runtime_form === 'common')");
   });
 });

@@ -78,12 +78,12 @@
               <div class="skill-picker-heading"><div><strong>授权工具</strong><span>已授权 {{ form.tool_ids.length }} 个</span></div></div>
               <a-empty v-if="!visibleTools.length" image="simple" description="没有可授权的工具" />
               <a-alert v-if="toolLoadError" class="tool-load-error" type="warning" show-icon :message="toolLoadError"><template #action><a-button class="tool-retry" size="small" :loading="toolsLoading" @click="loadTools">重试</a-button></template></a-alert>
-              <div v-else class="tool-picker-grid">
+              <div v-if="visibleTools.length" class="tool-picker-grid">
                 <div v-for="tool in visibleTools" :key="tool.tool_id" class="tool-picker-row" :class="{ selected: form.tool_ids.includes(tool.tool_id), unavailable: !isToolSelectable(tool) }" role="button" :tabindex="isToolSelectable(tool) ? 0 : -1" @click="toggleToolSelection(tool)" @keydown.enter="toggleToolSelection(tool)">
                   <span class="skill-check"><CheckOutlined v-if="form.tool_ids.includes(tool.tool_id)" /></span>
                   <span class="tool-picker-copy"><strong>{{ tool.name }}</strong><code>{{ tool.tool_id }}</code></span>
-                  <a-tag>{{ tool.risk_level }}</a-tag><em>{{ tool.source }}</em>
-                  <small v-if="!isToolSelectable(tool)">已停用或未发布，仅保留现有绑定 <a-button class="tool-remove" size="small" danger @click.stop="removeToolBinding(tool.tool_id)">移除绑定</a-button></small>
+                  <a-tag>{{ toolRiskLabel(tool) }}</a-tag><em>{{ toolSourceLabel(tool) }}</em>
+                  <small v-if="!isToolSelectable(tool)">{{ tool.missing ? '注册表缺失，仅保留历史绑定' : '已停用或未发布，仅保留现有绑定' }} <a-button class="tool-remove" size="small" danger @click.stop="removeToolBinding(tool.tool_id)">移除绑定</a-button></small>
                 </div>
               </div>
               <p class="skill-picker-help">只有已发布且启用的工具可以新增授权。</p>
@@ -125,7 +125,15 @@ const runtimeFilterOptions = [{ label: '全部形态', value: 'all' }, { label: 
 const enabledCount = computed(() => agents.value.filter((item) => item.enabled).length); const boundSkillCount = computed(() => new Set(agents.value.flatMap((item) => item.skill_names)).size); const approvalCount = computed(() => agents.value.filter((item) => item.approval_policy !== 'never').length);
 const filteredAgents = computed(() => { const term = query.value.trim().toLowerCase(); return agents.value.filter((item) => (!term || `${item.name} ${item.id} ${item.description}`.toLowerCase().includes(term)) && (runtimeFilter.value === 'all' || item.runtime_form === runtimeFilter.value)); });
 const providerOptions = computed(() => providers.value.filter((item) => item.enabled && item.configured).map((item) => ({ label: item.name, value: item.id }))); const activeProvider = computed(() => providers.value.find((item) => item.id === form.provider_id)); const modelOptions = computed(() => (activeProvider.value?.models || []).filter((item) => item.enabled).map((item) => ({ label: item.name, value: item.id }))); const enabledSkills = computed(() => skills.value.filter((item) => item.enabled)); const skillTagOptions = computed(() => [{ label: '全部标签', value: 'all' }, ...Array.from(new Set(enabledSkills.value.flatMap((item) => item.tags))).sort((a, b) => a.localeCompare(b, 'zh-CN')).map((tag) => ({ label: tag, value: tag }))]); const visibleSkills = computed(() => { const term = skillQuery.value.trim().toLowerCase(); return enabledSkills.value.filter((item) => (!term || `${item.name} ${item.description}`.toLowerCase().includes(term)) && (skillTag.value === 'all' || item.tags.includes(skillTag.value))); });
-const visibleTools = computed(() => tools.value.filter((tool) => (tool.published && tool.enabled) || form.tool_ids.includes(tool.tool_id)));
+type ToolOption = ToolInfo & { missing?: boolean };
+function missingTool(toolId: string): ToolOption { return { tool_id: toolId, version: '', name: toolId, description: '', source: 'builtin', risk_level: 'low', input_schema: {}, output_schema: {}, requires_approval: false, published: false, enabled: false, is_builtin: false, created_at: '', updated_at: '', missing: true }; }
+const visibleTools = computed<ToolOption[]>(() => {
+  const registryTools = tools.value.filter((tool) => (tool.published && tool.enabled) || form.tool_ids.includes(tool.tool_id));
+  const registryIds = new Set(registryTools.map((tool) => tool.tool_id));
+  return [...registryTools, ...form.tool_ids.filter((toolId) => !registryIds.has(toolId)).map(missingTool)];
+});
+function toolRiskLabel(tool: ToolOption) { return tool.missing ? '未知' : tool.risk_level; }
+function toolSourceLabel(tool: ToolOption) { return tool.missing ? '历史绑定' : tool.source; }
 function isToolSelectable(tool: ToolInfo) { return tool.published && tool.enabled; }
 const unavailableBindingMessage = '存在不可用的工具绑定，请先编辑并移除后再复制';
 function unavailableToolIds(toolIds: string[]) { if (toolLoadError.value) return toolIds; const available = new Set(tools.value.filter(isToolSelectable).map((tool) => tool.tool_id)); return toolIds.filter((toolId) => !available.has(toolId)); }

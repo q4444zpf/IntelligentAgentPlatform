@@ -30,29 +30,45 @@ const stubs = {
 const wrappers: ReturnType<typeof mount>[] = [];
 function render() { const wrapper = mount(AgentManageView, { global: { stubs } }); wrappers.push(wrapper); return wrapper; }
 
-beforeEach(() => { Object.values(mocks).forEach((mock) => mock.mockReset()); mocks.agentsList.mockResolvedValue([structuredClone(agent)]); mocks.providersList.mockResolvedValue([]); mocks.skillsList.mockResolvedValue([]); mocks.toolsList.mockResolvedValue([structuredClone(disabledTool)]); mocks.update.mockResolvedValue(structuredClone(agent)); });
+beforeEach(() => { Object.values(mocks).forEach((mock) => mock.mockReset()); mocks.agentsList.mockResolvedValue([structuredClone(agent)]); mocks.providersList.mockResolvedValue([]); mocks.skillsList.mockResolvedValue([]); mocks.toolsList.mockResolvedValue([]); mocks.update.mockResolvedValue({ ...structuredClone(agent), tool_ids: [] }); });
 afterEach(() => wrappers.splice(0).forEach((wrapper) => wrapper.unmount()));
 
 describe('AgentManageView tool interactions', () => {
   it('shows a disabled binding, blocks save and copy, then removes it from update payload', async () => {
+    mocks.agentsList.mockResolvedValueOnce([structuredClone(agent)]).mockResolvedValue([{ ...structuredClone(agent), tool_ids: [] }]);
     const wrapper = render(); await flushPromises();
     expect(wrapper.get('[aria-label="复制智能体"]').attributes('disabled')).toBeDefined();
     await wrapper.get('[aria-label="复制智能体"]').trigger('click'); expect(mocks.copy).not.toHaveBeenCalled();
     await wrapper.get('[aria-label="编辑智能体"]').trigger('click'); await flushPromises();
-    expect(wrapper.text()).toContain('停用工具'); expect(wrapper.text()).toContain('已停用或未发布，仅保留现有绑定');
+    expect(wrapper.text()).toContain('disabled.tool'); expect(wrapper.text()).toContain('注册表缺失'); expect(wrapper.text()).toContain('历史绑定');
     await wrapper.get('.modal-ok').trigger('click'); expect(mocks.update).not.toHaveBeenCalled(); expect(mocks.showError).toHaveBeenCalledWith('请先移除不可用的工具绑定再保存');
     await wrapper.get('.tool-remove').trigger('click'); await wrapper.get('.modal-ok').trigger('click'); await flushPromises();
     expect(mocks.update).toHaveBeenCalledWith('default-agent', expect.objectContaining({ tool_ids: [] }));
+    expect(wrapper.get('[aria-label="复制智能体"]').attributes('disabled')).toBeUndefined();
   });
 
   it('keeps core data usable when tool loading fails and retries locally', async () => {
     mocks.toolsList.mockRejectedValueOnce(new Error('工具目录不可用')).mockResolvedValueOnce([]);
+    mocks.agentsList.mockResolvedValue([structuredClone(agent)]);
     const wrapper = render(); await flushPromises();
     expect(wrapper.text()).toContain('默认智能体');
     await wrapper.get('[aria-label="编辑智能体"]').trigger('click'); await flushPromises();
-    expect(wrapper.text()).toContain('工具目录不可用');
+    expect(wrapper.text()).toContain('工具目录不可用'); expect(wrapper.text()).toContain('disabled.tool'); expect(wrapper.find('.tool-remove').exists()).toBe(true);
     await wrapper.get('.tool-retry').trigger('click'); await flushPromises();
     expect(mocks.toolsList).toHaveBeenCalledTimes(2); expect(wrapper.text()).not.toContain('工具目录不可用');
+  });
+  it('selects only published enabled tools and submits risk/source-visible bindings', async () => {
+    const cleanAgent = { ...structuredClone(agent), tool_ids: [], is_default: false, is_builtin: false };
+    mocks.agentsList.mockResolvedValue([cleanAgent]);
+    mocks.toolsList.mockResolvedValue([
+      { ...structuredClone(disabledTool), tool_id: 'enabled.tool', name: '可用工具', enabled: true, risk_level: 'high', source: 'mcp' },
+      { ...structuredClone(disabledTool), tool_id: 'draft.tool', name: '未发布工具', enabled: true, published: false },
+    ]);
+    mocks.update.mockResolvedValue({ ...cleanAgent, tool_ids: ['enabled.tool'] });
+    const wrapper = render(); await flushPromises(); await wrapper.get('[aria-label="编辑智能体"]').trigger('click'); await flushPromises();
+    expect(wrapper.text()).toContain('可用工具'); expect(wrapper.text()).toContain('high'); expect(wrapper.text()).toContain('mcp'); expect(wrapper.text()).not.toContain('未发布工具');
+    await wrapper.get('.tool-picker-row').trigger('click'); await wrapper.get('.modal-ok').trigger('click'); await flushPromises();
+    expect(mocks.update).toHaveBeenCalledWith('default-agent', expect.objectContaining({ tool_ids: ['enabled.tool'] }));
   });
 });
 
@@ -60,5 +76,6 @@ describe('AgentManageView contracts', () => {
   it('keeps default protection and tool contracts explicit', () => {
     expect(apiSource).toContain('tool_ids: string[]'); expect(source).toContain('agentsApi.setDefault');
     expect(source).toContain('agent.is_builtin || agent.is_default'); expect(source).toContain('toolsApi.list');
+    expect(source).toContain('平台默认'); expect(source).toContain('系统内置'); expect(source).toContain('agentsApi.setDefault');
   });
 });
