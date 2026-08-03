@@ -6,6 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.audit.models import AuditEvent
+from app.audit.recorder import AuditRecorder
 from app.conversations.models import AgentRun, Conversation, Message, RunEvent, ToolInvocation
 from app.conversations.repository import ConversationRepository
 from app.db.base import Base
@@ -283,6 +284,67 @@ def test_started_integrity_error_is_duplicate_only_when_call_exists(
         session.close()
 
 
+class OneShotTerminalFailingRecorder(AuditRecorder):
+    def __init__(self):
+        self.failed = False
+
+    def record(self, session, request):
+        if request.action == "tool.invoke.succeeded" and not self.failed:
+            self.failed = True
+            raise RuntimeError("one-shot terminal audit failure")
+        return super().record(session, request)
+
+
+def test_success_terminal_audit_failure_retries_true_outcome_without_duplicates(runtime):
+    factory, store = runtime
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        audit_recorder=OneShotTerminalFailingRecorder(),
+    )
+
+    result = execute(gateway)
+
+    invocation = session.get(ToolInvocation, result.invocation_id)
+    audits = list(session.scalars(select(AuditEvent).order_by(AuditEvent.occurred_at)))
+    events = list(session.scalars(select(RunEvent).order_by(RunEvent.sequence)))
+    assert invocation.status == "completed"
+    assert invocation.result_summary["timezone"] == "Asia/Shanghai"
+    assert invocation.error_code is None
+    assert [event.action for event in audits] == [
+        "tool.invoke.started", "tool.invoke.succeeded"
+    ]
+    assert audits[1].parent_event_id == audits[0].id
+    assert [event.event_type for event in events] == ["tool.started", "tool.completed"]
+
+
+class PersistentTerminalFailingRecorder(AuditRecorder):
+    def record(self, session, request):
+        if request.action == "tool.invoke.succeeded":
+            raise RuntimeError("persistent terminal audit failure")
+        return super().record(session, request)
+
+
+def test_persistent_success_audit_failure_preserves_external_success(runtime):
+    factory, store = runtime
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        audit_recorder=PersistentTerminalFailingRecorder(),
+    )
+
+    with pytest.raises(ToolRuntimeError) as caught:
+        execute(gateway)
+
+    assert caught.value.code == "tool_execution_failed"
+    invocation = session.scalar(select(ToolInvocation))
+    assert invocation.status == "completed"
+    assert invocation.result_summary["timezone"] == "Asia/Shanghai"
+    assert invocation.error_code is None
+
+
 def test_completion_commit_failure_compensates_started_invocation(
     runtime, monkeypatch
 ):
@@ -299,16 +361,20 @@ def test_completion_commit_failure_compensates_started_invocation(
 
     monkeypatch.setattr(session, "commit", fail_completion_once)
     try:
-        with pytest.raises(ToolRuntimeError) as caught:
-            execute(gateway)
-        assert caught.value.code == "tool_execution_failed"
+        result = execute(gateway)
         invocation = session.scalar(select(ToolInvocation))
-        assert invocation.status == "failed"
-        assert invocation.error_code == "tool_execution_failed"
+        assert result.invocation_id == invocation.id
+        assert invocation.status == "completed"
+        assert invocation.error_code is None
+        assert invocation.result_summary["timezone"] == "Asia/Shanghai"
         assert [
             event.event_type
             for event in session.scalars(select(RunEvent).order_by(RunEvent.sequence))
-        ] == ["tool.started", "tool.failed"]
+        ] == ["tool.started", "tool.completed"]
+        audits = list(session.scalars(select(AuditEvent).order_by(AuditEvent.occurred_at)))
+        assert [event.action for event in audits] == [
+            "tool.invoke.started", "tool.invoke.succeeded"
+        ]
     finally:
         session.close()
 
@@ -331,8 +397,9 @@ def test_failed_compensation_event_still_closes_invocation(runtime, monkeypatch)
             execute(gateway)
         assert caught.value.code == "tool_execution_failed"
         invocation = session.scalar(select(ToolInvocation))
-        assert invocation.status == "failed"
-        assert invocation.error_code == "tool_execution_failed"
+        assert invocation.status == "completed"
+        assert invocation.error_code is None
+        assert invocation.result_summary["timezone"] == "Asia/Shanghai"
     finally:
         session.close()
 
@@ -378,12 +445,11 @@ def test_completion_uses_preserved_invocation_id_after_rollback(
     monkeypatch.setattr(gateway, "_rollback_safely", rollback_and_detach)
     monkeypatch.setattr(session, "commit", fail_completion_once)
     try:
-        with pytest.raises(ToolRuntimeError) as caught:
-            execute(gateway)
-        assert caught.value.code == "tool_execution_failed"
+        result = execute(gateway)
         assert compensation_ids == [captured["invocation_id"]]
+        assert result.invocation_id == captured["invocation_id"]
         invocation = session.scalar(select(ToolInvocation))
-        assert invocation.status == "failed"
-        assert invocation.error_code == "tool_execution_failed"
+        assert invocation.status == "completed"
+        assert invocation.error_code is None
     finally:
         session.close()

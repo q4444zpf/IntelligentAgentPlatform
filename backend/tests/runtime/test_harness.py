@@ -5,6 +5,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.agents.service import AgentNotFoundError
+from app.audit.recorder import AuditRecorder
 from app.audit.models import AuditEvent
 from app.conversations.models import AgentRun, Conversation, Message, RunEvent
 from app.conversations.repository import ConversationRepository
@@ -161,6 +162,88 @@ def test_records_failed_llm_and_agent_without_raw_error():
     assert {event.action for event in events} == {"agent.run.running", "llm.invoke.failed", "agent.run.failed"}
     assert next(event for event in events if event.source == "llm").error_code == "model_request_failed"
     assert "runtime-secret" not in str(events)
+
+
+def test_empty_model_response_records_only_failed_llm_terminal_event():
+    session, run_id = build_queued_run()
+    model = ScriptedToolModel([ModelResult(content="  ")])
+
+    PlatformAgentHarness(
+        ConversationRepository(session), model, FakeAgentService()
+    ).execute(run_id)
+
+    llm_events = list(session.scalars(select(AuditEvent).where(AuditEvent.source == "llm")))
+    assert [(event.action, event.status) for event in llm_events] == [
+        ("llm.invoke.failed", "failed")
+    ]
+    assert session.get(AgentRun, run_id).status == "failed"
+
+
+def test_successful_llm_tool_iteration_survives_preexecution_failure():
+    session, run_id = build_queued_run()
+    model = ScriptedToolModel([
+        ModelResult(None, tool_calls=(ToolCall("call-1", "missing.tool", {}),)),
+    ])
+
+    PlatformAgentHarness(
+        ConversationRepository(session),
+        model,
+        FakeAgentService(tool_ids=["missing.tool"]),
+        tool_service=FakeToolService(),
+    ).execute(run_id)
+
+    llm_events = list(session.scalars(select(AuditEvent).where(AuditEvent.source == "llm")))
+    assert [(event.action, event.metadata_json["iteration"]) for event in llm_events] == [
+        ("llm.invoke.succeeded", 0)
+    ]
+    assert session.get(AgentRun, run_id).status == "failed"
+
+
+class PersistentFailingRecorder(AuditRecorder):
+    def record(self, session, request):
+        raise RuntimeError("audit storage unavailable")
+
+
+def test_running_audit_failure_leaves_failed_run_and_usable_session():
+    session, run_id = build_queued_run()
+
+    PlatformAgentHarness(
+        ConversationRepository(session),
+        SuccessfulGateway(),
+        FakeAgentService(),
+        audit_recorder=PersistentFailingRecorder(),
+    ).execute(run_id)
+
+    assert session.get(AgentRun, run_id).status == "failed"
+    events = list(session.scalars(select(RunEvent).where(RunEvent.run_id == run_id)))
+    assert events[-2].event_type == "run.error"
+    assert events[-2].payload["code"] == "audit_persistence_failed"
+    assert events[-1].payload == {"status": "failed"}
+    assert session.scalar(select(AgentRun).where(AgentRun.id == run_id)) is not None
+
+
+class TerminalFailingRecorder(AuditRecorder):
+    def record(self, session, request):
+        if request.action in {"agent.run.completed", "agent.run.failed"}:
+            raise RuntimeError("terminal audit storage unavailable")
+        return super().record(session, request)
+
+
+def test_completed_audit_failure_does_not_leave_run_running():
+    session, run_id = build_queued_run()
+
+    PlatformAgentHarness(
+        ConversationRepository(session),
+        SuccessfulGateway(),
+        FakeAgentService(),
+        audit_recorder=TerminalFailingRecorder(),
+    ).execute(run_id)
+
+    assert session.get(AgentRun, run_id).status == "failed"
+    events = list(session.scalars(select(RunEvent).where(RunEvent.run_id == run_id)))
+    assert events[-2].payload["code"] == "audit_persistence_failed"
+    assert events[-1].payload == {"status": "failed"}
+    assert session.scalar(select(AgentRun).where(AgentRun.id == run_id)) is not None
 
 
 class FailingGateway:

@@ -141,46 +141,7 @@ class ToolGateway:
         except Exception:
             pass
 
-    def _compensate_failed_completion(
-        self,
-        invocation_id: str,
-        display_name: str,
-        duration_ms: int,
-        error: ToolRuntimeError,
-    ) -> None:
-        try:
-            invocation = self.repository.session.get(ToolInvocation, invocation_id)
-            if invocation is None:
-                return
-            self._apply_failed_state(invocation, error, duration_ms)
-            self.repository.append_event(
-                invocation.run_id,
-                "tool.failed",
-                {
-                    "invocation_id": invocation.id,
-                    "tool_id": invocation.tool_id,
-                    "display_name": display_name,
-                    "duration_ms": duration_ms,
-                    "code": error.code,
-                    "message": error.safe_message,
-                },
-            )
-            self.repository.session.commit()
-            return
-        except Exception:
-            self._rollback_safely()
-
-        # If event persistence is unavailable, close the invocation on its own.
-        try:
-            invocation = self.repository.session.get(ToolInvocation, invocation_id)
-            if invocation is None:
-                return
-            self._apply_failed_state(invocation, error, duration_ms)
-            self.repository.session.commit()
-        except Exception:
-            self._rollback_safely()
-
-    def _commit_finished(
+    def _persist_terminal(
         self,
         invocation: ToolInvocation,
         display_name: str,
@@ -189,28 +150,28 @@ class ToolGateway:
         duration_ms: int,
         context: ToolExecutionContext,
         parent_event_id: str,
-        result: dict[str, Any] | None = None,
-        error: ToolRuntimeError | None = None,
+        result: dict[str, Any] | None,
+        error: ToolRuntimeError | None,
+        include_audit: bool = True,
     ) -> None:
-        invocation_id = str(invocation.id)
-        try:
-            invocation.status = status
-            invocation.duration_ms = duration_ms
-            invocation.completed_at = datetime.now(timezone.utc)
-            if result is not None:
-                invocation.result_summary = self.summarize(result)
-            payload: dict[str, Any] = {
-                "invocation_id": invocation.id,
-                "tool_id": invocation.tool_id,
-                "display_name": display_name,
-                "duration_ms": duration_ms,
-            }
-            event_type = "tool.completed"
-            invocation.error_code = error.code if error is not None else None
-            if error is not None:
-                event_type = "tool.failed"
-                payload.update(code=error.code, message=error.safe_message)
-            self.repository.append_event(invocation.run_id, event_type, payload)
+        invocation.status = status
+        invocation.duration_ms = duration_ms
+        invocation.completed_at = datetime.now(timezone.utc)
+        invocation.error_code = error.code if error is not None else None
+        if result is not None:
+            invocation.result_summary = self.summarize(result)
+        payload: dict[str, Any] = {
+            "invocation_id": invocation.id,
+            "tool_id": invocation.tool_id,
+            "display_name": display_name,
+            "duration_ms": duration_ms,
+        }
+        event_type = "tool.completed"
+        if error is not None:
+            event_type = "tool.failed"
+            payload.update(code=error.code, message=error.safe_message)
+        self.repository.append_event(invocation.run_id, event_type, payload)
+        if include_audit:
             audit_status = "failed" if error is not None else "succeeded"
             self.audit_recorder.record(
                 self.repository.session,
@@ -235,14 +196,77 @@ class ToolGateway:
                     error_code=error.code if error is not None else None,
                 ),
             )
-            self.repository.session.commit()
+        self.repository.session.commit()
+
+    def _compensate_failed_completion(
+        self,
+        invocation_id: str,
+        display_name: str,
+        duration_ms: int,
+        error: ToolRuntimeError | None,
+        *,
+        status: str,
+        result: dict[str, Any] | None,
+        context: ToolExecutionContext,
+        parent_event_id: str,
+    ) -> bool:
+        try:
+            invocation = self.repository.session.get(ToolInvocation, invocation_id)
+            if invocation is None:
+                return False
+            self._persist_terminal(
+                invocation, display_name, status=status, duration_ms=duration_ms,
+                context=context, parent_event_id=parent_event_id,
+                result=result, error=error,
+            )
+            return True
+        except Exception:
+            self._rollback_safely()
+
+        try:
+            invocation = self.repository.session.get(ToolInvocation, invocation_id)
+            if invocation is None:
+                return False
+            self._persist_terminal(
+                invocation, display_name, status=status, duration_ms=duration_ms,
+                context=context, parent_event_id=parent_event_id,
+                result=result, error=error, include_audit=False,
+            )
+        except Exception:
+            self._rollback_safely()
+        return False
+
+    def _commit_finished(
+        self,
+        invocation: ToolInvocation,
+        display_name: str,
+        *,
+        status: str,
+        duration_ms: int,
+        context: ToolExecutionContext,
+        parent_event_id: str,
+        result: dict[str, Any] | None = None,
+        error: ToolRuntimeError | None = None,
+    ) -> None:
+        invocation_id = str(invocation.id)
+        try:
+            self._persist_terminal(
+                invocation, display_name, status=status, duration_ms=duration_ms,
+                context=context, parent_event_id=parent_event_id,
+                result=result, error=error,
+            )
+            return
         except Exception as database_error:
             self._rollback_safely()
-            safe_error = ToolRuntimeError("tool_execution_failed", "工具执行失败。")
-            self._compensate_failed_completion(
-                invocation_id, display_name, duration_ms, safe_error,
-            )
-            raise safe_error from database_error
+            if self._compensate_failed_completion(
+                invocation_id, display_name, duration_ms, error,
+                status=status, result=result, context=context,
+                parent_event_id=parent_event_id,
+            ):
+                return
+            raise ToolRuntimeError(
+                "tool_execution_failed", "工具执行失败。"
+            ) from database_error
     def execute(
         self,
         call: ToolCall,
@@ -289,6 +313,7 @@ class ToolGateway:
                 "tool_execution_failed", "工具执行失败。"
             ) from database_error
 
+        invocation_id = str(invocation.id)
         started_at = time.perf_counter()
         try:
             value = executor(call.arguments, context, self.clock)
@@ -314,4 +339,4 @@ class ToolGateway:
             invocation, tool["name"], status="completed", duration_ms=duration_ms,
             result=value, context=context, parent_event_id=started_audit.id,
         )
-        return ToolExecutionResult(invocation_id=invocation.id, value=value)
+        return ToolExecutionResult(invocation_id=invocation_id, value=value)

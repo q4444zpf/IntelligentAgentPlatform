@@ -53,19 +53,13 @@ class PlatformAgentHarness:
         execution_context = self.repository.get_run_execution_context(run_id)
         if execution_context is None:
             raise KeyError(run_id)
-        run.status = "running"
-        self.repository.append_event(run_id, "run.status", {"status": "running"})
-        self.audit_recorder.record(self.repository.session, AuditRecordRequest(
-            unit_id=execution_context["unit_id"],
-            project_id=execution_context["project_id"],
-            user_id=execution_context["user_id"],
-            category="runtime", source="agent", action="agent.run.running",
-            status="started", risk_level="low", trace_id=run_id, run_id=run_id,
-            resource_type="agent", resource_id=run.actor_id,
-            idempotency_key=f"agent:{run_id}:status:running",
-            occurred_at=datetime.now(UTC),
-        ))
-        self.repository.session.commit()
+        try:
+            self._record_agent_status(run_id, "running")
+        except Exception:
+            self._persist_failure_safely(
+                run_id, "audit_persistence_failed", "智能体运行失败，请稍后重试"
+            )
+            return
 
         llm_iteration: int | None = None
         llm_started = 0.0
@@ -96,6 +90,10 @@ class PlatformAgentHarness:
                     "completion_tokens": result.completion_tokens,
                     "total_tokens": result.total_tokens,
                 }
+                calls = result.tool_calls
+                if not calls and (result.content is None or not result.content.strip()):
+                    raise ModelRuntimeError("empty model response")
+
                 self.audit_recorder.record(self.repository.session, AuditRecordRequest(
                     unit_id=execution_context["unit_id"],
                     project_id=execution_context["project_id"],
@@ -108,16 +106,14 @@ class PlatformAgentHarness:
                     metadata=metadata,
                     allowed_metadata_keys=frozenset(metadata),
                 ))
+                self.repository.session.commit()
                 for key in usage:
                     value = getattr(result, key)
                     if value is not None:
                         usage[key] += value
                         usage_seen[key] = True
 
-                calls = result.tool_calls
                 if not calls:
-                    if result.content is None or not result.content.strip():
-                        raise ModelRuntimeError("empty model response")
                     self._complete(run_id, result.content, usage, usage_seen)
                     return
 
@@ -177,13 +173,19 @@ class PlatformAgentHarness:
                     metadata=metadata, allowed_metadata_keys=frozenset(metadata),
                     error_code="model_request_failed",
                 ))
-            self._fail(run_id, "model_request_failed", "模型调用失败，请检查默认模型配置或稍后重试")
+            self._persist_failure_safely(
+                run_id, "model_request_failed",
+                "模型调用失败，请检查默认模型配置或稍后重试",
+                rollback=False,
+            )
         except ToolRuntimeError as error:
             self.repository.session.rollback()
-            self._fail(run_id, error.code, error.safe_message)
+            self._persist_failure_safely(run_id, error.code, error.safe_message, rollback=False)
         except Exception:
             self.repository.session.rollback()
-            self._fail(run_id, "runtime_failed", "智能体运行失败，请稍后重试")
+            self._persist_failure_safely(
+                run_id, "runtime_failed", "智能体运行失败，请稍后重试", rollback=False
+            )
 
     def _build_messages(self, run_id, agent):
         conversation_messages = [
@@ -218,40 +220,74 @@ class PlatformAgentHarness:
         return ToolExecutionContext(**value) if value is not None else None
 
     def _complete(self, run_id, content, usage, usage_seen):
-        assistant_message = self.repository.add_assistant_message(run_id, content)
-        self.repository.append_event(run_id, "message.completed", {"message_id": assistant_message.id, "role": "assistant"})
-        if any(usage_seen.values()):
-            self.repository.append_event(run_id, "run.usage", {key: usage[key] if usage_seen[key] else None for key in usage})
+        try:
+            assistant_message = self.repository.add_assistant_message(run_id, content)
+            self.repository.append_event(run_id, "message.completed", {"message_id": assistant_message.id, "role": "assistant"})
+            if any(usage_seen.values()):
+                self.repository.append_event(run_id, "run.usage", {key: usage[key] if usage_seen[key] else None for key in usage})
+            self._record_agent_status(run_id, "completed", commit=False)
+            self.repository.session.commit()
+        except Exception:
+            self._persist_failure_safely(
+                run_id, "audit_persistence_failed", "智能体运行失败，请稍后重试"
+            )
+
+    def _record_agent_status(
+        self, run_id: str, status: str, *, code: str | None = None,
+        message: str | None = None, commit: bool = True,
+    ) -> None:
         run = self.repository.get_run_by_id(run_id)
-        run.status = "completed"
-        self.repository.append_event(run_id, "run.status", {"status": "completed"})
+        if run is None:
+            raise KeyError(run_id)
+        run.status = status
+        if status == "failed":
+            self.repository.append_event(
+                run_id, "run.error", {"code": code, "message": message}
+            )
+        self.repository.append_event(run_id, "run.status", {"status": status})
         context = self.repository.get_run_execution_context(run_id)
+        audit_status = {
+            "running": "started", "completed": "succeeded", "failed": "failed"
+        }[status]
         self.audit_recorder.record(self.repository.session, AuditRecordRequest(
             unit_id=context["unit_id"], project_id=context["project_id"],
             user_id=context["user_id"], category="runtime", source="agent",
-            action="agent.run.completed", status="succeeded", risk_level="low",
+            action=f"agent.run.{status}", status=audit_status,
+            risk_level="medium" if status == "failed" else "low",
             trace_id=run_id, run_id=run_id, resource_type="agent",
             resource_id=run.actor_id,
-            idempotency_key=f"agent:{run_id}:status:completed",
-            occurred_at=datetime.now(UTC),
+            idempotency_key=f"agent:{run_id}:status:{status}",
+            occurred_at=datetime.now(UTC), error_code=code,
         ))
-        self.repository.session.commit()
+        if commit:
+            self.repository.session.commit()
 
     def _fail(self, run_id: str, code: str, message: str) -> None:
+        self._persist_failure_safely(run_id, code, message)
+
+    def _persist_failure_safely(
+        self, run_id: str, code: str, message: str, *, rollback: bool = True,
+    ) -> None:
+        if rollback:
+            self.repository.session.rollback()
+        try:
+            self._record_agent_status(
+                run_id, "failed", code=code, message=message
+            )
+            return
+        except Exception:
+            self.repository.session.rollback()
+
         run = self.repository.get_run_by_id(run_id)
         if run is None:
             raise KeyError(run_id)
         run.status = "failed"
-        self.repository.append_event(run_id, "run.error", {"code": code, "message": message})
+        self.repository.append_event(
+            run_id, "run.error",
+            {
+                "code": "audit_persistence_failed",
+                "message": "智能体运行失败，请稍后重试",
+            },
+        )
         self.repository.append_event(run_id, "run.status", {"status": "failed"})
-        context = self.repository.get_run_execution_context(run_id)
-        self.audit_recorder.record(self.repository.session, AuditRecordRequest(
-            unit_id=context["unit_id"], project_id=context["project_id"],
-            user_id=context["user_id"], category="runtime", source="agent",
-            action="agent.run.failed", status="failed", risk_level="medium",
-            trace_id=run_id, run_id=run_id, resource_type="agent",
-            resource_id=run.actor_id,
-            idempotency_key=f"agent:{run_id}:status:failed",
-            occurred_at=datetime.now(UTC), error_code=code,
-        ))
         self.repository.session.commit()
