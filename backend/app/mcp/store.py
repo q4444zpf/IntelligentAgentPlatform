@@ -38,31 +38,47 @@ class McpStore:
 
     def create(self, key: str, config: dict[str, Any]) -> dict[str, Any]:
         with self.session_factory.begin() as session:
-            session.add(McpClientRecord(client_key=key, config=config, tool_records=[]))
-        return self.get(key)
+            return self.create_in_session(session, key, config)
+
+    def create_in_session(self, session: Session, key: str, config: dict[str, Any]) -> dict[str, Any]:
+        row = McpClientRecord(client_key=key, config=config, tool_records=[])
+        session.add(row)
+        session.flush()
+        session.refresh(row)
+        return self._decode(row)
 
     def update_config(self, key: str, config: dict[str, Any]) -> dict[str, Any] | None:
         return self._update(key, config=config)
 
     def update_tools(self, key: str, tools: list[dict[str, Any]], synced_at: str) -> dict[str, Any] | None:
         return self._update(key, tool_records=tools, last_synced_at=synced_at)
+    def update_in_session(self, session: Session, key: str, **values: Any) -> dict[str, Any] | None:
+        row = session.get(McpClientRecord, key)
+        if row is None:
+            return None
+        for name, value in values.items():
+            setattr(row, name, value)
+        session.flush()
+        session.refresh(row)
+        return self._decode(row)
+
 
     def update_whitelist(self, key: str, tools: list[str] | None) -> dict[str, Any] | None:
         return self._update(key, whitelist=tools)
 
     def _update(self, key: str, **values: Any) -> dict[str, Any] | None:
         with self.session_factory.begin() as session:
-            row = session.get(McpClientRecord, key)
-            if row is None:
-                return None
-            for name, value in values.items():
-                setattr(row, name, value)
-        return self.get(key)
+            return self.update_in_session(session, key, **values)
 
     def delete(self, key: str) -> bool:
         with self.session_factory.begin() as session:
             row = session.get(McpClientRecord, key)
-            if row is None:
-                return False
-            session.delete(row)
-            return True
+            return self.delete_in_session(session, key)
+
+    def delete_in_session(self, session: Session, key: str) -> bool:
+        row = session.get(McpClientRecord, key)
+        if row is None:
+            return False
+        session.delete(row)
+        session.flush()
+        return True

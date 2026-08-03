@@ -72,13 +72,17 @@ class ToolStore:
             row.enabled = enabled
         return self.get(tool_id)
 
+    def toggle_in_session(self, session: Session, tool_id: str) -> dict[str, Any] | None:
+        statement = (
+            update(RegisteredToolRecord)
+            .where(RegisteredToolRecord.tool_id == tool_id)
+            .values(enabled=not_(RegisteredToolRecord.enabled), updated_at=func.now())
+            .returning(RegisteredToolRecord)
+        )
+        row = session.execute(statement).scalar_one_or_none()
+        session.flush()
+        return self._decode(row)
+
     def toggle(self, tool_id: str) -> dict[str, Any] | None:
         with self.session_factory.begin() as session:
-            statement = (
-                update(RegisteredToolRecord)
-                .where(RegisteredToolRecord.tool_id == tool_id)
-                .values(enabled=not_(RegisteredToolRecord.enabled), updated_at=func.now())
-                .returning(RegisteredToolRecord)
-            )
-            row = session.execute(statement).scalar_one_or_none()
-            return self._decode(row)
+            return self.toggle_in_session(session, tool_id)

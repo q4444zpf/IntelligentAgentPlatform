@@ -1,16 +1,39 @@
 import time
 from copy import deepcopy
 
+from datetime import UTC, datetime
 import httpx
 
+from sqlalchemy.orm import Session
+from app.audit.recorder import AuditRecorder, AuditRecordRequest
+from app.core.request_context import RequestContext
 from .registry import builtin_providers
 from .schemas import ActiveModel, AddModelRequest, CreateProviderRequest, DiscoverModelsResponse, ModelConfigRequest, ModelInfo, ProbeMultimodalResponse, ProviderConfigRequest, ProviderInfo, TestConnectionResponse
 from .store import ProviderStore
 
 
 class ProviderService:
-    def __init__(self, store: ProviderStore | None = None):
+    def __init__(self, store: ProviderStore | None = None, *, audit_recorder: AuditRecorder | None = None):
         self.store = store or ProviderStore()
+        self.audit_recorder = audit_recorder or AuditRecorder()
+
+    def _commit_management(self, context: RequestContext, session: Session, request_id: str | None, *, action: str, resource_id: str, resource_name: str, risk_level: str = "high", metadata: dict | None = None) -> None:
+        metadata = metadata or {}
+        try:
+            self.audit_recorder.record(session, AuditRecordRequest(
+                unit_id=context.unit_id, project_id=context.project_id, user_id=context.user_id,
+                actor_role=context.role, category="management", source="llm", action=action,
+                status="succeeded", risk_level=risk_level, resource_type="model_provider",
+                resource_id=resource_id, resource_name=resource_name,
+                summary=f"Model provider resource {resource_id} management operation succeeded",
+                metadata=metadata, allowed_metadata_keys=frozenset(metadata),
+                idempotency_key=f"management:{request_id or resource_id}:{action}:{resource_id}",
+                occurred_at=datetime.now(UTC),
+            ))
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
 
     @staticmethod
     def _mask(secret: str) -> str:
@@ -64,7 +87,7 @@ class ProviderService:
         if provider_id not in providers: raise KeyError(provider_id)
         return providers[provider_id]
 
-    def configure(self, provider_id: str, body: ProviderConfigRequest) -> ProviderInfo:
+    def configure(self, provider_id: str, body: ProviderConfigRequest, *, context: RequestContext | None = None, session: Session | None = None, request_id: str | None = None) -> ProviderInfo:
         providers, state = self._merged()
         if provider_id not in providers: raise KeyError(provider_id)
         provider = providers[provider_id]
@@ -82,18 +105,41 @@ class ProviderService:
         bucket["custom_headers"] = body.custom_headers
         bucket["auth_mode"] = body.auth_mode
         bucket["enabled"] = body.enabled if body.enabled is not None else True
-        self.store.save(state)
+        if context is None or session is None:
+            self.store.save(state)
+            return self.get(provider_id)
+        try:
+            self.store.save_in_session(session, state)
+            self.audit_recorder.record(session, AuditRecordRequest(
+                unit_id=context.unit_id, project_id=context.project_id, user_id=context.user_id,
+                actor_role=context.role, category="management", source="llm",
+                action="resource.updated", status="succeeded", risk_level="high",
+                resource_type="model_provider", resource_id=provider_id,
+                resource_name=provider.name, summary=f"Model provider {provider_id} was updated",
+                metadata={"enabled": bucket["enabled"], "protocol": bucket.get("protocol", provider.protocol)},
+                allowed_metadata_keys=frozenset({"enabled", "protocol"}),
+                idempotency_key=f"management:{request_id or provider_id}:provider.configure:{provider_id}",
+                occurred_at=datetime.now(UTC),
+            ))
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
         return self.get(provider_id)
 
-    def create(self, body: CreateProviderRequest) -> ProviderInfo:
+    def create(self, body: CreateProviderRequest, *, context: RequestContext | None = None, session: Session | None = None, request_id: str | None = None) -> ProviderInfo:
         providers, state = self._merged()
         if body.id in providers: raise ValueError("Provider ID already exists")
         provider = ProviderInfo(id=body.id, name=body.name.strip(), kind="local", base_url=body.default_base_url.strip(), protocol=body.protocol, is_custom=True)
         state.setdefault("custom_providers", {})[body.id] = {"definition": provider.model_dump(exclude={"masked_api_key", "configured", "models"}), "api_key": "", "api_key_prefix": body.api_key_prefix, "models": []}
-        self.store.save(state)
+        if context is None or session is None:
+            self.store.save(state)
+        else:
+            self.store.save_in_session(session, state)
+            self._commit_management(context, session, request_id, action="resource.created", resource_id=body.id, resource_name=body.name)
         return self.get(body.id)
 
-    def add_model(self, provider_id: str, body: AddModelRequest) -> ProviderInfo:
+    def add_model(self, provider_id: str, body: AddModelRequest, *, context: RequestContext | None = None, session: Session | None = None, request_id: str | None = None) -> ProviderInfo:
         provider, state = self.get(provider_id), self.store.load()
         if any(item.id == body.id for item in provider.models): raise ValueError("Model ID already exists")
         model = ModelInfo(id=body.id, name=body.name or body.id, type=body.type, builtin=False)
@@ -101,10 +147,13 @@ class ProviderService:
         bucket = state.setdefault(bucket_name, {}).setdefault(provider_id, {})
         key = "models" if provider.is_custom else "extra_models"
         bucket.setdefault(key, []).append(model.model_dump())
-        self.store.save(state)
+        if context is None or session is None: self.store.save(state)
+        else:
+            self.store.save_in_session(session, state)
+            self._commit_management(context, session, request_id, action="resource.updated", resource_id=f"{provider_id}/{body.id}", resource_name=body.name or body.id, metadata={"model_id": body.id})
         return self.get(provider_id)
 
-    def configure_model(self, provider_id: str, model_id: str, body: ModelConfigRequest) -> ProviderInfo:
+    def configure_model(self, provider_id: str, model_id: str, body: ModelConfigRequest, *, context: RequestContext | None = None, session: Session | None = None, request_id: str | None = None) -> ProviderInfo:
         provider, state = self.get(provider_id), self.store.load()
         if not any(item.id == model_id for item in provider.models): raise KeyError(model_id)
         bucket_name = "custom_providers" if provider.is_custom else "providers"
@@ -113,10 +162,13 @@ class ProviderService:
         if provider.is_custom:
             for item in bucket.get("models", []):
                 if item["id"] == model_id: item.update(body.model_dump())
-        self.store.save(state)
+        if context is None or session is None: self.store.save(state)
+        else:
+            self.store.save_in_session(session, state)
+            self._commit_management(context, session, request_id, action="resource.updated", resource_id=f"{provider_id}/{model_id}", resource_name=model_id, metadata={"model_id": model_id})
         return self.get(provider_id)
 
-    def remove_model(self, provider_id: str, model_id: str) -> ProviderInfo:
+    def remove_model(self, provider_id: str, model_id: str, *, context: RequestContext | None = None, session: Session | None = None, request_id: str | None = None) -> ProviderInfo:
         provider, state = self.get(provider_id), self.store.load()
         model = next((item for item in provider.models if item.id == model_id), None)
         if model is None: raise KeyError(model_id)
@@ -129,10 +181,13 @@ class ProviderService:
         active = state.get("active_model", {})
         if active.get("provider_id") == provider_id and active.get("model") == model_id:
             state["active_model"] = {}
-        self.store.save(state)
+        if context is None or session is None: self.store.save(state)
+        else:
+            self.store.save_in_session(session, state)
+            self._commit_management(context, session, request_id, action="resource.deleted", resource_id=f"{provider_id}/{model_id}", resource_name=model_id)
         return self.get(provider_id)
 
-    async def discover_models(self, provider_id: str, save: bool = True) -> DiscoverModelsResponse:
+    async def discover_models(self, provider_id: str, save: bool = True, *, context: RequestContext | None = None, session: Session | None = None, request_id: str | None = None) -> DiscoverModelsResponse:
         provider, state = self._merged(); item = provider.get(provider_id)
         if item is None: raise KeyError(provider_id)
         if not item.support_model_discovery: raise ValueError("This provider does not support model discovery")
@@ -162,10 +217,13 @@ class ProviderService:
             bucket = state.setdefault(bucket_name, {}).setdefault(provider_id, {})
             key = "models" if item.is_custom else "extra_models"
             bucket.setdefault(key, []).extend(model.model_dump() for model in additions)
-            self.store.save(state)
+            if context is None or session is None: self.store.save(state)
+            else:
+                self.store.save_in_session(session, state)
+                self._commit_management(context, session, request_id, action="resource.updated", resource_id=provider_id, resource_name=item.name, metadata={"discovered_count": len(additions)})
         return DiscoverModelsResponse(models=discovered, discovered_count=len(discovered), added_count=len(additions) if save else 0)
 
-    async def probe_multimodal(self, provider_id: str, model_id: str) -> ProbeMultimodalResponse:
+    async def probe_multimodal(self, provider_id: str, model_id: str, *, context: RequestContext | None = None, session: Session | None = None, request_id: str | None = None) -> ProbeMultimodalResponse:
         provider, state = self._merged(); item = provider.get(provider_id)
         if item is None: raise KeyError(provider_id)
         if not any(model.id == model_id for model in item.models): raise KeyError(model_id)
@@ -195,7 +253,7 @@ class ProviderService:
                 )
             except (httpx.HTTPError, ValueError) as exc:
                 raise ValueError(f"Ollama capability probe failed: {exc}") from exc
-            self._save_probe_result(state, item, model_id, result)
+            self._save_probe_result(state, item, model_id, result, context=context, session=session, request_id=request_id)
             return result
         url = base_url + "/chat/completions"
         # Transparent 1x1 PNG. It is sufficient to verify whether the upstream
@@ -227,10 +285,10 @@ class ProviderService:
             image_message=image_message,
             video_message="当前协议不支持通用视频能力探测",
         )
-        self._save_probe_result(state, item, model_id, result)
+        self._save_probe_result(state, item, model_id, result, context=context, session=session, request_id=request_id)
         return result
 
-    def _save_probe_result(self, state: dict, item: ProviderInfo, model_id: str, result: ProbeMultimodalResponse) -> None:
+    def _save_probe_result(self, state: dict, item: ProviderInfo, model_id: str, result: ProbeMultimodalResponse, *, context: RequestContext | None = None, session: Session | None = None, request_id: str | None = None) -> None:
         bucket_name = "custom_providers" if item.is_custom else "providers"
         bucket = state.setdefault(bucket_name, {}).setdefault(item.id, {})
         config = bucket.setdefault("model_configs", {}).setdefault(model_id, {})
@@ -241,15 +299,22 @@ class ProviderService:
         else:
             for model in bucket.get("extra_models", []):
                 if model.get("id") == model_id: model.update(config)
-        self.store.save(state)
+        if context is None or session is None: self.store.save(state)
+        else:
+            self.store.save_in_session(session, state)
+            self._commit_management(context, session, request_id, action="resource.updated", resource_id=f"{item.id}/{model_id}", resource_name=model_id, metadata={"probe_source": "probed"})
 
     def get_active(self) -> ActiveModel:
         return ActiveModel.model_validate(self.store.load().get("active_model") or {})
 
-    def set_active(self, active: ActiveModel) -> ActiveModel:
+    def set_active(self, active: ActiveModel, *, context: RequestContext | None = None, session: Session | None = None, request_id: str | None = None) -> ActiveModel:
         provider = self.get(active.provider_id)
         if not provider.configured or not any(model.id == active.model and model.enabled for model in provider.models): raise ValueError("Provider or model is unavailable")
-        state = self.store.load(); state["active_model"] = active.model_dump(); self.store.save(state); return active
+        state = self.store.load(); state["active_model"] = active.model_dump()
+        if context is None or session is None: self.store.save(state)
+        else:
+            self.store.save_in_session(session, state); self._commit_management(context, session, request_id, action="resource.updated", resource_id=f"{active.provider_id}/{active.model}", resource_name=active.model, metadata={"active": True})
+        return active
 
     async def test(self, provider_id: str, model_id: str | None = None, override: ProviderConfigRequest | None = None) -> TestConnectionResponse:
         provider, state = self._merged(); item = provider.get(provider_id)

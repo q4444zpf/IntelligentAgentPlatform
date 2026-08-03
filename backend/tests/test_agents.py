@@ -14,6 +14,9 @@ from app.db.platform_models import PlatformSettingRecord, RegisteredToolRecord
 from app.skills.schemas import SkillCreateRequest
 from app.skills.service import SkillService
 
+AUTH_HEADERS = {"X-Unit-ID": "unit-1", "X-User-ID": "u1", "X-Project-ID": "p1", "X-User-Role": "admin"}
+
+
 
 class CountingAgentStore(AgentStore):
     def __init__(self, session_factory):
@@ -118,9 +121,10 @@ version: "1.0"
     store = AgentStore(sessionmaker(bind=engine, expire_on_commit=False, class_=Session))
     service = AgentService(store, skill_service=skill_service, workspace_root=tmp_path / "agent-workspaces")
     app = FastAPI()
+    app.state.allow_dev_identity = True
     app.include_router(create_router(service), prefix="/api/agents")
     app.state.agent_service = service
-    return TestClient(app)
+    return TestClient(app, headers=AUTH_HEADERS)
 
 
 def agent_payload(**overrides):
@@ -721,14 +725,14 @@ def test_builtin_agent_cannot_be_deleted_after_default_switch(client):
 def test_maps_concurrent_default_update_to_conflict(client, monkeypatch):
     assert client.post("/api/agents", json=agent_payload()).status_code == 201
 
-    def reject_stale_update(agent_id, expected_version):
+    def reject_stale_update(session, agent_id, expected_version):
         raise AgentConcurrentUpdateError(
             "Default agent changed concurrently; retry the request"
         )
 
     monkeypatch.setattr(
         client.app.state.agent_service.store,
-        "set_default_agent",
+        "set_default_agent_in_session",
         reject_stale_update,
     )
     response = client.put(
@@ -792,3 +796,79 @@ def test_deletes_agent(client):
     deleted = client.delete("/api/agents/reservoir-dispatch")
     assert deleted.status_code == 200
     assert client.get("/api/agents/reservoir-dispatch").status_code == 404
+
+def test_create_rolls_back_agent_and_workspace_when_audit_fails(tmp_path):
+    from app.audit.recorder import AuditRecorder
+    from app.core.request_context import RequestContext
+
+    class FailingRecorder(AuditRecorder):
+        def record(self, session, request):
+            raise RuntimeError("audit unavailable")
+
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'agent-audit.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    store = AgentStore(factory)
+    service = AgentService(store, workspace_root=tmp_path / "workspaces", audit_recorder=FailingRecorder())
+    context = RequestContext(unit_id="unit-1", project_id="p1", user_id="u1")
+    with factory() as session, pytest.raises(RuntimeError, match="audit unavailable"):
+        service.create(AgentCreateRequest(**agent_payload(skill_names=[])), context=context, session=session, request_id="agent-create-fail")
+    assert store.get("reservoir-dispatch") is None
+    assert not (tmp_path / "workspaces" / "reservoir-dispatch").exists()
+
+
+def test_delete_restores_quarantined_workspace_when_audit_fails(tmp_path):
+    from app.audit.recorder import AuditRecorder
+    from app.core.request_context import RequestContext
+
+    class FailingRecorder(AuditRecorder):
+        def record(self, session, request):
+            raise RuntimeError("audit unavailable")
+
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'agent-delete-audit.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    store = AgentStore(factory)
+    root = tmp_path / "workspaces"
+    service = AgentService(store, workspace_root=root)
+    service.create(AgentCreateRequest(**agent_payload(skill_names=[])))
+    workspace = root / "reservoir-dispatch"
+    assert workspace.is_dir()
+    failing = AgentService(store, workspace_root=root, audit_recorder=FailingRecorder())
+    context = RequestContext(unit_id="unit-1", project_id="p1", user_id="u1")
+    with factory() as session, pytest.raises(RuntimeError, match="audit unavailable"):
+        failing.delete("reservoir-dispatch", context=context, session=session, request_id="agent-delete-fail")
+    assert store.get("reservoir-dispatch") is not None
+    assert workspace.is_dir()
+    assert not list(root.glob(".reservoir-dispatch.quarantine-*"))
+
+def test_agent_create_route_requires_request_context(tmp_path):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'agent-auth.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    app = FastAPI()
+    app.state.allow_dev_identity = True
+    app.include_router(create_router(AgentService(AgentStore(factory), workspace_root=tmp_path / "workspaces")), prefix="/api/agents")
+    with TestClient(app) as unauthenticated:
+        response = unauthenticated.post("/api/agents", json=agent_payload(skill_names=[]))
+    assert response.status_code == 401
+
+def test_protected_agent_delete_records_failed_audit_in_fresh_transaction(client):
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+
+    response = client.delete(
+        f"/api/agents/{BUILTIN_AGENT_ID}",
+        headers={**AUTH_HEADERS, "X-Request-ID": "protected-delete-1"},
+    )
+    assert response.status_code == 409
+    factory = client.app.state.agent_service.store.session_factory
+    with factory() as session:
+        event = session.scalar(select(AuditEvent))
+    assert event.status == "failed"
+    assert event.action == "resource.deleted"
+    assert event.source == "agent"
+    assert event.error_code == "AGENT_PROTECTED"
+    assert event.resource_id == BUILTIN_AGENT_ID
+    assert event.metadata_json == {}
+    assert "protected-delete-1" in event.idempotency_key

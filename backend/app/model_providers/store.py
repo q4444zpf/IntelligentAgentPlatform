@@ -44,28 +44,31 @@ class ProviderStore:
                 "active_model": active.version if active else 0,
             })
 
-    def save(self, data: dict[str, Any]) -> None:
-        original = data.original if isinstance(data, ProviderState) else EMPTY_STATE
-        versions = data.versions if isinstance(data, ProviderState) else {"providers": {}, "custom_providers": {}, "active_model": 0}
+    def save(self, data: dict[str, Any], session: Session | None = None) -> None:
+        if session is not None:
+            self.save_in_session(session, data)
+            return
         try:
-            with self.session_factory.begin() as session:
-                self._save_bucket(session, ProviderConfigRecord, "providers", data, original, versions)
-                self._save_bucket(session, CustomProviderRecord, "custom_providers", data, original, versions)
-                active_value = data.get("active_model", {})
-                if active_value != original.get("active_model", {}):
-                    expected = int(versions["active_model"])
-                    if expected:
-                        result = session.execute(
-                            update(PlatformSettingRecord)
-                            .where(PlatformSettingRecord.setting_key == "active_model", PlatformSettingRecord.version == expected)
-                            .values(value=active_value, version=expected + 1)
-                        )
-                        if result.rowcount != 1:
-                            raise ConcurrentProviderUpdateError("Provider configuration changed concurrently; retry the request")
-                    else:
-                        session.add(PlatformSettingRecord(setting_key="active_model", value=active_value))
+            with self.session_factory.begin() as owned_session:
+                self.save_in_session(owned_session, data)
         except IntegrityError as exc:
             raise ConcurrentProviderUpdateError("Provider configuration changed concurrently; retry the request") from exc
+
+    def save_in_session(self, session: Session, data: dict[str, Any]) -> None:
+        original = data.original if isinstance(data, ProviderState) else EMPTY_STATE
+        versions = data.versions if isinstance(data, ProviderState) else {"providers": {}, "custom_providers": {}, "active_model": 0}
+        self._save_bucket(session, ProviderConfigRecord, "providers", data, original, versions)
+        self._save_bucket(session, CustomProviderRecord, "custom_providers", data, original, versions)
+        active_value = data.get("active_model", {})
+        if active_value != original.get("active_model", {}):
+            expected = int(versions["active_model"])
+            if expected:
+                result = session.execute(update(PlatformSettingRecord).where(PlatformSettingRecord.setting_key == "active_model", PlatformSettingRecord.version == expected).values(value=active_value, version=expected + 1))
+                if result.rowcount != 1:
+                    raise ConcurrentProviderUpdateError("Provider configuration changed concurrently; retry the request")
+            else:
+                session.add(PlatformSettingRecord(setting_key="active_model", value=active_value))
+        session.flush()
 
     @staticmethod
     def _save_bucket(session: Session, model: type, bucket: str, data: dict[str, Any], original: dict[str, Any], versions: dict[str, Any]) -> None:

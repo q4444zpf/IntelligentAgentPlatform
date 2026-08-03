@@ -31,6 +31,7 @@ def client(tmp_path):
     app = FastAPI()
     app.state.allow_dev_identity = True
     app.include_router(create_router(service), prefix="/api/tools")
+    app.state.tool_service = service
     with TestClient(app) as test_client:
         yield test_client
 
@@ -74,11 +75,22 @@ def test_tool_registry_requires_authentication(client):
 
 def test_regular_user_cannot_toggle_tool(client):
     response = client.patch(
-        "/api/tools/system.get_current_time/toggle", headers=AUTH_HEADERS
+        "/api/tools/system.get_current_time/toggle",
+        headers={**AUTH_HEADERS, "X-Request-ID": "tool-denied-1"},
     )
 
     assert response.status_code == 403
     assert response.json() == {"detail": "Administrator permission is required"}
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+    with client.app.state.tool_service.store.session_factory() as session:
+        event = session.scalar(select(AuditEvent))
+    assert event.source == "tool"
+    assert event.status == "failed"
+    assert event.error_code == "PERMISSION_DENIED"
+    assert event.resource_id == "system.get_current_time"
+    assert event.metadata_json == {}
+    assert "tool-denied-1" in event.idempotency_key
 
 
 def test_authenticated_regular_user_can_read_tools(client):
@@ -174,3 +186,39 @@ def test_tool_invocations_return_not_found_for_missing_run(tmp_path):
     )
 
     assert response.status_code == 404
+
+def test_toggle_commits_tool_and_management_audit_together(tmp_path):
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+    from app.core.request_context import RequestContext
+
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'tool-audit.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    service = ToolService(ToolStore(factory))
+    context = RequestContext(unit_id="unit-1", project_id="p1", user_id="u1")
+    with factory() as session:
+        result = service.toggle("system.get_current_time", context=context, session=session, request_id="tool-toggle-1")
+        event = session.scalar(select(AuditEvent))
+    assert result.enabled is False
+    assert event.action == "resource.disabled"
+    assert event.source == "tool"
+    assert event.resource_id == "system.get_current_time"
+
+
+def test_toggle_rolls_back_when_audit_recorder_fails(tmp_path):
+    from app.audit.recorder import AuditRecorder
+    from app.core.request_context import RequestContext
+
+    class FailingRecorder(AuditRecorder):
+        def record(self, session, request):
+            raise RuntimeError("audit unavailable")
+
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'tool-audit-fail.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    service = ToolService(ToolStore(factory), audit_recorder=FailingRecorder())
+    context = RequestContext(unit_id="unit-1", project_id="p1", user_id="u1")
+    with factory() as session, pytest.raises(RuntimeError, match="audit unavailable"):
+        service.toggle("system.get_current_time", context=context, session=session, request_id="tool-toggle-rollback")
+    assert ToolService(ToolStore(factory)).get("system.get_current_time").enabled is True

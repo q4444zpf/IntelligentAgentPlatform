@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import shutil
 import os
+from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
+from app.audit.recorder import AuditRecorder, AuditRecordRequest
+from app.core.request_context import RequestContext
 from app.skills.service import SkillNotFoundError, SkillService
 from app.tools.service import ToolNotFoundError, ToolService, ToolValidationError
 from app.tools.store import ToolStore
@@ -69,11 +74,13 @@ class AgentService:
         skill_service: SkillService | None = None,
         tool_service: ToolService | None = None,
         workspace_root: str | Path | None = None,
+        audit_recorder: AuditRecorder | None = None,
     ):
         self.store = store or AgentStore()
         self.skill_service = skill_service or SkillService()
         self._tool_service = tool_service
         default_workspace = Path(__file__).resolve().parents[2] / "data" / "agent-workspaces"
+        self.audit_recorder = audit_recorder or AuditRecorder()
         self.workspace_root = Path(workspace_root or os.getenv("AGENT_WORKSPACE_ROOT", default_workspace)).resolve()
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self._ensure_default_agent()
@@ -94,6 +101,25 @@ class AgentService:
             raise AgentValidationError(str(error)) from error
         except AgentStoreProtectedError as error:
             raise AgentProtectedError(str(error)) from error
+
+    def _commit_management(self, context: RequestContext, session: Session, request_id: str | None, *, action: str, agent_id: str, name: str, risk_level: str = "medium", metadata: dict | None = None) -> None:
+        metadata = metadata or {}
+        try:
+            self.audit_recorder.record(session, AuditRecordRequest(
+                unit_id=context.unit_id, project_id=context.project_id,
+                user_id=context.user_id, actor_role=context.role,
+                category="management", source="agent", action=action,
+                status="succeeded", risk_level=risk_level,
+                resource_type="agent", resource_id=agent_id, resource_name=name,
+                summary=f"Agent {agent_id} management operation succeeded",
+                metadata=metadata, allowed_metadata_keys=frozenset(metadata),
+                idempotency_key=f"management:{request_id or agent_id}:{action}:{agent_id}",
+                occurred_at=datetime.now(UTC),
+            ))
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
 
     def _info(
         self,
@@ -211,15 +237,18 @@ class AgentService:
             raise AgentNotFoundError(pointer.agent_id or BUILTIN_AGENT_ID)
         return self._info(record)
 
-    def set_default(self, agent_id: str) -> AgentInfo:
+    def set_default(self, agent_id: str, *, context: RequestContext | None = None, session: Session | None = None, request_id: str | None = None) -> AgentInfo:
         self._ensure_default_agent()
         pointer = self.store.get_default_id()
-        record = self._call_store_mutation(
-            lambda: self.store.set_default_agent(
-                agent_id,
-                expected_version=pointer.version,
-            )
-        )
+        if context is None or session is None:
+            record = self._call_store_mutation(lambda: self.store.set_default_agent(agent_id, expected_version=pointer.version))
+        else:
+            try:
+                record = self._call_store_mutation(lambda: self.store.set_default_agent_in_session(session, agent_id, pointer.version))
+                self._commit_management(context, session, request_id, action="resource.updated", agent_id=agent_id, name=record["name"], risk_level="high", metadata={"is_default": True})
+            except Exception:
+                session.rollback()
+                raise
         return self._info(record, default_id=agent_id)
 
     def _initialize_workspace(self, agent_id: str, config: AgentConfig) -> Path:
@@ -231,7 +260,7 @@ class AgentService:
         )
         return workspace
 
-    def create(self, request: AgentCreateRequest) -> AgentInfo:
+    def create(self, request: AgentCreateRequest, *, context: RequestContext | None = None, session: Session | None = None, request_id: str | None = None) -> AgentInfo:
         self._ensure_default_agent()
         if self.store.get(request.id):
             raise AgentConflictError(f"Agent '{request.id}' already exists")
@@ -239,43 +268,81 @@ class AgentService:
         self._validate_tools(request.tool_ids)
         config = AgentConfig(**request.model_dump(exclude={"id"}))
         workspace = self._initialize_workspace(request.id, config)
+        if context is None or session is None:
+            try:
+                record = self.store.create(request.id, config.model_dump(), str(workspace))
+            except IntegrityError as error:
+                shutil.rmtree(workspace, ignore_errors=True)
+                raise AgentConflictError(f"Agent '{request.id}' already exists") from error
+            return self._info(record)
         try:
-            record = self.store.create(request.id, config.model_dump(), str(workspace))
+            record = self.store.create_in_session(session, request.id, config.model_dump(), str(workspace))
+            self.audit_recorder.record(session, AuditRecordRequest(
+                unit_id=context.unit_id, project_id=context.project_id, user_id=context.user_id,
+                actor_role=context.role, category="management", source="agent",
+                action="resource.created", status="succeeded", risk_level="medium",
+                resource_type="agent", resource_id=request.id, resource_name=config.name,
+                summary=f"Agent {request.id} was created", metadata={"runtime_form": config.runtime_form, "enabled": config.enabled},
+                allowed_metadata_keys=frozenset({"runtime_form", "enabled"}),
+                idempotency_key=f"management:{request_id or request.id}:agent.create:{request.id}", occurred_at=datetime.now(UTC),
+            ))
+            session.commit()
         except IntegrityError as error:
+            session.rollback()
             shutil.rmtree(workspace, ignore_errors=True)
             raise AgentConflictError(f"Agent '{request.id}' already exists") from error
+        except Exception:
+            session.rollback()
+            shutil.rmtree(workspace, ignore_errors=True)
+            raise
         return self._info(record)
 
-    def update(self, agent_id: str, request: AgentConfig) -> AgentInfo:
+    def update(self, agent_id: str, request: AgentConfig, *, context: RequestContext | None = None, session: Session | None = None, request_id: str | None = None) -> AgentInfo:
         self._ensure_default_agent()
         self._validate_skills(request.skill_names)
         self._validate_tools(request.tool_ids)
-        record = self._call_store_mutation(
-            lambda: self.store.update_agent(agent_id, request.model_dump())
-        )
+        if context is None or session is None:
+            record = self._call_store_mutation(lambda: self.store.update_agent(agent_id, request.model_dump()))
+        else:
+            record = self._call_store_mutation(lambda: self.store.update_agent_in_session(session, agent_id, request.model_dump()))
         workspace = Path(record["workspace_dir"])
+        agents_file = workspace / "AGENTS.md"
+        previous = agents_file.read_bytes() if agents_file.is_file() else None
         if workspace.is_dir():
-            (workspace / "AGENTS.md").write_text(
+            agents_file.write_text(
                 f"# {request.name}\n\n{request.system_prompt or request.description}\n",
                 encoding="utf-8",
             )
+        if context is not None and session is not None:
+            try:
+                self._commit_management(context, session, request_id, action="resource.updated", agent_id=agent_id, name=request.name, metadata={"runtime_form": request.runtime_form, "enabled": request.enabled})
+            except Exception:
+                if previous is None:
+                    agents_file.unlink(missing_ok=True)
+                else:
+                    agents_file.write_bytes(previous)
+                raise
         return self._info(record)
 
-    def set_enabled(self, agent_id: str, enabled: bool) -> AgentInfo:
+    def set_enabled(self, agent_id: str, enabled: bool, *, context: RequestContext | None = None, session: Session | None = None, request_id: str | None = None) -> AgentInfo:
         self._ensure_default_agent()
-        record = self._call_store_mutation(
-            lambda: self.store.set_enabled_agent(agent_id, enabled)
-        )
+        if context is None or session is None:
+            record = self._call_store_mutation(lambda: self.store.set_enabled_agent(agent_id, enabled))
+        else:
+            record = self._call_store_mutation(lambda: self.store.set_enabled_agent_in_session(session, agent_id, enabled))
+            self._commit_management(context, session, request_id, action="resource.enabled" if enabled else "resource.disabled", agent_id=agent_id, name=record["name"], metadata={"enabled": enabled})
         return self._info(record)
 
-    def set_pinned(self, agent_id: str, pinned: bool) -> AgentInfo:
+    def set_pinned(self, agent_id: str, pinned: bool, *, context: RequestContext | None = None, session: Session | None = None, request_id: str | None = None) -> AgentInfo:
         self._ensure_default_agent()
-        record = self.store.set_pinned(agent_id, pinned)
+        record = self.store.set_pinned(agent_id, pinned) if context is None or session is None else self.store.set_pinned_in_session(session, agent_id, pinned)
         if not record:
             raise AgentNotFoundError(agent_id)
+        if context is not None and session is not None:
+            self._commit_management(context, session, request_id, action="resource.updated", agent_id=agent_id, name=record["name"], metadata={"pinned": pinned})
         return self._info(record)
 
-    def copy(self, source_id: str, request: AgentCopyRequest) -> AgentInfo:
+    def copy(self, source_id: str, request: AgentCopyRequest, *, context: RequestContext | None = None, session: Session | None = None, request_id: str | None = None) -> AgentInfo:
         self._ensure_default_agent()
         source = self.store.get(source_id)
         if not source:
@@ -284,16 +351,38 @@ class AgentService:
         config["name"] = request.name
         config["skill_names"] = config["skill_names"] if request.copy_skills else []
         config["enabled"] = False
-        return self.create(AgentCreateRequest(id=request.id, **config))
+        return self.create(AgentCreateRequest(id=request.id, **config), context=context, session=session, request_id=request_id)
 
-    def delete(self, agent_id: str) -> None:
+    def delete(self, agent_id: str, *, context: RequestContext | None = None, session: Session | None = None, request_id: str | None = None) -> None:
         self._ensure_default_agent()
-        record = self._call_store_mutation(
-            lambda: self.store.delete_agent(
-                agent_id,
-                builtin_agent_id=BUILTIN_AGENT_ID,
-            )
-        )
-        workspace = Path(record["workspace_dir"]).resolve()
+        if context is None or session is None:
+            record = self._call_store_mutation(lambda: self.store.delete_agent(agent_id, builtin_agent_id=BUILTIN_AGENT_ID))
+            workspace = Path(record["workspace_dir"]).resolve()
+            if workspace.parent == self.workspace_root and workspace.is_dir():
+                shutil.rmtree(workspace)
+            return
+        existing = self.store.get(agent_id)
+        if existing is None:
+            raise AgentNotFoundError(agent_id)
+        workspace = Path(existing["workspace_dir"]).resolve()
+        quarantine = None
         if workspace.parent == self.workspace_root and workspace.is_dir():
-            shutil.rmtree(workspace)
+            quarantine = workspace.with_name(f".{workspace.name}.quarantine-{uuid4().hex}")
+            workspace.rename(quarantine)
+        try:
+            record = self._call_store_mutation(lambda: self.store.delete_agent_in_session(session, agent_id, builtin_agent_id=BUILTIN_AGENT_ID))
+            self.audit_recorder.record(session, AuditRecordRequest(
+                unit_id=context.unit_id, project_id=context.project_id, user_id=context.user_id,
+                actor_role=context.role, category="management", source="agent", action="resource.deleted",
+                status="succeeded", risk_level="high", resource_type="agent", resource_id=agent_id,
+                resource_name=record["name"], summary=f"Agent {agent_id} was deleted",
+                idempotency_key=f"management:{request_id or agent_id}:agent.delete:{agent_id}", occurred_at=datetime.now(UTC),
+            ))
+            session.commit()
+        except Exception:
+            session.rollback()
+            if quarantine is not None and quarantine.is_dir() and not workspace.exists():
+                quarantine.rename(workspace)
+            raise
+        if quarantine is not None and quarantine.is_dir():
+            shutil.rmtree(quarantine)

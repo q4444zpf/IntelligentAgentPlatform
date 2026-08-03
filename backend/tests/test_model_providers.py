@@ -202,3 +202,24 @@ def test_probes_and_persists_multimodal_capability(tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+def test_configure_commits_provider_and_redacted_audit_together(tmp_path):
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+    from app.core.request_context import RequestContext
+
+    store = provider_store(tmp_path / "provider-audit.db")
+    context = RequestContext(unit_id="unit-1", project_id="p1", user_id="u1")
+    service = ProviderService(store)
+    with store.session_factory() as session:
+        service.configure(
+            "ollama",
+            ProviderConfigRequest(base_url="http://127.0.0.1:11434/v1", api_key="top-secret-key", custom_headers={"Authorization": "Bearer hidden"}, enabled=True),
+            context=context, session=session, request_id="provider-configure-1",
+        )
+        event = session.scalar(select(AuditEvent))
+    serialized = f"{event.summary} {event.metadata_json}"
+    assert event.action == "resource.updated"
+    assert event.source == "llm"
+    assert "top-secret-key" not in serialized
+    assert "Bearer hidden" not in serialized

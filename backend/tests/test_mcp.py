@@ -10,6 +10,9 @@ from app.mcp.service import McpService
 from app.mcp.store import McpStore
 from app.db.base import Base
 
+AUTH_HEADERS = {"X-Unit-ID": "unit-1", "X-User-ID": "u1", "X-Project-ID": "p1", "X-User-Role": "admin"}
+
+
 
 @pytest.fixture
 def client(tmp_path):
@@ -51,8 +54,9 @@ def client(tmp_path):
         http_client=httpx.Client(transport=httpx.MockTransport(remote_handler)),
     )
     app = FastAPI()
+    app.state.allow_dev_identity = True
     app.include_router(create_router(service), prefix="/api/mcp")
-    with TestClient(app) as test_client:
+    with TestClient(app, headers=AUTH_HEADERS) as test_client:
         yield test_client
 
 
@@ -156,3 +160,34 @@ def test_deletes_client(client):
     deleted = client.delete("/api/mcp/water-data")
     assert deleted.status_code == 200
     assert client.get("/api/mcp/water-data").status_code == 404
+
+def test_create_commits_mcp_and_redacted_management_audit_together(tmp_path):
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+    from app.core.request_context import RequestContext
+    from app.mcp.schemas import McpClientCreate
+
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'mcp-audit.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    service = McpService(McpStore(factory))
+    context = RequestContext(unit_id="unit-1", project_id="p1", user_id="u1")
+    secret = "Bearer secret-token"
+    with factory() as session:
+        service.create(McpClientCreate.model_validate(remote_payload()), context=context, session=session, request_id="mcp-create-1")
+        event = session.scalar(select(AuditEvent))
+    assert event.action == "resource.created"
+    assert event.source == "mcp"
+    assert secret not in event.summary
+    assert secret not in str(event.metadata_json)
+
+def test_mcp_create_route_requires_request_context(tmp_path):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'mcp-auth.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    app = FastAPI()
+    app.state.allow_dev_identity = True
+    app.include_router(create_router(McpService(McpStore(factory))), prefix="/api/mcp")
+    with TestClient(app) as unauthenticated:
+        response = unauthenticated.post("/api/mcp", json=remote_payload())
+    assert response.status_code == 401

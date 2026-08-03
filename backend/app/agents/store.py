@@ -265,6 +265,63 @@ class AgentStore:
             session.refresh(target)
             return self._decode(target)
 
+    def set_default_agent_in_session(self, session: Session, agent_id: str, expected_version: int) -> dict[str, Any]:
+        pointer = self._lock_default_pointer(session)
+        current_version = pointer.version if pointer is not None else 0
+        if current_version != expected_version:
+            raise AgentConcurrentUpdateError("Default agent changed concurrently; retry the request")
+        target = self._lock_agent(session, agent_id)
+        if target is None:
+            raise AgentStoreNotFoundError(agent_id)
+        if not target.config.get("enabled", False):
+            raise AgentStoreValidationError(f"Disabled agent '{agent_id}' cannot be the default")
+        value = {"agent_id": agent_id, "scope": "platform"}
+        if pointer is None:
+            session.add(PlatformSettingRecord(setting_key=DEFAULT_SETTING_KEY, value=value))
+        else:
+            pointer.value = value
+            pointer.version = current_version + 1
+        session.flush()
+        session.refresh(target)
+        return self._decode(target)
+
+    def update_agent_in_session(self, session: Session, agent_id: str, config: dict[str, Any]) -> dict[str, Any]:
+        pointer = self._lock_default_pointer(session)
+        default_id = self._decode_default_agent_id(pointer)
+        target = self._lock_agent(session, agent_id)
+        if target is None:
+            raise AgentStoreNotFoundError(agent_id)
+        if not config.get("enabled", False) and default_id == agent_id:
+            raise AgentStoreProtectedError(f"Default agent '{agent_id}' cannot be disabled")
+        target.config = config
+        session.flush()
+        session.refresh(target)
+        return self._decode(target)
+
+    def set_enabled_agent_in_session(self, session: Session, agent_id: str, enabled: bool) -> dict[str, Any]:
+        pointer = self._lock_default_pointer(session)
+        default_id = self._decode_default_agent_id(pointer)
+        target = self._lock_agent(session, agent_id)
+        if target is None:
+            raise AgentStoreNotFoundError(agent_id)
+        if not enabled and default_id == agent_id:
+            raise AgentStoreProtectedError(f"Default agent '{agent_id}' cannot be disabled")
+        config = dict(target.config)
+        config["enabled"] = enabled
+        target.config = config
+        session.flush()
+        session.refresh(target)
+        return self._decode(target)
+
+    def set_pinned_in_session(self, session: Session, agent_id: str, pinned: bool) -> dict[str, Any] | None:
+        row = session.get(ManagedAgentRecord, agent_id)
+        if row is None:
+            return None
+        row.pinned = pinned
+        session.flush()
+        session.refresh(row)
+        return self._decode(row)
+
     def delete_agent(
         self,
         agent_id: str,
@@ -291,10 +348,31 @@ class AgentStore:
             session.flush()
             return record
 
+    def delete_agent_in_session(self, session: Session, agent_id: str, *, builtin_agent_id: str) -> dict[str, Any]:
+        pointer = self._lock_default_pointer(session)
+        default_id = self._decode_default_agent_id(pointer)
+        target = self._lock_agent(session, agent_id)
+        if target is None:
+            raise AgentStoreNotFoundError(agent_id)
+        if agent_id == builtin_agent_id:
+            raise AgentStoreProtectedError(f"Built-in agent '{agent_id}' cannot be deleted")
+        if default_id == agent_id:
+            raise AgentStoreProtectedError(f"Default agent '{agent_id}' cannot be deleted")
+        record = self._decode(target)
+        session.delete(target)
+        session.flush()
+        return record
+
+    def create_in_session(self, session: Session, agent_id: str, config: dict[str, Any], workspace_dir: str) -> dict[str, Any]:
+        row = ManagedAgentRecord(agent_id=agent_id, config=config, workspace_dir=workspace_dir, pinned=False)
+        session.add(row)
+        session.flush()
+        session.refresh(row)
+        return self._decode(row)
+
     def create(self, agent_id: str, config: dict[str, Any], workspace_dir: str) -> dict[str, Any]:
         with self.session_factory.begin() as session:
-            session.add(ManagedAgentRecord(agent_id=agent_id, config=config, workspace_dir=workspace_dir, pinned=False))
-        return self.get(agent_id)
+            return self.create_in_session(session, agent_id, config, workspace_dir)
 
     def update(self, agent_id: str, config: dict[str, Any]) -> dict[str, Any] | None:
         with self.session_factory.begin() as session:
