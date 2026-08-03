@@ -34,7 +34,7 @@ python -m uvicorn app.main:app --reload --port 8000
 
 `GET /api/agent-runs` 仅查询请求身份所属的当前项目和当前用户数据，支持 `page`、`page_size` 分页（`page_size` 最大为 100），以及 `status`、`actor_id`、`query`、`started_after`、`started_before` 筛选。响应包含当前筛选范围的分页记录、总数和状态/工具调用汇总；`query` 匹配会话标题或 Run ID，`started_after` 和 `started_before` 必须使用包含 `Z` 或明确时区偏移的 timezone-aware ISO 8601 时间，且须满足 `started_after <= started_before`。
 
-运行详情继续复用既有的 `GET /api/agent-runs/{run_id}`、`GET /api/agent-runs/{run_id}/events` 和 `GET /api/agent-runs/{run_id}/tool-invocations`。这些接口沿用相同的项目与用户范围隔离；工具调用接口只返回参数摘要、结果摘要、错误码和耗时等审计字段，不返回原始凭据或密码。
+运行详情继续复用既有的 `GET /api/agent-runs/{run_id}`、`GET /api/agent-runs/{run_id}/events` 和 `GET /api/agent-runs/{run_id}/tool-invocations`。这些接口沿用相同的项目与用户范围隔离；工具调用接口返回 Tool Gateway 按敏感字段名脱敏后持久化的 `arguments_summary`、`result_summary` 及错误码、耗时等审计字段。调用方仍须避免把秘密放在非敏感字段中，审计接口不应作为秘密存储。
 
 当前生产 Dispatcher 会让新 Run 保持 `queued`，不会伪造智能体回复或沙箱运行状态。
 
