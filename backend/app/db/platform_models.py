@@ -54,6 +54,7 @@ class McpClientRecord(Base):
     tool_records: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
     whitelist: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     last_synced_at: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

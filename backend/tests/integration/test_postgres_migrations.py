@@ -62,6 +62,10 @@ def test_upgrade_head_creates_conversation_tables():
     audit_columns = {
         column["name"]: column for column in inspector.get_columns("audit_events")
     }
+    mcp_columns = {
+        column["name"]: column for column in inspector.get_columns("mcp_clients")
+    }
+    assert mcp_columns["version"]["nullable"] is False
     assert audit_columns["unit_id"]["nullable"] is False
     assert audit_columns["metadata_json"]["nullable"] is False
     audit_constraints = inspector.get_unique_constraints("audit_events")

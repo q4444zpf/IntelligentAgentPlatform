@@ -12,7 +12,7 @@ from app.audit.management import management_event_id, management_trace_id
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.core.request_context import RequestContext
 from .schemas import McpClientConfig, McpClientCreate, McpClientInfo, McpToolInfo
-from .store import McpStore
+from .store import McpConcurrentUpdateError, McpStore
 
 
 MASK = "********"
@@ -41,6 +41,15 @@ class McpService:
         self.http_client = http_client or httpx.Client(timeout=15, follow_redirects=False)
         self.audit_recorder = audit_recorder or AuditRecorder()
 
+    @staticmethod
+    def _cas(operation):
+        try:
+            record = operation()
+        except McpConcurrentUpdateError as error:
+            raise McpConflictError(str(error)) from error
+        if record is None:
+            raise McpNotFoundError("MCP client")
+        return record
     def _info(self, record: dict) -> McpClientInfo:
         whitelist = record["tools"]
         tools = record["tool_records"]
@@ -133,9 +142,9 @@ class McpService:
             if value == MASK and header in current["headers"]:
                 config["headers"][header] = current["headers"][header]
         if context is None or session is None:
-            record = self.store.update_config(key, config)
+            record = self._cas(lambda: self.store.update_config(key, config, current["version"]))
         else:
-            record = self.store.update_in_session(session, key, config=config)
+            record = self._cas(lambda: self.store.update_in_session(session, key, expected_version=current["version"], config=config))
             self._commit_management(context, session, request_id, action="resource.updated", key=key, name=request.name, metadata={"transport": request.transport, "enabled": request.enabled})
         return self._info(record)
 
@@ -146,9 +155,9 @@ class McpService:
         config = {name: current[name] for name in McpClientConfig.model_fields}
         config["enabled"] = not config["enabled"]
         if context is None or session is None:
-            record = self.store.update_config(key, config)
+            record = self._cas(lambda: self.store.update_config(key, config, current["version"]))
         else:
-            record = self.store.update_in_session(session, key, config=config)
+            record = self._cas(lambda: self.store.update_in_session(session, key, expected_version=current["version"], config=config))
             self._commit_management(context, session, request_id, action="resource.enabled" if config["enabled"] else "resource.disabled", key=key, name=current["name"], metadata={"enabled": config["enabled"]})
         return self._info(record)
 
@@ -200,9 +209,9 @@ class McpService:
             raise McpValidationError(f"Unable to synchronize MCP tools: {error}") from error
         synced_at = datetime.now(UTC).isoformat()
         if context is None or session is None:
-            self.store.update_tools(key, tools, synced_at)
+            self._cas(lambda: self.store.update_tools(key, tools, synced_at, record["version"]))
         else:
-            self.store.update_in_session(session, key, tool_records=tools, last_synced_at=synced_at)
+            self._cas(lambda: self.store.update_in_session(session, key, expected_version=record["version"], tool_records=tools, last_synced_at=synced_at))
             self._commit_management(context, session, request_id, action="resource.updated", key=key, name=record["name"], metadata={"tool_count": len(tools)})
         return self.list_tools(key)
 
@@ -215,8 +224,8 @@ class McpService:
         if unknown:
             raise McpValidationError(f"Unknown MCP tools: {', '.join(sorted(unknown))}")
         if context is None or session is None:
-            self.store.update_whitelist(key, tools)
+            self._cas(lambda: self.store.update_whitelist(key, tools, record["version"]))
         else:
-            self.store.update_in_session(session, key, whitelist=tools)
+            self._cas(lambda: self.store.update_in_session(session, key, expected_version=record["version"], whitelist=tools))
             self._commit_management(context, session, request_id, action="resource.permission_changed", key=key, name=record["name"], risk_level="high", metadata={"tool_count": len(tools or [])})
         return self.list_tools(key)

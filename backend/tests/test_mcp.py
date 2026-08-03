@@ -6,6 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.mcp.router import create_router
+from app.mcp.schemas import McpClientConfig, McpClientCreate
 from app.mcp.service import McpService
 from app.mcp.store import McpStore
 from app.db.base import Base
@@ -274,3 +275,54 @@ def test_repeated_mcp_whitelist_without_request_id_records_each_mutation(client)
         )))
     assert len(events) == 2
     assert len({event.idempotency_key for event in events}) == 2
+
+
+def test_mcp_store_rejects_stale_config_update(tmp_path):
+    from app.mcp.store import McpConcurrentUpdateError
+
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'mcp-cas.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    store = McpStore(factory)
+    request = McpClientCreate.model_validate(remote_payload())
+    created = store.create("water-data", request.model_dump(exclude={"key"}))
+    first_config = {key: created[key] for key in McpClientConfig.model_fields}
+    second_config = dict(first_config)
+    first_config["name"] = "First winner"
+    second_config["enabled"] = False
+    assert store.update_config("water-data", first_config, created["version"])["name"] == "First winner"
+    with pytest.raises(McpConcurrentUpdateError, match="concurrently"):
+        store.update_config("water-data", second_config, created["version"])
+    current = store.get("water-data")
+    assert current["name"] == "First winner"
+    assert current["enabled"] is True
+
+
+def test_sync_rejects_stale_result_after_concurrent_config_update(client):
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+    from app.mcp.schemas import McpClientConfig, McpClientCreate
+
+    assert client.post("/api/mcp", json=remote_payload()).status_code == 201
+    service = client.app.state.mcp_service
+
+    def concurrent_handler(_request: httpx.Request) -> httpx.Response:
+        snapshot = service.store.get("water-data")
+        config = {key: snapshot[key] for key in McpClientConfig.model_fields}
+        config["enabled"] = False
+        service.store.update_config("water-data", config, snapshot["version"])
+        return httpx.Response(200, json={"result": {"tools": [{"name": "stale-tool"}]}})
+
+    service.http_client = httpx.Client(transport=httpx.MockTransport(concurrent_handler))
+    response = client.post(
+        "/api/mcp/water-data/tools/sync",
+        headers={"X-Request-ID": "sync-stale-correlation"},
+    )
+    assert response.status_code == 409
+    current = service.store.get("water-data")
+    assert current["enabled"] is False
+    assert current["tool_records"] == []
+    with service.store.session_factory() as session:
+        event = session.scalar(select(AuditEvent).where(AuditEvent.status == "failed"))
+    assert event.error_code == "MCP_CONFLICT"
+    assert event.trace_id == "sync-stale-correlation"

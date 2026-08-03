@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.database import SessionFactory
 from app.db.platform_models import McpClientRecord
+
+
+class McpConcurrentUpdateError(Exception):
+    pass
 
 
 class McpStore:
@@ -23,6 +27,7 @@ class McpStore:
             "tool_records": row.tool_records,
             "tools": row.whitelist,
             "last_synced_at": row.last_synced_at,
+            "version": row.version,
             "created_at": row.created_at,
             "updated_at": row.updated_at,
         }
@@ -47,29 +52,53 @@ class McpStore:
         session.refresh(row)
         return self._decode(row)
 
-    def update_config(self, key: str, config: dict[str, Any]) -> dict[str, Any] | None:
-        return self._update(key, config=config)
+    def update_config(self, key: str, config: dict[str, Any], expected_version: int) -> dict[str, Any] | None:
+        return self._update(key, expected_version=expected_version, config=config)
 
-    def update_tools(self, key: str, tools: list[dict[str, Any]], synced_at: str) -> dict[str, Any] | None:
-        return self._update(key, tool_records=tools, last_synced_at=synced_at)
-    def update_in_session(self, session: Session, key: str, **values: Any) -> dict[str, Any] | None:
-        row = session.get(McpClientRecord, key)
-        if row is None:
-            return None
-        for name, value in values.items():
-            setattr(row, name, value)
-        session.flush()
-        session.refresh(row)
-        return self._decode(row)
+    def update_tools(self, key: str, tools: list[dict[str, Any]], synced_at: str, expected_version: int) -> dict[str, Any] | None:
+        return self._update(
+            key,
+            expected_version=expected_version,
+            tool_records=tools,
+            last_synced_at=synced_at,
+        )
 
+    def update_in_session(
+        self,
+        session: Session,
+        key: str,
+        *,
+        expected_version: int,
+        **values: Any,
+    ) -> dict[str, Any] | None:
+        result = session.execute(
+            update(McpClientRecord)
+            .where(
+                McpClientRecord.client_key == key,
+                McpClientRecord.version == expected_version,
+            )
+            .values(**values, version=expected_version + 1)
+        )
+        if result.rowcount != 1:
+            if session.get(McpClientRecord, key) is None:
+                return None
+            raise McpConcurrentUpdateError(
+                "MCP client changed concurrently; retry the request"
+            )
+        session.expire_all()
+        return self._decode(session.get(McpClientRecord, key))
 
-    def update_whitelist(self, key: str, tools: list[str] | None) -> dict[str, Any] | None:
-        return self._update(key, whitelist=tools)
+    def update_whitelist(self, key: str, tools: list[str] | None, expected_version: int) -> dict[str, Any] | None:
+        return self._update(key, expected_version=expected_version, whitelist=tools)
 
-    def _update(self, key: str, **values: Any) -> dict[str, Any] | None:
+    def _update(self, key: str, *, expected_version: int, **values: Any) -> dict[str, Any] | None:
         with self.session_factory.begin() as session:
-            return self.update_in_session(session, key, **values)
-
+            return self.update_in_session(
+                session,
+                key,
+                expected_version=expected_version,
+                **values,
+            )
     def delete(self, key: str) -> bool:
         with self.session_factory.begin() as session:
             row = session.get(McpClientRecord, key)
