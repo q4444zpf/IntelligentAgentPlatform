@@ -14,8 +14,12 @@ from app.db.platform_models import PlatformSettingRecord, RegisteredToolRecord
 from app.skills.schemas import SkillCreateRequest
 from app.skills.service import SkillService
 
-AUTH_HEADERS = {"X-Unit-ID": "unit-1", "X-User-ID": "u1", "X-Project-ID": "p1", "X-User-Role": "admin"}
-
+AUTH_HEADERS = {
+    "X-Unit-ID": "unit-1",
+    "X-User-ID": "u1",
+    "X-Project-ID": "p1",
+    "X-User-Role": "admin",
+}
 
 
 class CountingAgentStore(AgentStore):
@@ -106,20 +110,24 @@ def client(tmp_path):
         SkillCreateRequest(
             name="flood-forecast",
             description="洪水预报",
-            content='''---
+            content="""---
 name: flood-forecast
 description: 洪水预报
 version: "1.0"
 ---
 # 洪水预报
-''',
+""",
             tags=["水文"],
         )
     )
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'agents.db'}")
     Base.metadata.create_all(engine)
-    store = AgentStore(sessionmaker(bind=engine, expire_on_commit=False, class_=Session))
-    service = AgentService(store, skill_service=skill_service, workspace_root=tmp_path / "agent-workspaces")
+    store = AgentStore(
+        sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    )
+    service = AgentService(
+        store, skill_service=skill_service, workspace_root=tmp_path / "agent-workspaces"
+    )
     app = FastAPI()
     app.state.allow_dev_identity = True
     app.include_router(create_router(service), prefix="/api/agents")
@@ -276,8 +284,7 @@ def test_builtin_repair_uses_locked_latest_config_during_concurrent_update(tmp_p
     stale["tool_ids"] = []
 
     latest_config = {
-        name: store.get(BUILTIN_AGENT_ID)[name]
-        for name in AgentConfig.model_fields
+        name: store.get(BUILTIN_AGENT_ID)[name] for name in AgentConfig.model_fields
     }
     latest_config["system_prompt"] = "管理员最新提示词"
     latest_config["model"] = "latest-model"
@@ -314,6 +321,7 @@ def test_repairs_legacy_builtin_tool_bindings_without_removing_others(tmp_path):
     ).get(BUILTIN_AGENT_ID)
 
     assert repaired.tool_ids == ["legacy.external_tool", *BUILTIN_TOOL_IDS]
+
 
 def test_creates_and_lists_runtime_specific_agent(client):
     created = client.post("/api/agents", json=agent_payload())
@@ -654,10 +662,13 @@ def test_switches_default_to_enabled_agent_atomically(client):
 
 
 def test_rejects_disabled_or_missing_default_target(client):
-    assert client.post(
+    assert (
+        client.post(
         "/api/agents",
         json=agent_payload(enabled=False),
-    ).status_code == 201
+        ).status_code
+        == 201
+    )
 
     disabled = client.put(
         "/api/agents/default",
@@ -689,32 +700,47 @@ def test_rejects_deleting_or_disabling_active_default(client):
 
 def test_old_ordinary_default_can_be_disabled_and_deleted_after_switch(client):
     assert client.post("/api/agents", json=agent_payload()).status_code == 201
-    assert client.put(
+    assert (
+        client.put(
         "/api/agents/default",
         json={"agent_id": "reservoir-dispatch"},
-    ).status_code == 200
-    assert client.patch(
+        ).status_code
+        == 200
+    )
+    assert (
+        client.patch(
         "/api/agents/reservoir-dispatch/toggle",
         json={"enabled": False},
-    ).status_code == 409
+        ).status_code
+        == 409
+    )
 
-    assert client.put(
+    assert (
+        client.put(
         "/api/agents/default",
         json={"agent_id": BUILTIN_AGENT_ID},
-    ).status_code == 200
-    assert client.patch(
+        ).status_code
+        == 200
+    )
+    assert (
+        client.patch(
         "/api/agents/reservoir-dispatch/toggle",
         json={"enabled": False},
-    ).status_code == 200
+        ).status_code
+        == 200
+    )
     assert client.delete("/api/agents/reservoir-dispatch").status_code == 200
 
 
 def test_builtin_agent_cannot_be_deleted_after_default_switch(client):
     assert client.post("/api/agents", json=agent_payload()).status_code == 201
-    assert client.put(
+    assert (
+        client.put(
         "/api/agents/default",
         json={"agent_id": "reservoir-dispatch"},
-    ).status_code == 200
+        ).status_code
+        == 200
+    )
 
     deleted = client.delete(f"/api/agents/{BUILTIN_AGENT_ID}")
 
@@ -745,7 +771,9 @@ def test_maps_concurrent_default_update_to_conflict(client, monkeypatch):
 
 
 def test_rejects_unknown_skills_and_duplicate_id(client):
-    missing = client.post("/api/agents", json=agent_payload(skill_names=["missing-skill"]))
+    missing = client.post(
+        "/api/agents", json=agent_payload(skill_names=["missing-skill"])
+    )
     assert missing.status_code == 422
     assert "missing-skill" in missing.text
 
@@ -762,13 +790,16 @@ def test_updates_toggles_and_pins_agent(client):
             name="水库联合调度智能体",
             runtime_form="web",
             context_prompt="结合当前页面的水库对象与告警信息回答。",
-        ) | {"id": None},
+        )
+        | {"id": None},
     )
     assert updated.status_code == 200
     assert updated.json()["runtime_form"] == "web"
     assert updated.json()["name"] == "水库联合调度智能体"
 
-    disabled = client.patch("/api/agents/reservoir-dispatch/toggle", json={"enabled": False})
+    disabled = client.patch(
+        "/api/agents/reservoir-dispatch/toggle", json={"enabled": False}
+    )
     assert disabled.status_code == 200
     assert disabled.json()["startup_status"] == "disabled"
 
@@ -781,7 +812,11 @@ def test_copies_agent_with_independent_identity(client):
     client.post("/api/agents", json=agent_payload())
     copied = client.post(
         "/api/agents/reservoir-dispatch/copy",
-        json={"id": "reservoir-dispatch-copy", "name": "水库调度智能体副本", "copy_skills": True},
+        json={
+            "id": "reservoir-dispatch-copy",
+            "name": "水库调度智能体副本",
+            "copy_skills": True,
+        },
     )
     assert copied.status_code == 201
     assert copied.json()["id"] == "reservoir-dispatch-copy"
@@ -797,6 +832,7 @@ def test_deletes_agent(client):
     assert deleted.status_code == 200
     assert client.get("/api/agents/reservoir-dispatch").status_code == 404
 
+
 def test_create_rolls_back_agent_and_workspace_when_audit_fails(tmp_path):
     from app.audit.recorder import AuditRecorder
     from app.core.request_context import RequestContext
@@ -809,10 +845,17 @@ def test_create_rolls_back_agent_and_workspace_when_audit_fails(tmp_path):
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
     store = AgentStore(factory)
-    service = AgentService(store, workspace_root=tmp_path / "workspaces", audit_recorder=FailingRecorder())
+    service = AgentService(
+        store, workspace_root=tmp_path / "workspaces", audit_recorder=FailingRecorder()
+    )
     context = RequestContext(unit_id="unit-1", project_id="p1", user_id="u1")
     with factory() as session, pytest.raises(RuntimeError, match="audit unavailable"):
-        service.create(AgentCreateRequest(**agent_payload(skill_names=[])), context=context, session=session, request_id="agent-create-fail")
+        service.create(
+            AgentCreateRequest(**agent_payload(skill_names=[])),
+            context=context,
+            session=session,
+            request_id="agent-create-fail",
+        )
     assert store.get("reservoir-dispatch") is None
     assert not (tmp_path / "workspaces" / "reservoir-dispatch").exists()
 
@@ -837,10 +880,16 @@ def test_delete_restores_quarantined_workspace_when_audit_fails(tmp_path):
     failing = AgentService(store, workspace_root=root, audit_recorder=FailingRecorder())
     context = RequestContext(unit_id="unit-1", project_id="p1", user_id="u1")
     with factory() as session, pytest.raises(RuntimeError, match="audit unavailable"):
-        failing.delete("reservoir-dispatch", context=context, session=session, request_id="agent-delete-fail")
+        failing.delete(
+            "reservoir-dispatch",
+            context=context,
+            session=session,
+            request_id="agent-delete-fail",
+        )
     assert store.get("reservoir-dispatch") is not None
     assert workspace.is_dir()
     assert not list(root.glob(".reservoir-dispatch.quarantine-*"))
+
 
 def test_agent_create_route_requires_request_context(tmp_path):
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'agent-auth.db'}")
@@ -848,10 +897,18 @@ def test_agent_create_route_requires_request_context(tmp_path):
     factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
     app = FastAPI()
     app.state.allow_dev_identity = True
-    app.include_router(create_router(AgentService(AgentStore(factory), workspace_root=tmp_path / "workspaces")), prefix="/api/agents")
+    app.include_router(
+        create_router(
+            AgentService(AgentStore(factory), workspace_root=tmp_path / "workspaces")
+        ),
+        prefix="/api/agents",
+    )
     with TestClient(app) as unauthenticated:
-        response = unauthenticated.post("/api/agents", json=agent_payload(skill_names=[]))
+        response = unauthenticated.post(
+            "/api/agents", json=agent_payload(skill_names=[])
+        )
     assert response.status_code == 401
+
 
 def test_protected_agent_delete_records_failed_audit_in_fresh_transaction(client):
     from sqlalchemy import select
@@ -908,16 +965,33 @@ def test_repeated_agent_pin_without_request_id_records_each_mutation(client):
     from sqlalchemy import select
     from app.audit.models import AuditEvent
 
-    assert client.post("/api/agents", json=agent_payload(skill_names=[])).status_code == 201
-    assert client.patch("/api/agents/reservoir-dispatch/pin", json={"pinned": True}).status_code == 200
-    assert client.patch("/api/agents/reservoir-dispatch/pin", json={"pinned": False}).status_code == 200
+    assert (
+        client.post("/api/agents", json=agent_payload(skill_names=[])).status_code
+        == 201
+    )
+    assert (
+        client.patch(
+            "/api/agents/reservoir-dispatch/pin", json={"pinned": True}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.patch(
+            "/api/agents/reservoir-dispatch/pin", json={"pinned": False}
+        ).status_code
+        == 200
+    )
     factory = client.app.state.agent_service.store.session_factory
     with factory() as session:
-        events = list(session.scalars(select(AuditEvent).where(
+        events = list(
+            session.scalars(
+                select(AuditEvent).where(
             AuditEvent.source == "agent",
             AuditEvent.action == "resource.updated",
             AuditEvent.resource_id == "reservoir-dispatch",
-        )))
+                )
+            )
+        )
     assert len(events) == 2
     assert len({event.idempotency_key for event in events}) == 2
 
@@ -934,19 +1008,27 @@ def test_update_restores_workspace_after_partial_write_failure(tmp_path, monkeyp
     service.create(AgentCreateRequest(**agent_payload(skill_names=[])))
     agents_file = tmp_path / "workspaces" / "reservoir-dispatch" / "AGENTS.md"
     previous = agents_file.read_bytes()
-    original_write_text = Path.write_text
+    original_write_bytes = Path.write_bytes
 
     def partial_write_then_fail(path, data, *args, **kwargs):
-        if path == agents_file:
-            path.write_bytes(b"partial")
+        if path.parent == agents_file.parent and path.name.startswith(
+            ".AGENTS.md.tmp-"
+        ):
+            original_write_bytes(path, b"partial")
             raise OSError("disk write failed")
-        return original_write_text(path, data, *args, **kwargs)
+        return original_write_bytes(path, data, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "write_text", partial_write_then_fail)
+    monkeypatch.setattr(Path, "write_bytes", partial_write_then_fail)
     updated = AgentConfig(**agent_payload(name="Changed", skill_names=[]))
     context = RequestContext(unit_id="unit-1", project_id="p1", user_id="u1")
     with factory() as session, pytest.raises(OSError, match="disk write failed"):
-        service.update("reservoir-dispatch", updated, context=context, session=session, request_id="partial-write-1")
+        service.update(
+            "reservoir-dispatch",
+            updated,
+            context=context,
+            session=session,
+            request_id="partial-write-1",
+        )
     assert agents_file.read_bytes() == previous
     assert store.get("reservoir-dispatch")["name"] != "Changed"
 
@@ -955,17 +1037,36 @@ def test_same_client_request_id_does_not_deduplicate_distinct_http_requests(clie
     from sqlalchemy import select
     from app.audit.models import AuditEvent
 
-    assert client.post("/api/agents", json=agent_payload(skill_names=[])).status_code == 201
+    assert (
+        client.post("/api/agents", json=agent_payload(skill_names=[])).status_code
+        == 201
+    )
     headers = {"X-Request-ID": "shared-correlation"}
-    assert client.patch("/api/agents/reservoir-dispatch/pin", json={"pinned": True}, headers=headers).status_code == 200
-    assert client.patch("/api/agents/reservoir-dispatch/pin", json={"pinned": False}, headers=headers).status_code == 200
+    assert (
+        client.patch(
+            "/api/agents/reservoir-dispatch/pin", json={"pinned": True}, headers=headers
+        ).status_code
+        == 200
+    )
+    assert (
+        client.patch(
+            "/api/agents/reservoir-dispatch/pin",
+            json={"pinned": False},
+            headers=headers,
+        ).status_code
+        == 200
+    )
     factory = client.app.state.agent_service.store.session_factory
     with factory() as session:
-        events = list(session.scalars(select(AuditEvent).where(
+        events = list(
+            session.scalars(
+                select(AuditEvent).where(
             AuditEvent.source == "agent",
             AuditEvent.action == "resource.updated",
             AuditEvent.resource_id == "reservoir-dispatch",
-        )))
+                )
+            )
+        )
     assert len(events) == 2
     assert {event.trace_id for event in events} == {"shared-correlation"}
     assert len({event.idempotency_key for event in events}) == 2
@@ -977,18 +1078,26 @@ def test_same_correlation_preserves_fail_then_success_statuses(client):
     from app.audit.models import AuditEvent
 
     headers = {"X-Request-ID": "retry-correlation"}
-    failed = client.patch("/api/agents/retry-agent/pin", json={"pinned": True}, headers=headers)
+    failed = client.patch(
+        "/api/agents/retry-agent/pin", json={"pinned": True}, headers=headers
+    )
     assert failed.status_code == 404
     payload = agent_payload(id="retry-agent", skill_names=[])
     assert client.post("/api/agents", json=payload).status_code == 201
-    succeeded = client.patch("/api/agents/retry-agent/pin", json={"pinned": True}, headers=headers)
+    succeeded = client.patch(
+        "/api/agents/retry-agent/pin", json={"pinned": True}, headers=headers
+    )
     assert succeeded.status_code == 200
     factory = client.app.state.agent_service.store.session_factory
     with factory() as session:
-        events = list(session.scalars(select(AuditEvent).where(
+        events = list(
+            session.scalars(
+                select(AuditEvent).where(
             AuditEvent.action == "resource.updated",
             AuditEvent.resource_id == "retry-agent",
-        )))
+                )
+            )
+        )
     assert {event.status for event in events} == {"failed", "succeeded"}
     assert {event.trace_id for event in events} == {"retry-correlation"}
 
@@ -1008,3 +1117,102 @@ def test_failed_audit_is_best_effort_and_invalid_request_id_is_safe(client):
     )
     assert response.status_code == 404
     assert "not found" in response.json()["detail"].lower()
+
+
+def test_update_rejects_workspace_outside_root_without_touching_file(client, tmp_path):
+    from app.db.platform_models import ManagedAgentRecord
+
+    assert (
+        client.post("/api/agents", json=agent_payload(skill_names=[])).status_code
+        == 201
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "AGENTS.md"
+    target.write_text("outside-safe", encoding="utf-8")
+    factory = client.app.state.agent_service.store.session_factory
+    with factory.begin() as session:
+        row = session.get(ManagedAgentRecord, "reservoir-dispatch")
+        row.workspace_dir = str(outside)
+    response = client.put(
+        "/api/agents/reservoir-dispatch",
+        json=agent_payload(name="Changed", skill_names=[]),
+    )
+    assert response.status_code == 422
+    assert target.read_text(encoding="utf-8") == "outside-safe"
+
+
+def test_update_rejects_agents_file_symlink(client, tmp_path):
+    assert (
+        client.post("/api/agents", json=agent_payload(skill_names=[])).status_code
+        == 201
+    )
+    workspace = tmp_path / "agent-workspaces" / "reservoir-dispatch"
+    agents_file = workspace / "AGENTS.md"
+    outside = tmp_path / "outside-agents.md"
+    outside.write_text("outside-safe", encoding="utf-8")
+    agents_file.unlink()
+    try:
+        agents_file.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    response = client.put(
+        "/api/agents/reservoir-dispatch",
+        json=agent_payload(name="Changed", skill_names=[]),
+    )
+    assert response.status_code == 422
+    assert outside.read_text(encoding="utf-8") == "outside-safe"
+
+
+def test_delete_cleanup_failure_keeps_successful_business_result(client, monkeypatch):
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+    import app.agents.service as agent_service_module
+
+    assert (
+        client.post("/api/agents", json=agent_payload(skill_names=[])).status_code
+        == 201
+    )
+    original_rmtree = agent_service_module.shutil.rmtree
+
+    def fail_quarantine_cleanup(path, *args, **kwargs):
+        if ".quarantine-" in str(path):
+            raise OSError("cleanup failed")
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(agent_service_module.shutil, "rmtree", fail_quarantine_cleanup)
+    response = client.delete("/api/agents/reservoir-dispatch")
+    assert response.status_code == 200
+    assert client.app.state.agent_service.store.get("reservoir-dispatch") is None
+    factory = client.app.state.agent_service.store.session_factory
+    with factory() as session:
+        event = session.scalar(
+            select(AuditEvent).where(AuditEvent.action == "resource.deleted")
+        )
+    assert event.status == "succeeded"
+
+
+def test_delete_restore_failure_does_not_mask_audit_error(client, monkeypatch):
+    from pathlib import Path
+    from app.audit.recorder import AuditRecorder
+
+    class FailingRecorder(AuditRecorder):
+        def record(self, session, request):
+            raise RuntimeError("audit unavailable")
+
+    assert (
+        client.post("/api/agents", json=agent_payload(skill_names=[])).status_code
+        == 201
+    )
+    service = client.app.state.agent_service
+    service.audit_recorder = FailingRecorder()
+    original_rename = Path.rename
+
+    def fail_restore(path, target):
+        if ".quarantine-" in path.name:
+            raise OSError("restore failed")
+        return original_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", fail_restore)
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        client.delete("/api/agents/reservoir-dispatch")
