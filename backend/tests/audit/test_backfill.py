@@ -139,6 +139,73 @@ def test_backfill_is_idempotent_and_does_not_skip_runs_at_batch_boundaries(
         ).all() == ["run-a", "run-b", "run-c"]
 
 
+@pytest.mark.parametrize(
+    ("run_status", "audit_status", "error_code"),
+    [
+        ("queued", "started", None),
+        ("running", "started", None),
+        ("completed", "succeeded", None),
+        ("failed", "failed", None),
+        ("cancelled", "cancelled", None),
+        ("corrupted-status", "failed", "unknown_agent_run_status"),
+    ],
+)
+def test_backfill_snapshots_every_run_with_a_safe_status_mapping(
+    session_factory, run_status, audit_status, error_code
+):
+    with session_factory() as session:
+        seed_run(
+            session,
+            run_id="run-status",
+            unit_id="unit-1",
+            project_id="project-1",
+            user_id="user-1",
+            status=run_status,
+        )
+        session.commit()
+
+    assert backfill_agent_run_snapshots(session_factory) == 1
+
+    with session_factory() as session:
+        event = session.scalar(select(AuditEvent))
+        assert event is not None
+        assert event.status == audit_status
+        assert event.error_code == error_code
+        assert event.metadata_json == {"backfilled": True}
+
+
+def test_backfill_counts_only_rows_inserted_by_this_invocation(
+    session_factory, monkeypatch
+):
+    from app.audit import backfill
+    from app.audit.recorder import AuditRecordResult
+
+    with session_factory() as session:
+        seed_run(
+            session,
+            run_id="run-raced",
+            unit_id="unit-1",
+            project_id="project-1",
+            user_id="user-1",
+            status="completed",
+        )
+        session.commit()
+
+    original = backfill.AuditRecorder.record_with_result
+
+    def lose_unique_key_race(self, session, request):
+        result = original(self, session, request)
+        return AuditRecordResult(event=result.event, inserted=False)
+
+    monkeypatch.setattr(
+        backfill.AuditRecorder,
+        "record_with_result",
+        lose_unique_key_race,
+    )
+
+    assert backfill_agent_run_snapshots(session_factory) == 0
+
+
 def test_backfill_empty_database_returns_zero(session_factory):
     assert backfill_agent_run_snapshots(session_factory) == 0
 

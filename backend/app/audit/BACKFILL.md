@@ -3,6 +3,7 @@
 统一审计表升级后，由运维人员在 API 启动前或独立维护窗口显式执行：
 
 ```powershell
+cd backend
 python -m alembic upgrade head
 python -m app.audit.backfill
 ```

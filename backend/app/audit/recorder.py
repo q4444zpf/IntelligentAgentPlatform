@@ -66,6 +66,12 @@ class AuditRecordRequest:
     allowed_metadata_keys: frozenset[str] = field(default_factory=frozenset)
 
 
+@dataclass(frozen=True)
+class AuditRecordResult:
+    event: AuditEvent
+    inserted: bool
+
+
 def _validate(request: AuditRecordRequest) -> None:
     required_strings = (
         "unit_id", "category", "source", "action", "status", "risk_level",
@@ -122,13 +128,20 @@ def _is_idempotency_conflict(error: IntegrityError) -> bool:
 
 class AuditRecorder:
     def record(self, session: Session, request: AuditRecordRequest) -> AuditEvent:
+        return self.record_with_result(session, request).event
+
+    def record_with_result(
+        self,
+        session: Session,
+        request: AuditRecordRequest,
+    ) -> AuditRecordResult:
         _validate(request)
         lookup = select(AuditEvent).where(
             AuditEvent.idempotency_key == request.idempotency_key
         )
         existing = session.scalar(lookup)
         if existing is not None:
-            return existing
+            return AuditRecordResult(event=existing, inserted=False)
 
         event = AuditEvent(
             unit_id=request.unit_id,
@@ -165,5 +178,5 @@ class AuditRecorder:
             existing = session.scalar(lookup)
             if existing is None:
                 raise
-            return existing
-        return event
+            return AuditRecordResult(event=existing, inserted=False)
+        return AuditRecordResult(event=event, inserted=True)

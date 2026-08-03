@@ -3,12 +3,24 @@ from datetime import timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.audit.models import AuditEvent
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.conversations.models import AgentRun, Conversation
 
 
-_STATUS_MAP = {"completed": "succeeded", "failed": "failed"}
+_STATUS_MAP = {
+    "queued": "started",
+    "running": "started",
+    "completed": "succeeded",
+    "failed": "failed",
+    "cancelled": "cancelled",
+}
+
+
+def _audit_status(run_status: str) -> tuple[str, str | None]:
+    status = _STATUS_MAP.get(run_status)
+    if status is None:
+        return "failed", "unknown_agent_run_status"
+    return status, None
 
 
 def backfill_agent_run_snapshots(
@@ -27,7 +39,6 @@ def backfill_agent_run_snapshots(
             statement = (
                 select(AgentRun, Conversation)
                 .join(Conversation, Conversation.id == AgentRun.conversation_id)
-                .where(AgentRun.status.in_(_STATUS_MAP))
                 .order_by(AgentRun.id)
                 .limit(batch_size)
             )
@@ -37,20 +48,13 @@ def backfill_agent_run_snapshots(
             if not rows:
                 break
 
-            keys = [f"audit-backfill:agent:{run.id}" for run, _ in rows]
-            existing_keys = set(
-                session.scalars(
-                    select(AuditEvent.idempotency_key).where(
-                        AuditEvent.idempotency_key.in_(keys)
-                    )
-                ).all()
-            )
             for run, conversation in rows:
                 key = f"audit-backfill:agent:{run.id}"
+                status, error_code = _audit_status(run.status)
                 occurred_at = run.created_at
                 if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
                     occurred_at = occurred_at.replace(tzinfo=timezone.utc)
-                recorder.record(
+                result = recorder.record_with_result(
                     session,
                     AuditRecordRequest(
                         unit_id=conversation.unit_id,
@@ -60,7 +64,7 @@ def backfill_agent_run_snapshots(
                         category="runtime",
                         source="agent",
                         action="agent.run_snapshot",
-                        status=_STATUS_MAP[run.status],
+                        status=status,
                         risk_level="low",
                         run_id=run.id,
                         resource_type="agent_run",
@@ -70,9 +74,10 @@ def backfill_agent_run_snapshots(
                         allowed_metadata_keys=frozenset({"backfilled"}),
                         idempotency_key=key,
                         occurred_at=occurred_at,
+                        error_code=error_code,
                     ),
                 )
-                if key not in existing_keys:
+                if result.inserted:
                     inserted += 1
             session.commit()
             last_run_id = rows[-1][0].id

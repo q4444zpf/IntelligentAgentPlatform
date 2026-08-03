@@ -183,6 +183,20 @@ def test_named_idempotency_conflict_returns_existing_record():
     assert session.queries == 2
 
 
+def test_record_with_result_reports_existing_after_unique_key_race():
+    error = IntegrityError(
+        "insert",
+        {},
+        Exception("uq_audit_idempotency_key"),
+    )
+    session = _FailingSession(error)
+
+    result = AuditRecorder().record_with_result(session, make_request())
+
+    assert result.event == "existing-event"
+    assert result.inserted is False
+
+
 def test_unrelated_integrity_error_is_not_swallowed():
     error = IntegrityError("insert", {}, Exception("NOT NULL constraint failed"))
     session = _FailingSession(error)
