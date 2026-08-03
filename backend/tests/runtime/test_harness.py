@@ -1,10 +1,11 @@
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.agents.service import AgentNotFoundError
+from app.audit.models import AuditEvent
 from app.conversations.models import AgentRun, Conversation, Message, RunEvent
 from app.conversations.repository import ConversationRepository
 from app.db.base import Base
@@ -137,6 +138,29 @@ def test_completes_run_and_persists_assistant_message():
         "total_tokens": 18,
     }
     session.close()
+
+
+def test_records_agent_status_and_safe_llm_iteration_events_idempotently():
+    session, run_id = build_queued_run()
+    repository = ConversationRepository(session)
+    harness = PlatformAgentHarness(repository, SuccessfulGateway(), FakeAgentService())
+    harness.execute(run_id)
+    harness._complete(run_id, "replayed", {}, {})
+    events = list(session.scalars(select(AuditEvent)))
+    assert {event.action for event in events} == {"agent.run.running", "llm.invoke.succeeded", "agent.run.completed"}
+    llm = next(event for event in events if event.source == "llm")
+    assert llm.idempotency_key == f"llm:{run_id}:0:succeeded"
+    assert llm.metadata_json == {"provider": "deepseek", "model": "deepseek-chat", "iteration": 0, "prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+    assert "分析洪峰" not in str(events)
+
+
+def test_records_failed_llm_and_agent_without_raw_error():
+    session, run_id = build_queued_run()
+    PlatformAgentHarness(ConversationRepository(session), FailingGateway(), FakeAgentService()).execute(run_id)
+    events = list(session.scalars(select(AuditEvent)))
+    assert {event.action for event in events} == {"agent.run.running", "llm.invoke.failed", "agent.run.failed"}
+    assert next(event for event in events if event.source == "llm").error_code == "model_request_failed"
+    assert "runtime-secret" not in str(events)
 
 
 class FailingGateway:

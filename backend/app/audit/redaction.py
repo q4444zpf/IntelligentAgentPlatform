@@ -17,6 +17,8 @@ _WINDOWS_ABSOLUTE_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
 
 def _is_sensitive_key(value: str) -> bool:
     normalized = value.casefold()
+    if normalized in {"prompt_tokens", "completion_tokens", "total_tokens"}:
+        return False
     return (
         any(marker in normalized for marker in _SENSITIVE_KEYS)
         or "env" in normalized

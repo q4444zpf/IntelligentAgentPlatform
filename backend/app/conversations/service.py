@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 
 from app.agents.service import AgentNotFoundError, AgentService
 from app.core.request_context import RequestContext
+from app.audit.recorder import AuditRecorder, AuditRecordRequest
 
 from .dispatcher import RunDispatcher
 from .models import AgentRun, Conversation, Message, RunEvent
@@ -39,10 +40,12 @@ class ConversationService:
         dispatcher: RunDispatcher,
         *,
         agent_service: AgentService | None = None,
+        audit_recorder: AuditRecorder | None = None,
     ):
         self.repository = repository
         self.dispatcher = dispatcher
         self.agent_service = agent_service or AgentService()
+        self.audit_recorder = audit_recorder or AuditRecorder()
 
     def _resolve_actor(self, request: MessageCreate) -> str:
         if request.actor_type == "team":
@@ -147,6 +150,29 @@ class ConversationService:
                 payload={"status": "queued"},
             )
         )
+        try:
+            self.audit_recorder.record(
+                self.repository.session,
+                AuditRecordRequest(
+                    unit_id=context.unit_id,
+                    project_id=context.project_id,
+                    user_id=context.user_id,
+                    category="runtime",
+                    source="agent",
+                    action="agent.run.created",
+                    status="succeeded",
+                    risk_level="low",
+                    trace_id=run.id,
+                    run_id=run.id,
+                    resource_type="agent",
+                    resource_id=actor_id,
+                    idempotency_key=f"agent:{run.id}:created",
+                    occurred_at=datetime.now(UTC),
+                ),
+            )
+        except Exception:
+            self.repository.session.rollback()
+            raise
         self.repository.session.commit()
         self.dispatcher.dispatch(run.id)
         return MessageAccepted(

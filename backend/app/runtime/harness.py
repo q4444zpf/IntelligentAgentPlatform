@@ -1,6 +1,9 @@
 import json
+from datetime import UTC, datetime
+from time import perf_counter
 
 from app.agents.service import AgentNotFoundError, AgentService
+from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.conversations.repository import ConversationRepository
 from app.tools.gateway import ToolGateway
 from app.tools.schemas import ToolDefinition, ToolExecutionContext, ToolRuntimeError
@@ -22,12 +25,14 @@ class PlatformAgentHarness:
         *,
         tool_service: ToolService | None = None,
         tool_gateway: ToolGateway | None = None,
+        audit_recorder: AuditRecorder | None = None,
     ):
         self.repository = repository
         self.model_gateway = model_gateway
         self.agent_service = agent_service
         self.tool_service = tool_service
         self.tool_gateway = tool_gateway
+        self.audit_recorder = audit_recorder or AuditRecorder()
 
     def execute(self, run_id: str) -> None:
         run = self.repository.get_run_by_id(run_id)
@@ -45,10 +50,26 @@ class PlatformAgentHarness:
             self._fail(run_id, "agent_unavailable", "智能体不可用，请检查智能体配置")
             return
 
+        execution_context = self.repository.get_run_execution_context(run_id)
+        if execution_context is None:
+            raise KeyError(run_id)
         run.status = "running"
         self.repository.append_event(run_id, "run.status", {"status": "running"})
+        self.audit_recorder.record(self.repository.session, AuditRecordRequest(
+            unit_id=execution_context["unit_id"],
+            project_id=execution_context["project_id"],
+            user_id=execution_context["user_id"],
+            category="runtime", source="agent", action="agent.run.running",
+            status="started", risk_level="low", trace_id=run_id, run_id=run_id,
+            resource_type="agent", resource_id=run.actor_id,
+            idempotency_key=f"agent:{run_id}:status:running",
+            occurred_at=datetime.now(UTC),
+        ))
         self.repository.session.commit()
 
+        llm_iteration: int | None = None
+        llm_started = 0.0
+        selection = ModelSelection(agent.provider_id, agent.model)
         try:
             messages = self._build_messages(run_id, agent)
             definitions = self._resolve_tool_definitions(agent.tool_ids)
@@ -59,11 +80,34 @@ class PlatformAgentHarness:
             total_tool_calls = 0
 
             for iteration in range(MAX_MODEL_ITERATIONS):
+                llm_iteration = iteration
+                llm_started = perf_counter()
                 result = self.model_gateway.generate(
                     messages,
-                    ModelSelection(agent.provider_id, agent.model),
+                    selection,
                     tools=definitions,
                 )
+                duration_ms = max(0, round((perf_counter() - llm_started) * 1000))
+                metadata = {
+                    "provider": selection.provider_id,
+                    "model": selection.model,
+                    "iteration": iteration,
+                    "prompt_tokens": result.prompt_tokens,
+                    "completion_tokens": result.completion_tokens,
+                    "total_tokens": result.total_tokens,
+                }
+                self.audit_recorder.record(self.repository.session, AuditRecordRequest(
+                    unit_id=execution_context["unit_id"],
+                    project_id=execution_context["project_id"],
+                    user_id=execution_context["user_id"],
+                    category="runtime", source="llm", action="llm.invoke.succeeded",
+                    status="succeeded", risk_level="low", trace_id=run_id, run_id=run_id,
+                    resource_type="model", resource_id=selection.model,
+                    idempotency_key=f"llm:{run_id}:{iteration}:succeeded",
+                    occurred_at=datetime.now(UTC), duration_ms=duration_ms,
+                    metadata=metadata,
+                    allowed_metadata_keys=frozenset(metadata),
+                ))
                 for key in usage:
                     value = getattr(result, key)
                     if value is not None:
@@ -114,6 +158,25 @@ class PlatformAgentHarness:
 
         except ModelRuntimeError:
             self.repository.session.rollback()
+            if llm_iteration is not None:
+                metadata = {
+                    "provider": selection.provider_id,
+                    "model": selection.model,
+                    "iteration": llm_iteration,
+                }
+                self.audit_recorder.record(self.repository.session, AuditRecordRequest(
+                    unit_id=execution_context["unit_id"],
+                    project_id=execution_context["project_id"],
+                    user_id=execution_context["user_id"],
+                    category="runtime", source="llm", action="llm.invoke.failed",
+                    status="failed", risk_level="medium", trace_id=run_id, run_id=run_id,
+                    resource_type="model", resource_id=selection.model,
+                    idempotency_key=f"llm:{run_id}:{llm_iteration}:failed",
+                    occurred_at=datetime.now(UTC),
+                    duration_ms=max(0, round((perf_counter() - llm_started) * 1000)),
+                    metadata=metadata, allowed_metadata_keys=frozenset(metadata),
+                    error_code="model_request_failed",
+                ))
             self._fail(run_id, "model_request_failed", "模型调用失败，请检查默认模型配置或稍后重试")
         except ToolRuntimeError as error:
             self.repository.session.rollback()
@@ -162,6 +225,16 @@ class PlatformAgentHarness:
         run = self.repository.get_run_by_id(run_id)
         run.status = "completed"
         self.repository.append_event(run_id, "run.status", {"status": "completed"})
+        context = self.repository.get_run_execution_context(run_id)
+        self.audit_recorder.record(self.repository.session, AuditRecordRequest(
+            unit_id=context["unit_id"], project_id=context["project_id"],
+            user_id=context["user_id"], category="runtime", source="agent",
+            action="agent.run.completed", status="succeeded", risk_level="low",
+            trace_id=run_id, run_id=run_id, resource_type="agent",
+            resource_id=run.actor_id,
+            idempotency_key=f"agent:{run_id}:status:completed",
+            occurred_at=datetime.now(UTC),
+        ))
         self.repository.session.commit()
 
     def _fail(self, run_id: str, code: str, message: str) -> None:
@@ -171,4 +244,14 @@ class PlatformAgentHarness:
         run.status = "failed"
         self.repository.append_event(run_id, "run.error", {"code": code, "message": message})
         self.repository.append_event(run_id, "run.status", {"status": "failed"})
+        context = self.repository.get_run_execution_context(run_id)
+        self.audit_recorder.record(self.repository.session, AuditRecordRequest(
+            unit_id=context["unit_id"], project_id=context["project_id"],
+            user_id=context["user_id"], category="runtime", source="agent",
+            action="agent.run.failed", status="failed", risk_level="medium",
+            trace_id=run_id, run_id=run_id, resource_type="agent",
+            resource_id=run.actor_id,
+            idempotency_key=f"agent:{run_id}:status:failed",
+            occurred_at=datetime.now(UTC), error_code=code,
+        ))
         self.repository.session.commit()

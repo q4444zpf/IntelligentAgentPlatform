@@ -5,6 +5,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.audit.models import AuditEvent
 from app.conversations.models import AgentRun, Conversation, Message, RunEvent, ToolInvocation
 from app.conversations.repository import ConversationRepository
 from app.db.base import Base
@@ -58,6 +59,30 @@ def context(**overrides):
 
 def execute(gateway, name="system.get_current_time", arguments=None, call_id="call-1", authorized=None, execution_context=None):
     return gateway.execute(ToolCall(id=call_id, name=name, arguments=arguments or {}), execution_context or context(), authorized if authorized is not None else {name})
+
+
+def test_records_tool_started_and_succeeded_with_context_and_parent(runtime):
+    session, gateway = make_gateway(runtime)
+    result = execute(gateway)
+    events = list(session.scalars(select(AuditEvent).order_by(AuditEvent.occurred_at, AuditEvent.id)))
+    assert [event.action for event in events] == ["tool.invoke.started", "tool.invoke.succeeded"]
+    assert events[1].parent_event_id == events[0].id
+    assert events[0].idempotency_key == f"tool:{result.invocation_id}:started"
+    assert (events[0].unit_id, events[0].project_id, events[0].user_id) == ("unit-1", "project-1", "user-1")
+
+
+def test_records_tool_failure_without_arguments_or_raw_error(runtime, monkeypatch):
+    session, gateway = make_gateway(runtime)
+    def fail(*_args):
+        raise RuntimeError("secret raw failure")
+    monkeypatch.setitem(BUILTIN_EXECUTORS, "system.get_current_time", fail)
+    with pytest.raises(ToolRuntimeError):
+        execute(gateway, arguments={"timezone": "Asia/Shanghai"})
+    events = list(session.scalars(select(AuditEvent).order_by(AuditEvent.occurred_at, AuditEvent.id)))
+    assert [event.action for event in events] == ["tool.invoke.started", "tool.invoke.failed"]
+    assert events[-1].error_code == "tool_execution_failed"
+    assert "Asia/Shanghai" not in str(events)
+    assert "secret raw failure" not in str(events)
 
 
 def test_current_time_uses_frozen_clock_and_chinese_weekday(runtime):

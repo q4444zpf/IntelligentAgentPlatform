@@ -6,6 +6,8 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 
 from app.agents.service import BUILTIN_AGENT_ID, AgentNotFoundError
+from app.audit.models import AuditEvent
+from app.audit.recorder import AuditRecorder
 from app.conversations.dispatcher import RunDispatcher
 from app.conversations.models import AgentRun, Conversation, Message
 from app.conversations.repository import ConversationRepository
@@ -74,6 +76,32 @@ def test_creates_message_run_and_initial_event_atomically():
     )[0].payload == {"status": "queued"}
     assert dispatcher.run_ids == [accepted.run.id]
     session.close()
+
+
+def test_message_creation_records_agent_run_in_same_transaction():
+    session, _, service = build_service()
+    context = RequestContext(unit_id="unit-1", user_id="u1", project_id="p1")
+    conversation = service.create_conversation(context, ConversationCreate(title="x"))
+    accepted = service.create_message(context, conversation.id, MessageCreate(content="x", actor_type="agent", actor_id="flood"))
+    event = session.scalar(select(AuditEvent))
+    assert event.idempotency_key == f"agent:{accepted.run.id}:created"
+    assert (event.action, event.unit_id, event.project_id, event.user_id) == ("agent.run.created", "unit-1", "p1", "u1")
+
+
+def test_audit_failure_rolls_back_message_and_run():
+    class FailingRecorder(AuditRecorder):
+        def record(self, session, request):
+            raise RuntimeError("audit unavailable")
+
+    session, dispatcher, service = build_service()
+    service.audit_recorder = FailingRecorder()
+    context = RequestContext(unit_id="unit-1", user_id="u1", project_id="p1")
+    conversation = service.create_conversation(context, ConversationCreate(title="x"))
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        service.create_message(context, conversation.id, MessageCreate(content="x", actor_type="agent", actor_id="flood"))
+    assert session.scalar(select(func.count()).select_from(Message)) == 0
+    assert session.scalar(select(func.count()).select_from(AgentRun)) == 0
+    assert dispatcher.run_ids == []
 
 
 def test_message_activity_advances_conversation_recency():

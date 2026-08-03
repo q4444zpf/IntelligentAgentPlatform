@@ -11,6 +11,8 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
 from sqlalchemy.exc import IntegrityError
 
+from app.audit.models import AuditEvent
+from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.conversations.models import ToolInvocation
 from app.conversations.repository import ConversationRepository
 
@@ -30,10 +32,12 @@ class ToolGateway:
         tool_store: ToolStore,
         repository: ConversationRepository,
         clock: Callable[[], datetime] | None = None,
+        audit_recorder: AuditRecorder | None = None,
     ):
         self.tool_store = tool_store
         self.repository = repository
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.audit_recorder = audit_recorder or AuditRecorder()
 
     @staticmethod
     def _validate(schema: dict[str, Any], value: Any, code: str, message: str) -> None:
@@ -91,7 +95,9 @@ class ToolGateway:
             return serialized
         return json.dumps({"_summary": _TRUNCATED}, separators=(",", ":"))
 
-    def _commit_started(self, invocation: ToolInvocation, display_name: str) -> None:
+    def _commit_started(
+        self, invocation: ToolInvocation, display_name: str, context: ToolExecutionContext,
+    ) -> AuditEvent:
         self.repository.add_tool_invocation(invocation)
         self.repository.append_event(
             invocation.run_id,
@@ -102,7 +108,21 @@ class ToolGateway:
                 "display_name": display_name,
             },
         )
+        audit_event = self.audit_recorder.record(
+            self.repository.session,
+            AuditRecordRequest(
+                unit_id=context.unit_id, project_id=context.project_id,
+                user_id=context.user_id, category="runtime", source="tool",
+                action="tool.invoke.started", status="started", risk_level="low",
+                trace_id=context.run_id, run_id=context.run_id,
+                resource_type="tool", resource_id=invocation.tool_id,
+                resource_name=display_name,
+                idempotency_key=f"tool:{invocation.id}:started",
+                occurred_at=datetime.now(timezone.utc),
+            ),
+        )
         self.repository.session.commit()
+        return audit_event
 
     @staticmethod
     def _apply_failed_state(
@@ -167,6 +187,8 @@ class ToolGateway:
         *,
         status: str,
         duration_ms: int,
+        context: ToolExecutionContext,
+        parent_event_id: str,
         result: dict[str, Any] | None = None,
         error: ToolRuntimeError | None = None,
     ) -> None:
@@ -189,15 +211,36 @@ class ToolGateway:
                 event_type = "tool.failed"
                 payload.update(code=error.code, message=error.safe_message)
             self.repository.append_event(invocation.run_id, event_type, payload)
+            audit_status = "failed" if error is not None else "succeeded"
+            self.audit_recorder.record(
+                self.repository.session,
+                AuditRecordRequest(
+                    unit_id=context.unit_id,
+                    project_id=context.project_id,
+                    user_id=context.user_id,
+                    category="runtime",
+                    source="tool",
+                    action=f"tool.invoke.{audit_status}",
+                    status=audit_status,
+                    risk_level="medium" if error is not None else "low",
+                    trace_id=context.run_id,
+                    run_id=context.run_id,
+                    parent_event_id=parent_event_id,
+                    resource_type="tool",
+                    resource_id=invocation.tool_id,
+                    resource_name=display_name,
+                    idempotency_key=f"tool:{invocation.id}:{audit_status}",
+                    occurred_at=datetime.now(timezone.utc),
+                    duration_ms=duration_ms,
+                    error_code=error.code if error is not None else None,
+                ),
+            )
             self.repository.session.commit()
         except Exception as database_error:
             self._rollback_safely()
             safe_error = ToolRuntimeError("tool_execution_failed", "工具执行失败。")
             self._compensate_failed_completion(
-                invocation_id,
-                display_name,
-                duration_ms,
-                safe_error,
+                invocation_id, display_name, duration_ms, safe_error,
             )
             raise safe_error from database_error
     def execute(
@@ -227,7 +270,7 @@ class ToolGateway:
             arguments_summary=self.summarize(call.arguments),
         )
         try:
-            self._commit_started(invocation, tool["name"])
+            started_audit = self._commit_started(invocation, tool["name"], context)
         except Exception as database_error:
             self._rollback_safely()
             if isinstance(database_error, IntegrityError):
@@ -252,14 +295,23 @@ class ToolGateway:
             self._validate(tool["output_schema"], value, "tool_execution_failed", "工具执行失败。")
         except ToolRuntimeError as error:
             duration_ms = max(0, round((time.perf_counter() - started_at) * 1000))
-            self._commit_finished(invocation, tool["name"], status="failed", duration_ms=duration_ms, error=error)
+            self._commit_finished(
+                invocation, tool["name"], status="failed", duration_ms=duration_ms,
+                error=error, context=context, parent_event_id=started_audit.id,
+            )
             raise
         except Exception as error:
             safe_error = ToolRuntimeError("tool_execution_failed", "工具执行失败。")
             duration_ms = max(0, round((time.perf_counter() - started_at) * 1000))
-            self._commit_finished(invocation, tool["name"], status="failed", duration_ms=duration_ms, error=safe_error)
+            self._commit_finished(
+                invocation, tool["name"], status="failed", duration_ms=duration_ms,
+                error=safe_error, context=context, parent_event_id=started_audit.id,
+            )
             raise safe_error from error
 
         duration_ms = max(0, round((time.perf_counter() - started_at) * 1000))
-        self._commit_finished(invocation, tool["name"], status="completed", duration_ms=duration_ms, result=value)
+        self._commit_finished(
+            invocation, tool["name"], status="completed", duration_ms=duration_ms,
+            result=value, context=context, parent_event_id=started_audit.id,
+        )
         return ToolExecutionResult(invocation_id=invocation.id, value=value)
