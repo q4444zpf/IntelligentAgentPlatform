@@ -260,3 +260,20 @@ def test_unrelated_integrity_error_rolls_back_savepoint_not_outer_transaction():
 def test_record_rejects_non_integer_duration(session, value):
     with pytest.raises(ValueError, match="duration_ms"):
         AuditRecorder().record(session, make_request(duration_ms=value))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("summary", None),
+        ("metadata", None),
+        ("allowed_metadata_keys", "safe"),
+        ("allowed_metadata_keys", b"safe"),
+        ("allowed_metadata_keys", {1}),
+    ],
+)
+def test_record_stably_rejects_invalid_redaction_input_types(
+    session, field, value
+):
+    with pytest.raises(ValueError, match=field):
+        AuditRecorder().record(session, make_request(**{field: value}))

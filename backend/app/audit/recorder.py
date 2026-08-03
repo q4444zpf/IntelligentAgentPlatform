@@ -1,4 +1,4 @@
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -81,6 +81,16 @@ def _validate(request: AuditRecordRequest) -> None:
         value = getattr(request, field_name)
         if value is not None and not isinstance(value, str):
             raise ValueError(f"{field_name} must be a string")
+    if not isinstance(request.summary, str):
+        raise ValueError("summary must be a string")
+    if not isinstance(request.metadata, Mapping):
+        raise ValueError("metadata must be a mapping")
+    if isinstance(request.allowed_metadata_keys, (str, bytes)) or not isinstance(
+        request.allowed_metadata_keys, Collection
+    ):
+        raise ValueError("allowed_metadata_keys must be a collection of strings")
+    if not all(isinstance(key, str) for key in request.allowed_metadata_keys):
+        raise ValueError("allowed_metadata_keys must contain only strings")
     for field_name, allowed in _ENUMS.items():
         if getattr(request, field_name) not in allowed:
             raise ValueError(f"invalid {field_name}")

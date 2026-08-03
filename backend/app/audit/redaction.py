@@ -18,8 +18,8 @@ _WINDOWS_ABSOLUTE_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
 def _is_sensitive_key(value: str) -> bool:
     normalized = value.casefold()
     return (
-        normalized == "env"
-        or normalized in _SENSITIVE_KEYS
+        any(marker in normalized for marker in _SENSITIVE_KEYS)
+        or "env" in normalized
         or any(marker in normalized for marker in ("prompt", "response", "header", "file_content"))
     )
 
@@ -51,9 +51,10 @@ def _sanitize(value: Any, *, depth: int) -> Any:
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
         for key, item in list(value.items())[:50]:
-            string_key = _basename_if_absolute(str(key))[:512]
-            normalized_key = string_key.casefold()
-            if _is_sensitive_key(normalized_key):
+            raw_key = str(key)
+            normalized_key = _basename_if_absolute(raw_key)
+            string_key = html.escape(normalized_key, quote=True)[:512]
+            if _is_sensitive_key(raw_key) or _is_sensitive_key(normalized_key):
                 result[string_key] = _REDACTED
             else:
                 result[string_key] = _sanitize(item, depth=depth + 1)
@@ -61,10 +62,11 @@ def _sanitize(value: Any, *, depth: int) -> Any:
     if isinstance(value, (list, tuple)):
         return [_sanitize(item, depth=depth + 1) for item in value[:20]]
     if isinstance(value, str):
-        return _basename_if_absolute(value)[:512]
+        return html.escape(_basename_if_absolute(value), quote=True)[:512]
     if value is None or isinstance(value, (bool, int, float)):
         return value
-    return _basename_if_absolute(str(value))[:512]
+    converted = _basename_if_absolute(str(value))
+    return html.escape(converted, quote=True)[:512]
 
 
 def _encoded_size(value: Mapping[str, Any]) -> int:
@@ -122,10 +124,12 @@ def redact_metadata(
     for key, item in value.items():
         if key not in allowed:
             continue
-        sanitized_key = _basename_if_absolute(str(key))[:512]
+        raw_key = str(key)
+        normalized_key = _basename_if_absolute(raw_key)
+        sanitized_key = html.escape(normalized_key, quote=True)[:512]
         result[sanitized_key] = (
             _REDACTED
-            if _is_sensitive_key(sanitized_key)
+            if _is_sensitive_key(raw_key) or _is_sensitive_key(normalized_key)
             else _sanitize(item, depth=1)
         )
     while _encoded_size(result) > max_bytes:

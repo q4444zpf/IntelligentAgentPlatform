@@ -138,3 +138,28 @@ def test_path_key_sensitivity_is_checked_after_basename_sanitizing():
         allowed_keys={windows_key, posix_key},
     )
     assert redacted == {"token": "[REDACTED]", "password": "[REDACTED]"}
+
+
+def test_sensitive_keys_are_checked_before_truncation_at_every_depth():
+    sensitive_key = "a" * 512 + "password"
+    redacted = redact_metadata(
+        {sensitive_key: "top-secret", "nested": {sensitive_key: "nested-secret"}},
+        allowed_keys={sensitive_key, "nested"},
+    )
+
+    assert redacted["a" * 512] == "[REDACTED]"
+    assert redacted["nested"]["a" * 512] == "[REDACTED]"
+
+
+def test_metadata_escapes_html_in_string_and_converted_values():
+    class HtmlValue:
+        def __str__(self):
+            return '<img src=x onerror="alert(1)">'
+
+    redacted = redact_metadata(
+        {"string": "<script>alert(1)</script>", "object": HtmlValue()},
+        allowed_keys={"string", "object"},
+    )
+
+    assert "<" not in redacted["string"]
+    assert "<" not in redacted["object"]
