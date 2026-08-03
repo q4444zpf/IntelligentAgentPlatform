@@ -46,7 +46,11 @@ def migrated_database():
 
 
 def make_factory(database_url: str):
-    engine = create_engine(database_url, pool_pre_ping=True)
+    engine = create_engine(
+        database_url,
+        pool_pre_ping=True,
+        connect_args={"options": "-c lock_timeout=3000 -c statement_timeout=5000"},
+    )
     factory = sessionmaker(
         bind=engine,
         expire_on_commit=False,
@@ -95,6 +99,7 @@ def test_record_with_result_reports_real_unique_key_loser_and_keeps_session_usab
     key = f"integration-recorder-race:{suffix}"
     request = make_request(key=key, run_id=str(uuid.uuid4()))
     result: dict[str, object] = {}
+    thread: threading.Thread | None = None
 
     def run_loser() -> None:
         try:
@@ -110,7 +115,7 @@ def test_record_with_result_reports_real_unique_key_loser_and_keeps_session_usab
         with winner_factory() as winner:
             winning = AuditRecorder().record_with_result(winner, request)
             assert winning.inserted is True
-            thread = threading.Thread(target=run_loser, daemon=True)
+            thread = threading.Thread(target=run_loser)
             thread.start()
             assert attempted.wait(5), "loser did not attempt the concurrent insert"
             winner.commit()
@@ -129,6 +134,11 @@ def test_record_with_result_reports_real_unique_key_loser_and_keeps_session_usab
                 )
             ) == 1
     finally:
+        if thread is not None:
+            thread.join(7)
+        thread_stopped = thread is None or not thread.is_alive()
+        if not thread_stopped:
+            pytest.fail("loser thread did not stop within bounded database timeouts")
         with winner_factory.begin() as cleanup:
             cleanup.execute(delete(AuditEvent).where(AuditEvent.idempotency_key == key))
         winner_engine.dispose()
@@ -148,6 +158,7 @@ def test_backfill_returns_zero_when_another_transaction_wins_the_unique_key():
     key = f"audit-backfill:agent:{run_id}"
     request = make_request(key=key, run_id=run_id)
     result: dict[str, object] = {}
+    thread: threading.Thread | None = None
 
     def run_losing_backfill() -> None:
         try:
@@ -192,7 +203,7 @@ def test_backfill_returns_zero_when_another_transaction_wins_the_unique_key():
         with winner_factory() as winner:
             winning = AuditRecorder().record_with_result(winner, request)
             assert winning.inserted is True
-            thread = threading.Thread(target=run_losing_backfill, daemon=True)
+            thread = threading.Thread(target=run_losing_backfill)
             thread.start()
             assert attempted.wait(5), "backfill did not attempt the concurrent insert"
             winner.commit()
@@ -208,6 +219,11 @@ def test_backfill_returns_zero_when_another_transaction_wins_the_unique_key():
                 )
             ) == 1
     finally:
+        if thread is not None:
+            thread.join(7)
+        thread_stopped = thread is None or not thread.is_alive()
+        if not thread_stopped:
+            pytest.fail("backfill thread did not stop within bounded database timeouts")
         with winner_factory.begin() as cleanup:
             cleanup.execute(delete(AuditEvent).where(AuditEvent.idempotency_key == key))
             cleanup.execute(delete(AgentRun).where(AgentRun.id == run_id))
