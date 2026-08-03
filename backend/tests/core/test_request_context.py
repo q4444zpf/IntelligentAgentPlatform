@@ -55,6 +55,20 @@ def test_rejects_unknown_role():
     assert response.status_code == 401
 
 
+def test_rejects_unknown_legacy_role_when_modern_roles_are_valid():
+    response = build_client(True).get(
+        "/context",
+        headers={
+            "X-Unit-ID": "unit-1",
+            "X-User-ID": "user-1",
+            "X-Project-ID": "project-1",
+            "X-User-Roles": "user,project_admin",
+            "X-User-Role": "superuser",
+        },
+    )
+    assert response.status_code == 401
+
+
 def test_compatibility_role_maps_elevated_roles_to_admin():
     assert RequestContext(unit_id="unit-1", project_id="project-1", user_id="user-1").role == "user"
     assert RequestContext(unit_id="unit-1", project_id="project-1", user_id="user-1", roles=frozenset({"unit_auditor"})).role == "admin"

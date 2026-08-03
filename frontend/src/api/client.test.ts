@@ -12,6 +12,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 function capturedHeaders(init: RequestInit | undefined) {
@@ -32,6 +33,42 @@ describe('request headers', () => {
       'X-Unit-ID': 'unit-1', 'X-Project-ID': 'project-1', 'X-User-ID': 'user-1',
       'X-User-Roles': 'user,unit_auditor',
     });
+  });
+
+  it.each([
+    'VITE_DEV_UNIT_ID',
+    'VITE_DEV_PROJECT_ID',
+    'VITE_DEV_USER_ID',
+  ])('omits development identity when %s is missing', async (missing) => {
+    vi.resetModules();
+    vi.stubEnv('VITE_DEV_UNIT_ID', 'unit-1');
+    vi.stubEnv('VITE_DEV_PROJECT_ID', 'project-1');
+    vi.stubEnv('VITE_DEV_USER_ID', 'user-1');
+    vi.stubEnv('VITE_DEV_USER_ROLES', 'user');
+    vi.stubEnv(missing, '');
+
+    const { identityHeaders } = await import('./client');
+
+    expect(identityHeaders).toEqual({});
+  });
+
+  it('omits the roles header when development roles are missing', async () => {
+    vi.resetModules();
+    vi.stubEnv('VITE_DEV_UNIT_ID', 'unit-1');
+    vi.stubEnv('VITE_DEV_PROJECT_ID', 'project-1');
+    vi.stubEnv('VITE_DEV_USER_ID', 'user-1');
+    vi.stubEnv('VITE_DEV_USER_ROLES', '');
+    vi.stubEnv('VITE_DEV_USER_ROLE', '');
+
+    const { identityHeaders } = await import('./client');
+
+    expect(identityHeaders).toEqual({
+      'X-Unit-ID': 'unit-1',
+      'X-Project-ID': 'project-1',
+      'X-User-ID': 'user-1',
+    });
+    expect(identityHeaders).not.toHaveProperty('X-User-Roles');
+    expect(Object.values(identityHeaders)).not.toContain('undefined');
   });
 
   it('adds JSON content type for a string request body', async () => {

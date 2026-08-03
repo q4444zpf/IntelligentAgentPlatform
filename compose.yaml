@@ -48,8 +48,10 @@ services:
       context: .
       dockerfile: frontend/Dockerfile
       args:
+        VITE_DEV_UNIT_ID: "${VITE_DEV_UNIT_ID:-}"
         VITE_DEV_USER_ID: "${VITE_DEV_USER_ID:-}"
         VITE_DEV_PROJECT_ID: "${VITE_DEV_PROJECT_ID:-}"
+        VITE_DEV_USER_ROLES: "${VITE_DEV_USER_ROLES:-}"
         VITE_DEV_USER_ROLE: "${VITE_DEV_USER_ROLE:-}"
     depends_on:
       api:

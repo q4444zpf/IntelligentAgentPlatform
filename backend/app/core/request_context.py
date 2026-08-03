@@ -32,6 +32,8 @@ def require_request_context(
             status_code=401,
             detail="Unit, user, and project headers are required",
         )
+    if role not in {None, "user", "admin"}:
+        raise HTTPException(status_code=401, detail="Invalid development identity")
     parsed_roles = {
         value.strip() for value in roles.split(",") if value.strip()
     } if roles is not None else set()
