@@ -191,3 +191,66 @@ def test_unrelated_integrity_error_is_not_swallowed():
         AuditRecorder().record(session, make_request())
 
     assert raised.value is error
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "unit_id",
+        "category",
+        "source",
+        "action",
+        "status",
+        "risk_level",
+        "idempotency_key",
+    ],
+)
+@pytest.mark.parametrize("value", [None, 7, ""])
+def test_record_stably_rejects_invalid_required_strings(session, field, value):
+    with pytest.raises(ValueError, match=field):
+        AuditRecorder().record(session, make_request(**{field: value}))
+
+
+@pytest.mark.parametrize("value", [None, "2026-08-03T00:00:00Z", 7])
+def test_record_stably_rejects_non_datetime_occurred_at(session, value):
+    with pytest.raises(ValueError, match="occurred_at"):
+        AuditRecorder().record(session, make_request(occurred_at=value))
+
+
+def test_unrelated_integrity_error_rolls_back_savepoint_not_outer_transaction():
+    from sqlalchemy import event
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    raised_once = False
+
+    def fail_first_insert(mapper, connection, target):
+        nonlocal raised_once
+        if not raised_once:
+            raised_once = True
+            raise IntegrityError(
+                "insert", {}, Exception("unrelated check constraint")
+            )
+
+    event.listen(AuditEvent, "before_insert", fail_first_insert)
+    try:
+        with Session(engine) as real_session:
+            with real_session.begin():
+                with pytest.raises(
+                    IntegrityError, match="unrelated check constraint"
+                ):
+                    AuditRecorder().record(real_session, make_request())
+
+                recovered = AuditRecorder().record(
+                    real_session,
+                    make_request(idempotency_key="audit-key-after-error"),
+                )
+                recovered_id = recovered.id
+
+        with Session(engine) as verification_session:
+            assert verification_session.get(AuditEvent, recovered_id) is not None
+            assert verification_session.scalar(
+                select(func.count()).select_from(AuditEvent)
+            ) == 1
+    finally:
+        event.remove(AuditEvent, "before_insert", fail_first_insert)

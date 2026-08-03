@@ -67,9 +67,20 @@ class AuditRecordRequest:
 
 
 def _validate(request: AuditRecordRequest) -> None:
-    for field_name in ("unit_id", "action", "idempotency_key"):
-        if not getattr(request, field_name):
-            raise ValueError(f"{field_name} must not be empty")
+    required_strings = (
+        "unit_id", "category", "source", "action", "status", "risk_level",
+        "idempotency_key",
+    )
+    for field_name in required_strings:
+        value = getattr(request, field_name)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{field_name} must be a non-empty string")
+    if not isinstance(request.occurred_at, datetime):
+        raise ValueError("occurred_at must be a timezone-aware datetime")
+    for field_name in _LENGTHS:
+        value = getattr(request, field_name)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{field_name} must be a string")
     for field_name, allowed in _ENUMS.items():
         if getattr(request, field_name) not in allowed:
             raise ValueError(f"invalid {field_name}")

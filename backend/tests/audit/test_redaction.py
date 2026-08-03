@@ -94,3 +94,35 @@ def test_redact_metadata_never_exceeds_serialized_byte_limit():
     ).encode("utf-8")
     assert len(encoded) <= 100
     assert redacted
+
+
+def test_redact_metadata_sanitizes_pathlike_values_after_string_conversion():
+    from pathlib import Path, PurePosixPath, PureWindowsPath
+
+    value = {
+        "native": Path("/customer/basin/native.nc"),
+        "windows": PureWindowsPath(r"C:\customer\basin\windows.nc"),
+        "posix": PurePosixPath("/customer/basin/posix.nc"),
+    }
+
+    redacted = redact_metadata(value, allowed_keys=value.keys())
+
+    assert redacted == {
+        "native": "native.nc",
+        "windows": "windows.nc",
+        "posix": "posix.nc",
+    }
+    assert "customer" not in json.dumps(redacted)
+
+
+def test_redact_metadata_sanitizes_absolute_path_dictionary_keys():
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    windows_key = PureWindowsPath(r"C:\customer\basin\windows.nc")
+    posix_key = PurePosixPath("/customer/basin/posix.nc")
+    redacted = redact_metadata(
+        {windows_key: "windows", posix_key: "posix"},
+        allowed_keys={windows_key, posix_key},
+    )
+
+    assert redacted == {"windows.nc": "windows", "posix.nc": "posix"}

@@ -38,6 +38,8 @@ def redact_summary(value: str, *, max_chars: int = 500) -> str:
 def _basename_if_absolute(value: str) -> str:
     if _WINDOWS_ABSOLUTE_PATH.match(value):
         return ntpath.basename(value.rstrip("\\/"))
+    if value.startswith("\\"):
+        return ntpath.basename(value.rstrip("\\/"))
     if value.startswith("/"):
         return posixpath.basename(value.rstrip("/"))
     return value
@@ -49,7 +51,7 @@ def _sanitize(value: Any, *, depth: int) -> Any:
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
         for key, item in list(value.items())[:50]:
-            string_key = str(key)[:512]
+            string_key = _basename_if_absolute(str(key))[:512]
             normalized_key = string_key.casefold()
             if _is_sensitive_key(normalized_key):
                 result[string_key] = _REDACTED
@@ -62,7 +64,7 @@ def _sanitize(value: Any, *, depth: int) -> Any:
         return _basename_if_absolute(value)[:512]
     if value is None or isinstance(value, (bool, int, float)):
         return value
-    return str(value)[:512]
+    return _basename_if_absolute(str(value))[:512]
 
 
 def _encoded_size(value: Mapping[str, Any]) -> int:
@@ -117,7 +119,7 @@ def redact_metadata(
         raise ValueError("max_bytes must be at least 2")
     allowed = set(allowed_keys)
     result = {
-        str(key)[:512]: (
+        _basename_if_absolute(str(key))[:512]: (
             _REDACTED
             if _is_sensitive_key(str(key))
             else _sanitize(item, depth=1)
