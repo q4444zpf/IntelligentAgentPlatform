@@ -20,8 +20,13 @@ export function parseSseFrame(frame: string): RunEvent {
   };
 }
 
-export async function getRunEvents(runId: string, afterSequence: number): Promise<RunEvent[]> {
+export async function getRunEvents(
+  runId: string,
+  afterSequence: number,
+  signal?: AbortSignal,
+): Promise<RunEvent[]> {
   const response = await fetch(`${apiBaseUrl}/agent-runs/${encodeURIComponent(runId)}/events`, {
+    signal,
     headers: {
       Accept: 'text/event-stream',
       'Last-Event-ID': String(afterSequence),

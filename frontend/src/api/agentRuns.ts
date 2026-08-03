@@ -53,5 +53,6 @@ export const agentRunsApi = {
       `/agent-runs/${encodeURIComponent(runId)}/tool-invocations`,
       { signal },
     ),
-  listEvents: (runId: string): Promise<RunEvent[]> => getRunEvents(runId, 0),
+  listEvents: (runId: string, signal?: AbortSignal): Promise<RunEvent[]> =>
+    getRunEvents(runId, 0, signal),
 };

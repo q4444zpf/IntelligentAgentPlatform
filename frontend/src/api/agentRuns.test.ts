@@ -66,8 +66,9 @@ describe('agentRunsApi', () => {
   it('delegates event loading to the existing bounded SSE reader', async () => {
     const events = [{ sequence: 1, event_type: 'run.started', payload: {} }];
     vi.mocked(getRunEvents).mockResolvedValue(events);
+    const controller = new AbortController();
 
-    await expect(agentRunsApi.listEvents('run/1')).resolves.toBe(events);
-    expect(getRunEvents).toHaveBeenCalledWith('run/1', 0);
+    await expect(agentRunsApi.listEvents('run/1', controller.signal)).resolves.toBe(events);
+    expect(getRunEvents).toHaveBeenCalledWith('run/1', 0, controller.signal);
   });
 });
