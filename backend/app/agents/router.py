@@ -1,6 +1,6 @@
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from app.core.request_context import RequestContext, require_request_context
-from app.audit.management import management_audit_route_class, record_failed_management
+from app.audit.management import management_audit_route_class, management_request_id, record_failed_management
 
 from .schemas import (
     AgentConfig,
@@ -69,10 +69,11 @@ def create_router(service: AgentService | None = None) -> APIRouter:
     def require_agent_admin(request: Request, context: RequestContext = Depends(require_request_context)) -> RequestContext:
         if context.role == "admin":
             request.state.management_context = context
+            management_request_id(request)
             return context
         action = "resource.deleted" if request.method == "DELETE" else "resource.created" if request.method == "POST" else "resource.updated"
         resource_id = request.path_params.get("agent_id", "agents")
-        record_failed_management(manager.store.session_factory, manager.audit_recorder, context, source="agent", action=action, resource_type="agent", resource_id=resource_id, error_code="PERMISSION_DENIED", request_id=request.headers.get("X-Request-ID"))
+        record_failed_management(manager.store.session_factory, manager.audit_recorder, context, source="agent", action=action, resource_type="agent", resource_id=resource_id, error_code="PERMISSION_DENIED", request_id=management_request_id(request))
         raise HTTPException(status_code=403, detail="Administrator permission is required")
 
 
@@ -84,7 +85,7 @@ def create_router(service: AgentService | None = None) -> APIRouter:
     def create_agent(
         request: AgentCreateRequest,
         context: RequestContext = Depends(require_agent_admin),
-        request_id: str | None = Header(default=None, alias="X-Request-ID"),
+        request_id: str = Depends(management_request_id),
     ):
         with manager.store.session_factory() as session:
             return call_management(lambda: manager.create(request, context=context, session=session, request_id=request_id), session, context, request_id, "resource.created", request.id)
@@ -94,7 +95,7 @@ def create_router(service: AgentService | None = None) -> APIRouter:
         return call(manager.get_default)
 
     @router.put("/default", response_model=AgentInfo)
-    def set_default_agent(request: AgentDefaultRequest, context: RequestContext = Depends(require_agent_admin), request_id: str | None = Header(default=None, alias="X-Request-ID")):
+    def set_default_agent(request: AgentDefaultRequest, context: RequestContext = Depends(require_agent_admin), request_id: str = Depends(management_request_id)):
         with manager.store.session_factory() as session:
             return call_management(lambda: manager.set_default(request.agent_id, context=context, session=session, request_id=request_id), session, context, request_id, "resource.updated", request.agent_id)
 
@@ -103,22 +104,22 @@ def create_router(service: AgentService | None = None) -> APIRouter:
         return call(lambda: manager.get(agent_id))
 
     @router.put("/{agent_id}", response_model=AgentInfo)
-    def update_agent(agent_id: str, request: AgentConfig, context: RequestContext = Depends(require_agent_admin), request_id: str | None = Header(default=None, alias="X-Request-ID")):
+    def update_agent(agent_id: str, request: AgentConfig, context: RequestContext = Depends(require_agent_admin), request_id: str = Depends(management_request_id)):
         with manager.store.session_factory() as session:
             return call_management(lambda: manager.update(agent_id, request, context=context, session=session, request_id=request_id), session, context, request_id, "resource.updated", agent_id)
 
     @router.patch("/{agent_id}/toggle", response_model=AgentInfo)
-    def toggle_agent(agent_id: str, request: AgentToggleRequest, context: RequestContext = Depends(require_agent_admin), request_id: str | None = Header(default=None, alias="X-Request-ID")):
+    def toggle_agent(agent_id: str, request: AgentToggleRequest, context: RequestContext = Depends(require_agent_admin), request_id: str = Depends(management_request_id)):
         with manager.store.session_factory() as session:
             return call_management(lambda: manager.set_enabled(agent_id, request.enabled, context=context, session=session, request_id=request_id), session, context, request_id, "resource.enabled" if request.enabled else "resource.disabled", agent_id)
 
     @router.patch("/{agent_id}/pin", response_model=AgentInfo)
-    def pin_agent(agent_id: str, request: AgentPinRequest, context: RequestContext = Depends(require_agent_admin), request_id: str | None = Header(default=None, alias="X-Request-ID")):
+    def pin_agent(agent_id: str, request: AgentPinRequest, context: RequestContext = Depends(require_agent_admin), request_id: str = Depends(management_request_id)):
         with manager.store.session_factory() as session:
             return call_management(lambda: manager.set_pinned(agent_id, request.pinned, context=context, session=session, request_id=request_id), session, context, request_id, "resource.updated", agent_id)
 
     @router.post("/{agent_id}/copy", response_model=AgentInfo, status_code=201)
-    def copy_agent(agent_id: str, request: AgentCopyRequest, context: RequestContext = Depends(require_agent_admin), request_id: str | None = Header(default=None, alias="X-Request-ID")):
+    def copy_agent(agent_id: str, request: AgentCopyRequest, context: RequestContext = Depends(require_agent_admin), request_id: str = Depends(management_request_id)):
         with manager.store.session_factory() as session:
             return call_management(lambda: manager.copy(agent_id, request, context=context, session=session, request_id=request_id), session, context, request_id, "resource.created", request.id)
 
@@ -126,7 +127,7 @@ def create_router(service: AgentService | None = None) -> APIRouter:
     def delete_agent(
         agent_id: str,
         context: RequestContext = Depends(require_agent_admin),
-        request_id: str | None = Header(default=None, alias="X-Request-ID"),
+        request_id: str = Depends(management_request_id),
     ):
         with manager.store.session_factory() as session:
             call_management(lambda: manager.delete(agent_id, context=context, session=session, request_id=request_id), session, context, request_id, "resource.deleted", agent_id)

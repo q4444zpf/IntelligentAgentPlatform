@@ -1,6 +1,6 @@
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
-from app.audit.management import management_audit_route_class, record_failed_management
+from app.audit.management import management_audit_route_class, management_request_id, record_failed_management
 from app.core.request_context import RequestContext, require_request_context
 
 from .schemas import McpClientConfig, McpClientCreate, McpClientInfo, McpToolInfo, McpToolWhitelistRequest
@@ -47,9 +47,10 @@ def create_router(service: McpService | None = None) -> APIRouter:
         if context.role != "admin":
             key = request.path_params.get("client_key", "mcp_clients")
             action = "resource.deleted" if request.method == "DELETE" else "resource.created" if request.method == "POST" and not request.path_params else "resource.updated"
-            record_failed_management(manager.store.session_factory, manager.audit_recorder, context, source="mcp", action=action, resource_type="mcp_client", resource_id=key, error_code="PERMISSION_DENIED", request_id=request.headers.get("X-Request-ID"))
+            record_failed_management(manager.store.session_factory, manager.audit_recorder, context, source="mcp", action=action, resource_type="mcp_client", resource_id=key, error_code="PERMISSION_DENIED", request_id=management_request_id(request))
             raise HTTPException(status_code=403, detail="Administrator permission is required")
         request.state.management_context = context
+        management_request_id(request)
         return context
 
     @router.get("", response_model=list[McpClientInfo])
@@ -60,7 +61,7 @@ def create_router(service: McpService | None = None) -> APIRouter:
     def create_client(
         request: McpClientCreate,
         context: RequestContext = Depends(require_mcp_admin),
-        request_id: str | None = Header(default=None, alias="X-Request-ID"),
+        request_id: str = Depends(management_request_id),
     ):
 
         with manager.store.session_factory() as session:
@@ -71,17 +72,17 @@ def create_router(service: McpService | None = None) -> APIRouter:
         return call(lambda: manager.get(client_key))
 
     @router.put("/{client_key}", response_model=McpClientInfo)
-    def update_client(client_key: str, request: McpClientConfig, context: RequestContext = Depends(require_mcp_admin), request_id: str | None = Header(default=None, alias="X-Request-ID")):
+    def update_client(client_key: str, request: McpClientConfig, context: RequestContext = Depends(require_mcp_admin), request_id: str = Depends(management_request_id)):
         with manager.store.session_factory() as session:
             return call_management(lambda: manager.update(client_key, request, context=context, session=session, request_id=request_id), session, context, request_id, "resource.updated", client_key)
 
     @router.patch("/{client_key}/toggle", response_model=McpClientInfo)
-    def toggle_client(client_key: str, context: RequestContext = Depends(require_mcp_admin), request_id: str | None = Header(default=None, alias="X-Request-ID")):
+    def toggle_client(client_key: str, context: RequestContext = Depends(require_mcp_admin), request_id: str = Depends(management_request_id)):
         with manager.store.session_factory() as session:
             return call_management(lambda: manager.toggle(client_key, context=context, session=session, request_id=request_id), session, context, request_id, "resource.updated", client_key)
 
     @router.delete("/{client_key}")
-    def delete_client(client_key: str, context: RequestContext = Depends(require_mcp_admin), request_id: str | None = Header(default=None, alias="X-Request-ID")):
+    def delete_client(client_key: str, context: RequestContext = Depends(require_mcp_admin), request_id: str = Depends(management_request_id)):
         with manager.store.session_factory() as session:
             call_management(lambda: manager.delete(client_key, context=context, session=session, request_id=request_id), session, context, request_id, "resource.deleted", client_key)
         return {"message": "MCP client deleted"}
@@ -91,12 +92,12 @@ def create_router(service: McpService | None = None) -> APIRouter:
         return call(lambda: manager.list_tools(client_key))
 
     @router.post("/{client_key}/tools/sync", response_model=list[McpToolInfo])
-    def sync_tools(client_key: str, context: RequestContext = Depends(require_mcp_admin), request_id: str | None = Header(default=None, alias="X-Request-ID")):
+    def sync_tools(client_key: str, context: RequestContext = Depends(require_mcp_admin), request_id: str = Depends(management_request_id)):
         with manager.store.session_factory() as session:
             return call_management(lambda: manager.sync_tools(client_key, context=context, session=session, request_id=request_id), session, context, request_id, "resource.updated", client_key)
 
     @router.put("/{client_key}/tools", response_model=list[McpToolInfo])
-    def update_tools(client_key: str, request: McpToolWhitelistRequest, context: RequestContext = Depends(require_mcp_admin), request_id: str | None = Header(default=None, alias="X-Request-ID")):
+    def update_tools(client_key: str, request: McpToolWhitelistRequest, context: RequestContext = Depends(require_mcp_admin), request_id: str = Depends(management_request_id)):
         with manager.store.session_factory() as session:
             return call_management(lambda: manager.update_whitelist(client_key, request.tools, context=context, session=session, request_id=request_id), session, context, request_id, "resource.permission_changed", client_key)
 

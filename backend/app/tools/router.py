@@ -1,9 +1,9 @@
 from collections.abc import Callable
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
-from app.audit.management import management_audit_route_class, record_failed_management
+from app.audit.management import management_audit_route_class, management_request_id, record_failed_management
 from app.core.request_context import (
     RequestContext,
     require_request_context,
@@ -48,12 +48,13 @@ def create_router(service: ToolService | None = None) -> APIRouter:
     ) -> RequestContext:
         if context.role == "admin":
             request.state.management_context = context
+            management_request_id(request)
             return context
         service_instance = manager()
         tool_id = request.path_params.get("tool_id", "unknown")
         current = service_instance.store.get(tool_id)
         action = "resource.disabled" if current and current["enabled"] else "resource.enabled"
-        request_id = request.headers.get("X-Request-ID")
+        request_id = management_request_id(request)
         record_failed_management(service_instance.store.session_factory, service_instance.audit_recorder, context, source="tool", action=action, resource_type="tool", resource_id=tool_id, error_code="PERMISSION_DENIED", request_id=request_id, risk_level="medium")
         raise HTTPException(
             status_code=403,
@@ -78,7 +79,7 @@ def create_router(service: ToolService | None = None) -> APIRouter:
     def toggle_tool(
         tool_id: str,
         context: RequestContext = Depends(require_tool_admin),
-        request_id: str | None = Header(default=None, alias="X-Request-ID"),
+        request_id: str = Depends(management_request_id),
     ):
         service_instance = manager()
         with service_instance.store.session_factory() as session:

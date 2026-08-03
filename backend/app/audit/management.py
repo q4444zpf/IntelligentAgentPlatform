@@ -13,6 +13,18 @@ from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.core.request_context import RequestContext
 
 
+MANAGEMENT_REQUEST_ID_STATE_KEY = "management_request_id"
+
+
+def management_request_id(request: Request) -> str:
+    existing = getattr(request.state, MANAGEMENT_REQUEST_ID_STATE_KEY, None)
+    if existing:
+        return existing
+    request_id = request.headers.get("X-Request-ID") or str(uuid4())
+    setattr(request.state, MANAGEMENT_REQUEST_ID_STATE_KEY, request_id)
+    return request_id
+
+
 def record_failed_management(
     session_factory: sessionmaker[Session],
     recorder: AuditRecorder,
@@ -88,7 +100,7 @@ def management_audit_route_class(
                             session_factory_provider(), recorder_provider(), context,
                             source=source, action=action, resource_type=resource_type,
                             resource_id=resource_id, error_code="REQUEST_VALIDATION",
-                            request_id=request.headers.get("X-Request-ID"),
+                            request_id=management_request_id(request),
                         )
                     raise
 

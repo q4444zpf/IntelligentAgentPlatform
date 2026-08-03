@@ -256,3 +256,21 @@ def test_invalid_mcp_body_records_failed_audit_without_request_secrets(client):
     serialized = f"{event.summary} {event.metadata_json}"
     assert secret not in serialized
     assert "mcp-validation-1" in event.idempotency_key
+
+
+def test_repeated_mcp_whitelist_without_request_id_records_each_mutation(client):
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+
+    assert client.post("/api/mcp", json=remote_payload()).status_code == 201
+    assert client.put("/api/mcp/water-data/tools", json={"tools": []}).status_code == 200
+    assert client.put("/api/mcp/water-data/tools", json={"tools": None}).status_code == 200
+    factory = client.app.state.mcp_service.store.session_factory
+    with factory() as session:
+        events = list(session.scalars(select(AuditEvent).where(
+            AuditEvent.source == "mcp",
+            AuditEvent.action == "resource.permission_changed",
+            AuditEvent.resource_id == "water-data",
+        )))
+    assert len(events) == 2
+    assert len({event.idempotency_key for event in events}) == 2

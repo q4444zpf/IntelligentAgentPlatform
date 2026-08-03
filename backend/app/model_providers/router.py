@@ -1,6 +1,6 @@
-from fastapi import APIRouter, Body, Depends, Header, HTTPException, Path, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Path, Request
 from app.core.request_context import RequestContext, require_request_context
-from app.audit.management import management_audit_route_class, record_failed_management
+from app.audit.management import management_audit_route_class, management_request_id, record_failed_management
 
 from .schemas import ActiveModel, AddModelRequest, CreateProviderRequest, DiscoverModelsResponse, ModelConfigRequest, ProbeMultimodalResponse, ProviderConfigRequest, ProviderInfo, TestConnectionResponse
 from .service import ProviderService
@@ -38,12 +38,13 @@ def call_management(operation, session, context: RequestContext, request_id: str
 def require_provider_admin(request: Request, context: RequestContext = Depends(require_request_context)) -> RequestContext:
     if context.role == "admin":
         request.state.management_context = context
+        management_request_id(request)
         return context
     resource_id = request.path_params.get("provider_id", "providers")
     if request.path_params.get("model_id"):
         resource_id = f"{resource_id}/{request.path_params['model_id']}"
     action = "resource.deleted" if request.method == "DELETE" else "resource.created" if request.method == "POST" and "custom-providers" in request.url.path else "resource.updated"
-    record_failed_management(service.store.session_factory, service.audit_recorder, context, source="llm", action=action, resource_type="model_provider", resource_id=resource_id, error_code="PERMISSION_DENIED", request_id=request.headers.get("X-Request-ID"))
+    record_failed_management(service.store.session_factory, service.audit_recorder, context, source="llm", action=action, resource_type="model_provider", resource_id=resource_id, error_code="PERMISSION_DENIED", request_id=management_request_id(request))
     raise HTTPException(status_code=403, detail="Administrator permission is required")
 async def call_management_async(operation, session, context: RequestContext, request_id: str | None, action: str, resource_id: str):
     try:
@@ -67,7 +68,7 @@ async def call_management_async(operation, session, context: RequestContext, req
 def list_providers(): return service.list()
 
 @router.post("/custom-providers", response_model=ProviderInfo, status_code=201)
-def create_provider(body: CreateProviderRequest, context: RequestContext = Depends(require_provider_admin), request_id: str | None = Header(default=None, alias="X-Request-ID")):
+def create_provider(body: CreateProviderRequest, context: RequestContext = Depends(require_provider_admin), request_id: str = Depends(management_request_id)):
     try:
         with service.store.session_factory() as session:
             return call_management(lambda: service.create(body, context=context, session=session, request_id=request_id), session, context, request_id, "resource.created", body.id, value_status=409)
@@ -77,7 +78,7 @@ def create_provider(body: CreateProviderRequest, context: RequestContext = Depen
 def configure_provider(
     provider_id: str, body: ProviderConfigRequest,
     context: RequestContext = Depends(require_provider_admin),
-    request_id: str | None = Header(default=None, alias="X-Request-ID"),
+    request_id: str = Depends(management_request_id),
 ):
     try:
         with service.store.session_factory() as session:
@@ -86,7 +87,7 @@ def configure_provider(
     except ConcurrentProviderUpdateError as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 @router.post("/{provider_id}/models", response_model=ProviderInfo)
-def add_model(provider_id: str, body: AddModelRequest, context: RequestContext = Depends(require_provider_admin), request_id: str | None = Header(default=None, alias="X-Request-ID")):
+def add_model(provider_id: str, body: AddModelRequest, context: RequestContext = Depends(require_provider_admin), request_id: str = Depends(management_request_id)):
     try:
         with service.store.session_factory() as session:
             return call_management(lambda: service.add_model(provider_id, body, context=context, session=session, request_id=request_id), session, context, request_id, "resource.updated", f"{provider_id}/{body.id}", value_status=409)
@@ -94,7 +95,7 @@ def add_model(provider_id: str, body: AddModelRequest, context: RequestContext =
     except ValueError as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 @router.put("/{provider_id}/models/{model_id}/config", response_model=ProviderInfo)
-def configure_model(provider_id: str, model_id: str, body: ModelConfigRequest, context: RequestContext = Depends(require_provider_admin), request_id: str | None = Header(default=None, alias="X-Request-ID")):
+def configure_model(provider_id: str, model_id: str, body: ModelConfigRequest, context: RequestContext = Depends(require_provider_admin), request_id: str = Depends(management_request_id)):
     try:
         with service.store.session_factory() as session:
             return call_management(lambda: service.configure_model(provider_id, model_id, body, context=context, session=session, request_id=request_id), session, context, request_id, "resource.updated", f"{provider_id}/{model_id}")
@@ -102,7 +103,7 @@ def configure_model(provider_id: str, model_id: str, body: ModelConfigRequest, c
     except ConcurrentProviderUpdateError as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 @router.delete("/{provider_id}/models/{model_id}", response_model=ProviderInfo)
-def remove_model(provider_id: str, model_id: str, context: RequestContext = Depends(require_provider_admin), request_id: str | None = Header(default=None, alias="X-Request-ID")):
+def remove_model(provider_id: str, model_id: str, context: RequestContext = Depends(require_provider_admin), request_id: str = Depends(management_request_id)):
     try:
         with service.store.session_factory() as session:
             return call_management(lambda: service.remove_model(provider_id, model_id, context=context, session=session, request_id=request_id), session, context, request_id, "resource.deleted", f"{provider_id}/{model_id}")
@@ -111,7 +112,7 @@ def remove_model(provider_id: str, model_id: str, context: RequestContext = Depe
     except ValueError as exc: raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 @router.post("/{provider_id}/discover", response_model=DiscoverModelsResponse)
-async def discover_models(provider_id: str, save: bool = True, context: RequestContext = Depends(require_provider_admin), request_id: str | None = Header(default=None, alias="X-Request-ID")):
+async def discover_models(provider_id: str, save: bool = True, context: RequestContext = Depends(require_provider_admin), request_id: str = Depends(management_request_id)):
     try:
         with service.store.session_factory() as session:
             return await call_management_async(lambda: service.discover_models(provider_id, save, context=context, session=session, request_id=request_id), session, context, request_id, "resource.updated", provider_id)
@@ -120,7 +121,7 @@ async def discover_models(provider_id: str, save: bool = True, context: RequestC
     except ValueError as exc: raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 @router.post("/{provider_id}/models/{model_id}/probe-multimodal", response_model=ProbeMultimodalResponse)
-async def probe_multimodal(provider_id: str, model_id: str, context: RequestContext = Depends(require_provider_admin), request_id: str | None = Header(default=None, alias="X-Request-ID")):
+async def probe_multimodal(provider_id: str, model_id: str, context: RequestContext = Depends(require_provider_admin), request_id: str = Depends(management_request_id)):
     try:
         with service.store.session_factory() as session:
             return await call_management_async(lambda: service.probe_multimodal(provider_id, model_id, context=context, session=session, request_id=request_id), session, context, request_id, "resource.updated", f"{provider_id}/{model_id}")
@@ -142,7 +143,7 @@ async def test_model(provider_id: str, model_id: str):
 def get_active(): return service.get_active()
 
 @router.put("/active", response_model=ActiveModel)
-def set_active(body: ActiveModel, context: RequestContext = Depends(require_provider_admin), request_id: str | None = Header(default=None, alias="X-Request-ID")):
+def set_active(body: ActiveModel, context: RequestContext = Depends(require_provider_admin), request_id: str = Depends(management_request_id)):
     try:
         with service.store.session_factory() as session:
             return call_management(lambda: service.set_active(body, context=context, session=session, request_id=request_id), session, context, request_id, "resource.updated", f"{body.provider_id}/{body.model}")

@@ -902,3 +902,50 @@ def test_invalid_agent_body_records_failed_audit_without_request_secrets(client)
     assert event.metadata_json == {}
     assert secret not in f"{event.summary} {event.metadata_json}"
     assert "agent-validation-1" in event.idempotency_key
+
+
+def test_repeated_agent_pin_without_request_id_records_each_mutation(client):
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+
+    assert client.post("/api/agents", json=agent_payload(skill_names=[])).status_code == 201
+    assert client.patch("/api/agents/reservoir-dispatch/pin", json={"pinned": True}).status_code == 200
+    assert client.patch("/api/agents/reservoir-dispatch/pin", json={"pinned": False}).status_code == 200
+    factory = client.app.state.agent_service.store.session_factory
+    with factory() as session:
+        events = list(session.scalars(select(AuditEvent).where(
+            AuditEvent.source == "agent",
+            AuditEvent.action == "resource.updated",
+            AuditEvent.resource_id == "reservoir-dispatch",
+        )))
+    assert len(events) == 2
+    assert len({event.idempotency_key for event in events}) == 2
+
+
+def test_update_restores_workspace_after_partial_write_failure(tmp_path, monkeypatch):
+    from pathlib import Path
+    from app.core.request_context import RequestContext
+
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'agent-partial-write.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    store = AgentStore(factory)
+    service = AgentService(store, workspace_root=tmp_path / "workspaces")
+    service.create(AgentCreateRequest(**agent_payload(skill_names=[])))
+    agents_file = tmp_path / "workspaces" / "reservoir-dispatch" / "AGENTS.md"
+    previous = agents_file.read_bytes()
+    original_write_text = Path.write_text
+
+    def partial_write_then_fail(path, data, *args, **kwargs):
+        if path == agents_file:
+            path.write_bytes(b"partial")
+            raise OSError("disk write failed")
+        return original_write_text(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", partial_write_then_fail)
+    updated = AgentConfig(**agent_payload(name="Changed", skill_names=[]))
+    context = RequestContext(unit_id="unit-1", project_id="p1", user_id="u1")
+    with factory() as session, pytest.raises(OSError, match="disk write failed"):
+        service.update("reservoir-dispatch", updated, context=context, session=session, request_id="partial-write-1")
+    assert agents_file.read_bytes() == previous
+    assert store.get("reservoir-dispatch")["name"] != "Changed"

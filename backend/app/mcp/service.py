@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from uuid import uuid4
 
 import httpx
 from sqlalchemy.exc import IntegrityError
@@ -73,7 +74,7 @@ class McpService:
                 resource_type="mcp_client", resource_id=key, resource_name=name,
                 summary=f"MCP client {key} management operation succeeded",
                 metadata=metadata, allowed_metadata_keys=frozenset(metadata),
-                idempotency_key=f"management:{request_id or key}:{action}:{key}",
+                idempotency_key=f"management:{request_id or str(uuid4())}:{action}:{key}",
                 occurred_at=datetime.now(UTC),
             ))
             session.commit()
@@ -110,7 +111,7 @@ class McpService:
                 summary=f"MCP client {request.key} was created",
                 metadata={"transport": request.transport, "enabled": request.enabled},
                 allowed_metadata_keys=frozenset({"transport", "enabled"}),
-                idempotency_key=f"management:{request_id or request.key}:mcp.create:{request.key}",
+                idempotency_key=f"management:{request_id or str(uuid4())}:mcp.create:{request.key}",
                 occurred_at=datetime.now(UTC),
             ))
             session.commit()

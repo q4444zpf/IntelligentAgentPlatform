@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
+from uuid import uuid4
 from sqlalchemy.orm import Session
 
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
@@ -85,7 +86,7 @@ class ToolService:
                 resource_type="tool", resource_id=tool_id,
                 summary=f"Tool {tool_id} was {'enabled' if enabled else 'disabled'}",
                 metadata={"enabled": enabled}, allowed_metadata_keys=frozenset({"enabled"}),
-                idempotency_key=f"management:{request_id or tool_id}:tool.toggle:{tool_id}",
+                idempotency_key=f"management:{request_id or str(uuid4())}:tool.toggle:{tool_id}",
                 occurred_at=datetime.now(UTC),
             ))
             session.commit()

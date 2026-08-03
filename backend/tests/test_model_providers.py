@@ -294,3 +294,22 @@ def test_invalid_provider_body_records_failed_audit_without_request_secrets(tmp_
     assert secret not in serialized
     assert "Bearer hidden" not in serialized
     assert "provider-validation-1" in event.idempotency_key
+
+
+def test_repeated_provider_config_without_request_id_records_each_mutation(tmp_path, monkeypatch):
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+
+    client, service = provider_api_client(tmp_path, monkeypatch)
+    first = client.put("/api/providers/ollama/config", json={"base_url": "http://localhost:11434/v1", "enabled": True})
+    second = client.put("/api/providers/ollama/config", json={"base_url": "http://localhost:11435/v1", "enabled": True})
+    assert first.status_code == 200
+    assert second.status_code == 200
+    with service.store.session_factory() as session:
+        events = list(session.scalars(select(AuditEvent).where(
+            AuditEvent.source == "llm",
+            AuditEvent.action == "resource.updated",
+            AuditEvent.resource_id == "ollama",
+        )))
+    assert len(events) == 2
+    assert len({event.idempotency_key for event in events}) == 2

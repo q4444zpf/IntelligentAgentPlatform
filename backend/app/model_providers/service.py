@@ -2,6 +2,7 @@ import time
 from copy import deepcopy
 
 from datetime import UTC, datetime
+from uuid import uuid4
 import httpx
 
 from sqlalchemy.orm import Session
@@ -27,7 +28,7 @@ class ProviderService:
                 resource_id=resource_id, resource_name=resource_name,
                 summary=f"Model provider resource {resource_id} management operation succeeded",
                 metadata=metadata, allowed_metadata_keys=frozenset(metadata),
-                idempotency_key=f"management:{request_id or resource_id}:{action}:{resource_id}",
+                idempotency_key=f"management:{request_id or str(uuid4())}:{action}:{resource_id}",
                 occurred_at=datetime.now(UTC),
             ))
             session.commit()
@@ -118,7 +119,7 @@ class ProviderService:
                 resource_name=provider.name, summary=f"Model provider {provider_id} was updated",
                 metadata={"enabled": bucket["enabled"], "protocol": bucket.get("protocol", provider.protocol)},
                 allowed_metadata_keys=frozenset({"enabled", "protocol"}),
-                idempotency_key=f"management:{request_id or provider_id}:provider.configure:{provider_id}",
+                idempotency_key=f"management:{request_id or str(uuid4())}:provider.configure:{provider_id}",
                 occurred_at=datetime.now(UTC),
             ))
             session.commit()

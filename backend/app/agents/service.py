@@ -113,7 +113,7 @@ class AgentService:
                 resource_type="agent", resource_id=agent_id, resource_name=name,
                 summary=f"Agent {agent_id} management operation succeeded",
                 metadata=metadata, allowed_metadata_keys=frozenset(metadata),
-                idempotency_key=f"management:{request_id or agent_id}:{action}:{agent_id}",
+                idempotency_key=f"management:{request_id or str(uuid4())}:{action}:{agent_id}",
                 occurred_at=datetime.now(UTC),
             ))
             session.commit()
@@ -284,7 +284,7 @@ class AgentService:
                 resource_type="agent", resource_id=request.id, resource_name=config.name,
                 summary=f"Agent {request.id} was created", metadata={"runtime_form": config.runtime_form, "enabled": config.enabled},
                 allowed_metadata_keys=frozenset({"runtime_form", "enabled"}),
-                idempotency_key=f"management:{request_id or request.id}:agent.create:{request.id}", occurred_at=datetime.now(UTC),
+                idempotency_key=f"management:{request_id or str(uuid4())}:agent.create:{request.id}", occurred_at=datetime.now(UTC),
             ))
             session.commit()
         except IntegrityError as error:
@@ -308,20 +308,22 @@ class AgentService:
         workspace = Path(record["workspace_dir"])
         agents_file = workspace / "AGENTS.md"
         previous = agents_file.read_bytes() if agents_file.is_file() else None
-        if workspace.is_dir():
-            agents_file.write_text(
-                f"# {request.name}\n\n{request.system_prompt or request.description}\n",
-                encoding="utf-8",
-            )
-        if context is not None and session is not None:
-            try:
+        try:
+            if workspace.is_dir():
+                agents_file.write_text(
+                    f"# {request.name}\n\n{request.system_prompt or request.description}\n",
+                    encoding="utf-8",
+                )
+            if context is not None and session is not None:
                 self._commit_management(context, session, request_id, action="resource.updated", agent_id=agent_id, name=request.name, metadata={"runtime_form": request.runtime_form, "enabled": request.enabled})
-            except Exception:
-                if previous is None:
-                    agents_file.unlink(missing_ok=True)
-                else:
-                    agents_file.write_bytes(previous)
-                raise
+        except Exception:
+            if session is not None:
+                session.rollback()
+            if previous is None:
+                agents_file.unlink(missing_ok=True)
+            else:
+                agents_file.write_bytes(previous)
+            raise
         return self._info(record)
 
     def set_enabled(self, agent_id: str, enabled: bool, *, context: RequestContext | None = None, session: Session | None = None, request_id: str | None = None) -> AgentInfo:
@@ -376,7 +378,7 @@ class AgentService:
                 actor_role=context.role, category="management", source="agent", action="resource.deleted",
                 status="succeeded", risk_level="high", resource_type="agent", resource_id=agent_id,
                 resource_name=record["name"], summary=f"Agent {agent_id} was deleted",
-                idempotency_key=f"management:{request_id or agent_id}:agent.delete:{agent_id}", occurred_at=datetime.now(UTC),
+                idempotency_key=f"management:{request_id or str(uuid4())}:agent.delete:{agent_id}", occurred_at=datetime.now(UTC),
             ))
             session.commit()
         except Exception:
