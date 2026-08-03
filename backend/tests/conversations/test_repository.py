@@ -284,6 +284,14 @@ def test_list_runs_filters_paginates_and_summarizes_full_scope(tmp_path):
     }
     assert second_page.total == 3
     assert [item["id"] for item in second_page.items] == ["run-old"]
+    assert filtered.total == 1
+    assert filtered.summary == {
+        "total": 1,
+        "completed": 1,
+        "running": 0,
+        "failed": 0,
+        "tool_invocations": 2,
+    }
     assert [item["id"] for item in filtered.items] == ["run-b"]
     assert [item["id"] for item in by_id.items] == ["run-b"]
     item = page.items[0]
@@ -293,3 +301,56 @@ def test_list_runs_filters_paginates_and_summarizes_full_scope(tmp_path):
     assert len(item["trigger_summary"]) == 200
     assert item["tool_invocation_count"] == 2
     assert item["duration_ms"] == 1250
+
+
+def test_list_runs_rejects_trigger_message_from_another_conversation(tmp_path):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.conversations.models import Message
+    from app.db.base import Base
+
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'mismatch.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    with factory.begin() as session:
+        session.add_all(
+            [
+                Conversation(id="c-a", project_id="p1", owner_id="u1", title="A"),
+                Conversation(id="c-b", project_id="p1", owner_id="u2", title="B"),
+            ]
+        )
+        session.add(
+            Message(
+                id="message-b",
+                conversation_id="c-b",
+                sequence=1,
+                role="user",
+                content="secret from user B",
+            )
+        )
+        session.add(
+            AgentRun(
+                id="run-a",
+                conversation_id="c-a",
+                trigger_message_id="message-b",
+                actor_type="agent",
+                actor_id="a1",
+                status="completed",
+            )
+        )
+
+    with factory() as session:
+        result = ConversationRepository(session).list_runs(
+            project_id="p1", owner_id="u1", page=1, page_size=20
+        )
+
+    assert result.items == []
+    assert result.total == 0
+    assert result.summary == {
+        "total": 0,
+        "completed": 0,
+        "running": 0,
+        "failed": 0,
+        "tool_invocations": 0,
+    }

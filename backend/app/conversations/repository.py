@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, TypeVar
 
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session
 
 from .models import AgentRun, Conversation, Message, RunEvent, ToolInvocation
@@ -58,6 +58,7 @@ class ConversationRepository:
                 AgentRun.conversation_id,
                 Conversation.title.label("conversation_title"),
                 AgentRun.trigger_message_id,
+                Message.content.label("trigger_content"),
                 AgentRun.actor_type,
                 AgentRun.actor_id,
                 AgentRun.status,
@@ -65,30 +66,41 @@ class ConversationRepository:
                 AgentRun.updated_at,
             )
             .join(Conversation, Conversation.id == AgentRun.conversation_id)
+            .join(
+                Message,
+                and_(
+                    Message.id == AgentRun.trigger_message_id,
+                    Message.conversation_id == AgentRun.conversation_id,
+                ),
+            )
             .where(*filters)
             .subquery()
         )
-        tool_counts = (
+        page_runs = (
+            select(runs)
+            .order_by(runs.c.created_at.desc(), runs.c.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .subquery()
+        )
+        page_tool_counts = (
             select(
                 ToolInvocation.run_id,
                 func.count(ToolInvocation.id).label("tool_invocation_count"),
             )
+            .where(ToolInvocation.run_id.in_(select(page_runs.c.id)))
             .group_by(ToolInvocation.run_id)
             .subquery()
         )
         rows = self.session.execute(
             select(
-                runs,
-                Message.content.label("trigger_content"),
-                func.coalesce(tool_counts.c.tool_invocation_count, 0).label(
+                page_runs,
+                func.coalesce(page_tool_counts.c.tool_invocation_count, 0).label(
                     "tool_invocation_count"
                 ),
             )
-            .join(Message, Message.id == runs.c.trigger_message_id)
-            .outerjoin(tool_counts, tool_counts.c.run_id == runs.c.id)
-            .order_by(runs.c.created_at.desc(), runs.c.id.desc())
-            .offset((page - 1) * page_size)
-            .limit(page_size)
+            .outerjoin(page_tool_counts, page_tool_counts.c.run_id == page_runs.c.id)
+            .order_by(page_runs.c.created_at.desc(), page_runs.c.id.desc())
         ).mappings()
 
         items = []
@@ -113,6 +125,11 @@ class ConversationRepository:
                 }
             )
 
+        scoped_tool_total = (
+            select(func.count(ToolInvocation.id))
+            .where(ToolInvocation.run_id.in_(select(runs.c.id)))
+            .scalar_subquery()
+        )
         aggregate = (
             self.session.execute(
                 select(
@@ -129,10 +146,8 @@ class ConversationRepository:
                     func.coalesce(
                         func.sum(case((runs.c.status == "failed", 1), else_=0)), 0
                     ).label("failed"),
-                    func.coalesce(
-                        func.sum(tool_counts.c.tool_invocation_count), 0
-                    ).label("tool_invocations"),
-                ).outerjoin(tool_counts, tool_counts.c.run_id == runs.c.id)
+                    func.coalesce(scoped_tool_total, 0).label("tool_invocations"),
+                )
             )
             .mappings()
             .one()
