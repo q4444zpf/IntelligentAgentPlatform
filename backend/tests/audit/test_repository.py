@@ -61,15 +61,16 @@ def test_repository_filters_searches_literal_wildcards_and_summarizes_full_set(s
         event("a", minute=1, resource_name=r"literal %_\\ target", status="failed", risk_level="critical", source="tool"),
         event("b", minute=2, category="management", source="system", action="resource.updated", duration_ms=None),
         event("c", minute=2, source="llm", risk_level="high"),
+        event("d", minute=0, category="management", source="system", risk_level="critical"),
     ])
     session.commit()
     repository = AuditRepository(session)
     scope = [AuditEvent.unit_id == "u1", AuditEvent.project_id == "p1"]
     page = repository.list_events(scope, page=1, page_size=1)
     assert [item.id for item in page.items] == ["c"]
-    assert page.total == 3
-    assert page.summary == {"total": 3, "failed": 1, "high_risk": 2, "runtime": 2,
-                            "management": 1, "by_source": {"llm": 1, "system": 1, "tool": 1}}
+    assert page.total == 4
+    assert page.summary == {"total": 4, "failed": 1, "high_risk": 2, "runtime": 2,
+                            "management": 2, "by_source": {"llm": 1, "system": 2, "tool": 1}}
     assert [item.id for item in repository.list_events(scope, page=1, page_size=20, query=r"%_\\").items] == ["a"]
     assert repository.list_events(scope, page=1, page_size=20, query="safe").items == []
 
