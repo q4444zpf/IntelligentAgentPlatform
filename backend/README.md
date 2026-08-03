@@ -14,9 +14,9 @@ python -m uvicorn app.main:app --reload --port 8000
 
 `DATABASE_URL` 用于会话、消息、Agent Run 和 Run Event。修改模型后先创建 Alembic 迁移，再执行 `python -m alembic upgrade head`。
 
-`IAP_ALLOW_DEV_IDENTITY` 默认是 `false`。开启后，请求仍必须同时提供 `X-User-ID` 和 `X-Project-ID`；这只是本地开发适配器，不得作为生产认证。生产环境应使用可信认证会话，并保持该开关关闭。
+`IAP_ALLOW_DEV_IDENTITY` 默认是 `false`。开启后，请求仍必须同时提供 `X-Unit-ID`、`X-User-ID` 和 `X-Project-ID`；这只是本地开发适配器，不得作为生产认证。生产环境应使用可信认证会话，并保持该开关关闭。
 
-根目录 Compose 同样默认关闭开发身份。需要在容器化本机环境调试会话页面时，必须同时显式设置 `IAP_ALLOW_DEV_IDENTITY=true`、`VITE_DEV_USER_ID` 和 `VITE_DEV_PROJECT_ID` 并重新构建 Web 镜像；这些变量不得用于生产部署。
+根目录 Compose 同样默认关闭开发身份。需要在容器化本机环境调试会话或审计页面时，必须同时显式设置 `IAP_ALLOW_DEV_IDENTITY=true`、`VITE_DEV_UNIT_ID`、`VITE_DEV_USER_ID`、`VITE_DEV_PROJECT_ID` 和 `VITE_DEV_USER_ROLES` 并重新构建 Web 镜像；`VITE_DEV_USER_ROLES` 是逗号分隔的 `user`、`project_admin`、`unit_auditor` 集合。这些变量只用于非敏感测试身份，不得用于生产部署。
 
 ## 会话和运行接口
 
@@ -37,6 +37,28 @@ python -m uvicorn app.main:app --reload --port 8000
 运行详情继续复用既有的 `GET /api/agent-runs/{run_id}`、`GET /api/agent-runs/{run_id}/events` 和 `GET /api/agent-runs/{run_id}/tool-invocations`。这些接口沿用相同的项目与用户范围隔离；工具调用接口返回 Tool Gateway 按敏感字段名脱敏后持久化的 `arguments_summary`、`result_summary` 及错误码、耗时等审计字段。调用方仍须避免把秘密放在非敏感字段中，审计接口不应作为秘密存储。
 
 当前生产 Dispatcher 会让新 Run 保持 `queued`，不会伪造智能体回复或沙箱运行状态。
+
+## 统一审计接口
+
+- `GET /api/audit/events`
+- `GET /api/audit/events/{event_id}`
+- `GET /api/audit/events/{event_id}/related`
+
+列表支持 `page`、`page_size`（最大 100）、`category`、`source`、`action`、`status`、`risk_level`、`project_id`、`user_id`、`query`、`occurred_after` 和 `occurred_before`。`query` 匹配事件、Trace、Run 或资源标识；时间边界必须是带 `Z` 或明确偏移的 timezone-aware ISO 8601 值，且开始时间不得晚于结束时间。
+
+读取范围由服务端角色约束：`unit_auditor` 可读当前单位，`project_admin` 可读当前项目，普通 `user` 仅可读当前项目中的本人事件；客户端筛选不能扩大该范围。详情和关联事件对“不存在”与“越权”统一返回安全 404，避免暴露资源是否存在。
+
+审计记录是追加写入的独立事件，不提供更新或删除 API。写入前仅保留显式允许的元数据字段，并按敏感字段名递归脱敏、限制层级与大小；不得将凭据、口令、客户数据或原始 Prompt 写入摘要或元数据。当前已接入 Agent、tool、LLM 运行事件及 Agent、MCP、Tool、模型供应商等选定管理操作。知识库真实审计、真实 MCP 执行、沙箱审计、导出、保留期自动化和事件总线尚未实现。
+
+升级统一审计表后，运维人员可在 API 启动前或独立维护窗口显式执行受控回填：
+
+```powershell
+cd backend
+python -m alembic upgrade head
+python -m app.audit.backfill
+```
+
+该命令按批提交，并以每个 Agent Run 的稳定幂等键写入快照，可安全重跑；API 启动不会自动回填。仅对目标测试或维护数据库执行，并在执行前确认 `DATABASE_URL`。
 
 ## 大模型供应商配置
 
