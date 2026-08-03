@@ -21,10 +21,12 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue';
 import { EyeOutlined, ReloadOutlined } from '@ant-design/icons-vue';
+import { useRoute } from 'vue-router';
 import { agentRunsApi, type AgentRunListItem, type RunEvent } from '@/api/agentRuns';
 import { ApiError } from '@/api/client';
 import type { AgentRunInfo } from '@/api/conversations';
 import type { ToolInvocationInfo } from '@/api/tools';
+const route = useRoute();
 type Resource<T> = { data: T | null; loading: boolean; error: string };
 type DetailKey = 'run' | 'events' | 'tools';
 type DateBoundary = { startOf: (unit: 'day') => { toISOString: () => string }; endOf: (unit: 'day') => { toISOString: () => string } };
@@ -42,7 +44,7 @@ const detailRequests: Record<DetailKey, { controller?: AbortController; generati
 const errorText = (e: unknown) => e instanceof ApiError && e.status === 404 ? '记录不存在或无权访问' : e instanceof Error ? e.message : '加载失败';
 const isAbort = (e: unknown) => e instanceof DOMException && e.name === 'AbortError';
 function filters() { return { page: page.value, page_size: pageSize.value, ...(status.value !== 'all' ? {status:status.value}:{}), ...(actorId.value.trim()?{actor_id:actorId.value.trim()}:{}), ...(query.value.trim()?{query:query.value.trim()}:{}), ...(startedAfter.value?{started_after:startedAfter.value}:{}), ...(startedBefore.value?{started_before:startedBefore.value}:{}) }; }
-async function loadRuns() { const id=++listId; listController?.abort(); const controller=new AbortController(); listController=controller; loading.value=true; listError.value=''; try { const result=await agentRunsApi.list(filters(),controller.signal); if(id!==listId)return; runs.value=result.items; total.value=result.total; summary.value=result.summary; } catch(e) { if(id!==listId||isAbort(e))return; listError.value=errorText(e); } finally { if(id===listId){loading.value=false;if(listController===controller)listController=undefined;} } }
+async function loadRuns() { const id=++listId; listController?.abort(); const controller=new AbortController(); listController=controller; loading.value=true; listError.value=''; try { const result=await agentRunsApi.list(filters(),controller.signal); if(id!==listId)return; runs.value=result.items; total.value=result.total; summary.value=result.summary; const deepLink=typeof route.query.run_id==='string'?route.query.run_id:''; if(deepLink&&!drawerOpen.value&&result.items.some(item=>item.id===deepLink))openRun(deepLink); } catch(e) { if(id!==listId||isAbort(e))return; listError.value=errorText(e); } finally { if(id===listId){loading.value=false;if(listController===controller)listController=undefined;} } }
 function refresh(){const runId=drawerOpen.value?activeRunId.value:'';cache.clear();if(runId)openRun(runId);else cancelDetails();loadRuns();} function applyFilters(){page.value=1;loadRuns();}
 function changeDates(dates:[DateBoundary,DateBoundary]|null){startedAfter.value=dates?.[0]?.startOf('day').toISOString()||'';startedBefore.value=dates?.[1]?.endOf('day').toISOString()||'';applyFilters();}
 function changePage(next:number,size:number){const sizeChanged=size!==pageSize.value;pageSize.value=size;page.value=sizeChanged?1:next;loadRuns();}

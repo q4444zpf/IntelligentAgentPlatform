@@ -13,8 +13,10 @@ const mocks = vi.hoisted(() => ({
   listEvents: vi.fn(),
   listInvocations: vi.fn(),
 }));
+const routeState = vi.hoisted(() => ({ query: {} as Record<string, string> }));
 
 vi.mock('@/api/agentRuns', () => ({ agentRunsApi: mocks }));
+vi.mock('vue-router', () => ({ useRoute: () => routeState }));
 
 function run(id = 'run-1', status = 'completed') {
   return {
@@ -86,6 +88,7 @@ function render() {
 }
 
 beforeEach(() => {
+  routeState.query = {};
   Object.values(mocks).forEach((mock) => mock.mockReset());
   mocks.list.mockResolvedValue(page());
   mocks.get.mockResolvedValue(run());
@@ -180,6 +183,17 @@ describe('AgentRunListView list behavior', () => {
 });
 
 describe('AgentRunListView details', () => {
+  it('opens the matching run drawer from the run_id query after the list loads', async () => {
+    routeState.query = { run_id: 'run-2' };
+    mocks.list.mockResolvedValue(page([run('run-1'), run('run-2')]));
+    mocks.get.mockImplementation((id: string) => Promise.resolve(run(id)));
+    const wrapper = render();
+    await flushPromises();
+
+    expect(mocks.get).toHaveBeenCalledWith('run-2', expect.any(AbortSignal));
+    expect(wrapper.get('.drawer').text()).toContain('run-2');
+  });
+
   it('loads all detail resources only after opening a run and shows tools', async () => {
     const wrapper = render(); await flushPromises();
     expect(mocks.get).not.toHaveBeenCalled();

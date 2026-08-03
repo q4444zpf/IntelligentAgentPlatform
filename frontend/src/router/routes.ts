@@ -143,7 +143,7 @@ export const routes: RouteRecordRaw[] = [
       { path: 'system/tenant-projects', name: 'TenantProjects', component: genericView, meta: { title: '租户与项目', module: 'users', permission: 'system:users' } },
       { path: 'system/roles', name: 'Roles', component: genericView, meta: { title: '角色管理', module: 'users', permission: 'system:users' } },
       { path: 'system/users', name: 'Users', component: genericView, meta: { title: '用户与权限', module: 'users', permission: 'system:users' } },
-      { path: 'system/audit', name: 'Audit', component: genericView, meta: { title: '审计与日志', module: 'audit', permission: 'system:audit' } },
+      { path: 'system/audit', name: 'Audit', component: () => import('@/views/security/AuditLogView.vue'), meta: { title: '审计与日志', permission: 'system:audit' } },
       { path: 'system/sandbox', name: 'SandboxMonitor', component: () => import('@/views/security/SandboxMonitorView.vue'), meta: { title: '沙箱监控', permission: 'platform:sandbox' } },
       { path: 'system/settings', name: 'Settings', component: genericView, meta: { title: '系统设置', module: 'settings', permission: 'system:settings' } },
     ],
