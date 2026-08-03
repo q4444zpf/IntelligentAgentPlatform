@@ -31,10 +31,15 @@ describe('auditApi', () => {
     );
   });
 
-  it('preserves false values in the query serializer', async () => {
+  it('does not forward runtime keys outside the backend filter contract', async () => {
     vi.mocked(request).mockResolvedValue({});
-    await auditApi.list({ page: 1, page_size: 20, include_system: false } as never);
-    expect(request).toHaveBeenCalledWith('/audit/events?page=1&page_size=20&include_system=false', { signal: undefined });
+    await auditApi.list({
+      page: 1,
+      page_size: 20,
+      include_system: false,
+      unknown_field: 'value',
+    } as never);
+    expect(request).toHaveBeenCalledWith('/audit/events?page=1&page_size=20', { signal: undefined });
   });
 
   it('encodes ids and forwards AbortSignal for all endpoints', async () => {

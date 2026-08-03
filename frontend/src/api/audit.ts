@@ -78,14 +78,10 @@ function hasValue(value: unknown): boolean {
 function auditQuery(filters: AuditFilters): string {
   const params = new URLSearchParams();
   const values = filters as Record<string, unknown>;
-  const known = new Set<string>(filterOrder);
 
   for (const key of filterOrder) {
     const value = values[key];
     if (hasValue(value)) params.set(key, String(value));
-  }
-  for (const [key, value] of Object.entries(values)) {
-    if (!known.has(key) && hasValue(value)) params.set(key, String(value));
   }
 
   const query = params.toString();
