@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, select
@@ -173,6 +175,72 @@ def test_agent_run_list_rejects_invalid_query_parameters():
             "/api/agent-runs?started_after=not-a-time", headers=HEADERS
         ).status_code
         == 422
+    )
+
+
+@pytest.mark.parametrize("query", ["%", "_"])
+def test_agent_run_list_treats_query_wildcards_as_literals(query):
+    client = build_client()
+    create_run(client, title="ordinary title")
+
+    response = client.get(
+        "/api/agent-runs", params={"query": query}, headers=HEADERS
+    )
+
+    assert response.status_code == 200
+    assert response.json()["items"] == []
+    assert response.json()["total"] == 0
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("status", "Invalid"),
+        ("status", "_invalid"),
+        ("status", "a" * 31),
+        ("actor_id", "Invalid"),
+        ("actor_id", "a" * 65),
+        ("query", "q" * 201),
+    ],
+)
+def test_agent_run_list_rejects_unsafe_or_oversized_filters(name, value):
+    client = build_client()
+
+    response = client.get(
+        "/api/agent-runs", params={name: value}, headers=HEADERS
+    )
+
+    assert response.status_code == 422
+
+
+def test_agent_run_list_rejects_naive_time_filters():
+    client = build_client()
+
+    response = client.get(
+        "/api/agent-runs",
+        params={"started_after": "2026-01-01T00:00:00"},
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Run date filters must include a timezone"
+
+
+def test_agent_run_list_rejects_reversed_time_range():
+    client = build_client()
+
+    response = client.get(
+        "/api/agent-runs",
+        params={
+            "started_after": "2026-01-02T00:00:00Z",
+            "started_before": "2026-01-01T00:00:00Z",
+        },
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        "started_after must not be later than started_before"
     )
 
 

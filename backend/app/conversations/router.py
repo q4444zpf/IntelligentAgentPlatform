@@ -49,6 +49,26 @@ def encode_sse(event: RunEventInfo) -> str:
     return f"id: {event.sequence}\nevent: {event.event_type}\ndata: {data}\n\n"
 
 
+def validate_run_date_filters(
+    started_after: datetime | None, started_before: datetime | None
+) -> None:
+    values = (started_after, started_before)
+    if any(value is not None and value.utcoffset() is None for value in values):
+        raise HTTPException(
+            status_code=422,
+            detail="Run date filters must include a timezone",
+        )
+    if (
+        started_after is not None
+        and started_before is not None
+        and started_after > started_before
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="started_after must not be later than started_before",
+        )
+
+
 def create_router(
     service_factory: ServiceFactory = default_service_factory,
 ) -> APIRouter:
@@ -119,14 +139,24 @@ def create_router(
     def list_runs(
         page: Annotated[int, Query(ge=1)] = 1,
         page_size: Annotated[int, Query(ge=1, le=100)] = 20,
-        status: str | None = None,
-        actor_id: str | None = None,
-        query: str | None = None,
+        status: Annotated[
+            str | None,
+            Query(max_length=30, pattern=r"^[a-z][a-z0-9_-]*$"),
+        ] = None,
+        actor_id: Annotated[
+            str | None,
+            Query(
+                max_length=64,
+                pattern=r"^[a-z][a-z0-9_-]{0,63}$",
+            ),
+        ] = None,
+        query: Annotated[str | None, Query(max_length=200)] = None,
         started_after: datetime | None = None,
         started_before: datetime | None = None,
         context: RequestContext = Depends(require_request_context),
         manager: ConversationService = Depends(service),
     ):
+        validate_run_date_filters(started_after, started_before)
         return manager.list_runs(
             context,
             page=page,

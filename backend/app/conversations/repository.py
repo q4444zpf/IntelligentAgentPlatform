@@ -43,9 +43,17 @@ class ConversationRepository:
         if actor_id is not None:
             filters.append(AgentRun.actor_id == actor_id)
         if query:
-            pattern = f"%{query}%"
+            escaped_query = (
+                query.replace("\\", "\\\\")
+                .replace("%", r"\%")
+                .replace("_", r"\_")
+            )
+            pattern = f"%{escaped_query}%"
             filters.append(
-                or_(AgentRun.id.ilike(pattern), Conversation.title.ilike(pattern))
+                or_(
+                    AgentRun.id.ilike(pattern, escape="\\"),
+                    Conversation.title.ilike(pattern, escape="\\"),
+                )
             )
         if started_after is not None:
             filters.append(AgentRun.created_at >= started_after)
