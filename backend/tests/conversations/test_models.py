@@ -24,6 +24,7 @@ def test_conversation_requires_unit_and_has_scope_index():
         "project_id",
         "owner_id",
     )
+    assert not any(columns == ("unit_id",) for columns in indexes.values())
 
 
 def test_persists_project_scoped_conversation_graph():

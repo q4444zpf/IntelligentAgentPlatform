@@ -29,7 +29,7 @@ class Conversation(Base):
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    unit_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    unit_id: Mapped[str] = mapped_column(String(64), nullable=False)
     project_id: Mapped[str] = mapped_column(String(64), index=True)
     owner_id: Mapped[str] = mapped_column(String(64), index=True)
     title: Mapped[str] = mapped_column(String(200))

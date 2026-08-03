@@ -1,16 +1,29 @@
 import os
 import subprocess
+import sys
 
 import pytest
 from sqlalchemy import create_engine, inspect
+
+ALEMBIC_UPGRADE_COMMAND = (
+    sys.executable,
+    "-m",
+    "alembic",
+    "-c",
+    "backend/alembic.ini",
+    "upgrade",
+    "head",
+)
+
+
+def test_upgrade_command_uses_backend_alembic_config():
+    assert ALEMBIC_UPGRADE_COMMAND[3:5] == ("-c", "backend/alembic.ini")
 
 
 @pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="requires PostgreSQL")
 def test_upgrade_head_creates_conversation_tables():
     env = os.environ | {"DATABASE_URL": os.environ["TEST_DATABASE_URL"]}
-    subprocess.run(
-        ["python", "-m", "alembic", "upgrade", "head"], check=True, env=env
-    )
+    subprocess.run(ALEMBIC_UPGRADE_COMMAND, check=True, env=env)
     inspector = inspect(create_engine(env["DATABASE_URL"]))
     tables = set(inspector.get_table_names())
     assert {
@@ -33,9 +46,10 @@ def test_upgrade_head_creates_conversation_tables():
     }
     assert conversation_columns["unit_id"]["nullable"] is False
     conversation_indexes = {
-        index["name"] for index in inspector.get_indexes("conversations")
+        index["name"]: tuple(index["column_names"])
+        for index in inspector.get_indexes("conversations")
     }
-    assert "ix_conversations_unit_project_owner" in conversation_indexes
+    assert conversation_indexes["ix_conversations_unit_project_owner"] == ("unit_id", "project_id", "owner_id")
     invocation_columns = {
         column["name"]: column
         for column in inspector.get_columns("tool_invocations")
@@ -57,13 +71,16 @@ def test_upgrade_head_creates_conversation_tables():
     )
     assert idempotency_constraint["column_names"] == ["idempotency_key"]
     audit_indexes = {
-        index["name"] for index in inspector.get_indexes("audit_events")
+        index["name"]: tuple(index["column_names"])
+        for index in inspector.get_indexes("audit_events")
     }
-    assert {
-        "ix_audit_unit_time",
-        "ix_audit_project_time",
-        "ix_audit_user_time",
-        "ix_audit_trace_time",
-        "ix_audit_run_time",
-        "ix_audit_source_action_status",
-    } <= audit_indexes
+    assert audit_indexes == {
+        "ix_audit_unit_time": ("unit_id", "occurred_at", "id"),
+        "ix_audit_project_time": ("unit_id", "project_id", "occurred_at", "id"),
+        "ix_audit_user_time": (
+            "unit_id", "project_id", "user_id", "occurred_at", "id"
+        ),
+        "ix_audit_trace_time": ("trace_id", "occurred_at", "id"),
+        "ix_audit_run_time": ("run_id", "occurred_at", "id"),
+        "ix_audit_source_action_status": ("source", "action", "status"),
+    }
