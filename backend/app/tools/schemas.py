@@ -41,6 +41,7 @@ class ToolCall:
 
 @dataclass(frozen=True)
 class ToolExecutionContext:
+    unit_id: str
     run_id: str
     conversation_id: str
     project_id: str

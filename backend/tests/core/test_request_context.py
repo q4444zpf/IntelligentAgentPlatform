@@ -22,7 +22,7 @@ def test_rejects_missing_identity():
 def test_rejects_headers_when_dev_identity_is_disabled():
     response = build_client(False).get(
         "/context",
-        headers={"X-User-ID": "user-1", "X-Project-ID": "project-1"},
+        headers={"X-Unit-ID": "unit-1", "X-User-ID": "user-1", "X-Project-ID": "project-1"},
     )
     assert response.status_code == 401
 
@@ -30,8 +30,31 @@ def test_rejects_headers_when_dev_identity_is_disabled():
 def test_accepts_explicit_dev_identity():
     response = build_client(True).get(
         "/context",
-        headers={"X-User-ID": "user-1", "X-Project-ID": "project-1"},
+        headers={"X-Unit-ID": "unit-1", "X-User-ID": "user-1", "X-Project-ID": "project-1", "X-User-Roles": "user, unit_auditor"},
     )
-    assert response.json() == {
-        "user_id": "user-1", "project_id": "project-1", "role": "user"
+    body = response.json()
+    assert {key: body[key] for key in ("unit_id", "user_id", "project_id")} == {
+        "unit_id": "unit-1", "user_id": "user-1", "project_id": "project-1"
     }
+    assert set(body["roles"]) == {"user", "unit_auditor"}
+
+
+def test_requires_unit_header_for_dev_identity():
+    response = build_client(True).get("/context", headers={"X-User-ID": "user-1", "X-Project-ID": "project-1"})
+    assert response.status_code == 401
+
+
+def test_maps_legacy_admin_role_to_project_admin():
+    response = build_client(True).get("/context", headers={"X-Unit-ID": "unit-1", "X-User-ID": "user-1", "X-Project-ID": "project-1", "X-User-Role": "admin"})
+    assert response.status_code == 200
+    assert response.json()["roles"] == ["project_admin"]
+
+
+def test_rejects_unknown_role():
+    response = build_client(True).get("/context", headers={"X-Unit-ID": "unit-1", "X-User-ID": "user-1", "X-Project-ID": "project-1", "X-User-Roles": "user,superuser"})
+    assert response.status_code == 401
+
+
+def test_compatibility_role_maps_elevated_roles_to_admin():
+    assert RequestContext(unit_id="unit-1", project_id="project-1", user_id="user-1").role == "user"
+    assert RequestContext(unit_id="unit-1", project_id="project-1", user_id="user-1", roles=frozenset({"unit_auditor"})).role == "admin"

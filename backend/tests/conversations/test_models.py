@@ -15,7 +15,7 @@ def test_persists_project_scoped_conversation_graph():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
-        conversation = Conversation(project_id="p1", owner_id="u1", title="洪水研判")
+        conversation = Conversation(unit_id="unit-1", project_id="p1", owner_id="u1", title="洪水研判")
         session.add(conversation)
         session.flush()
         message = Message(
@@ -51,7 +51,7 @@ def test_persists_tool_invocation_for_agent_run():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
-        conversation = Conversation(project_id="p1", owner_id="u1", title="查询时间")
+        conversation = Conversation(unit_id="unit-1", project_id="p1", owner_id="u1", title="查询时间")
         session.add(conversation)
         session.flush()
         message = Message(

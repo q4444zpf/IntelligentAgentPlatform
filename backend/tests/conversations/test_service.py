@@ -59,7 +59,7 @@ def build_service():
 
 def test_creates_message_run_and_initial_event_atomically():
     session, dispatcher, service = build_service()
-    context = RequestContext(user_id="u1", project_id="p1")
+    context = RequestContext(unit_id="unit-1", user_id="u1", project_id="p1")
     conversation = service.create_conversation(
         context, ConversationCreate(title="洪水研判")
     )
@@ -78,7 +78,7 @@ def test_creates_message_run_and_initial_event_atomically():
 
 def test_message_activity_advances_conversation_recency():
     session, _, service = build_service()
-    context = RequestContext(user_id="u1", project_id="p1")
+    context = RequestContext(unit_id="unit-1", user_id="u1", project_id="p1")
     conversation = service.create_conversation(
         context, ConversationCreate(title="洪水研判")
     )
@@ -100,11 +100,11 @@ def test_message_activity_advances_conversation_recency():
 
 def test_cannot_read_another_project_conversation():
     _, _, service = build_service()
-    owner = RequestContext(user_id="u1", project_id="p1")
+    owner = RequestContext(unit_id="unit-1", user_id="u1", project_id="p1")
     conversation = service.create_conversation(
         owner, ConversationCreate(title="项目一")
     )
-    other = RequestContext(user_id="u2", project_id="p2")
+    other = RequestContext(unit_id="unit-1", user_id="u2", project_id="p2")
     try:
         service.get_conversation(other, conversation.id)
     except ConversationNotFound:
@@ -115,11 +115,11 @@ def test_cannot_read_another_project_conversation():
 
 def test_cannot_read_another_users_private_conversation_in_same_project():
     _, _, service = build_service()
-    owner = RequestContext(user_id="u1", project_id="p1")
+    owner = RequestContext(unit_id="unit-1", user_id="u1", project_id="p1")
     conversation = service.create_conversation(
         owner, ConversationCreate(title="个人研判")
     )
-    other_user = RequestContext(user_id="u2", project_id="p1")
+    other_user = RequestContext(unit_id="unit-1", user_id="u2", project_id="p1")
     try:
         service.get_conversation(other_user, conversation.id)
     except ConversationNotFound:
@@ -130,7 +130,7 @@ def test_cannot_read_another_users_private_conversation_in_same_project():
 
 def test_uses_default_agent_when_agent_id_is_omitted():
     session, dispatcher, service = build_service()
-    context = RequestContext(user_id="u1", project_id="p1")
+    context = RequestContext(unit_id="unit-1", user_id="u1", project_id="p1")
     conversation = service.create_conversation(
         context, ConversationCreate(title="默认智能体")
     )
@@ -148,7 +148,7 @@ def test_uses_default_agent_when_agent_id_is_omitted():
 
 def test_preserves_explicit_enabled_agent():
     session, _, service = build_service()
-    context = RequestContext(user_id="u1", project_id="p1")
+    context = RequestContext(unit_id="unit-1", user_id="u1", project_id="p1")
     conversation = service.create_conversation(
         context, ConversationCreate(title="指定智能体")
     )
@@ -165,7 +165,7 @@ def test_preserves_explicit_enabled_agent():
 @pytest.mark.parametrize("actor_id", ["missing-agent", "disabled-agent"])
 def test_rejects_unavailable_explicit_agent_without_persisting(actor_id):
     session, dispatcher, service = build_service()
-    context = RequestContext(user_id="u1", project_id="p1")
+    context = RequestContext(unit_id="unit-1", user_id="u1", project_id="p1")
     conversation = service.create_conversation(
         context, ConversationCreate(title="无效智能体")
     )
@@ -187,7 +187,7 @@ def test_rejects_unavailable_explicit_agent_without_persisting(actor_id):
 
 def test_requires_actor_id_for_team_without_persisting():
     session, dispatcher, service = build_service()
-    context = RequestContext(user_id="u1", project_id="p1")
+    context = RequestContext(unit_id="unit-1", user_id="u1", project_id="p1")
     conversation = service.create_conversation(
         context, ConversationCreate(title="团队协作")
     )

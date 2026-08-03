@@ -19,6 +19,21 @@ function capturedHeaders(init: RequestInit | undefined) {
 }
 
 describe('request headers', () => {
+  it('builds development identity headers with unit and roles', async () => {
+    vi.resetModules();
+    vi.stubEnv('VITE_DEV_UNIT_ID', 'unit-1');
+    vi.stubEnv('VITE_DEV_PROJECT_ID', 'project-1');
+    vi.stubEnv('VITE_DEV_USER_ID', 'user-1');
+    vi.stubEnv('VITE_DEV_USER_ROLES', 'user,unit_auditor');
+
+    const { identityHeaders } = await import('./client');
+
+    expect(identityHeaders).toEqual({
+      'X-Unit-ID': 'unit-1', 'X-Project-ID': 'project-1', 'X-User-ID': 'user-1',
+      'X-User-Roles': 'user,unit_auditor',
+    });
+  });
+
   it('adds JSON content type for a string request body', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{}'));
 

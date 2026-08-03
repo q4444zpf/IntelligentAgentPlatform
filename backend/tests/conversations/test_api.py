@@ -55,7 +55,7 @@ def build_client():
     return TestClient(app)
 
 
-HEADERS = {"X-User-ID": "u1", "X-Project-ID": "p1"}
+HEADERS = {"X-Unit-ID": "unit-1", "X-User-ID": "u1", "X-Project-ID": "p1"}
 
 
 def create_run(client, *, headers=HEADERS, title="洪水研判", actor_id="flood"):
@@ -142,7 +142,7 @@ def test_agent_run_list_filters_by_status_actor_and_query():
 
 def test_agent_run_list_is_scoped_to_project_and_user():
     client = build_client()
-    create_run(client, headers={"X-User-ID": "u2", "X-Project-ID": "p2"})
+    create_run(client, headers={"X-Unit-ID": "unit-1", "X-User-ID": "u2", "X-Project-ID": "p2"})
 
     response = client.get("/api/agent-runs", headers=HEADERS)
 
@@ -160,6 +160,20 @@ def test_agent_run_list_is_scoped_to_project_and_user():
             "tool_invocations": 0,
         },
     }
+
+
+def test_conversations_and_runs_are_scoped_to_unit():
+    client = build_client()
+    hidden = create_run(client, headers={"X-Unit-ID": "unit-2", "X-User-ID": "u1", "X-Project-ID": "p1"})
+
+    conversations = client.get("/api/conversations", headers=HEADERS)
+    runs = client.get("/api/agent-runs", headers=HEADERS)
+    run = client.get(f"/api/agent-runs/{hidden['run']['id']}", headers=HEADERS)
+
+    assert conversations.json() == []
+    assert runs.json()["items"] == []
+    assert runs.json()["summary"]["total"] == 0
+    assert run.status_code == 404
 
 
 def test_agent_run_list_rejects_invalid_query_parameters():

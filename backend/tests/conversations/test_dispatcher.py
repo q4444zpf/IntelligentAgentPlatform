@@ -46,6 +46,7 @@ def test_dispatches_run_with_an_independent_database_session(tmp_path):
 
     with factory() as request_session:
         conversation = Conversation(
+            unit_id="unit-1",
             project_id="p1", owner_id="u1", title="洪水研判"
         )
         request_session.add(conversation)
@@ -130,7 +131,7 @@ def test_dispatcher_executes_tool_loop_entirely_in_supplied_database(tmp_path):
     factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
     model = TwoRoundToolModel()
     with factory.begin() as session:
-        conversation = Conversation(project_id="p-tool", owner_id="u-tool", title="时间")
+        conversation = Conversation(unit_id="unit-1", project_id="p-tool", owner_id="u-tool", title="时间")
         session.add(conversation)
         session.flush()
         message = Message(conversation_id=conversation.id, role="user", content="现在几点？")

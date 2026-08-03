@@ -24,6 +24,7 @@ class ConversationRepository:
     def list_runs(
         self,
         *,
+        unit_id: str,
         project_id: str,
         owner_id: str,
         page: int,
@@ -35,6 +36,7 @@ class ConversationRepository:
         started_before: datetime | None = None,
     ) -> RunListResult:
         filters = [
+            Conversation.unit_id == unit_id,
             Conversation.project_id == project_id,
             Conversation.owner_id == owner_id,
         ]
@@ -171,10 +173,11 @@ class ConversationRepository:
         self.session.flush()
         return value
 
-    def list_conversations(self, project_id: str, owner_id: str) -> list[Conversation]:
+    def list_conversations(self, unit_id: str, project_id: str, owner_id: str) -> list[Conversation]:
         query = (
             select(Conversation)
             .where(
+                Conversation.unit_id == unit_id,
                 Conversation.project_id == project_id,
                 Conversation.owner_id == owner_id,
                 Conversation.archived_at.is_(None),
@@ -184,22 +187,24 @@ class ConversationRepository:
         return list(self.session.scalars(query))
 
     def get_conversation(
-        self, project_id: str, owner_id: str, conversation_id: str
+        self, unit_id: str, project_id: str, owner_id: str, conversation_id: str
     ) -> Conversation | None:
         return self.session.scalar(
             select(Conversation).where(
                 Conversation.id == conversation_id,
+                Conversation.unit_id == unit_id,
                 Conversation.project_id == project_id,
                 Conversation.owner_id == owner_id,
             )
         )
 
-    def get_run(self, project_id: str, owner_id: str, run_id: str) -> AgentRun | None:
+    def get_run(self, unit_id: str, project_id: str, owner_id: str, run_id: str) -> AgentRun | None:
         return self.session.scalar(
             select(AgentRun)
             .join(Conversation)
             .where(
                 AgentRun.id == run_id,
+                Conversation.unit_id == unit_id,
                 Conversation.project_id == project_id,
                 Conversation.owner_id == owner_id,
             )
@@ -214,6 +219,7 @@ class ConversationRepository:
                 select(
                     AgentRun.id.label("run_id"),
                     Conversation.id.label("conversation_id"),
+                    Conversation.unit_id,
                     Conversation.project_id,
                     Conversation.owner_id.label("user_id"),
                 )
@@ -287,9 +293,9 @@ class ConversationRepository:
         return list(self.session.scalars(query))
 
     def list_messages(
-        self, project_id: str, owner_id: str, conversation_id: str
+        self, unit_id: str, project_id: str, owner_id: str, conversation_id: str
     ) -> list[Message]:
-        if self.get_conversation(project_id, owner_id, conversation_id) is None:
+        if self.get_conversation(unit_id, project_id, owner_id, conversation_id) is None:
             return []
         query = (
             select(Message)

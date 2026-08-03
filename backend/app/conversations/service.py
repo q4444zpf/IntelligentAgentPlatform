@@ -70,6 +70,7 @@ class ConversationService:
     ) -> ConversationInfo:
         value = self.repository.add(
             Conversation(
+                unit_id=context.unit_id,
                 project_id=context.project_id,
                 owner_id=context.user_id,
                 title=request.title,
@@ -82,7 +83,7 @@ class ConversationService:
         self, context: RequestContext
     ) -> list[ConversationInfo]:
         values = self.repository.list_conversations(
-            context.project_id, context.user_id
+            context.unit_id, context.project_id, context.user_id
         )
         return [ConversationInfo.model_validate(value) for value in values]
 
@@ -90,7 +91,7 @@ class ConversationService:
         self, context: RequestContext, conversation_id: str
     ) -> ConversationInfo:
         value = self.repository.get_conversation(
-            context.project_id, context.user_id, conversation_id
+            context.unit_id, context.project_id, context.user_id, conversation_id
         )
         if value is None:
             raise ConversationNotFound(conversation_id)
@@ -100,11 +101,11 @@ class ConversationService:
         self, context: RequestContext, conversation_id: str
     ) -> list[MessageInfo]:
         if self.repository.get_conversation(
-            context.project_id, context.user_id, conversation_id
+            context.unit_id, context.project_id, context.user_id, conversation_id
         ) is None:
             raise ConversationNotFound(conversation_id)
         values = self.repository.list_messages(
-            context.project_id, context.user_id, conversation_id
+            context.unit_id, context.project_id, context.user_id, conversation_id
         )
         return [MessageInfo.model_validate(value) for value in values]
 
@@ -115,7 +116,7 @@ class ConversationService:
         request: MessageCreate,
     ) -> MessageAccepted:
         conversation = self.repository.get_conversation(
-            context.project_id, context.user_id, conversation_id
+            context.unit_id, context.project_id, context.user_id, conversation_id
         )
         if conversation is None:
             raise ConversationNotFound(conversation_id)
@@ -166,6 +167,7 @@ class ConversationService:
         started_before: datetime | None = None,
     ) -> AgentRunPage:
         result = self.repository.list_runs(
+            unit_id=context.unit_id,
             project_id=context.project_id,
             owner_id=context.user_id,
             page=page,
@@ -188,7 +190,7 @@ class ConversationService:
 
     def get_run(self, context: RequestContext, run_id: str) -> AgentRunInfo:
         value = self.repository.get_run(
-            context.project_id, context.user_id, run_id
+            context.unit_id, context.project_id, context.user_id, run_id
         )
         if value is None:
             raise RunNotFound(run_id)
@@ -198,7 +200,7 @@ class ConversationService:
         self, context: RequestContext, run_id: str
     ) -> list[ToolInvocationInfo]:
         if self.repository.get_run(
-            context.project_id, context.user_id, run_id
+            context.unit_id, context.project_id, context.user_id, run_id
         ) is None:
             raise RunNotFound(run_id)
         values = self.repository.list_tool_invocations(run_id)
@@ -208,7 +210,7 @@ class ConversationService:
         self, context: RequestContext, run_id: str, after_sequence: int
     ) -> list[RunEventInfo]:
         if self.repository.get_run(
-            context.project_id, context.user_id, run_id
+            context.unit_id, context.project_id, context.user_id, run_id
         ) is None:
             raise RunNotFound(run_id)
         values = self.repository.list_events(run_id, after_sequence)

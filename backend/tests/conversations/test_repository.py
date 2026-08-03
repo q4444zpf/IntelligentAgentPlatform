@@ -16,7 +16,7 @@ class RecordingSession:
         self.statements.append(statement)
         if len(self.statements) == 1:
             return Conversation(
-                id="c1", project_id="p1", owner_id="u1", title="洪水研判"
+                id="c1", unit_id="unit-1", project_id="p1", owner_id="u1", title="洪水研判"
             )
         return 2
 
@@ -44,7 +44,7 @@ def test_repository_lists_invocations_in_creation_order(tmp_path):
     factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
     with factory.begin() as session:
         conversation = Conversation(
-            id="c1", project_id="p1", owner_id="u1", title="test"
+            id="c1", unit_id="unit-1", project_id="p1", owner_id="u1", title="test"
         )
         message = Message(
             id="m1", conversation_id="c1", sequence=1, role="user", content="test"
@@ -128,7 +128,7 @@ def test_list_runs_returns_scoped_run(tmp_path):
     factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
     with factory.begin() as session:
         session.add(
-            Conversation(id="c1", project_id="p1", owner_id="u1", title="Flood")
+            Conversation(id="c1", unit_id="unit-1", project_id="p1", owner_id="u1", title="Flood")
         )
         session.add(
             Message(
@@ -152,6 +152,7 @@ def test_list_runs_returns_scoped_run(tmp_path):
 
     with factory() as session:
         result = ConversationRepository(session).list_runs(
+            unit_id="unit-1",
             project_id="p1", owner_id="u1", page=1, page_size=20
         )
 
@@ -188,6 +189,7 @@ def test_list_runs_filters_paginates_and_summarizes_full_scope(tmp_path):
         message_id = f"m-{run_id}"
         session.add(
             Conversation(
+                unit_id="unit-1",
                 id=conversation_id, project_id=project, owner_id=owner, title=title
             )
         )
@@ -254,10 +256,11 @@ def test_list_runs_filters_paginates_and_summarizes_full_scope(tmp_path):
 
     with factory() as session:
         repository = ConversationRepository(session)
-        page = repository.list_runs(project_id="p1", owner_id="u1", page=1, page_size=2)
+        page = repository.list_runs(unit_id="unit-1", project_id="p1", owner_id="u1", page=1, page_size=2)
         filtered = repository.list_runs(
             project_id="p1",
             owner_id="u1",
+            unit_id="unit-1",
             page=1,
             page_size=10,
             status="completed",
@@ -267,10 +270,10 @@ def test_list_runs_filters_paginates_and_summarizes_full_scope(tmp_path):
             started_before=moment + timedelta(hours=1),
         )
         by_id = repository.list_runs(
-            project_id="p1", owner_id="u1", page=1, page_size=10, query="run-b"
+            unit_id="unit-1", project_id="p1", owner_id="u1", page=1, page_size=10, query="run-b"
         )
         second_page = repository.list_runs(
-            project_id="p1", owner_id="u1", page=2, page_size=2
+            unit_id="unit-1", project_id="p1", owner_id="u1", page=2, page_size=2
         )
 
     assert [item["id"] for item in page.items] == ["run-b", "run-a"]
@@ -316,8 +319,8 @@ def test_list_runs_rejects_trigger_message_from_another_conversation(tmp_path):
     with factory.begin() as session:
         session.add_all(
             [
-                Conversation(id="c-a", project_id="p1", owner_id="u1", title="A"),
-                Conversation(id="c-b", project_id="p1", owner_id="u2", title="B"),
+                Conversation(id="c-a", unit_id="unit-1", project_id="p1", owner_id="u1", title="A"),
+                Conversation(id="c-b", unit_id="unit-1", project_id="p1", owner_id="u2", title="B"),
             ]
         )
         session.add(
@@ -342,7 +345,7 @@ def test_list_runs_rejects_trigger_message_from_another_conversation(tmp_path):
 
     with factory() as session:
         result = ConversationRepository(session).list_runs(
-            project_id="p1", owner_id="u1", page=1, page_size=20
+            unit_id="unit-1", project_id="p1", owner_id="u1", page=1, page_size=20
         )
 
     assert result.items == []
@@ -354,3 +357,33 @@ def test_list_runs_rejects_trigger_message_from_another_conversation(tmp_path):
         "failed": 0,
         "tool_invocations": 0,
     }
+
+def test_repository_scopes_conversations_runs_and_execution_context_to_unit(tmp_path):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.conversations.models import Message
+    from app.db.base import Base
+
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'unit-scope.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    with factory.begin() as session:
+        session.add_all([
+            Conversation(id="c1", unit_id="unit-2", project_id="p1", owner_id="u1", title="hidden"),
+            Message(id="m1", conversation_id="c1", sequence=1, role="user", content="secret"),
+            AgentRun(id="r1", conversation_id="c1", trigger_message_id="m1", actor_type="agent", actor_id="a1", status="completed"),
+        ])
+
+    with factory() as session:
+        repository = ConversationRepository(session)
+        assert repository.list_conversations("unit-1", "p1", "u1") == []
+        assert repository.get_conversation("unit-1", "p1", "u1", "c1") is None
+        assert repository.get_run("unit-1", "p1", "u1", "r1") is None
+        result = repository.list_runs(unit_id="unit-1", project_id="p1", owner_id="u1", page=1, page_size=20)
+        assert result.total == 0
+        assert result.summary["total"] == 0
+        assert repository.get_run_execution_context("r1") == {
+            "unit_id": "unit-2", "project_id": "p1", "user_id": "u1",
+            "conversation_id": "c1", "run_id": "r1",
+        }

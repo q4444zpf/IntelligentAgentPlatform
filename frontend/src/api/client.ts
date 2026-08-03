@@ -1,9 +1,13 @@
 export const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || '/api';
 export const identityHeaders: Record<string, string> =
-  import.meta.env.VITE_DEV_USER_ID && import.meta.env.VITE_DEV_PROJECT_ID
+  import.meta.env.VITE_DEV_UNIT_ID && import.meta.env.VITE_DEV_USER_ID && import.meta.env.VITE_DEV_PROJECT_ID
     ? {
+        'X-Unit-ID': import.meta.env.VITE_DEV_UNIT_ID,
         'X-User-ID': import.meta.env.VITE_DEV_USER_ID,
         'X-Project-ID': import.meta.env.VITE_DEV_PROJECT_ID,
+        ...(import.meta.env.VITE_DEV_USER_ROLES
+          ? { 'X-User-Roles': import.meta.env.VITE_DEV_USER_ROLES }
+          : {}),
         ...(import.meta.env.VITE_DEV_USER_ROLE
           ? { 'X-User-Role': import.meta.env.VITE_DEV_USER_ROLE }
           : {}),
