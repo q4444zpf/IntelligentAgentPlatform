@@ -872,3 +872,33 @@ def test_protected_agent_delete_records_failed_audit_in_fresh_transaction(client
     assert event.resource_id == BUILTIN_AGENT_ID
     assert event.metadata_json == {}
     assert "protected-delete-1" in event.idempotency_key
+
+
+def test_invalid_agent_body_records_failed_audit_without_request_secrets(client):
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+
+    secret = "Bearer agent-validation-secret"
+    payload = agent_payload(skill_names=[])
+    payload.pop("name")
+    payload["system_prompt"] = secret
+    response = client.post(
+        "/api/agents",
+        json=payload,
+        headers={**AUTH_HEADERS, "X-Request-ID": "agent-validation-1"},
+    )
+    assert response.status_code == 422
+    factory = client.app.state.agent_service.store.session_factory
+    with factory() as session:
+        event = session.scalar(select(AuditEvent))
+    assert event.source == "agent"
+    assert event.action == "resource.created"
+    assert event.resource_type == "agent"
+    assert event.resource_id == "agent"
+    assert event.unit_id == "unit-1"
+    assert event.project_id == "p1"
+    assert event.user_id == "u1"
+    assert event.error_code == "REQUEST_VALIDATION"
+    assert event.metadata_json == {}
+    assert secret not in f"{event.summary} {event.metadata_json}"
+    assert "agent-validation-1" in event.idempotency_key

@@ -1,9 +1,6 @@
-from fastapi import APIRouter, Depends, Header, HTTPException
-from datetime import UTC, datetime
-from uuid import uuid4
-
-from app.core.request_context import RequestContext, require_admin_context, require_request_context
-from app.audit.recorder import AuditRecordRequest
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from app.core.request_context import RequestContext, require_request_context
+from app.audit.management import management_audit_route_class, record_failed_management
 
 from .schemas import (
     AgentConfig,
@@ -25,8 +22,14 @@ from .store import AgentConcurrentUpdateError
 
 
 def create_router(service: AgentService | None = None) -> APIRouter:
-    router = APIRouter(dependencies=[Depends(require_request_context)])
     manager = service or AgentService()
+    router = APIRouter(
+        dependencies=[Depends(require_request_context)],
+        route_class=management_audit_route_class(
+            lambda: manager.store.session_factory, lambda: manager.audit_recorder,
+            source="agent", resource_type="agent",
+        ),
+    )
 
     def call(operation):
         try:
@@ -39,6 +42,39 @@ def create_router(service: AgentService | None = None) -> APIRouter:
             raise HTTPException(status_code=409, detail=str(error)) from error
         except AgentValidationError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
+    def call_management(operation, session, context: RequestContext, request_id: str | None, action: str, resource_id: str):
+        try:
+            return operation()
+        except AgentNotFoundError as error:
+            session.rollback()
+            record_failed_management(manager.store.session_factory, manager.audit_recorder, context, source="agent", action=action, resource_type="agent", resource_id=resource_id, error_code="AGENT_NOT_FOUND", request_id=request_id)
+            raise HTTPException(status_code=404, detail=f"Agent '{error}' was not found") from error
+        except AgentConflictError as error:
+            session.rollback()
+            record_failed_management(manager.store.session_factory, manager.audit_recorder, context, source="agent", action=action, resource_type="agent", resource_id=resource_id, error_code="AGENT_CONFLICT", request_id=request_id)
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except AgentProtectedError as error:
+            session.rollback()
+            record_failed_management(manager.store.session_factory, manager.audit_recorder, context, source="agent", action=action, resource_type="agent", resource_id=resource_id, error_code="AGENT_PROTECTED", request_id=request_id)
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except AgentConcurrentUpdateError as error:
+            session.rollback()
+            record_failed_management(manager.store.session_factory, manager.audit_recorder, context, source="agent", action=action, resource_type="agent", resource_id=resource_id, error_code="AGENT_STALE_UPDATE", request_id=request_id)
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except AgentValidationError as error:
+            session.rollback()
+            record_failed_management(manager.store.session_factory, manager.audit_recorder, context, source="agent", action=action, resource_type="agent", resource_id=resource_id, error_code="AGENT_VALIDATION", request_id=request_id)
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    def require_agent_admin(request: Request, context: RequestContext = Depends(require_request_context)) -> RequestContext:
+        if context.role == "admin":
+            request.state.management_context = context
+            return context
+        action = "resource.deleted" if request.method == "DELETE" else "resource.created" if request.method == "POST" else "resource.updated"
+        resource_id = request.path_params.get("agent_id", "agents")
+        record_failed_management(manager.store.session_factory, manager.audit_recorder, context, source="agent", action=action, resource_type="agent", resource_id=resource_id, error_code="PERMISSION_DENIED", request_id=request.headers.get("X-Request-ID"))
+        raise HTTPException(status_code=403, detail="Administrator permission is required")
+
 
     @router.get("", response_model=list[AgentInfo])
     def list_agents():
@@ -47,83 +83,54 @@ def create_router(service: AgentService | None = None) -> APIRouter:
     @router.post("", response_model=AgentInfo, status_code=201)
     def create_agent(
         request: AgentCreateRequest,
-        context: RequestContext = Depends(require_admin_context),
+        context: RequestContext = Depends(require_agent_admin),
         request_id: str | None = Header(default=None, alias="X-Request-ID"),
     ):
         with manager.store.session_factory() as session:
-            return call(lambda: manager.create(request, context=context, session=session, request_id=request_id))
+            return call_management(lambda: manager.create(request, context=context, session=session, request_id=request_id), session, context, request_id, "resource.created", request.id)
 
     @router.get("/default", response_model=AgentInfo)
     def get_default_agent():
         return call(manager.get_default)
 
     @router.put("/default", response_model=AgentInfo)
-    def set_default_agent(request: AgentDefaultRequest, context: RequestContext = Depends(require_admin_context), request_id: str | None = Header(default=None, alias="X-Request-ID")):
+    def set_default_agent(request: AgentDefaultRequest, context: RequestContext = Depends(require_agent_admin), request_id: str | None = Header(default=None, alias="X-Request-ID")):
         with manager.store.session_factory() as session:
-            return call(lambda: manager.set_default(request.agent_id, context=context, session=session, request_id=request_id))
+            return call_management(lambda: manager.set_default(request.agent_id, context=context, session=session, request_id=request_id), session, context, request_id, "resource.updated", request.agent_id)
 
     @router.get("/{agent_id}", response_model=AgentInfo)
     def get_agent(agent_id: str):
         return call(lambda: manager.get(agent_id))
 
     @router.put("/{agent_id}", response_model=AgentInfo)
-    def update_agent(agent_id: str, request: AgentConfig, context: RequestContext = Depends(require_admin_context), request_id: str | None = Header(default=None, alias="X-Request-ID")):
+    def update_agent(agent_id: str, request: AgentConfig, context: RequestContext = Depends(require_agent_admin), request_id: str | None = Header(default=None, alias="X-Request-ID")):
         with manager.store.session_factory() as session:
-            return call(lambda: manager.update(agent_id, request, context=context, session=session, request_id=request_id))
+            return call_management(lambda: manager.update(agent_id, request, context=context, session=session, request_id=request_id), session, context, request_id, "resource.updated", agent_id)
 
     @router.patch("/{agent_id}/toggle", response_model=AgentInfo)
-    def toggle_agent(agent_id: str, request: AgentToggleRequest, context: RequestContext = Depends(require_admin_context), request_id: str | None = Header(default=None, alias="X-Request-ID")):
+    def toggle_agent(agent_id: str, request: AgentToggleRequest, context: RequestContext = Depends(require_agent_admin), request_id: str | None = Header(default=None, alias="X-Request-ID")):
         with manager.store.session_factory() as session:
-            return call(lambda: manager.set_enabled(agent_id, request.enabled, context=context, session=session, request_id=request_id))
+            return call_management(lambda: manager.set_enabled(agent_id, request.enabled, context=context, session=session, request_id=request_id), session, context, request_id, "resource.enabled" if request.enabled else "resource.disabled", agent_id)
 
     @router.patch("/{agent_id}/pin", response_model=AgentInfo)
-    def pin_agent(agent_id: str, request: AgentPinRequest, context: RequestContext = Depends(require_admin_context), request_id: str | None = Header(default=None, alias="X-Request-ID")):
+    def pin_agent(agent_id: str, request: AgentPinRequest, context: RequestContext = Depends(require_agent_admin), request_id: str | None = Header(default=None, alias="X-Request-ID")):
         with manager.store.session_factory() as session:
-            return call(lambda: manager.set_pinned(agent_id, request.pinned, context=context, session=session, request_id=request_id))
+            return call_management(lambda: manager.set_pinned(agent_id, request.pinned, context=context, session=session, request_id=request_id), session, context, request_id, "resource.updated", agent_id)
 
     @router.post("/{agent_id}/copy", response_model=AgentInfo, status_code=201)
-    def copy_agent(agent_id: str, request: AgentCopyRequest, context: RequestContext = Depends(require_admin_context), request_id: str | None = Header(default=None, alias="X-Request-ID")):
+    def copy_agent(agent_id: str, request: AgentCopyRequest, context: RequestContext = Depends(require_agent_admin), request_id: str | None = Header(default=None, alias="X-Request-ID")):
         with manager.store.session_factory() as session:
-            return call(lambda: manager.copy(agent_id, request, context=context, session=session, request_id=request_id))
+            return call_management(lambda: manager.copy(agent_id, request, context=context, session=session, request_id=request_id), session, context, request_id, "resource.created", request.id)
 
     @router.delete("/{agent_id}")
     def delete_agent(
         agent_id: str,
-        context: RequestContext = Depends(require_admin_context),
+        context: RequestContext = Depends(require_agent_admin),
         request_id: str | None = Header(default=None, alias="X-Request-ID"),
     ):
-        try:
-            with manager.store.session_factory() as session:
-                manager.delete(agent_id, context=context, session=session, request_id=request_id)
-        except AgentNotFoundError as error:
-            _record_failed_delete(context, request_id, agent_id, "AGENT_NOT_FOUND")
-            raise HTTPException(status_code=404, detail=f"Agent '{error}' was not found") from error
-        except AgentProtectedError as error:
-            _record_failed_delete(context, request_id, agent_id, "AGENT_PROTECTED")
-            raise HTTPException(status_code=409, detail=str(error)) from error
-        except AgentConcurrentUpdateError as error:
-            _record_failed_delete(context, request_id, agent_id, "AGENT_STALE_UPDATE")
-            raise HTTPException(status_code=409, detail=str(error)) from error
+        with manager.store.session_factory() as session:
+            call_management(lambda: manager.delete(agent_id, context=context, session=session, request_id=request_id), session, context, request_id, "resource.deleted", agent_id)
         return {"success": True, "agent_id": agent_id}
-
-    def _record_failed_delete(
-        context: RequestContext,
-        request_id: str | None,
-        agent_id: str,
-        error_code: str,
-    ) -> None:
-        stable_request_id = request_id or str(uuid4())
-        with manager.store.session_factory.begin() as audit_session:
-            manager.audit_recorder.record(audit_session, AuditRecordRequest(
-                unit_id=context.unit_id, project_id=context.project_id,
-                user_id=context.user_id, actor_role=context.role,
-                category="management", source="agent", action="resource.deleted",
-                status="failed", risk_level="high", resource_type="agent",
-                resource_id=agent_id, summary=f"Agent {agent_id} deletion failed",
-                metadata={}, allowed_metadata_keys=frozenset(), error_code=error_code,
-                idempotency_key=f"management:{stable_request_id}:agent.delete:{agent_id}",
-                occurred_at=datetime.now(UTC),
-            ))
 
     return router
 

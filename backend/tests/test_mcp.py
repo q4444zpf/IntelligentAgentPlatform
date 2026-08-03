@@ -55,6 +55,7 @@ def client(tmp_path):
     )
     app = FastAPI()
     app.state.allow_dev_identity = True
+    app.state.mcp_service = service
     app.include_router(create_router(service), prefix="/api/mcp")
     with TestClient(app, headers=AUTH_HEADERS) as test_client:
         yield test_client
@@ -191,3 +192,67 @@ def test_mcp_create_route_requires_request_context(tmp_path):
     with TestClient(app) as unauthenticated:
         response = unauthenticated.post("/api/mcp", json=remote_payload())
     assert response.status_code == 401
+
+def test_missing_mcp_delete_records_failed_audit_in_fresh_transaction(client):
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+
+    response = client.delete(
+        "/api/mcp/missing-client",
+        headers={**AUTH_HEADERS, "X-Request-ID": "mcp-delete-missing-1"},
+    )
+    assert response.status_code == 404
+    with client.app.state.mcp_service.store.session_factory() as session:
+        event = session.scalar(select(AuditEvent))
+    assert event.source == "mcp"
+    assert event.action == "resource.deleted"
+    assert event.status == "failed"
+    assert event.error_code == "MCP_NOT_FOUND"
+    assert event.resource_id == "missing-client"
+    assert event.metadata_json == {}
+    assert "mcp-delete-missing-1" in event.idempotency_key
+
+def test_sync_rolls_back_tool_records_when_audit_recorder_fails(client):
+    from app.audit.recorder import AuditRecorder
+
+    class FailingRecorder(AuditRecorder):
+        def record(self, session, request):
+            raise RuntimeError("audit unavailable")
+
+    created = client.post("/api/mcp", json=remote_payload())
+    assert created.status_code == 201
+    service = client.app.state.mcp_service
+    service.audit_recorder = FailingRecorder()
+
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        client.post(
+            "/api/mcp/water-data/tools/sync",
+            headers={**AUTH_HEADERS, "X-Request-ID": "mcp-sync-audit-fail"},
+        )
+
+    reloaded = McpService(McpStore(service.store.session_factory)).get("water-data")
+    assert reloaded.tool_count == 0
+
+def test_invalid_mcp_body_records_failed_audit_without_request_secrets(client):
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+
+    secret = "Bearer validation-secret"
+    payload = remote_payload()
+    payload.pop("name")
+    payload["headers"] = {"Authorization": secret}
+    response = client.post(
+        "/api/mcp",
+        json=payload,
+        headers={**AUTH_HEADERS, "X-Request-ID": "mcp-validation-1"},
+    )
+    assert response.status_code == 422
+    with client.app.state.mcp_service.store.session_factory() as session:
+        event = session.scalar(select(AuditEvent))
+    assert event.source == "mcp"
+    assert event.action == "resource.created"
+    assert event.error_code == "REQUEST_VALIDATION"
+    assert event.metadata_json == {}
+    serialized = f"{event.summary} {event.metadata_json}"
+    assert secret not in serialized
+    assert "mcp-validation-1" in event.idempotency_key

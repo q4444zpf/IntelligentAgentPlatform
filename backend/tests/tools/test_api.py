@@ -103,6 +103,7 @@ def build_invocation_client(tmp_path):
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'invocations-api.db'}")
     Base.metadata.create_all(engine)
     session = Session(engine)
+
     service = ConversationService(
         ConversationRepository(session), UnavailableRunDispatcher()
     )
@@ -113,6 +114,24 @@ def build_invocation_client(tmp_path):
         create_conversation_router(lambda _session: service), prefix="/api"
     )
     return TestClient(app), session
+
+def test_missing_tool_toggle_records_failed_audit(client):
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+
+    response = client.patch(
+        "/api/tools/system.missing/toggle",
+        headers={**ADMIN_HEADERS, "X-Request-ID": "tool-missing-1"},
+    )
+    assert response.status_code == 404
+    with client.app.state.tool_service.store.session_factory() as session:
+        event = session.scalar(select(AuditEvent))
+    assert event.source == "tool"
+    assert event.status == "failed"
+    assert event.error_code == "TOOL_NOT_FOUND"
+    assert event.resource_id == "system.missing"
+    assert event.metadata_json == {}
+    assert "tool-missing-1" in event.idempotency_key
 
 
 def create_run(client, headers):

@@ -1,3 +1,6 @@
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
 from app.model_providers.schemas import AddModelRequest, CreateProviderRequest, ProviderConfigRequest
 from app.model_providers.service import ProviderService
 from sqlalchemy import create_engine
@@ -223,3 +226,71 @@ def test_configure_commits_provider_and_redacted_audit_together(tmp_path):
     assert event.source == "llm"
     assert "top-secret-key" not in serialized
     assert "Bearer hidden" not in serialized
+
+
+def provider_api_client(tmp_path, monkeypatch):
+    import app.model_providers.router as provider_router
+
+    service = ProviderService(provider_store(tmp_path / "provider-api-audit.db"))
+    monkeypatch.setattr(provider_router, "service", service)
+    app = FastAPI()
+    app.state.allow_dev_identity = True
+    app.include_router(provider_router.router, prefix="/api/providers")
+    headers = {
+        "X-Unit-ID": "unit-1",
+        "X-Project-ID": "p1",
+        "X-User-ID": "u1",
+        "X-User-Role": "admin",
+    }
+    return TestClient(app, headers=headers), service
+
+
+def test_missing_provider_management_attempt_records_failed_audit(tmp_path, monkeypatch):
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+
+    client, service = provider_api_client(tmp_path, monkeypatch)
+    response = client.put(
+        "/api/providers/missing-provider/config",
+        json={"base_url": "http://localhost:9000/v1"},
+        headers={"X-Request-ID": "provider-missing-1"},
+    )
+    assert response.status_code == 404
+    with service.store.session_factory() as session:
+        event = session.scalar(select(AuditEvent))
+    assert event.source == "llm"
+    assert event.action == "resource.updated"
+    assert event.resource_type == "model_provider"
+    assert event.resource_id == "missing-provider"
+    assert event.error_code == "PROVIDER_NOT_FOUND"
+    assert event.metadata_json == {}
+    assert "provider-missing-1" in event.idempotency_key
+
+
+def test_invalid_provider_body_records_failed_audit_without_request_secrets(tmp_path, monkeypatch):
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+
+    client, service = provider_api_client(tmp_path, monkeypatch)
+    secret = "provider-validation-api-key"
+    response = client.put(
+        "/api/providers/ollama/config",
+        json={"api_key": secret, "custom_headers": {"Authorization": "Bearer hidden"}},
+        headers={"X-Request-ID": "provider-validation-1"},
+    )
+    assert response.status_code == 422
+    with service.store.session_factory() as session:
+        event = session.scalar(select(AuditEvent))
+    assert event.source == "llm"
+    assert event.action == "resource.updated"
+    assert event.resource_type == "model_provider"
+    assert event.resource_id == "ollama"
+    assert event.unit_id == "unit-1"
+    assert event.project_id == "p1"
+    assert event.user_id == "u1"
+    assert event.error_code == "REQUEST_VALIDATION"
+    assert event.metadata_json == {}
+    serialized = f"{event.summary} {event.metadata_json}"
+    assert secret not in serialized
+    assert "Bearer hidden" not in serialized
+    assert "provider-validation-1" in event.idempotency_key
