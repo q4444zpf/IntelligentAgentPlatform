@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from .audit.router import router as audit_router
 from .agents.router import router as agents_router
 from .conversations.router import (
     default_run_dispatcher,
@@ -41,6 +42,7 @@ app.include_router(platform_router, prefix="/api/platform", tags=["platform"])
 app.include_router(skills_router, prefix="/api/skills", tags=["skills"])
 app.include_router(tools_router, prefix="/api/tools", tags=["tools"])
 app.include_router(conversations_router, prefix="/api", tags=["conversations"])
+app.include_router(audit_router, prefix="/api/audit", tags=["audit"])
 
 
 @app.get("/api/health")

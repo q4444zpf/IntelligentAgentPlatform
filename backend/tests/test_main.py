@@ -4,6 +4,13 @@ from app.conversations.router import default_run_dispatcher
 from app.main import app
 
 
+def test_application_mounts_audit_router():
+    paths = set(app.openapi()["paths"])
+    assert "/api/audit/events" in paths
+    assert "/api/audit/events/{event_id}" in paths
+    assert "/api/audit/events/{event_id}/related" in paths
+
+
 def test_application_shutdown_closes_run_dispatcher(monkeypatch):
     calls: list[tuple[bool, bool]] = []
 
