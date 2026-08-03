@@ -164,6 +164,41 @@ def test_records_failed_llm_and_agent_without_raw_error():
     assert "runtime-secret" not in str(events)
 
 
+class FailedLlmAuditRecorder(AuditRecorder):
+    def record(self, session, request):
+        if request.action == "llm.invoke.failed":
+            raise RuntimeError("raw failed-llm audit storage secret")
+        return super().record(session, request)
+
+
+def test_failed_llm_audit_failure_closes_run_without_raw_error():
+    session, run_id = build_queued_run()
+    repository = ConversationRepository(session)
+
+    PlatformAgentHarness(
+        repository,
+        FailingGateway(),
+        FakeAgentService(),
+        audit_recorder=FailedLlmAuditRecorder(),
+    ).execute(run_id)
+
+    run = session.get(AgentRun, run_id)
+    events = repository.list_events(run_id, 0)
+    audits = list(session.scalars(select(AuditEvent)))
+    assert run is not None and run.status == "failed"
+    assert events[-2].payload == {
+        "code": "audit_persistence_failed",
+        "message": "智能体运行失败，请稍后重试",
+    }
+    assert events[-1].payload == {"status": "failed"}
+    assert {event.action for event in audits} == {
+        "agent.run.running", "agent.run.failed"
+    }
+    assert "raw failed-llm audit storage secret" not in str(events)
+    assert "raw failed-llm audit storage secret" not in str(audits)
+    assert session.scalar(select(AgentRun).where(AgentRun.id == run_id)) is not None
+
+
 def test_empty_model_response_records_only_failed_llm_terminal_event():
     session, run_id = build_queued_run()
     model = ScriptedToolModel([ModelResult(content="  ")])

@@ -154,25 +154,33 @@ class PlatformAgentHarness:
 
         except ModelRuntimeError:
             self.repository.session.rollback()
-            if llm_iteration is not None:
-                metadata = {
-                    "provider": selection.provider_id,
-                    "model": selection.model,
-                    "iteration": llm_iteration,
-                }
-                self.audit_recorder.record(self.repository.session, AuditRecordRequest(
-                    unit_id=execution_context["unit_id"],
-                    project_id=execution_context["project_id"],
-                    user_id=execution_context["user_id"],
-                    category="runtime", source="llm", action="llm.invoke.failed",
-                    status="failed", risk_level="medium", trace_id=run_id, run_id=run_id,
-                    resource_type="model", resource_id=selection.model,
-                    idempotency_key=f"llm:{run_id}:{llm_iteration}:failed",
-                    occurred_at=datetime.now(UTC),
-                    duration_ms=max(0, round((perf_counter() - llm_started) * 1000)),
-                    metadata=metadata, allowed_metadata_keys=frozenset(metadata),
-                    error_code="model_request_failed",
-                ))
+            try:
+                if llm_iteration is not None:
+                    metadata = {
+                        "provider": selection.provider_id,
+                        "model": selection.model,
+                        "iteration": llm_iteration,
+                    }
+                    self.audit_recorder.record(self.repository.session, AuditRecordRequest(
+                        unit_id=execution_context["unit_id"],
+                        project_id=execution_context["project_id"],
+                        user_id=execution_context["user_id"],
+                        category="runtime", source="llm", action="llm.invoke.failed",
+                        status="failed", risk_level="medium", trace_id=run_id, run_id=run_id,
+                        resource_type="model", resource_id=selection.model,
+                        idempotency_key=f"llm:{run_id}:{llm_iteration}:failed",
+                        occurred_at=datetime.now(UTC),
+                        duration_ms=max(0, round((perf_counter() - llm_started) * 1000)),
+                        metadata=metadata, allowed_metadata_keys=frozenset(metadata),
+                        error_code="model_request_failed",
+                    ))
+            except Exception:
+                self.repository.session.rollback()
+                self._persist_failure_safely(
+                    run_id, "audit_persistence_failed",
+                    "智能体运行失败，请稍后重试", rollback=False,
+                )
+                return
             self._persist_failure_safely(
                 run_id, "model_request_failed",
                 "模型调用失败，请检查默认模型配置或稍后重试",

@@ -127,17 +127,6 @@ class ToolGateway:
         self.repository.session.commit()
         return audit_event
 
-    @staticmethod
-    def _apply_failed_state(
-        invocation: ToolInvocation,
-        error: ToolRuntimeError,
-        duration_ms: int,
-    ) -> None:
-        invocation.status = "failed"
-        invocation.error_code = error.code
-        invocation.duration_ms = duration_ms
-        invocation.completed_at = datetime.now(timezone.utc)
-
     def _rollback_safely(self) -> None:
         try:
             self.repository.session.rollback()
