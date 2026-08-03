@@ -183,15 +183,38 @@ describe('AgentRunListView list behavior', () => {
 });
 
 describe('AgentRunListView details', () => {
-  it('opens the matching run drawer from the run_id query after the list loads', async () => {
-    routeState.query = { run_id: 'run-2' };
-    mocks.list.mockResolvedValue(page([run('run-1'), run('run-2')]));
+  it('opens a run_id deep link after the first list succeeds even when it is not on that page', async () => {
+    routeState.query = { run_id: 'run-deep-link' };
+    mocks.list.mockResolvedValue(page([run('run-1')]));
     mocks.get.mockImplementation((id: string) => Promise.resolve(run(id)));
     const wrapper = render();
     await flushPromises();
 
-    expect(mocks.get).toHaveBeenCalledWith('run-2', expect.any(AbortSignal));
-    expect(wrapper.get('.drawer').text()).toContain('run-2');
+    expect(mocks.get).toHaveBeenCalledOnce();
+    expect(mocks.get).toHaveBeenCalledWith('run-deep-link', expect.any(AbortSignal));
+    expect(wrapper.get('.drawer').text()).toContain('run-deep-link');
+  });
+
+  it('consumes a deep link once and never reopens it after close and later list loads', async () => {
+    routeState.query = { run_id: 'run-deep-link' };
+    mocks.get.mockImplementation((id: string) => Promise.resolve(run(id)));
+    const wrapper = render(); await flushPromises();
+    await wrapper.get('.close-drawer').trigger('click');
+    await wrapper.get('[aria-label="刷新运行列表"]').trigger('click'); await flushPromises();
+    await wrapper.get('.next-page').trigger('click'); await flushPromises();
+    await wrapper.get('.status-filter').trigger('click'); await flushPromises();
+
+    expect(mocks.get).toHaveBeenCalledOnce();
+    expect(wrapper.find('.drawer').exists()).toBe(false);
+  });
+
+  it('does not load any detail resource without a run_id query', async () => {
+    const wrapper = render();
+    await flushPromises();
+
+    expect(mocks.get).not.toHaveBeenCalled();
+    expect(mocks.listEvents).not.toHaveBeenCalled();
+    expect(mocks.listInvocations).not.toHaveBeenCalled();
   });
 
   it('loads all detail resources only after opening a run and shows tools', async () => {
