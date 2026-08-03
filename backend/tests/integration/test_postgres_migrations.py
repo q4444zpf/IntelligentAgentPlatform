@@ -45,10 +45,17 @@ def test_upgrade_head_creates_conversation_tables():
         index["name"] for index in inspector.get_indexes("tool_invocations")
     }
     assert "ix_tool_invocations_run_id" in invocation_indexes
-    audit_constraints = inspector.get_unique_constraints("audit_events")
-    assert "uq_audit_idempotency_key" in {
-        constraint["name"] for constraint in audit_constraints
+    audit_columns = {
+        column["name"]: column for column in inspector.get_columns("audit_events")
     }
+    assert audit_columns["unit_id"]["nullable"] is False
+    assert audit_columns["metadata_json"]["nullable"] is False
+    audit_constraints = inspector.get_unique_constraints("audit_events")
+    idempotency_constraint = next(
+        constraint for constraint in audit_constraints
+        if constraint["name"] == "uq_audit_idempotency_key"
+    )
+    assert idempotency_constraint["column_names"] == ["idempotency_key"]
     audit_indexes = {
         index["name"] for index in inspector.get_indexes("audit_events")
     }

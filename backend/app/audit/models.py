@@ -58,7 +58,7 @@ class AuditEvent(Base):
     unit_id: Mapped[str] = mapped_column(String(64), nullable=False)
     project_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    actor_role: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    actor_role: Mapped[str | None] = mapped_column(String(40), nullable=True)
     category: Mapped[str] = mapped_column(String(30), nullable=False)
     source: Mapped[str] = mapped_column(String(30), nullable=False)
     action: Mapped[str] = mapped_column(String(100), nullable=False)

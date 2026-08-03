@@ -45,7 +45,7 @@ def upgrade() -> None:
         sa.Column("unit_id", sa.String(64), nullable=False),
         sa.Column("project_id", sa.String(64), nullable=True),
         sa.Column("user_id", sa.String(64), nullable=True),
-        sa.Column("actor_role", sa.String(64), nullable=True),
+        sa.Column("actor_role", sa.String(40), nullable=True),
         sa.Column("category", sa.String(30), nullable=False),
         sa.Column("source", sa.String(30), nullable=False),
         sa.Column("action", sa.String(100), nullable=False),

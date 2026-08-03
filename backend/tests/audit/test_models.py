@@ -52,3 +52,5 @@ def test_audit_event_model_declares_uniqueness_and_query_indexes():
         "ix_audit_run_time": ("run_id", "occurred_at", "id"),
         "ix_audit_source_action_status": ("source", "action", "status"),
     }
+    assert isinstance(table.c.actor_role.type, String)
+    assert table.c.actor_role.type.length == 40
