@@ -3,6 +3,7 @@ import { flushPromises, mount } from '@vue/test-utils';
 import dayjs from 'dayjs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { ApiError } from '@/api/client';
 import routesSource from '@/router/routes.ts?raw';
 import AgentRunListView from './AgentRunListView.vue';
 
@@ -62,12 +63,12 @@ const stubs = {
     template: '<button class="status-filter" @click="$emit(\'update:value\', \'failed\'); $emit(\'change\', \'failed\')">{{ value }}</button>',
   },
   'a-range-picker': { name: 'RangePickerStub', props: ['value'], emits: ['update:value', 'change'], template: '<button class="date-filter">date</button>' },
-  'a-spin': { template: '<div><slot /></div>' },
+  'a-spin': { props: ['spinning'], template: '<div class="spin" :data-spinning="spinning"><slot /></div>' },
   'a-tag': { template: '<span class="tag"><slot /></span>' },
   'a-empty': { props: ['description'], template: '<div class="empty">{{ description }}</div>' },
   'a-pagination': {
     props: ['current', 'pageSize', 'total'], emits: ['change', 'showSizeChange'],
-    template: '<div><button class="next-page" @click="$emit(\'change\', 2, pageSize)">next</button><button class="change-size" @click="$emit(\'showSizeChange\', 1, 50)">size</button></div>',
+    template: '<div><button class="next-page" @click="$emit(\'change\', 2, pageSize)">next</button><button class="change-size" @click="$emit(\'showSizeChange\', current, 50); $emit(\'change\', current, 50)">size</button></div>',
   },
   'a-drawer': {
     props: ['open'], emits: ['update:open', 'close'],
@@ -143,6 +144,15 @@ describe('AgentRunListView list behavior', () => {
     expect(mocks.get).toHaveBeenCalledTimes(2);
     expect(mocks.listEvents).toHaveBeenCalledTimes(2);
     expect(mocks.listInvocations).toHaveBeenCalledTimes(2);
+  });
+
+
+  it('loads only once when Ant emits size and change events together', async () => {
+    const wrapper = render(); await flushPromises();
+    const before = mocks.list.mock.calls.length;
+    await wrapper.get('.change-size').trigger('click'); await flushPromises();
+    expect(mocks.list.mock.calls.length - before).toBe(1);
+    expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ page: 1, page_size: 50 }), expect.any(AbortSignal));
   });
 
   it('shows a retry action after a list failure', async () => {
@@ -236,10 +246,44 @@ describe('AgentRunListView details', () => {
     expect(wrapper.text()).toContain('本次运行未调用工具');
   });
 
+
+  it('keeps only the newest result across consecutive event retries', async () => {
+    const older = deferred<{ sequence: number; event_type: string; payload: Record<string, unknown> }[]>();
+    const newer = deferred<{ sequence: number; event_type: string; payload: Record<string, unknown> }[]>();
+    mocks.listEvents.mockRejectedValueOnce(new Error('事件失败')).mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise);
+    const wrapper = render(); await flushPromises();
+    await wrapper.get('[aria-label="查看运行 run-1"]').trigger('click'); await flushPromises();
+    const retry = wrapper.get('[aria-label="重试运行事件"]');
+    retry.trigger('click');
+    retry.trigger('click');
+    await flushPromises();
+    const olderSignal = mocks.listEvents.mock.calls[1][1] as AbortSignal;
+    expect(olderSignal.aborted).toBe(true);
+    newer.resolve([{ sequence: 3, event_type: 'new.event', payload: {} }]); await flushPromises();
+    expect(wrapper.text()).toContain('new.event');
+    expect(wrapper.findAll('.details section')[1].get('.spin').attributes('data-spinning')).toBe('false');
+    older.resolve([{ sequence: 2, event_type: 'old.event', payload: {} }]); await flushPromises();
+    expect(wrapper.text()).toContain('new.event');
+    expect(wrapper.text()).not.toContain('old.event');
+    expect(wrapper.findAll('.details section')[1].get('.spin').attributes('data-spinning')).toBe('false');
+  });
+
+  it('maps detail 404 errors to the shared safe message', async () => {
+    mocks.get.mockRejectedValue(new ApiError('backend detail leaked', 404));
+    const wrapper = render(); await flushPromises();
+    await wrapper.get('[aria-label="查看运行 run-1"]').trigger('click'); await flushPromises();
+    expect(wrapper.text()).toContain('记录不存在或无权访问');
+    expect(wrapper.text()).not.toContain('backend detail leaked');
+  });
+
   it('aborts old details and blocks stale data when switching runs', async () => {
     mocks.list.mockResolvedValue(page([run('run-1'), run('run-2')]));
     const oldRun = deferred<ReturnType<typeof run>>();
+    const oldEvents = deferred<{ sequence: number; event_type: string; payload: Record<string, unknown> }[]>();
+    const oldTools = deferred<never[]>();
     mocks.get.mockImplementation((id: string) => id === 'run-1' ? oldRun.promise : Promise.resolve(run('run-2')));
+    mocks.listEvents.mockReturnValueOnce(oldEvents.promise).mockResolvedValue([]);
+    mocks.listInvocations.mockReturnValueOnce(oldTools.promise).mockResolvedValue([]);
     const wrapper = render(); await flushPromises();
     await wrapper.get('[aria-label="查看运行 run-1"]').trigger('click');
     const oldSignals = [mocks.get.mock.calls[0][1], mocks.listEvents.mock.calls[0][1], mocks.listInvocations.mock.calls[0][1]] as AbortSignal[];
@@ -252,7 +296,11 @@ describe('AgentRunListView details', () => {
 
   it('aborts open detail requests when the drawer closes', async () => {
     const pending = deferred<ReturnType<typeof run>>();
+    const pendingEvents = deferred<never[]>();
+    const pendingTools = deferred<never[]>();
     mocks.get.mockReturnValue(pending.promise);
+    mocks.listEvents.mockReturnValue(pendingEvents.promise);
+    mocks.listInvocations.mockReturnValue(pendingTools.promise);
     const wrapper = render(); await flushPromises();
     await wrapper.get('[aria-label="查看运行 run-1"]').trigger('click');
     const signals = [mocks.get.mock.calls[0][1], mocks.listEvents.mock.calls[0][1], mocks.listInvocations.mock.calls[0][1]] as AbortSignal[];

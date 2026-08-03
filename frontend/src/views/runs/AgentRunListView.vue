@@ -8,7 +8,7 @@
       <div v-if="runs.length" class="table-shell"><table><thead><tr><th>状态</th><th>智能体</th><th>会话</th><th>触发摘要</th><th>工具数</th><th>开始时间</th><th>耗时</th><th>操作</th></tr></thead><tbody><tr v-for="item in runs" :key="item.id"><td><a-tag :color="statusColor(item.status)">{{ statusLabel(item.status) }}</a-tag></td><td><strong>{{ item.actor_id }}</strong><small>{{ item.actor_type }}</small></td><td><span>{{ item.conversation_title }}</span><code>{{ item.id }}</code></td><td>{{ item.trigger_summary || '-' }}</td><td>{{ item.tool_invocation_count }}</td><td>{{ formatTime(item.created_at) }}</td><td>{{ formatDuration(item.duration_ms) }}</td><td><a-button type="text" :aria-label="`查看运行 ${item.id}`" @click="openRun(item.id)"><template #icon><EyeOutlined /></template></a-button></td></tr></tbody></table></div>
       <a-empty v-else-if="!loading && !listError" description="暂无符合条件的运行记录" />
     </a-spin>
-    <footer><span>共 {{ total }} 条</span><a-pagination :current="page" :page-size="pageSize" :total="total" show-size-changer @change="changePage" @show-size-change="changePageSize" /></footer>
+    <footer><span>共 {{ total }} 条</span><a-pagination :current="page" :page-size="pageSize" :total="total" show-size-changer @change="changePage" /></footer>
     <a-drawer v-model:open="drawerOpen" width="min(720px, 100vw)" title="运行详情" @close="closeDrawer">
       <div class="details">
         <section><h3>基础信息</h3><a-spin :spinning="detail.run.loading"><a-alert v-if="detail.run.error" type="error" message="基础信息读取失败" :description="detail.run.error"><template #action><a-button aria-label="重试运行详情" @click="retryDetail('run')">重试</a-button></template></a-alert><dl v-else-if="detail.run.data"><div><dt>Run ID</dt><dd>{{ detail.run.data.id }}</dd></div><div><dt>状态</dt><dd>{{ statusLabel(detail.run.data.status) }}</dd></div><div><dt>智能体</dt><dd>{{ detail.run.data.actor_id }}</dd></div><div><dt>会话 ID</dt><dd>{{ detail.run.data.conversation_id }}</dd></div></dl></a-spin></section>
@@ -22,6 +22,7 @@
 import { onBeforeUnmount, onMounted, ref } from 'vue';
 import { EyeOutlined, ReloadOutlined } from '@ant-design/icons-vue';
 import { agentRunsApi, type AgentRunListItem, type RunEvent } from '@/api/agentRuns';
+import { ApiError } from '@/api/client';
 import type { AgentRunInfo } from '@/api/conversations';
 import type { ToolInvocationInfo } from '@/api/tools';
 type Resource<T> = { data: T | null; loading: boolean; error: string };
@@ -34,16 +35,25 @@ const loading = ref(false), listError = ref(''), drawerOpen = ref(false), active
 const detail = ref({ run: { data: null, loading: false, error: '' } as Resource<AgentRunInfo>, events: { data: null, loading: false, error: '' } as Resource<RunEvent[]>, tools: { data: null, loading: false, error: '' } as Resource<ToolInvocationInfo[]> });
 const cache = new Map<string, { run?: AgentRunInfo; events?: RunEvent[]; tools?: ToolInvocationInfo[] }>();
 const statusOptions = [{label:'全部状态',value:'all'},{label:'排队中',value:'queued'},{label:'运行中',value:'running'},{label:'已完成',value:'completed'},{label:'失败',value:'failed'}];
-let listController: AbortController | undefined, listId = 0, detailId = 0, detailControllers: AbortController[] = [];
-const errorText = (e: unknown) => e instanceof Error ? e.message : '加载失败';
+let listController: AbortController | undefined, listId = 0, detailId = 0;
+const detailRequests: Record<DetailKey, { controller?: AbortController; generation: number }> = {
+  run: { generation: 0 }, events: { generation: 0 }, tools: { generation: 0 },
+};
+const errorText = (e: unknown) => e instanceof ApiError && e.status === 404 ? '记录不存在或无权访问' : e instanceof Error ? e.message : '加载失败';
 const isAbort = (e: unknown) => e instanceof DOMException && e.name === 'AbortError';
 function filters() { return { page: page.value, page_size: pageSize.value, ...(status.value !== 'all' ? {status:status.value}:{}), ...(actorId.value.trim()?{actor_id:actorId.value.trim()}:{}), ...(query.value.trim()?{query:query.value.trim()}:{}), ...(startedAfter.value?{started_after:startedAfter.value}:{}), ...(startedBefore.value?{started_before:startedBefore.value}:{}) }; }
 async function loadRuns() { const id=++listId; listController?.abort(); const controller=new AbortController(); listController=controller; loading.value=true; listError.value=''; try { const result=await agentRunsApi.list(filters(),controller.signal); if(id!==listId)return; runs.value=result.items; total.value=result.total; summary.value=result.summary; } catch(e) { if(id!==listId||isAbort(e))return; listError.value=errorText(e); } finally { if(id===listId){loading.value=false;if(listController===controller)listController=undefined;} } }
 function refresh(){const runId=drawerOpen.value?activeRunId.value:'';cache.clear();if(runId)openRun(runId);else cancelDetails();loadRuns();} function applyFilters(){page.value=1;loadRuns();}
 function changeDates(dates:[DateBoundary,DateBoundary]|null){startedAfter.value=dates?.[0]?.startOf('day').toISOString()||'';startedBefore.value=dates?.[1]?.endOf('day').toISOString()||'';applyFilters();}
-function changePage(next:number,size:number){page.value=next;if(size)pageSize.value=size;loadRuns();} function changePageSize(_c:number,size:number){page.value=1;pageSize.value=size;loadRuns();}
-function cancelDetails(){detailId++;detailControllers.forEach(c=>c.abort());detailControllers=[];}
-function requestDetail<T>(key:DetailKey,id:number,runId:string,request:(s:AbortSignal)=>Promise<T>){if(detail.value[key].data)return;const controller=new AbortController();detailControllers.push(controller);request(controller.signal).then(data=>{if(id!==detailId||activeRunId.value!==runId)return;(detail.value[key] as Resource<T>).data=data;const saved=cache.get(runId)||{};(saved as Record<string,unknown>)[key]=data;cache.set(runId,saved);}).catch(e=>{if(id===detailId&&!isAbort(e))detail.value[key].error=errorText(e);}).finally(()=>{if(id===detailId)detail.value[key].loading=false;});}
+function changePage(next:number,size:number){const sizeChanged=size!==pageSize.value;pageSize.value=size;page.value=sizeChanged?1:next;loadRuns();}
+function cancelDetails(){detailId++;(Object.keys(detailRequests) as DetailKey[]).forEach(key=>{const state=detailRequests[key];state.controller?.abort();state.controller=undefined;state.generation++;});}
+function requestDetail<T>(key:DetailKey,id:number,runId:string,request:(s:AbortSignal)=>Promise<T>){
+  if(detail.value[key].data)return;
+  const state=detailRequests[key];state.controller?.abort();
+  const controller=new AbortController();const generation=++state.generation;state.controller=controller;
+  const isCurrent=()=>id===detailId&&activeRunId.value===runId&&state.generation===generation&&state.controller===controller;
+  request(controller.signal).then(data=>{if(!isCurrent())return;(detail.value[key] as Resource<T>).data=data;const saved=cache.get(runId)||{};(saved as Record<string,unknown>)[key]=data;cache.set(runId,saved);}).catch(e=>{if(isCurrent()&&!isAbort(e))detail.value[key].error=errorText(e);}).finally(()=>{if(isCurrent()){detail.value[key].loading=false;state.controller=undefined;}});
+}
 function loadDetailResource(key:DetailKey,id:number,runId:string){if(key==='run')requestDetail('run',id,runId,s=>agentRunsApi.get(runId,s));else if(key==='events')requestDetail('events',id,runId,s=>agentRunsApi.listEvents(runId,s));else requestDetail('tools',id,runId,s=>agentRunsApi.listInvocations(runId,s));}
 function retryDetail(key:DetailKey){const runId=activeRunId.value;if(!runId)return;detail.value[key].data=null;detail.value[key].error='';detail.value[key].loading=true;loadDetailResource(key,detailId,runId);}
 function openRun(runId:string){cancelDetails();activeRunId.value=runId;drawerOpen.value=true;const saved=cache.get(runId)||{};detail.value={run:{data:saved.run||null,loading:!saved.run,error:''},events:{data:saved.events||null,loading:!saved.events,error:''},tools:{data:saved.tools||null,loading:!saved.tools,error:''}};const id=detailId;(['run','events','tools'] as DetailKey[]).forEach(key=>loadDetailResource(key,id,runId));}
