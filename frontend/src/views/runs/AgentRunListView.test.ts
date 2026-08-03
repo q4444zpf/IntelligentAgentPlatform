@@ -1,5 +1,6 @@
 // @vitest-environment happy-dom
 import { flushPromises, mount } from '@vue/test-utils';
+import dayjs from 'dayjs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import routesSource from '@/router/routes.ts?raw';
@@ -60,7 +61,7 @@ const stubs = {
     props: ['value'], emits: ['update:value', 'change'],
     template: '<button class="status-filter" @click="$emit(\'update:value\', \'failed\'); $emit(\'change\', \'failed\')">{{ value }}</button>',
   },
-  'a-range-picker': { props: ['value'], emits: ['update:value', 'change'], template: '<button class="date-filter" @click="$emit(\'change\', [null, null], [\'2026-08-01\', \'2026-08-03\'])">date</button>' },
+  'a-range-picker': { name: 'RangePickerStub', props: ['value'], emits: ['update:value', 'change'], template: '<button class="date-filter">date</button>' },
   'a-spin': { template: '<div><slot /></div>' },
   'a-tag': { template: '<span class="tag"><slot /></span>' },
   'a-empty': { props: ['description'], template: '<div class="empty">{{ description }}</div>' },
@@ -111,6 +112,37 @@ describe('AgentRunListView list behavior', () => {
 
     await wrapper.get('.status-filter').trigger('click'); await flushPromises();
     expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ page: 1, status: 'failed' }), expect.any(AbortSignal));
+  });
+
+
+  it('resets page for actor, query and full-day ISO date filters', async () => {
+    const wrapper = render(); await flushPromises();
+    await wrapper.get('.next-page').trigger('click'); await flushPromises();
+    await wrapper.get('.actor-filter').setValue('dispatch-agent');
+    await wrapper.get('.actor-filter').trigger('keyup.enter'); await flushPromises();
+    expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ page: 1, actor_id: 'dispatch-agent' }), expect.any(AbortSignal));
+    await wrapper.get('.next-page').trigger('click'); await flushPromises();
+    await wrapper.get('.run-search').setValue('run-2026');
+    await wrapper.get('.run-search-submit').trigger('click'); await flushPromises();
+    expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ page: 1, query: 'run-2026' }), expect.any(AbortSignal));
+    await wrapper.get('.next-page').trigger('click'); await flushPromises();
+    wrapper.findComponent({ name: 'RangePickerStub' }).vm.$emit('change', [dayjs('2026-08-01'), dayjs('2026-08-03')], ['2026-08-01', '2026-08-03']);
+    await flushPromises();
+    expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({
+      page: 1,
+      started_after: dayjs('2026-08-01').startOf('day').toISOString(),
+      started_before: dayjs('2026-08-03').endOf('day').toISOString(),
+    }), expect.any(AbortSignal));
+  });
+
+  it('refreshes the list and the selected open run', async () => {
+    const wrapper = render(); await flushPromises();
+    await wrapper.get('[aria-label="查看运行 run-1"]').trigger('click'); await flushPromises();
+    await wrapper.get('[aria-label="刷新运行列表"]').trigger('click'); await flushPromises();
+    expect(mocks.list).toHaveBeenCalledTimes(2);
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+    expect(mocks.listEvents).toHaveBeenCalledTimes(2);
+    expect(mocks.listInvocations).toHaveBeenCalledTimes(2);
   });
 
   it('shows a retry action after a list failure', async () => {
@@ -168,6 +200,71 @@ describe('AgentRunListView details', () => {
     expect(wrapper.text()).toContain('reservoir-agent');
   });
 });
+
+
+  it('retries only a failed run detail and preserves successful sections', async () => {
+    mocks.get.mockRejectedValueOnce(new Error('详情不可用')).mockResolvedValueOnce(run());
+    const wrapper = render(); await flushPromises();
+    await wrapper.get('[aria-label="查看运行 run-1"]').trigger('click'); await flushPromises();
+    await wrapper.get('[aria-label="重试运行详情"]').trigger('click'); await flushPromises();
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+    expect(mocks.listEvents).toHaveBeenCalledOnce();
+    expect(mocks.listInvocations).toHaveBeenCalledOnce();
+    expect(wrapper.text()).toContain('reservoir-agent');
+    expect(wrapper.text()).toContain('model.execute');
+  });
+
+  it('retries only failed events while keeping successful details', async () => {
+    mocks.listEvents.mockRejectedValueOnce(new Error('事件流不可用')).mockResolvedValueOnce([{ sequence: 2, event_type: 'run.completed', payload: {} }]);
+    const wrapper = render(); await flushPromises();
+    await wrapper.get('[aria-label="查看运行 run-1"]').trigger('click'); await flushPromises();
+    await wrapper.get('[aria-label="重试运行事件"]').trigger('click'); await flushPromises();
+    expect(mocks.listEvents).toHaveBeenCalledTimes(2);
+    expect(mocks.get).toHaveBeenCalledOnce();
+    expect(mocks.listInvocations).toHaveBeenCalledOnce();
+    expect(wrapper.text()).toContain('run.completed');
+  });
+
+  it('retries only failed tool invocations', async () => {
+    mocks.listInvocations.mockRejectedValueOnce(new Error('工具记录不可用')).mockResolvedValueOnce([]);
+    const wrapper = render(); await flushPromises();
+    await wrapper.get('[aria-label="查看运行 run-1"]').trigger('click'); await flushPromises();
+    await wrapper.get('[aria-label="重试工具调用"]').trigger('click'); await flushPromises();
+    expect(mocks.listInvocations).toHaveBeenCalledTimes(2);
+    expect(mocks.get).toHaveBeenCalledOnce();
+    expect(mocks.listEvents).toHaveBeenCalledOnce();
+    expect(wrapper.text()).toContain('本次运行未调用工具');
+  });
+
+  it('aborts old details and blocks stale data when switching runs', async () => {
+    mocks.list.mockResolvedValue(page([run('run-1'), run('run-2')]));
+    const oldRun = deferred<ReturnType<typeof run>>();
+    mocks.get.mockImplementation((id: string) => id === 'run-1' ? oldRun.promise : Promise.resolve(run('run-2')));
+    const wrapper = render(); await flushPromises();
+    await wrapper.get('[aria-label="查看运行 run-1"]').trigger('click');
+    const oldSignals = [mocks.get.mock.calls[0][1], mocks.listEvents.mock.calls[0][1], mocks.listInvocations.mock.calls[0][1]] as AbortSignal[];
+    await wrapper.get('[aria-label="查看运行 run-2"]').trigger('click'); await flushPromises();
+    expect(oldSignals.every((signal) => signal.aborted)).toBe(true);
+    oldRun.resolve(run('stale-run')); await flushPromises();
+    expect(wrapper.text()).toContain('run-2');
+    expect(wrapper.text()).not.toContain('stale-run');
+  });
+
+  it('aborts open detail requests when the drawer closes', async () => {
+    const pending = deferred<ReturnType<typeof run>>();
+    mocks.get.mockReturnValue(pending.promise);
+    const wrapper = render(); await flushPromises();
+    await wrapper.get('[aria-label="查看运行 run-1"]').trigger('click');
+    const signals = [mocks.get.mock.calls[0][1], mocks.listEvents.mock.calls[0][1], mocks.listInvocations.mock.calls[0][1]] as AbortSignal[];
+    await wrapper.get('.close-drawer').trigger('click');
+    expect(signals.every((signal) => signal.aborted)).toBe(true);
+  });
+
+  it('keeps the view button as the only row action', async () => {
+    const wrapper = render(); await flushPromises();
+    expect(wrapper.findAll('tbody button')).toHaveLength(1);
+    expect(wrapper.get('tbody button').attributes('aria-label')).toBe('查看运行 run-1');
+  });
 
 describe('AgentRunListView route contract', () => {
   it('routes runs directly to the lazy audit view without a collaboration module', () => {
