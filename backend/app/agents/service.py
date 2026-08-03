@@ -576,8 +576,8 @@ class AgentService:
             )
             shutil.rmtree(workspace)
             return
-            quarantine = workspace.with_name(f".{workspace.name}.quarantine-{uuid4().hex}")
-            workspace.rename(quarantine)
+        quarantine = workspace.with_name(f".{workspace.name}.quarantine-{uuid4().hex}")
+        workspace.rename(quarantine)
         try:
             record = self._call_store_mutation(
                 lambda: self.store.delete_agent_in_session(

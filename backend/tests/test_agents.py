@@ -828,9 +828,13 @@ def test_copies_agent_with_independent_identity(client):
 
 def test_deletes_agent(client):
     client.post("/api/agents", json=agent_payload())
+    service = client.app.state.agent_service
+    workspace = service.workspace_root / "reservoir-dispatch"
     deleted = client.delete("/api/agents/reservoir-dispatch")
     assert deleted.status_code == 200
     assert client.get("/api/agents/reservoir-dispatch").status_code == 404
+    assert not workspace.exists()
+    assert not list(service.workspace_root.glob(".reservoir-dispatch.quarantine-*"))
 
 
 def test_create_rolls_back_agent_and_workspace_when_audit_fails(tmp_path):
