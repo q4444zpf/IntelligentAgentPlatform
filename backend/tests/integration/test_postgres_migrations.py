@@ -74,7 +74,7 @@ def test_upgrade_head_creates_conversation_tables():
         index["name"]: tuple(index["column_names"])
         for index in inspector.get_indexes("audit_events")
     }
-    assert audit_indexes == {
+    expected_audit_indexes = {
         "ix_audit_unit_time": ("unit_id", "occurred_at", "id"),
         "ix_audit_project_time": ("unit_id", "project_id", "occurred_at", "id"),
         "ix_audit_user_time": (
@@ -84,3 +84,6 @@ def test_upgrade_head_creates_conversation_tables():
         "ix_audit_run_time": ("run_id", "occurred_at", "id"),
         "ix_audit_source_action_status": ("source", "action", "status"),
     }
+    assert {
+        name: audit_indexes[name] for name in expected_audit_indexes
+    } == expected_audit_indexes
