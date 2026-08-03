@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
+import logging
+import re
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -14,16 +17,40 @@ from app.core.request_context import RequestContext
 
 
 MANAGEMENT_REQUEST_ID_STATE_KEY = "management_request_id"
+_SAFE_CORRELATION = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+_logger = logging.getLogger(__name__)
 
 
-def management_request_id(request: Request) -> str:
+@dataclass(frozen=True)
+class ManagementAuditIdentity:
+    event_id: str
+    correlation_id: str
+
+    def __str__(self) -> str:
+        return self.event_id
+
+
+def management_request_id(request: Request) -> ManagementAuditIdentity:
     existing = getattr(request.state, MANAGEMENT_REQUEST_ID_STATE_KEY, None)
     if existing:
         return existing
-    request_id = request.headers.get("X-Request-ID") or str(uuid4())
-    setattr(request.state, MANAGEMENT_REQUEST_ID_STATE_KEY, request_id)
-    return request_id
+    supplied = request.headers.get("X-Request-ID", "")
+    correlation_id = supplied if _SAFE_CORRELATION.fullmatch(supplied) else str(uuid4())
+    identity = ManagementAuditIdentity(str(uuid4()), correlation_id)
+    setattr(request.state, MANAGEMENT_REQUEST_ID_STATE_KEY, identity)
+    return identity
 
+
+def management_event_id(identity: str | ManagementAuditIdentity | None) -> str:
+    return identity.event_id if isinstance(identity, ManagementAuditIdentity) else str(uuid4())
+
+
+def management_trace_id(identity: str | ManagementAuditIdentity | None) -> str | None:
+    if isinstance(identity, ManagementAuditIdentity):
+        return identity.correlation_id
+    if isinstance(identity, str) and _SAFE_CORRELATION.fullmatch(identity):
+        return identity
+    return None
 
 def record_failed_management(
     session_factory: sessionmaker[Session],
@@ -38,30 +65,34 @@ def record_failed_management(
     request_id: str | None,
     risk_level: str = "high",
 ) -> None:
-    stable_request_id = request_id or str(uuid4())
-    with session_factory.begin() as session:
-        recorder.record(session, AuditRecordRequest(
-            unit_id=context.unit_id,
-            project_id=context.project_id,
-            user_id=context.user_id,
-            actor_role=context.role,
-            category="management",
-            source=source,
-            action=action,
-            status="failed",
-            risk_level=risk_level,
-            resource_type=resource_type,
-            resource_id=resource_id,
-            summary=f"{resource_type} {resource_id} management operation failed",
-            metadata={},
-            allowed_metadata_keys=frozenset(),
-            error_code=error_code,
-            idempotency_key=(
-                f"management:{stable_request_id}:{source}:{action}:{resource_id}"
-            ),
-            occurred_at=datetime.now(UTC),
-        ))
-
+    event_id = management_event_id(request_id)
+    try:
+        with session_factory.begin() as session:
+            recorder.record(session, AuditRecordRequest(
+                unit_id=context.unit_id,
+                project_id=context.project_id,
+                user_id=context.user_id,
+                actor_role=context.role,
+                trace_id=management_trace_id(request_id),
+                category="management",
+                source=source,
+                action=action,
+                status="failed",
+                risk_level=risk_level,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                summary=f"{resource_type} {resource_id} management operation failed",
+                metadata={},
+                allowed_metadata_keys=frozenset(),
+                error_code=error_code,
+                idempotency_key=f"management:{event_id}:failed:{source}:{action}:{resource_id}",
+                occurred_at=datetime.now(UTC),
+            ))
+    except Exception:
+        _logger.warning(
+            "management_failed_audit_write_failed",
+            extra={"audit_source": source, "audit_action": action, "error_code": error_code},
+        )
 
 def management_audit_route_class(
     session_factory_provider: Callable[[], sessionmaker[Session]],

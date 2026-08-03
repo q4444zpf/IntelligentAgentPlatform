@@ -210,7 +210,7 @@ def test_missing_mcp_delete_records_failed_audit_in_fresh_transaction(client):
     assert event.error_code == "MCP_NOT_FOUND"
     assert event.resource_id == "missing-client"
     assert event.metadata_json == {}
-    assert "mcp-delete-missing-1" in event.idempotency_key
+    assert event.trace_id == "mcp-delete-missing-1"
 
 def test_sync_rolls_back_tool_records_when_audit_recorder_fails(client):
     from app.audit.recorder import AuditRecorder
@@ -255,7 +255,7 @@ def test_invalid_mcp_body_records_failed_audit_without_request_secrets(client):
     assert event.metadata_json == {}
     serialized = f"{event.summary} {event.metadata_json}"
     assert secret not in serialized
-    assert "mcp-validation-1" in event.idempotency_key
+    assert event.trace_id == "mcp-validation-1"
 
 
 def test_repeated_mcp_whitelist_without_request_id_records_each_mutation(client):

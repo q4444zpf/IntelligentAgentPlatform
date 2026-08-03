@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 from sqlalchemy.orm import Session
 
+from app.audit.management import management_event_id, management_trace_id
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.core.request_context import RequestContext
 from .builtins import BUILTIN_TOOL_DEFINITIONS
@@ -80,13 +81,13 @@ class ToolService:
             self.audit_recorder.record(session, AuditRecordRequest(
                 unit_id=context.unit_id, project_id=context.project_id,
                 user_id=context.user_id, actor_role=context.role,
-                category="management", source="tool",
+                trace_id=management_trace_id(request_id), category="management", source="tool",
                 action="resource.enabled" if enabled else "resource.disabled",
                 status="succeeded", risk_level="medium",
                 resource_type="tool", resource_id=tool_id,
                 summary=f"Tool {tool_id} was {'enabled' if enabled else 'disabled'}",
                 metadata={"enabled": enabled}, allowed_metadata_keys=frozenset({"enabled"}),
-                idempotency_key=f"management:{request_id or str(uuid4())}:tool.toggle:{tool_id}",
+                idempotency_key=f"management:{management_event_id(request_id)}:succeeded:tool.toggle:{tool_id}",
                 occurred_at=datetime.now(UTC),
             ))
             session.commit()

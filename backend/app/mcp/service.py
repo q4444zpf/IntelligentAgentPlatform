@@ -8,6 +8,7 @@ from sqlalchemy.exc import IntegrityError
 
 from sqlalchemy.orm import Session
 
+from app.audit.management import management_event_id, management_trace_id
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.core.request_context import RequestContext
 from .schemas import McpClientConfig, McpClientCreate, McpClientInfo, McpToolInfo
@@ -69,12 +70,12 @@ class McpService:
             self.audit_recorder.record(session, AuditRecordRequest(
                 unit_id=context.unit_id, project_id=context.project_id,
                 user_id=context.user_id, actor_role=context.role,
-                category="management", source="mcp", action=action,
+                trace_id=management_trace_id(request_id), category="management", source="mcp", action=action,
                 status="succeeded", risk_level=risk_level,
                 resource_type="mcp_client", resource_id=key, resource_name=name,
                 summary=f"MCP client {key} management operation succeeded",
                 metadata=metadata, allowed_metadata_keys=frozenset(metadata),
-                idempotency_key=f"management:{request_id or str(uuid4())}:{action}:{key}",
+                idempotency_key=f"management:{management_event_id(request_id)}:succeeded:{action}:{key}",
                 occurred_at=datetime.now(UTC),
             ))
             session.commit()
@@ -105,13 +106,13 @@ class McpService:
             self.audit_recorder.record(session, AuditRecordRequest(
                 unit_id=context.unit_id, project_id=context.project_id,
                 user_id=context.user_id, actor_role=context.role,
-                category="management", source="mcp", action="resource.created",
+                trace_id=management_trace_id(request_id), category="management", source="mcp", action="resource.created",
                 status="succeeded", risk_level="medium", resource_type="mcp_client",
                 resource_id=request.key, resource_name=request.name,
                 summary=f"MCP client {request.key} was created",
                 metadata={"transport": request.transport, "enabled": request.enabled},
                 allowed_metadata_keys=frozenset({"transport", "enabled"}),
-                idempotency_key=f"management:{request_id or str(uuid4())}:mcp.create:{request.key}",
+                idempotency_key=f"management:{management_event_id(request_id)}:succeeded:mcp.create:{request.key}",
                 occurred_at=datetime.now(UTC),
             ))
             session.commit()

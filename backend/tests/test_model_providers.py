@@ -264,7 +264,7 @@ def test_missing_provider_management_attempt_records_failed_audit(tmp_path, monk
     assert event.resource_id == "missing-provider"
     assert event.error_code == "PROVIDER_NOT_FOUND"
     assert event.metadata_json == {}
-    assert "provider-missing-1" in event.idempotency_key
+    assert event.trace_id == "provider-missing-1"
 
 
 def test_invalid_provider_body_records_failed_audit_without_request_secrets(tmp_path, monkeypatch):
@@ -293,7 +293,7 @@ def test_invalid_provider_body_records_failed_audit_without_request_secrets(tmp_
     serialized = f"{event.summary} {event.metadata_json}"
     assert secret not in serialized
     assert "Bearer hidden" not in serialized
-    assert "provider-validation-1" in event.idempotency_key
+    assert event.trace_id == "provider-validation-1"
 
 
 def test_repeated_provider_config_without_request_id_records_each_mutation(tmp_path, monkeypatch):

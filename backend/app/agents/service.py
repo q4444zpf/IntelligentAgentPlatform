@@ -9,6 +9,7 @@ from uuid import uuid4
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.audit.management import management_event_id, management_trace_id
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.core.request_context import RequestContext
 from app.skills.service import SkillNotFoundError, SkillService
@@ -108,12 +109,12 @@ class AgentService:
             self.audit_recorder.record(session, AuditRecordRequest(
                 unit_id=context.unit_id, project_id=context.project_id,
                 user_id=context.user_id, actor_role=context.role,
-                category="management", source="agent", action=action,
+                trace_id=management_trace_id(request_id), category="management", source="agent", action=action,
                 status="succeeded", risk_level=risk_level,
                 resource_type="agent", resource_id=agent_id, resource_name=name,
                 summary=f"Agent {agent_id} management operation succeeded",
                 metadata=metadata, allowed_metadata_keys=frozenset(metadata),
-                idempotency_key=f"management:{request_id or str(uuid4())}:{action}:{agent_id}",
+                idempotency_key=f"management:{management_event_id(request_id)}:succeeded:{action}:{agent_id}",
                 occurred_at=datetime.now(UTC),
             ))
             session.commit()
@@ -279,12 +280,12 @@ class AgentService:
             record = self.store.create_in_session(session, request.id, config.model_dump(), str(workspace))
             self.audit_recorder.record(session, AuditRecordRequest(
                 unit_id=context.unit_id, project_id=context.project_id, user_id=context.user_id,
-                actor_role=context.role, category="management", source="agent",
+                actor_role=context.role, trace_id=management_trace_id(request_id), category="management", source="agent",
                 action="resource.created", status="succeeded", risk_level="medium",
                 resource_type="agent", resource_id=request.id, resource_name=config.name,
                 summary=f"Agent {request.id} was created", metadata={"runtime_form": config.runtime_form, "enabled": config.enabled},
                 allowed_metadata_keys=frozenset({"runtime_form", "enabled"}),
-                idempotency_key=f"management:{request_id or str(uuid4())}:agent.create:{request.id}", occurred_at=datetime.now(UTC),
+                idempotency_key=f"management:{management_event_id(request_id)}:succeeded:agent.create:{request.id}", occurred_at=datetime.now(UTC),
             ))
             session.commit()
         except IntegrityError as error:
@@ -375,10 +376,10 @@ class AgentService:
             record = self._call_store_mutation(lambda: self.store.delete_agent_in_session(session, agent_id, builtin_agent_id=BUILTIN_AGENT_ID))
             self.audit_recorder.record(session, AuditRecordRequest(
                 unit_id=context.unit_id, project_id=context.project_id, user_id=context.user_id,
-                actor_role=context.role, category="management", source="agent", action="resource.deleted",
+                actor_role=context.role, trace_id=management_trace_id(request_id), category="management", source="agent", action="resource.deleted",
                 status="succeeded", risk_level="high", resource_type="agent", resource_id=agent_id,
                 resource_name=record["name"], summary=f"Agent {agent_id} was deleted",
-                idempotency_key=f"management:{request_id or str(uuid4())}:agent.delete:{agent_id}", occurred_at=datetime.now(UTC),
+                idempotency_key=f"management:{management_event_id(request_id)}:succeeded:agent.delete:{agent_id}", occurred_at=datetime.now(UTC),
             ))
             session.commit()
         except Exception:

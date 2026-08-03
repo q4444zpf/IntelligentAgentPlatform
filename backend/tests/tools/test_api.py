@@ -90,7 +90,7 @@ def test_regular_user_cannot_toggle_tool(client):
     assert event.error_code == "PERMISSION_DENIED"
     assert event.resource_id == "system.get_current_time"
     assert event.metadata_json == {}
-    assert "tool-denied-1" in event.idempotency_key
+    assert event.trace_id == "tool-denied-1"
 
 
 def test_authenticated_regular_user_can_read_tools(client):
@@ -131,7 +131,7 @@ def test_missing_tool_toggle_records_failed_audit(client):
     assert event.error_code == "TOOL_NOT_FOUND"
     assert event.resource_id == "system.missing"
     assert event.metadata_json == {}
-    assert "tool-missing-1" in event.idempotency_key
+    assert event.trace_id == "tool-missing-1"
 
 
 def create_run(client, headers):

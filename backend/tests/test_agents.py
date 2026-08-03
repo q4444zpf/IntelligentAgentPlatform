@@ -871,7 +871,7 @@ def test_protected_agent_delete_records_failed_audit_in_fresh_transaction(client
     assert event.error_code == "AGENT_PROTECTED"
     assert event.resource_id == BUILTIN_AGENT_ID
     assert event.metadata_json == {}
-    assert "protected-delete-1" in event.idempotency_key
+    assert event.trace_id == "protected-delete-1"
 
 
 def test_invalid_agent_body_records_failed_audit_without_request_secrets(client):
@@ -901,7 +901,7 @@ def test_invalid_agent_body_records_failed_audit_without_request_secrets(client)
     assert event.error_code == "REQUEST_VALIDATION"
     assert event.metadata_json == {}
     assert secret not in f"{event.summary} {event.metadata_json}"
-    assert "agent-validation-1" in event.idempotency_key
+    assert event.trace_id == "agent-validation-1"
 
 
 def test_repeated_agent_pin_without_request_id_records_each_mutation(client):
@@ -949,3 +949,62 @@ def test_update_restores_workspace_after_partial_write_failure(tmp_path, monkeyp
         service.update("reservoir-dispatch", updated, context=context, session=session, request_id="partial-write-1")
     assert agents_file.read_bytes() == previous
     assert store.get("reservoir-dispatch")["name"] != "Changed"
+
+
+def test_same_client_request_id_does_not_deduplicate_distinct_http_requests(client):
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+
+    assert client.post("/api/agents", json=agent_payload(skill_names=[])).status_code == 201
+    headers = {"X-Request-ID": "shared-correlation"}
+    assert client.patch("/api/agents/reservoir-dispatch/pin", json={"pinned": True}, headers=headers).status_code == 200
+    assert client.patch("/api/agents/reservoir-dispatch/pin", json={"pinned": False}, headers=headers).status_code == 200
+    factory = client.app.state.agent_service.store.session_factory
+    with factory() as session:
+        events = list(session.scalars(select(AuditEvent).where(
+            AuditEvent.source == "agent",
+            AuditEvent.action == "resource.updated",
+            AuditEvent.resource_id == "reservoir-dispatch",
+        )))
+    assert len(events) == 2
+    assert {event.trace_id for event in events} == {"shared-correlation"}
+    assert len({event.idempotency_key for event in events}) == 2
+    assert all("shared-correlation" not in event.idempotency_key for event in events)
+
+
+def test_same_correlation_preserves_fail_then_success_statuses(client):
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+
+    headers = {"X-Request-ID": "retry-correlation"}
+    failed = client.patch("/api/agents/retry-agent/pin", json={"pinned": True}, headers=headers)
+    assert failed.status_code == 404
+    payload = agent_payload(id="retry-agent", skill_names=[])
+    assert client.post("/api/agents", json=payload).status_code == 201
+    succeeded = client.patch("/api/agents/retry-agent/pin", json={"pinned": True}, headers=headers)
+    assert succeeded.status_code == 200
+    factory = client.app.state.agent_service.store.session_factory
+    with factory() as session:
+        events = list(session.scalars(select(AuditEvent).where(
+            AuditEvent.action == "resource.updated",
+            AuditEvent.resource_id == "retry-agent",
+        )))
+    assert {event.status for event in events} == {"failed", "succeeded"}
+    assert {event.trace_id for event in events} == {"retry-correlation"}
+
+
+def test_failed_audit_is_best_effort_and_invalid_request_id_is_safe(client):
+    from app.audit.recorder import AuditRecorder
+
+    class FailingRecorder(AuditRecorder):
+        def record(self, session, request):
+            raise RuntimeError("database secret must not escape")
+
+    client.app.state.agent_service.audit_recorder = FailingRecorder()
+    response = client.patch(
+        "/api/agents/missing-agent/pin",
+        json={"pinned": True},
+        headers={"X-Request-ID": "x" * 1000},
+    )
+    assert response.status_code == 404
+    assert "not found" in response.json()["detail"].lower()

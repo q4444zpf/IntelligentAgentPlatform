@@ -6,6 +6,7 @@ from uuid import uuid4
 import httpx
 
 from sqlalchemy.orm import Session
+from app.audit.management import management_event_id, management_trace_id
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.core.request_context import RequestContext
 from .registry import builtin_providers
@@ -23,12 +24,12 @@ class ProviderService:
         try:
             self.audit_recorder.record(session, AuditRecordRequest(
                 unit_id=context.unit_id, project_id=context.project_id, user_id=context.user_id,
-                actor_role=context.role, category="management", source="llm", action=action,
+                actor_role=context.role, trace_id=management_trace_id(request_id), category="management", source="llm", action=action,
                 status="succeeded", risk_level=risk_level, resource_type="model_provider",
                 resource_id=resource_id, resource_name=resource_name,
                 summary=f"Model provider resource {resource_id} management operation succeeded",
                 metadata=metadata, allowed_metadata_keys=frozenset(metadata),
-                idempotency_key=f"management:{request_id or str(uuid4())}:{action}:{resource_id}",
+                idempotency_key=f"management:{management_event_id(request_id)}:succeeded:{action}:{resource_id}",
                 occurred_at=datetime.now(UTC),
             ))
             session.commit()
@@ -113,13 +114,13 @@ class ProviderService:
             self.store.save_in_session(session, state)
             self.audit_recorder.record(session, AuditRecordRequest(
                 unit_id=context.unit_id, project_id=context.project_id, user_id=context.user_id,
-                actor_role=context.role, category="management", source="llm",
+                actor_role=context.role, trace_id=management_trace_id(request_id), category="management", source="llm",
                 action="resource.updated", status="succeeded", risk_level="high",
                 resource_type="model_provider", resource_id=provider_id,
                 resource_name=provider.name, summary=f"Model provider {provider_id} was updated",
                 metadata={"enabled": bucket["enabled"], "protocol": bucket.get("protocol", provider.protocol)},
                 allowed_metadata_keys=frozenset({"enabled", "protocol"}),
-                idempotency_key=f"management:{request_id or str(uuid4())}:provider.configure:{provider_id}",
+                idempotency_key=f"management:{management_event_id(request_id)}:succeeded:provider.configure:{provider_id}",
                 occurred_at=datetime.now(UTC),
             ))
             session.commit()
