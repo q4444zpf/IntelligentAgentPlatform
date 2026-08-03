@@ -8,6 +8,9 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from .models import AuditEvent
 
+_AUDIT_SOURCES = ("agent", "tool", "mcp", "knowledge", "sandbox", "llm", "system")
+
+
 
 @dataclass(frozen=True)
 class AuditListResult:
@@ -71,12 +74,19 @@ class AuditRepository:
             ).label("high_risk"),
             func.coalesce(func.sum(case((scoped.c.category == "runtime", 1), else_=0)), 0).label("runtime"),
             func.coalesce(func.sum(case((scoped.c.category == "management", 1), else_=0)), 0).label("management"),
+            *(
+                func.coalesce(
+                    func.sum(case((scoped.c.source == source_name, 1), else_=0)), 0
+                ).label(f"source_{source_name}")
+                for source_name in _AUDIT_SOURCES
+            ),
         )).mappings().one()
-        source_rows = self.session.execute(
-            select(scoped.c.source, func.count(scoped.c.id)).group_by(scoped.c.source).order_by(scoped.c.source)
-        ).all()
         summary = {key: int(aggregate[key]) for key in ("total", "failed", "high_risk", "runtime", "management")}
-        summary["by_source"] = {source_name: int(count) for source_name, count in source_rows}
+        summary["by_source"] = {
+            source_name: int(aggregate[f"source_{source_name}"])
+            for source_name in _AUDIT_SOURCES
+            if aggregate[f"source_{source_name}"]
+        }
         return AuditListResult(items, page, page_size, summary["total"], summary)
 
     def get_event(self, event_id: str, scope: Sequence[ColumnElement[bool]]) -> AuditEvent | None:

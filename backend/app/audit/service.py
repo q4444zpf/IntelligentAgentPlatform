@@ -29,6 +29,7 @@ class AuditService:
 
     def list_related(self, context: RequestContext, event_id: str) -> list[AuditEventListItem]:
         scope = audit_scope_filters(context)
-        if self.repository.get_event(event_id, scope) is None:
+        related = self.repository.list_related(event_id, scope)
+        if not related:
             raise AuditEventNotFound(event_id)
-        return [AuditEventListItem.model_validate(item) for item in self.repository.list_related(event_id, scope)]
+        return [AuditEventListItem.model_validate(item) for item in related]

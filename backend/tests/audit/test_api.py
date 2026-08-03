@@ -61,5 +61,9 @@ def test_api_uses_same_safe_404_for_missing_and_unauthorized():
     expected = {"detail": "记录不存在或无权访问"}
     for event_id in ("missing", "visible"):
         headers = HEADERS if event_id == "missing" else {**HEADERS, "X-Unit-ID": "u2"}
-        assert client.get(f"/api/audit/events/{event_id}", headers=headers).json() == expected
-        assert client.get(f"/api/audit/events/{event_id}/related", headers=headers).json() == expected
+        detail_response = client.get(f"/api/audit/events/{event_id}", headers=headers)
+        related_response = client.get(f"/api/audit/events/{event_id}/related", headers=headers)
+        assert detail_response.status_code == 404
+        assert related_response.status_code == 404
+        assert detail_response.json() == expected
+        assert related_response.json() == expected
