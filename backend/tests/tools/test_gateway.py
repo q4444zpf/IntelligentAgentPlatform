@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timezone
 
 import pytest
@@ -322,11 +323,11 @@ def test_success_terminal_audit_failure_retries_true_outcome_without_duplicates(
 class PersistentTerminalFailingRecorder(AuditRecorder):
     def record(self, session, request):
         if request.action == "tool.invoke.succeeded":
-            raise RuntimeError("persistent terminal audit failure")
+            raise RuntimeError("persistent terminal audit failure secret-raw-detail")
         return super().record(session, request)
 
 
-def test_persistent_success_audit_failure_preserves_external_success(runtime):
+def test_persistent_success_audit_failure_is_observable_and_preserves_external_success(runtime, caplog):
     factory, store = runtime
     session = factory()
     gateway = ToolGateway(
@@ -335,10 +336,23 @@ def test_persistent_success_audit_failure_preserves_external_success(runtime):
         audit_recorder=PersistentTerminalFailingRecorder(),
     )
 
-    with pytest.raises(ToolRuntimeError) as caught:
-        execute(gateway)
+    with caplog.at_level(logging.ERROR, logger="app.tools.gateway"):
+        with pytest.raises(ToolRuntimeError) as caught:
+            execute(gateway, arguments={"timezone": "Asia/Shanghai"})
 
-    assert caught.value.code == "tool_execution_failed"
+    assert caught.value.code == "audit_persistence_failed"
+    assert caught.value.safe_message == "工具执行结果已保存，但审计记录失败。"
+    metric = next(
+        record for record in caplog.records
+        if getattr(record, "metric_name", None)
+        == "tool_terminal_audit_persistence_failures_total"
+    )
+    assert metric.metric_value == 1
+    assert metric.run_id == "run-1"
+    assert metric.tool_id == "system.get_current_time"
+    assert metric.external_status == "completed"
+    assert "secret-raw-detail" not in caplog.text
+    assert "Asia/Shanghai" not in caplog.text
     invocation = session.scalar(select(ToolInvocation))
     assert invocation.status == "completed"
     assert invocation.result_summary["timezone"] == "Asia/Shanghai"
@@ -395,7 +409,7 @@ def test_failed_compensation_event_still_closes_invocation(runtime, monkeypatch)
     try:
         with pytest.raises(ToolRuntimeError) as caught:
             execute(gateway)
-        assert caught.value.code == "tool_execution_failed"
+        assert caught.value.code == "audit_persistence_failed"
         invocation = session.scalar(select(ToolInvocation))
         assert invocation.status == "completed"
         assert invocation.error_code is None

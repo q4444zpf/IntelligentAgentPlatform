@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from collections.abc import Collection, Callable
@@ -23,6 +24,8 @@ from .store import ToolStore
 _SENSITIVE_KEY = re.compile(r"authorization|api_?key|token|secret|password|credential", re.IGNORECASE)
 _REDACTED = "[REDACTED]"
 _TRUNCATED = "[TRUNCATED]"
+
+logger = logging.getLogger(__name__)
 
 
 class ToolGateway:
@@ -249,6 +252,7 @@ class ToolGateway:
         error: ToolRuntimeError | None = None,
     ) -> None:
         invocation_id = str(invocation.id)
+        tool_id = str(invocation.tool_id)
         try:
             self._persist_terminal(
                 invocation, display_name, status=status, duration_ms=duration_ms,
@@ -264,8 +268,20 @@ class ToolGateway:
                 parent_event_id=parent_event_id,
             ):
                 return
+            logger.error(
+                "tool terminal audit persistence failed",
+                extra={
+                    "metric_name": "tool_terminal_audit_persistence_failures_total",
+                    "metric_value": 1,
+                    "run_id": context.run_id,
+                    "tool_id": tool_id,
+                    "invocation_id": invocation_id,
+                    "external_status": status,
+                },
+            )
             raise ToolRuntimeError(
-                "tool_execution_failed", "工具执行失败。"
+                "audit_persistence_failed",
+                "工具执行结果已保存，但审计记录失败。",
             ) from database_error
     def execute(
         self,
