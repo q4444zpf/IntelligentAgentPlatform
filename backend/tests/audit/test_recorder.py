@@ -254,3 +254,9 @@ def test_unrelated_integrity_error_rolls_back_savepoint_not_outer_transaction():
             ) == 1
     finally:
         event.remove(AuditEvent, "before_insert", fail_first_insert)
+
+
+@pytest.mark.parametrize("value", ["12", 1.5, True])
+def test_record_rejects_non_integer_duration(session, value):
+    with pytest.raises(ValueError, match="duration_ms"):
+        AuditRecorder().record(session, make_request(duration_ms=value))

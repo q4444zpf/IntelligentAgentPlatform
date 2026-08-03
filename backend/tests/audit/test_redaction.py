@@ -126,3 +126,15 @@ def test_redact_metadata_sanitizes_absolute_path_dictionary_keys():
     )
 
     assert redacted == {"windows.nc": "windows", "posix.nc": "posix"}
+
+
+def test_path_key_sensitivity_is_checked_after_basename_sanitizing():
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    windows_key = PureWindowsPath(r"C:\customer\private\token")
+    posix_key = PurePosixPath("/customer/private/password")
+    redacted = redact_metadata(
+        {windows_key: "secret-1", posix_key: "secret-2"},
+        allowed_keys={windows_key, posix_key},
+    )
+    assert redacted == {"token": "[REDACTED]", "password": "[REDACTED]"}

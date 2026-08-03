@@ -118,15 +118,16 @@ def redact_metadata(
     if max_bytes < 2:
         raise ValueError("max_bytes must be at least 2")
     allowed = set(allowed_keys)
-    result = {
-        _basename_if_absolute(str(key))[:512]: (
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        if key not in allowed:
+            continue
+        sanitized_key = _basename_if_absolute(str(key))[:512]
+        result[sanitized_key] = (
             _REDACTED
-            if _is_sensitive_key(str(key))
+            if _is_sensitive_key(sanitized_key)
             else _sanitize(item, depth=1)
         )
-        for key, item in value.items()
-        if key in allowed
-    }
     while _encoded_size(result) > max_bytes:
         strings = list(_string_locations(result))
         if strings:

@@ -90,8 +90,12 @@ def _validate(request: AuditRecordRequest) -> None:
             raise ValueError(f"{field_name} exceeds {max_length} characters")
     if request.occurred_at.tzinfo is None or request.occurred_at.utcoffset() is None:
         raise ValueError("occurred_at must include timezone information")
-    if request.duration_ms is not None and request.duration_ms < 0:
-        raise ValueError("duration_ms must be non-negative")
+    if request.duration_ms is not None and (
+        isinstance(request.duration_ms, bool)
+        or not isinstance(request.duration_ms, int)
+        or request.duration_ms < 0
+    ):
+        raise ValueError("duration_ms must be a non-negative integer")
 
 
 def _is_idempotency_conflict(error: IntegrityError) -> bool:
