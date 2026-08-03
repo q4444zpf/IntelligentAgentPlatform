@@ -1,7 +1,7 @@
 import json
 from collections.abc import Callable
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -139,10 +139,7 @@ def create_router(
     def list_runs(
         page: Annotated[int, Query(ge=1)] = 1,
         page_size: Annotated[int, Query(ge=1, le=100)] = 20,
-        status: Annotated[
-            str | None,
-            Query(max_length=30, pattern=r"^[a-z][a-z0-9_-]*$"),
-        ] = None,
+        status: Literal["queued", "running", "completed", "failed"] | None = None,
         actor_id: Annotated[
             str | None,
             Query(

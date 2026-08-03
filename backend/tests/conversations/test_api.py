@@ -192,6 +192,42 @@ def test_agent_run_list_treats_query_wildcards_as_literals(query):
     assert response.json()["total"] == 0
 
 
+def test_agent_run_list_rejects_unknown_status():
+    client = build_client()
+
+    response = client.get(
+        "/api/agent-runs", params={"status": "banana"}, headers=HEADERS
+    )
+
+    assert response.status_code == 422
+
+
+def test_agent_run_list_treats_backslash_as_a_literal_without_match():
+    client = build_client()
+    create_run(client, title="ordinary title")
+
+    response = client.get(
+        "/api/agent-runs", params={"query": "\\"}, headers=HEADERS
+    )
+
+    assert response.status_code == 200
+    assert response.json()["items"] == []
+
+
+def test_agent_run_list_matches_a_literal_backslash_in_title():
+    client = build_client()
+    accepted = create_run(client, title="Gate\\Dispatch")
+
+    response = client.get(
+        "/api/agent-runs", params={"query": "\\"}, headers=HEADERS
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["items"]] == [
+        accepted["run"]["id"]
+    ]
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [
