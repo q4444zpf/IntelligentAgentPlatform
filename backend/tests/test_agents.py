@@ -1216,3 +1216,63 @@ def test_delete_restore_failure_does_not_mask_audit_error(client, monkeypatch):
     monkeypatch.setattr(Path, "rename", fail_restore)
     with pytest.raises(RuntimeError, match="audit unavailable"):
         client.delete("/api/agents/reservoir-dispatch")
+
+
+def test_same_correlation_preserves_success_then_fail_statuses(client):
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+
+    assert client.post("/api/agents", json=agent_payload(skill_names=[])).status_code == 201
+    headers = {"X-Request-ID": "success-fail-correlation"}
+    assert client.patch("/api/agents/reservoir-dispatch/pin", json={"pinned": True}, headers=headers).status_code == 200
+    assert client.delete("/api/agents/reservoir-dispatch").status_code == 200
+    assert client.patch("/api/agents/reservoir-dispatch/pin", json={"pinned": False}, headers=headers).status_code == 404
+    factory = client.app.state.agent_service.store.session_factory
+    with factory() as session:
+        events = list(session.scalars(select(AuditEvent).where(
+            AuditEvent.action == "resource.updated",
+            AuditEvent.resource_id == "reservoir-dispatch",
+            AuditEvent.trace_id == "success-fail-correlation",
+        )))
+    assert {event.status for event in events} == {"succeeded", "failed"}
+
+
+def test_update_rejects_workspace_directory_symlink(client, tmp_path):
+    from app.db.platform_models import ManagedAgentRecord
+
+    assert client.post("/api/agents", json=agent_payload(skill_names=[])).status_code == 201
+    real_workspace = tmp_path / "agent-workspaces" / "reservoir-dispatch"
+    linked_workspace = tmp_path / "linked-workspace"
+    try:
+        linked_workspace.symlink_to(real_workspace, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlink creation is unavailable")
+    factory = client.app.state.agent_service.store.session_factory
+    with factory.begin() as session:
+        session.get(ManagedAgentRecord, "reservoir-dispatch").workspace_dir = str(linked_workspace)
+    before = (real_workspace / "AGENTS.md").read_bytes()
+    response = client.put("/api/agents/reservoir-dispatch", json=agent_payload(name="Changed", skill_names=[]))
+    assert response.status_code == 422
+    assert (real_workspace / "AGENTS.md").read_bytes() == before
+
+
+def test_update_restores_database_when_atomic_replace_fails(client, monkeypatch):
+    import app.agents.service as agent_service_module
+
+    assert client.post("/api/agents", json=agent_payload(skill_names=[])).status_code == 201
+    service = client.app.state.agent_service
+    workspace = service.workspace_root / "reservoir-dispatch"
+    agents_file = workspace / "AGENTS.md"
+    previous = agents_file.read_bytes()
+    original_replace = agent_service_module.os.replace
+
+    def fail_agents_replace(source, target):
+        if target == agents_file:
+            raise OSError("replace failed")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(agent_service_module.os, "replace", fail_agents_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        client.put("/api/agents/reservoir-dispatch", json=agent_payload(name="Changed", skill_names=[]))
+    assert agents_file.read_bytes() == previous
+    assert service.store.get("reservoir-dispatch")["name"] != "Changed"

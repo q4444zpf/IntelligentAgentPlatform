@@ -326,3 +326,27 @@ def test_sync_rejects_stale_result_after_concurrent_config_update(client):
         event = session.scalar(select(AuditEvent).where(AuditEvent.status == "failed"))
     assert event.error_code == "MCP_CONFLICT"
     assert event.trace_id == "sync-stale-correlation"
+
+
+def test_toggle_rejects_concurrent_config_update(client, monkeypatch):
+    assert client.post("/api/mcp", json=remote_payload()).status_code == 201
+    service = client.app.state.mcp_service
+    original_update = service.store.update_in_session
+    raced = False
+
+    def race_then_update(session, key, *, expected_version, **values):
+        nonlocal raced
+        if not raced:
+            raced = True
+            snapshot = service.store.get(key)
+            winner = {name: snapshot[name] for name in McpClientConfig.model_fields}
+            winner["name"] = "Concurrent winner"
+            service.store.update_config(key, winner, snapshot["version"])
+        return original_update(session, key, expected_version=expected_version, **values)
+
+    monkeypatch.setattr(service.store, "update_in_session", race_then_update)
+    response = client.patch("/api/mcp/water-data/toggle")
+    assert response.status_code == 409
+    current = service.store.get("water-data")
+    assert current["name"] == "Concurrent winner"
+    assert current["enabled"] is True

@@ -52,10 +52,10 @@ class McpStore:
         session.refresh(row)
         return self._decode(row)
 
-    def update_config(self, key: str, config: dict[str, Any], expected_version: int) -> dict[str, Any] | None:
+    def update_config(self, key: str, config: dict[str, Any], expected_version: int | None = None) -> dict[str, Any] | None:
         return self._update(key, expected_version=expected_version, config=config)
 
-    def update_tools(self, key: str, tools: list[dict[str, Any]], synced_at: str, expected_version: int) -> dict[str, Any] | None:
+    def update_tools(self, key: str, tools: list[dict[str, Any]], synced_at: str, expected_version: int | None = None) -> dict[str, Any] | None:
         return self._update(
             key,
             expected_version=expected_version,
@@ -88,11 +88,16 @@ class McpStore:
         session.expire_all()
         return self._decode(session.get(McpClientRecord, key))
 
-    def update_whitelist(self, key: str, tools: list[str] | None, expected_version: int) -> dict[str, Any] | None:
+    def update_whitelist(self, key: str, tools: list[str] | None, expected_version: int | None = None) -> dict[str, Any] | None:
         return self._update(key, expected_version=expected_version, whitelist=tools)
 
-    def _update(self, key: str, *, expected_version: int, **values: Any) -> dict[str, Any] | None:
+    def _update(self, key: str, *, expected_version: int | None, **values: Any) -> dict[str, Any] | None:
         with self.session_factory.begin() as session:
+            if expected_version is None:
+                row = session.get(McpClientRecord, key)
+                if row is None:
+                    return None
+                expected_version = row.version
             return self.update_in_session(
                 session,
                 key,
