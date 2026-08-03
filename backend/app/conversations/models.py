@@ -24,6 +24,9 @@ def new_id() -> str:
 
 class Conversation(Base):
     __tablename__ = "conversations"
+    __table_args__ = (
+        Index("ix_conversations_unit_project_owner", "unit_id", "project_id", "owner_id"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     unit_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)

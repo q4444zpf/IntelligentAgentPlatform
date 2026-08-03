@@ -11,6 +11,21 @@ from app.conversations.models import (
 from app.db.base import Base
 
 
+def test_conversation_requires_unit_and_has_scope_index():
+    table = Base.metadata.tables["conversations"]
+
+    assert table.c.unit_id.nullable is False
+    indexes = {
+        index.name: tuple(column.name for column in index.columns)
+        for index in table.indexes
+    }
+    assert indexes["ix_conversations_unit_project_owner"] == (
+        "unit_id",
+        "project_id",
+        "owner_id",
+    )
+
+
 def test_persists_project_scoped_conversation_graph():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
