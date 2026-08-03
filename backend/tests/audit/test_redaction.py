@@ -94,4 +94,3 @@ def test_redact_metadata_never_exceeds_serialized_byte_limit():
     ).encode("utf-8")
     assert len(encoded) <= 100
     assert redacted
-
