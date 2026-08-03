@@ -1,8 +1,9 @@
 import json
 from collections.abc import Callable
+from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -14,6 +15,7 @@ from .dispatcher import ThreadRunDispatcher
 from .repository import ConversationRepository
 from .schemas import (
     AgentRunInfo,
+    AgentRunPage,
     ConversationCreate,
     ConversationInfo,
     MessageAccepted,
@@ -111,6 +113,29 @@ def create_router(
     ):
         return not_found(
             lambda: manager.create_message(context, conversation_id, request)
+        )
+
+    @router.get("/agent-runs", response_model=AgentRunPage)
+    def list_runs(
+        page: Annotated[int, Query(ge=1)] = 1,
+        page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+        status: str | None = None,
+        actor_id: str | None = None,
+        query: str | None = None,
+        started_after: datetime | None = None,
+        started_before: datetime | None = None,
+        context: RequestContext = Depends(require_request_context),
+        manager: ConversationService = Depends(service),
+    ):
+        return manager.list_runs(
+            context,
+            page=page,
+            page_size=page_size,
+            status=status,
+            actor_id=actor_id,
+            query=query,
+            started_after=started_after,
+            started_before=started_before,
         )
 
     @router.get("/agent-runs/{run_id}", response_model=AgentRunInfo)

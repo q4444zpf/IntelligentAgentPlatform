@@ -51,6 +51,37 @@ class AgentRunInfo(BaseModel):
     updated_at: datetime
 
 
+class AgentRunListItem(BaseModel):
+    id: str
+    conversation_id: str
+    conversation_title: str
+    trigger_message_id: str
+    trigger_summary: str
+    actor_type: Literal["agent", "team"]
+    actor_id: str
+    status: str
+    tool_invocation_count: int
+    duration_ms: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class AgentRunSummary(BaseModel):
+    total: int
+    completed: int
+    running: int
+    failed: int
+    tool_invocations: int
+
+
+class AgentRunPage(BaseModel):
+    items: list[AgentRunListItem]
+    page: int
+    page_size: int
+    total: int
+    summary: AgentRunSummary
+
+
 class MessageAccepted(BaseModel):
     message: MessageInfo
     run: AgentRunInfo
