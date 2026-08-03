@@ -74,7 +74,9 @@ def build_queued_run(actor_type: str = "agent"):
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     session = Session(engine)
-    conversation = Conversation(project_id="p1", owner_id="u1", title="洪水研判")
+    conversation = Conversation(
+        unit_id="unit-1", project_id="p1", owner_id="u1", title="洪水研判"
+    )
     session.add(conversation)
     session.flush()
     message = Message(
@@ -115,7 +117,9 @@ def test_completes_run_and_persists_assistant_message():
 
     run = session.get(AgentRun, run_id)
     assert run is not None
-    messages = repository.list_messages("p1", "u1", run.conversation_id)
+    messages = repository.list_messages(
+        "unit-1", "p1", "u1", run.conversation_id
+    )
     events = repository.list_events(run_id, 0)
     assert run.status == "completed"
     assert messages[-1].role == "assistant"
@@ -426,7 +430,12 @@ def build_integrated_runtime(tmp_path, *, enabled=True, bound=True):
     if not enabled:
         store.set_enabled("system.get_current_time", False)
     session = factory()
-    conversation = Conversation(project_id="trusted-project", owner_id="trusted-user", title="时间")
+    conversation = Conversation(
+        unit_id="trusted-unit",
+        project_id="trusted-project",
+        owner_id="trusted-user",
+        title="时间",
+    )
     session.add(conversation)
     session.flush()
     message = Message(conversation_id=conversation.id, role="user", content="今天星期几？")
@@ -489,6 +498,7 @@ def test_integrated_time_tool_loop_persists_events_and_trusted_context(tmp_path)
     assert context == {
         "run_id": run_id,
         "conversation_id": repository.get_run_by_id(run_id).conversation_id,
+        "unit_id": "trusted-unit",
         "project_id": "trusted-project",
         "user_id": "trusted-user",
     }

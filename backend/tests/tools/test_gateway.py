@@ -24,7 +24,13 @@ def runtime(tmp_path):
     for definition in BUILTIN_TOOL_DEFINITIONS:
         store.upsert_builtin(definition)
     with factory.begin() as session:
-        conversation = Conversation(id="conversation-1", project_id="project-1", owner_id="user-1", title="test")
+        conversation = Conversation(
+            id="conversation-1",
+            unit_id="unit-1",
+            project_id="project-1",
+            owner_id="user-1",
+            title="test",
+        )
         message = Message(id="message-1", conversation_id=conversation.id, sequence=1, role="user", content="time")
         run = AgentRun(id="run-1", conversation_id=conversation.id, trigger_message_id=message.id, actor_type="agent", actor_id="agent-1", status="running")
         session.add_all([conversation, message, run])
@@ -38,7 +44,14 @@ def make_gateway(runtime, now=datetime(2026, 8, 2, 4, 30, tzinfo=timezone.utc)):
 
 
 def context(**overrides):
-    values = dict(run_id="run-1", conversation_id="conversation-1", project_id="project-1", user_id="user-1", timezone="Asia/Shanghai")
+    values = dict(
+        run_id="run-1",
+        conversation_id="conversation-1",
+        unit_id="unit-1",
+        project_id="project-1",
+        user_id="user-1",
+        timezone="Asia/Shanghai",
+    )
     values.update(overrides)
     return ToolExecutionContext(**values)
 
