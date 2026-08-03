@@ -49,7 +49,10 @@ def make_factory(database_url: str):
     engine = create_engine(
         database_url,
         pool_pre_ping=True,
-        connect_args={"options": "-c lock_timeout=3000 -c statement_timeout=5000"},
+        connect_args={
+            "connect_timeout": 5,
+            "options": "-c lock_timeout=3000 -c statement_timeout=5000",
+        },
     )
     factory = sessionmaker(
         bind=engine,
@@ -115,7 +118,7 @@ def test_record_with_result_reports_real_unique_key_loser_and_keeps_session_usab
         with winner_factory() as winner:
             winning = AuditRecorder().record_with_result(winner, request)
             assert winning.inserted is True
-            thread = threading.Thread(target=run_loser)
+            thread = threading.Thread(target=run_loser, daemon=True)
             thread.start()
             assert attempted.wait(5), "loser did not attempt the concurrent insert"
             winner.commit()
@@ -203,7 +206,7 @@ def test_backfill_returns_zero_when_another_transaction_wins_the_unique_key():
         with winner_factory() as winner:
             winning = AuditRecorder().record_with_result(winner, request)
             assert winning.inserted is True
-            thread = threading.Thread(target=run_losing_backfill)
+            thread = threading.Thread(target=run_losing_backfill, daemon=True)
             thread.start()
             assert attempted.wait(5), "backfill did not attempt the concurrent insert"
             winner.commit()
