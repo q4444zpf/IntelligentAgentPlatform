@@ -19,9 +19,9 @@ const stubs = {
   'a-alert': { props: ['description', 'message'], template: '<div class="alert">{{ message }} {{ description }}<slot name="action" /></div>' },
   'a-input': { props: ['value', 'placeholder'], emits: ['update:value', 'pressEnter'], template: '<input :data-placeholder="placeholder" :value="value" @input="$emit(\'update:value\', $event.target.value)" @keyup.enter="$emit(\'pressEnter\')" />' },
   'a-button': { emits: ['click'], template: '<button v-bind="$attrs" @click="$emit(\'click\')"><slot name="icon" /><slot /></button>' },
-  'a-input-search': { props: ['value'], emits: ['update:value', 'search'], template: '<div><input class="audit-search" :value="value" @input="$emit(\'update:value\', $event.target.value)"/><button class="search-submit" @click="$emit(\'search\', value)">search</button></div>' },
+  'a-input-search': { inheritAttrs: false, props: ['value'], emits: ['update:value', 'search'], template: '<div><input v-bind="$attrs" class="audit-search" :value="value" @input="$emit(\'update:value\', $event.target.value)"/><button class="search-submit" @click="$emit(\'search\', value)">search</button></div>' },
   'a-select': { name: 'SelectStub', props: ['value', 'dataTest'], emits: ['update:value', 'change'], template: '<button :class="dataTest" @click="$emit(\'update:value\', dataTest === \'category-filter\' ? \'management\' : \'failed\'); $emit(\'change\')">{{ value }}</button>' },
-  'a-range-picker': { name: 'RangePickerStub', emits: ['change'], template: '<button class="date-filter">date</button>' },
+  'a-range-picker': { name: 'RangePickerStub', emits: ['change'], template: '<button v-bind="$attrs" class="date-filter">date</button>' },
   'a-spin': { props: ['spinning'], template: '<div class="spin" :data-spinning="spinning"><slot /></div>' },
   'a-tag': { template: '<span class="tag"><slot /></span>' }, 'a-empty': { props: ['description'], template: '<div>{{ description }}</div>' },
   'a-pagination': { props: ['current', 'pageSize'], emits: ['change', 'showSizeChange'], template: '<div><button class="next-page" @click="$emit(\'change\', 2, pageSize)">next</button><button class="change-size" @click="$emit(\'showSizeChange\', current, 50); $emit(\'change\', current, 50)">size</button></div>' },
@@ -34,6 +34,22 @@ beforeEach(() => { Object.values(mocks).forEach((mock) => mock.mockReset()); moc
 afterEach(() => wrappers.splice(0).forEach((wrapper) => wrapper.unmount()));
 
 describe('AuditLogView list', () => {
+  it('gives the filter group and every control a unique persistent accessible name', () => {
+    const wrapper = render();
+    expect(wrapper.get('section.filter-bar').attributes('aria-label')).toBe('筛选审计事件');
+    const labels = [
+      '审计类别', '审计来源', '审计状态', '风险等级', '操作类型',
+      '项目 ID', '用户 ID', '发生日期', '关键词',
+    ];
+
+    for (const label of labels) {
+      const controls = wrapper.findAll(`[aria-label="${label}"]`);
+      expect(controls, label).toHaveLength(1);
+      expect(['INPUT', 'BUTTON']).toContain(controls[0].element.tagName);
+    }
+    expect(new Set(labels).size).toBe(labels.length);
+  });
+
   it('loads the first page with its response summary', async () => {
     const wrapper = render(); await flushPromises();
     expect(mocks.list).toHaveBeenCalledWith({ page: 1, page_size: 20 }, expect.any(AbortSignal));

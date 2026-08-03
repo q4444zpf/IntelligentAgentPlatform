@@ -3,16 +3,16 @@
     <a-alert v-if="listError" type="error" message="审计列表加载失败" :description="listError"><template #action><a-button aria-label="重试审计列表" @click="loadEvents">重试</a-button></template></a-alert>
     <header class="audit-heading"><div><div class="heading-label">AUDIT TRACE</div><h2>统一审计中心</h2></div><a-button :loading="loading" aria-label="刷新审计列表" @click="loadEvents"><template #icon><ReloadOutlined /></template></a-button></header>
     <section class="summary-strip" aria-label="审计概览"><div><span>总事件</span><strong>{{ summary.total }}</strong></div><div><span>失败</span><strong>{{ summary.failed }}</strong></div><div><span>高风险</span><strong>{{ summary.high_risk }}</strong></div><div><span>运行事件</span><strong>{{ summary.runtime }}</strong></div><div><span>管理事件</span><strong>{{ summary.management }}</strong></div></section>
-    <section class="filter-bar">
-      <a-select v-model:value="category" data-test="category-filter" class="category-filter" :options="categoryOptions" @change="applyFilters" />
-      <a-select v-model:value="source" data-test="source-filter" :options="sourceOptions" @change="applyFilters" />
-      <a-select v-model:value="status" data-test="status-filter" :options="statusOptions" @change="applyFilters" />
-      <a-select v-model:value="risk" data-test="risk-filter" :options="riskOptions" @change="applyFilters" />
-      <a-input v-model:value="action" placeholder="操作类型" @press-enter="applyFilters" />
-      <a-input v-model:value="projectId" placeholder="项目 ID" @press-enter="applyFilters" />
-      <a-input v-model:value="userId" placeholder="用户 ID" @press-enter="applyFilters" />
-      <a-range-picker @change="changeDates" />
-      <a-input-search v-model:value="query" placeholder="事件、Trace 或资源 ID" @search="applyFilters" />
+    <section class="filter-bar" aria-label="筛选审计事件">
+      <a-select v-model:value="category" aria-label="审计类别" data-test="category-filter" class="category-filter" :options="categoryOptions" @change="applyFilters" />
+      <a-select v-model:value="source" aria-label="审计来源" data-test="source-filter" :options="sourceOptions" @change="applyFilters" />
+      <a-select v-model:value="status" aria-label="审计状态" data-test="status-filter" :options="statusOptions" @change="applyFilters" />
+      <a-select v-model:value="risk" aria-label="风险等级" data-test="risk-filter" :options="riskOptions" @change="applyFilters" />
+      <a-input v-model:value="action" aria-label="操作类型" placeholder="操作类型" @press-enter="applyFilters" />
+      <a-input v-model:value="projectId" aria-label="项目 ID" placeholder="项目 ID" @press-enter="applyFilters" />
+      <a-input v-model:value="userId" aria-label="用户 ID" placeholder="用户 ID" @press-enter="applyFilters" />
+      <a-range-picker aria-label="发生日期" @change="changeDates" />
+      <a-input-search v-model:value="query" aria-label="关键词" placeholder="事件、Trace 或资源 ID" @search="applyFilters" />
     </section>
     <a-spin :spinning="loading">
       <div v-if="events.length" class="table-shell"><table><thead><tr><th>时间</th><th>状态</th><th>风险</th><th>来源</th><th>操作</th><th>资源</th><th>Trace / Run</th><th>操作</th></tr></thead><tbody><tr v-for="item in events" :key="item.id"><td>{{ formatTime(item.occurred_at) }}</td><td><a-tag :color="statusColor(item.status)">{{ enumLabel(statusLabels,item.status) }}</a-tag></td><td><a-tag :color="riskColor(item.risk_level)">{{ enumLabel(riskLabels,item.risk_level) }}</a-tag></td><td>{{ enumLabel(sourceLabels,item.source) }}</td><td><strong>{{ item.action }}</strong><small>{{ item.id }}</small></td><td><span>{{ item.resource_name || item.resource_id || '-' }}</span><small>{{ item.resource_type || '-' }}</small></td><td><code>{{ item.trace_id || '-' }}</code><button v-if="item.source==='agent'&&item.run_id" class="run-link" :aria-label="`打开运行 ${item.run_id}`" @click="openRun(item.run_id)">{{ item.run_id }}</button><small v-else>{{ item.run_id || '-' }}</small></td><td><a-button type="text" :aria-label="`查看审计事件 ${item.id}`" @click="openEvent(item.id)"><template #icon><EyeOutlined /></template></a-button></td></tr></tbody></table></div>
