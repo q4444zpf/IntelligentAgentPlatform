@@ -17,7 +17,7 @@ from app.tools.service import ToolService
 from app.tools.store import ToolStore
 
 
-AUTH_HEADERS = {"X-User-ID": "u1", "X-Project-ID": "p1"}
+AUTH_HEADERS = {"X-Unit-ID": "unit-1", "X-User-ID": "u1", "X-Project-ID": "p1"}
 ADMIN_HEADERS = {**AUTH_HEADERS, "X-User-Role": "admin"}
 
 
@@ -117,7 +117,7 @@ def create_run(client, headers):
 
 def test_lists_scoped_tool_invocations_in_creation_order(tmp_path):
     client, session = build_invocation_client(tmp_path)
-    headers = {"X-User-ID": "u1", "X-Project-ID": "p1"}
+    headers = AUTH_HEADERS
     run_id = create_run(client, headers)
     session.add_all(
         [
@@ -152,12 +152,12 @@ def test_lists_scoped_tool_invocations_in_creation_order(tmp_path):
 
 
 @pytest.mark.parametrize("headers", [
-    {"X-User-ID": "other", "X-Project-ID": "p1"},
-    {"X-User-ID": "u1", "X-Project-ID": "other"},
+    {**AUTH_HEADERS, "X-User-ID": "other"},
+    {**AUTH_HEADERS, "X-Project-ID": "other"},
 ])
 def test_tool_invocations_hide_runs_outside_request_scope(tmp_path, headers):
     client, _session = build_invocation_client(tmp_path)
-    run_id = create_run(client, {"X-User-ID": "u1", "X-Project-ID": "p1"})
+    run_id = create_run(client, AUTH_HEADERS)
 
     response = client.get(f"/api/agent-runs/{run_id}/tool-invocations", headers=headers)
 
@@ -170,7 +170,7 @@ def test_tool_invocations_return_not_found_for_missing_run(tmp_path):
 
     response = client.get(
         "/api/agent-runs/missing/tool-invocations",
-        headers={"X-User-ID": "u1", "X-Project-ID": "p1"},
+        headers=AUTH_HEADERS,
     )
 
     assert response.status_code == 404
