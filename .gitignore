@@ -10,6 +10,13 @@ frontend/.vite/
 frontend/.playwright-cli/
 frontend/*.log
 
+/.pnpm-store/
+
+# Local working documents and generated task artifacts.
+/.work/
+/backend/.pytest-*/
+/backend/.task[0-9]-*/
+
 .worktrees/
 
 # Local AI and browser automation artifacts.
