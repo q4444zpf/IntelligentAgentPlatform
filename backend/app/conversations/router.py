@@ -1,8 +1,9 @@
 import json
 from collections.abc import Callable
-from typing import Annotated, Any
+from datetime import datetime
+from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -14,6 +15,7 @@ from .dispatcher import ThreadRunDispatcher
 from .repository import ConversationRepository
 from .schemas import (
     AgentRunInfo,
+    AgentRunPage,
     ConversationCreate,
     ConversationInfo,
     MessageAccepted,
@@ -45,6 +47,26 @@ def default_service_factory(session: Session) -> ConversationService:
 def encode_sse(event: RunEventInfo) -> str:
     data = json.dumps(event.payload, ensure_ascii=False, separators=(",", ":"))
     return f"id: {event.sequence}\nevent: {event.event_type}\ndata: {data}\n\n"
+
+
+def validate_run_date_filters(
+    started_after: datetime | None, started_before: datetime | None
+) -> None:
+    values = (started_after, started_before)
+    if any(value is not None and value.utcoffset() is None for value in values):
+        raise HTTPException(
+            status_code=422,
+            detail="Run date filters must include a timezone",
+        )
+    if (
+        started_after is not None
+        and started_before is not None
+        and started_after > started_before
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="started_after must not be later than started_before",
+        )
 
 
 def create_router(
@@ -111,6 +133,36 @@ def create_router(
     ):
         return not_found(
             lambda: manager.create_message(context, conversation_id, request)
+        )
+
+    @router.get("/agent-runs", response_model=AgentRunPage)
+    def list_runs(
+        page: Annotated[int, Query(ge=1)] = 1,
+        page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+        status: Literal["queued", "running", "completed", "failed"] | None = None,
+        actor_id: Annotated[
+            str | None,
+            Query(
+                max_length=64,
+                pattern=r"^[a-z][a-z0-9_-]{0,63}$",
+            ),
+        ] = None,
+        query: Annotated[str | None, Query(max_length=200)] = None,
+        started_after: datetime | None = None,
+        started_before: datetime | None = None,
+        context: RequestContext = Depends(require_request_context),
+        manager: ConversationService = Depends(service),
+    ):
+        validate_run_date_filters(started_after, started_before)
+        return manager.list_runs(
+            context,
+            page=page,
+            page_size=page_size,
+            status=status,
+            actor_id=actor_id,
+            query=query,
+            started_after=started_after,
+            started_before=started_before,
         )
 
     @router.get("/agent-runs/{run_id}", response_model=AgentRunInfo)

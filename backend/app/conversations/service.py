@@ -8,6 +8,8 @@ from .models import AgentRun, Conversation, Message, RunEvent
 from .repository import ConversationRepository
 from .schemas import (
     AgentRunInfo,
+    AgentRunListItem,
+    AgentRunPage,
     ConversationCreate,
     ConversationInfo,
     MessageAccepted,
@@ -149,6 +151,39 @@ class ConversationService:
         return MessageAccepted(
             message=MessageInfo.model_validate(message),
             run=AgentRunInfo.model_validate(run),
+        )
+
+    def list_runs(
+        self,
+        context: RequestContext,
+        *,
+        page: int,
+        page_size: int,
+        status: str | None = None,
+        actor_id: str | None = None,
+        query: str | None = None,
+        started_after: datetime | None = None,
+        started_before: datetime | None = None,
+    ) -> AgentRunPage:
+        result = self.repository.list_runs(
+            project_id=context.project_id,
+            owner_id=context.user_id,
+            page=page,
+            page_size=page_size,
+            status=status,
+            actor_id=actor_id,
+            query=query,
+            started_after=started_after,
+            started_before=started_before,
+        )
+        return AgentRunPage(
+            items=[
+                AgentRunListItem.model_validate(item) for item in result.items
+            ],
+            page=page,
+            page_size=page_size,
+            total=result.total,
+            summary=result.summary,
         )
 
     def get_run(self, context: RequestContext, run_id: str) -> AgentRunInfo:

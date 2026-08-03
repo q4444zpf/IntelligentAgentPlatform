@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, select
@@ -8,7 +10,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.agents.service import BUILTIN_AGENT_ID, AgentNotFoundError
 from app.conversations.dispatcher import UnavailableRunDispatcher
-from app.conversations.models import AgentRun, Message
+from app.conversations.models import AgentRun, Message, ToolInvocation
 from app.conversations.repository import ConversationRepository
 from app.conversations.router import create_router
 from app.conversations.service import ConversationService
@@ -54,6 +56,228 @@ def build_client():
 
 
 HEADERS = {"X-User-ID": "u1", "X-Project-ID": "p1"}
+
+
+def create_run(client, *, headers=HEADERS, title="洪水研判", actor_id="flood"):
+    conversation = client.post(
+        "/api/conversations", json={"title": title}, headers=headers
+    ).json()
+    return client.post(
+        f"/api/conversations/{conversation['id']}/messages",
+        json={"content": "分析 洪峰", "actor_type": "agent", "actor_id": actor_id},
+        headers=headers,
+    ).json()
+
+
+def test_agent_run_list_projects_items_and_summary():
+    client = build_client()
+    accepted = create_run(client, title="防洪调度")
+    session = client.app.state.conversation_session
+    run = session.get(AgentRun, accepted["run"]["id"])
+    run.status = "completed"
+    session.add(
+        ToolInvocation(
+            run_id=run.id,
+            tool_call_id="call-1",
+            tool_id="forecast",
+            tool_version="1",
+            status="completed",
+            arguments_summary={},
+        )
+    )
+    session.commit()
+
+    response = client.get("/api/agent-runs", headers=HEADERS)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["page"] == 1
+    assert body["page_size"] == 20
+    assert body["total"] == 1
+    assert body["summary"] == {
+        "total": 1,
+        "completed": 1,
+        "running": 0,
+        "failed": 0,
+        "tool_invocations": 1,
+    }
+    assert body["items"] == [
+        {
+            "id": run.id,
+            "conversation_id": accepted["run"]["conversation_id"],
+            "conversation_title": "防洪调度",
+            "trigger_message_id": accepted["message"]["id"],
+            "trigger_summary": "分析 洪峰",
+            "actor_type": "agent",
+            "actor_id": "flood",
+            "status": "completed",
+            "tool_invocation_count": 1,
+            "duration_ms": 0,
+            "created_at": body["items"][0]["created_at"],
+            "updated_at": body["items"][0]["updated_at"],
+        }
+    ]
+
+
+def test_agent_run_list_filters_by_status_actor_and_query():
+    client = build_client()
+    matched = create_run(client, title="闸门调度", actor_id="flood")
+    create_run(client, title="水情会商", actor_id="builtin-assistant")
+    session = client.app.state.conversation_session
+    session.get(AgentRun, matched["run"]["id"]).status = "completed"
+    session.commit()
+
+    response = client.get(
+        "/api/agent-runs",
+        params={"status": "completed", "actor_id": "flood", "query": "闸门"},
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["items"]] == [
+        matched["run"]["id"]
+    ]
+    assert response.json()["summary"]["total"] == 1
+
+
+def test_agent_run_list_is_scoped_to_project_and_user():
+    client = build_client()
+    create_run(client, headers={"X-User-ID": "u2", "X-Project-ID": "p2"})
+
+    response = client.get("/api/agent-runs", headers=HEADERS)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "items": [],
+        "page": 1,
+        "page_size": 20,
+        "total": 0,
+        "summary": {
+            "total": 0,
+            "completed": 0,
+            "running": 0,
+            "failed": 0,
+            "tool_invocations": 0,
+        },
+    }
+
+
+def test_agent_run_list_rejects_invalid_query_parameters():
+    client = build_client()
+
+    assert client.get("/api/agent-runs?page=0", headers=HEADERS).status_code == 422
+    assert (
+        client.get("/api/agent-runs?page_size=101", headers=HEADERS).status_code
+        == 422
+    )
+    assert (
+        client.get(
+            "/api/agent-runs?started_after=not-a-time", headers=HEADERS
+        ).status_code
+        == 422
+    )
+
+
+@pytest.mark.parametrize("query", ["%", "_"])
+def test_agent_run_list_treats_query_wildcards_as_literals(query):
+    client = build_client()
+    create_run(client, title="ordinary title")
+
+    response = client.get(
+        "/api/agent-runs", params={"query": query}, headers=HEADERS
+    )
+
+    assert response.status_code == 200
+    assert response.json()["items"] == []
+    assert response.json()["total"] == 0
+
+
+def test_agent_run_list_rejects_unknown_status():
+    client = build_client()
+
+    response = client.get(
+        "/api/agent-runs", params={"status": "banana"}, headers=HEADERS
+    )
+
+    assert response.status_code == 422
+
+
+def test_agent_run_list_treats_backslash_as_a_literal_without_match():
+    client = build_client()
+    create_run(client, title="ordinary title")
+
+    response = client.get(
+        "/api/agent-runs", params={"query": "\\"}, headers=HEADERS
+    )
+
+    assert response.status_code == 200
+    assert response.json()["items"] == []
+
+
+def test_agent_run_list_matches_a_literal_backslash_in_title():
+    client = build_client()
+    accepted = create_run(client, title="Gate\\Dispatch")
+
+    response = client.get(
+        "/api/agent-runs", params={"query": "\\"}, headers=HEADERS
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["items"]] == [
+        accepted["run"]["id"]
+    ]
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("status", "Invalid"),
+        ("status", "_invalid"),
+        ("status", "a" * 31),
+        ("actor_id", "Invalid"),
+        ("actor_id", "a" * 65),
+        ("query", "q" * 201),
+    ],
+)
+def test_agent_run_list_rejects_unsafe_or_oversized_filters(name, value):
+    client = build_client()
+
+    response = client.get(
+        "/api/agent-runs", params={name: value}, headers=HEADERS
+    )
+
+    assert response.status_code == 422
+
+
+def test_agent_run_list_rejects_naive_time_filters():
+    client = build_client()
+
+    response = client.get(
+        "/api/agent-runs",
+        params={"started_after": "2026-01-01T00:00:00"},
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Run date filters must include a timezone"
+
+
+def test_agent_run_list_rejects_reversed_time_range():
+    client = build_client()
+
+    response = client.get(
+        "/api/agent-runs",
+        params={
+            "started_after": "2026-01-02T00:00:00Z",
+            "started_before": "2026-01-01T00:00:00Z",
+        },
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        "started_after must not be later than started_before"
+    )
 
 
 def test_message_creation_returns_202_and_run():

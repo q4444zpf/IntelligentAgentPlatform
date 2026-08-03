@@ -134,7 +134,7 @@ export const routes: RouteRecordRaw[] = [
       { path: 'project/resources', name: 'ProjectResources', component: resourceView, meta: { title: '项目资源', permission: 'resources:personal' } },
       { path: 'resources/topology', name: 'HydraulicTopology', component: () => import('@/views/resources/TopologyDataView.vue'), meta: { title: '水利拓扑数据', permission: 'resources:personal' } },
       { path: 'tenant/resources', name: 'TenantResources', component: resourceView, meta: { title: '租户资源', permission: 'resources:public' } },
-      { path: 'runs', name: 'AgentRuns', component: genericView, meta: { title: 'Agent Runs', module: 'collaboration', permission: 'platform:view' } },
+      { path: 'runs', name: 'AgentRuns', component: () => import('@/views/runs/AgentRunListView.vue'), meta: { title: 'Agent Runs', permission: 'platform:view' } },
       { path: 'async-tasks', name: 'AsyncTasks', component: genericView, meta: { title: '异步任务', module: 'collaboration', permission: 'platform:view' } },
       { path: 'artifacts', name: 'Artifacts', component: genericView, meta: { title: '成果文件', module: 'integration', permission: 'platform:view' } },
       { path: 'approvals', name: 'Approvals', component: resourceView, meta: { title: '待办审批', permission: 'publish:review' } },

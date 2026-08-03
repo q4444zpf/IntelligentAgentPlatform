@@ -7,6 +7,7 @@
 - Web 管理控制台原型，包含工作台、AI 对话、资源库、智能体、Prompt、MCP、Skill / Tool、知识库、流程编排、多智能体协同、大模型配置、系统集成、用户权限、审计日志、沙箱监控和系统设置等页面。
 - FastAPI 后端服务，提供健康检查、会话与运行事件、平台运行总览和大模型供应商配置 API。
 - 项目及用户范围内的会话、消息、Agent Run 和 Run Event 使用 PostgreSQL 持久化，并支持有限、可恢复的 SSE 事件回放。
+- 提供真实的 Agent Runs 运行审计页面，支持当前项目、当前用户范围内的运行列表、条件筛选和分页，以及按运行查看事件时间线与工具调用安全摘要。
 - 会话、模型供应商、智能体和 MCP 配置统一使用 PostgreSQL 持久化。
 - 支持前后端分别启动，也可通过根目录脚本联合启动。
 
@@ -131,8 +132,10 @@ npm run dev
 - `POST/GET /api/conversations`：创建或查询当前项目、当前用户的会话。
 - `GET /api/conversations/{conversation_id}/messages`：读取持久化消息。
 - `POST /api/conversations/{conversation_id}/messages`：写入用户消息并创建等待执行的 Agent Run。
+- `GET /api/agent-runs`：分页查询当前项目、当前用户范围内的 Agent Run，可按状态、智能体、关键字和开始时间筛选。
 - `GET /api/agent-runs/{run_id}`：读取 Run 状态。
 - `GET /api/agent-runs/{run_id}/events`：通过 `Last-Event-ID` 恢复读取有限 SSE 事件。
+- `GET /api/agent-runs/{run_id}/tool-invocations`：读取工具调用安全摘要。
 
 模型供应商、智能体和 MCP 运行数据统一写入 `DATABASE_URL` 指定的 PostgreSQL。更新已有部署时，API 容器会在 Alembic 升级后检查 `/data/model-providers.db`、`/data/agents.db` 和 `/data/mcp.db`；仅当对应 PostgreSQL 表为空时执行一次性导入：
 
