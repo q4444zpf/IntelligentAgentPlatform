@@ -18,6 +18,23 @@ python -m uvicorn app.main:app --reload --port 8000
 
 根目录 Compose 同样默认关闭开发身份。需要在容器化本机环境调试会话或审计页面时，必须同时显式设置 `IAP_ALLOW_DEV_IDENTITY=true`、`VITE_DEV_UNIT_ID`、`VITE_DEV_USER_ID`、`VITE_DEV_PROJECT_ID` 和 `VITE_DEV_USER_ROLES` 并重新构建 Web 镜像；`VITE_DEV_USER_ROLES` 是逗号分隔的 `user`、`project_admin`、`unit_auditor` 集合。这些变量只用于非敏感测试身份，不得用于生产部署。
 
+## 首个单位管理员
+
+数据库迁移完成后，在离线维护窗口执行一次 bootstrap。默认命令逐项交互读取单位、初始项目、显示名以及原始 OIDC issuer/subject，不创建普通用户密码：
+
+```powershell
+cd backend
+python -m app.identity.bootstrap
+```
+
+自动化环境可改用仅限执行账号读取的 JSON 文件，并通过 `--request-file` 传入。文件必须恰好包含 `unit_code`、`unit_name`、`user_display_name`、`issuer`、`subject`、`initial_project_code` 和 `initial_project_name`；不要加入密码或令牌。Windows 上应先移除继承权限并只向执行账号授予读取权限，POSIX 上文件模式必须为 `0600`：
+
+```powershell
+python -m app.identity.bootstrap --request-file .\bootstrap-request.json
+```
+
+命令在一个事务中创建单位、项目、成员关系、原始外部身份绑定、内置授权目录和脱敏安全审计；任何失败都会整体回滚。issuer 与 subject 按输入原文保存，不会修剪、折叠大小写或规范化末尾斜杠。
+
 ## 会话和运行接口
 
 - `POST /api/conversations`
