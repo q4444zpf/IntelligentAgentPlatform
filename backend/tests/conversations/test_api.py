@@ -88,6 +88,10 @@ def test_agent_run_list_projects_items_and_summary():
     session.commit()
 
     response = client.get("/api/agent-runs", headers=HEADERS)
+    session.refresh(run)
+    expected_duration_ms = max(
+        0, int((run.updated_at - run.created_at).total_seconds() * 1000)
+    )
 
     assert response.status_code == 200
     body = response.json()
@@ -101,6 +105,8 @@ def test_agent_run_list_projects_items_and_summary():
         "failed": 0,
         "tool_invocations": 1,
     }
+    assert isinstance(body["items"][0]["duration_ms"], int)
+    assert body["items"][0]["duration_ms"] >= 0
     assert body["items"] == [
         {
             "id": run.id,
@@ -112,7 +118,7 @@ def test_agent_run_list_projects_items_and_summary():
             "actor_id": "flood",
             "status": "completed",
             "tool_invocation_count": 1,
-            "duration_ms": 0,
+            "duration_ms": expected_duration_ms,
             "created_at": body["items"][0]["created_at"],
             "updated_at": body["items"][0]["updated_at"],
         }
