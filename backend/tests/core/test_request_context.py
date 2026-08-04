@@ -81,6 +81,13 @@ def test_compatibility_role_only_maps_project_admin_to_admin():
     assert RequestContext(unit_id="unit-1", project_id="project-1", user_id="user-1").role == "user"
     assert RequestContext(unit_id="unit-1", project_id="project-1", user_id="user-1", roles=frozenset({"unit_auditor"})).role == "user"
     assert RequestContext(unit_id="unit-1", project_id="project-1", user_id="user-1", roles=frozenset({"project_admin"})).role == "admin"
+    assert RequestContext(
+        unit_id="unit-1",
+        project_id="project-1",
+        user_id="user-1",
+        roles=frozenset({"user", "project_admin"}),
+    ).actor_role == "project_admin,user"
+    assert RequestContext(unit_id="unit-1", project_id="project-1", user_id="user-1").actor_role == "user"
 
 
 def test_admin_dependency_rejects_unit_auditor_and_accepts_project_admin():

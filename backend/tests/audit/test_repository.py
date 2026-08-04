@@ -69,7 +69,7 @@ def test_repository_filters_searches_literal_wildcards_and_summarizes_full_set(s
     page = repository.list_events(scope, page=1, page_size=1)
     assert [item.id for item in page.items] == ["c"]
     assert page.total == 4
-    assert page.summary == {"total": 4, "failed": 1, "high_risk": 2, "runtime": 2,
+    assert page.summary == {"total": 4, "failed": 1, "high_risk": 3, "runtime": 2,
                             "management": 2, "by_source": {"llm": 1, "system": 2, "tool": 1}}
     assert [item.id for item in repository.list_events(scope, page=1, page_size=20, query=r"%_\\").items] == ["a"]
     assert repository.list_events(scope, page=1, page_size=20, query="safe").items == []

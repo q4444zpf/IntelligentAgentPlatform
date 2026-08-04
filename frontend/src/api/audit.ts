@@ -4,13 +4,16 @@ export type AuditCategory = 'runtime' | 'management';
 export type AuditSource = 'agent' | 'tool' | 'mcp' | 'knowledge' | 'sandbox' | 'llm' | 'system';
 export type AuditStatus = 'started' | 'succeeded' | 'failed' | 'cancelled';
 export type AuditRisk = 'low' | 'medium' | 'high' | 'critical';
+export type AuditActorRole = 'unknown' | 'user' | 'project_admin' | 'unit_auditor'
+  | 'project_admin,user' | 'project_admin,unit_auditor' | 'unit_auditor,user'
+  | 'project_admin,unit_auditor,user';
 
 export interface AuditEventListItem {
   id: string;
   unit_id: string;
   project_id: string | null;
   user_id: string | null;
-  actor_role: string | null;
+  actor_role: AuditActorRole;
   category: AuditCategory;
   source: AuditSource;
   action: string;

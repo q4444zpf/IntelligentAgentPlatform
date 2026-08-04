@@ -85,6 +85,7 @@ def test_record_redacts_flushes_and_leaves_transaction_to_caller(session, monkey
         "file_path": "result.nc",
     }
     assert session.get(AuditEvent, event.id) is event
+    assert event.actor_role == "unknown"
     assert session.in_transaction()
     assert commit_calls == 0
 
@@ -116,6 +117,16 @@ def test_record_rejects_empty_required_strings(session, field):
 def test_record_rejects_values_outside_strict_enums(session, field, value):
     with pytest.raises(ValueError, match=field):
         AuditRecorder().record(session, make_request(**{field: value}))
+
+
+@pytest.mark.parametrize("actor_role", ["admin", "agent", "user,project_admin", "user,user", ""])
+def test_record_rejects_invalid_or_non_deterministic_actor_roles(session, actor_role):
+    with pytest.raises(ValueError, match="actor_role"):
+        AuditRecorder().record(session, make_request(actor_role=actor_role))
+
+
+def test_record_preserves_deterministic_multi_role_snapshot(session):
+    assert AuditRecorder().record(session, make_request(actor_role="project_admin,user")).actor_role == "project_admin,user"
 
 
 @pytest.mark.parametrize(

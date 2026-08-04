@@ -386,4 +386,5 @@ def test_repository_scopes_conversations_runs_and_execution_context_to_unit(tmp_
         assert repository.get_run_execution_context("r1") == {
             "unit_id": "unit-2", "project_id": "p1", "user_id": "u1",
             "conversation_id": "c1", "run_id": "r1",
+            "actor_role": "unknown",
         }

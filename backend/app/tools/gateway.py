@@ -116,6 +116,7 @@ class ToolGateway:
             AuditRecordRequest(
                 unit_id=context.unit_id, project_id=context.project_id,
                 user_id=context.user_id, category="runtime", source="tool",
+                actor_role=context.actor_role,
                 action="tool.invoke.started", status="started", risk_level="low",
                 trace_id=context.run_id, run_id=context.run_id,
                 resource_type="tool", resource_id=invocation.tool_id,
@@ -171,6 +172,7 @@ class ToolGateway:
                     unit_id=context.unit_id,
                     project_id=context.project_id,
                     user_id=context.user_id,
+                    actor_role=context.actor_role,
                     category="runtime",
                     source="tool",
                     action=f"tool.invoke.{audit_status}",

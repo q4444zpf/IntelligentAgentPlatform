@@ -6,6 +6,10 @@ from pydantic import BaseModel
 UserRole: TypeAlias = Literal["user", "project_admin", "unit_auditor"]
 VALID_ROLES = frozenset({"user", "project_admin", "unit_auditor"})
 
+
+def actor_role_snapshot(roles: frozenset[UserRole]) -> str:
+    return ",".join(sorted(roles)) if roles else "unknown"
+
 class RequestContext(BaseModel):
     user_id: str
     project_id: str
@@ -15,6 +19,10 @@ class RequestContext(BaseModel):
     @property
     def role(self) -> Literal["user", "admin"]:
         return "admin" if "project_admin" in self.roles else "user"
+
+    @property
+    def actor_role(self) -> str:
+        return actor_role_snapshot(self.roles)
 
 
 def require_request_context(

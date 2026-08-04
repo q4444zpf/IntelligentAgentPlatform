@@ -67,9 +67,7 @@ class AuditRepository:
             func.count(scoped.c.id).label("total"),
             func.coalesce(func.sum(case((scoped.c.status == "failed", 1), else_=0)), 0).label("failed"),
             func.coalesce(
-                func.sum(case((
-                    (scoped.c.category == "runtime") & scoped.c.risk_level.in_(("high", "critical")), 1
-                ), else_=0)),
+                func.sum(case((scoped.c.risk_level.in_(("high", "critical")), 1), else_=0)),
                 0,
             ).label("high_risk"),
             func.coalesce(func.sum(case((scoped.c.category == "runtime", 1), else_=0)), 0).label("runtime"),

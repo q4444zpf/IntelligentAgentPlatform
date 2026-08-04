@@ -4,6 +4,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    CheckConstraint,
     DateTime,
     Index,
     Integer,
@@ -24,6 +25,10 @@ def new_id() -> str:
 class AuditEvent(Base):
     __tablename__ = "audit_events"
     __table_args__ = (
+        CheckConstraint(
+            "actor_role IN ('unknown','user','project_admin','unit_auditor','project_admin,user','project_admin,unit_auditor','unit_auditor,user','project_admin,unit_auditor,user')",
+            name="ck_audit_actor_role",
+        ),
         UniqueConstraint(
             "idempotency_key",
             name="uq_audit_idempotency_key",
@@ -58,7 +63,7 @@ class AuditEvent(Base):
     unit_id: Mapped[str] = mapped_column(String(64), nullable=False)
     project_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    actor_role: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    actor_role: Mapped[str] = mapped_column(String(40), nullable=False, default="unknown")
     category: Mapped[str] = mapped_column(String(30), nullable=False)
     source: Mapped[str] = mapped_column(String(30), nullable=False)
     action: Mapped[str] = mapped_column(String(100), nullable=False)

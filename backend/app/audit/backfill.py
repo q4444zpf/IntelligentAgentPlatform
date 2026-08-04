@@ -60,7 +60,7 @@ def backfill_agent_run_snapshots(
                         unit_id=conversation.unit_id,
                         project_id=conversation.project_id,
                         user_id=conversation.owner_id,
-                        actor_role=run.actor_type,
+                        actor_role="unknown",
                         category="runtime",
                         source="agent",
                         action="agent.run_snapshot",

@@ -72,7 +72,7 @@ def record_failed_management(
                 unit_id=context.unit_id,
                 project_id=context.project_id,
                 user_id=context.user_id,
-                actor_role=context.role,
+                actor_role=context.actor_role,
                 trace_id=management_trace_id(request_id),
                 category="management",
                 source=source,

@@ -7,6 +7,11 @@ AuditCategory: TypeAlias = Literal["runtime", "management"]
 AuditSource: TypeAlias = Literal["agent", "tool", "mcp", "knowledge", "sandbox", "llm", "system"]
 AuditStatus: TypeAlias = Literal["started", "succeeded", "failed", "cancelled"]
 AuditRisk: TypeAlias = Literal["low", "medium", "high", "critical"]
+AuditActorRole: TypeAlias = Literal[
+    "unknown", "user", "project_admin", "unit_auditor",
+    "project_admin,user", "project_admin,unit_auditor", "unit_auditor,user",
+    "project_admin,unit_auditor,user",
+]
 
 
 class AuditEventListItem(BaseModel):
@@ -15,7 +20,7 @@ class AuditEventListItem(BaseModel):
     unit_id: str
     project_id: str | None
     user_id: str | None
-    actor_role: str | None
+    actor_role: AuditActorRole
     category: AuditCategory
     source: AuditSource
     action: str

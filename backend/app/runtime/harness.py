@@ -98,6 +98,7 @@ class PlatformAgentHarness:
                     unit_id=execution_context["unit_id"],
                     project_id=execution_context["project_id"],
                     user_id=execution_context["user_id"],
+                    actor_role=execution_context["actor_role"],
                     category="runtime", source="llm", action="llm.invoke.succeeded",
                     status="succeeded", risk_level="low", trace_id=run_id, run_id=run_id,
                     resource_type="model", resource_id=selection.model,
@@ -165,6 +166,7 @@ class PlatformAgentHarness:
                         unit_id=execution_context["unit_id"],
                         project_id=execution_context["project_id"],
                         user_id=execution_context["user_id"],
+                        actor_role=execution_context["actor_role"],
                         category="runtime", source="llm", action="llm.invoke.failed",
                         status="failed", risk_level="medium", trace_id=run_id, run_id=run_id,
                         resource_type="model", resource_id=selection.model,
@@ -260,6 +262,7 @@ class PlatformAgentHarness:
         self.audit_recorder.record(self.repository.session, AuditRecordRequest(
             unit_id=context["unit_id"], project_id=context["project_id"],
             user_id=context["user_id"], category="runtime", source="agent",
+            actor_role=context["actor_role"],
             action=f"agent.run.{status}", status=audit_status,
             risk_level="medium" if status == "failed" else "low",
             trace_id=run_id, run_id=run_id, resource_type="agent",

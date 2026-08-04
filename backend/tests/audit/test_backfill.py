@@ -108,6 +108,7 @@ def test_backfills_terminal_runs_with_scope_status_and_safe_content(session_fact
         assert "prompt secret" not in serialized
         assert "sensitive trigger input" not in serialized
         assert event.idempotency_key == f"audit-backfill:agent:{event.run_id}"
+        assert event.actor_role == "unknown"
 
 
 def test_backfill_is_idempotent_and_does_not_skip_runs_at_batch_boundaries(

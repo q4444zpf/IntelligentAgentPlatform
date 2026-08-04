@@ -218,6 +218,7 @@ class ConversationRepository:
             self.session.execute(
                 select(
                     AgentRun.id.label("run_id"),
+                    AgentRun.actor_role,
                     Conversation.id.label("conversation_id"),
                     Conversation.unit_id,
                     Conversation.project_id,

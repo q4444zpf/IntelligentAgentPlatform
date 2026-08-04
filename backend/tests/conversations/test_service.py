@@ -80,12 +80,19 @@ def test_creates_message_run_and_initial_event_atomically():
 
 def test_message_creation_records_agent_run_in_same_transaction():
     session, _, service = build_service()
-    context = RequestContext(unit_id="unit-1", user_id="u1", project_id="p1")
+    context = RequestContext(
+        unit_id="unit-1",
+        user_id="u1",
+        project_id="p1",
+        roles=frozenset({"user", "project_admin"}),
+    )
     conversation = service.create_conversation(context, ConversationCreate(title="x"))
     accepted = service.create_message(context, conversation.id, MessageCreate(content="x", actor_type="agent", actor_id="flood"))
     event = session.scalar(select(AuditEvent))
     assert event.idempotency_key == f"agent:{accepted.run.id}:created"
     assert (event.action, event.unit_id, event.project_id, event.user_id) == ("agent.run.created", "unit-1", "p1", "u1")
+    assert session.get(AgentRun, accepted.run.id).actor_role == "project_admin,user"
+    assert event.actor_role == "project_admin,user"
 
 
 def test_audit_failure_rolls_back_message_and_run():

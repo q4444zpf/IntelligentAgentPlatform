@@ -26,7 +26,7 @@ def test_audit_event_model_has_complete_schema_and_defaults():
     assert table.c.created_at.server_default is not None
     assert "updated_at" not in table.c
     assert {column.name for column in table.c if column.nullable} == {
-        "project_id", "user_id", "actor_role", "trace_id", "run_id",
+        "project_id", "user_id", "trace_id", "run_id",
         "parent_event_id", "resource_type", "resource_id", "resource_name",
         "error_code", "duration_ms",
     }
@@ -54,3 +54,4 @@ def test_audit_event_model_declares_uniqueness_and_query_indexes():
     }
     assert isinstance(table.c.actor_role.type, String)
     assert table.c.actor_role.type.length == 40
+    assert table.c.actor_role.nullable is False

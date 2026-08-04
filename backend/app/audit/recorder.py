@@ -38,6 +38,22 @@ _LENGTHS = {
     "error_code": 120,
     "idempotency_key": 180,
 }
+_ACTOR_ROLES = frozenset({"user", "project_admin", "unit_auditor"})
+
+
+def normalize_actor_role(value: str | None) -> str:
+    if value is None or value == "unknown":
+        return "unknown"
+    roles = value.split(",")
+    if any(not role or role.strip() != role for role in roles):
+        raise ValueError("invalid actor_role")
+    role_set = frozenset(roles)
+    if len(role_set) != len(roles) or not role_set <= _ACTOR_ROLES:
+        raise ValueError("invalid actor_role")
+    normalized = ",".join(sorted(role_set))
+    if value != normalized:
+        raise ValueError("actor_role must use deterministic sorted roles")
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -73,6 +89,7 @@ class AuditRecordResult:
 
 
 def _validate(request: AuditRecordRequest) -> None:
+    normalize_actor_role(request.actor_role)
     required_strings = (
         "unit_id", "category", "source", "action", "status", "risk_level",
         "idempotency_key",
@@ -147,7 +164,7 @@ class AuditRecorder:
             unit_id=request.unit_id,
             project_id=request.project_id,
             user_id=request.user_id,
-            actor_role=request.actor_role,
+            actor_role=normalize_actor_role(request.actor_role),
             category=request.category,
             source=request.source,
             action=request.action,

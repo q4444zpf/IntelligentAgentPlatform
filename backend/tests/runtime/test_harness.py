@@ -643,6 +643,7 @@ def test_integrated_time_tool_loop_persists_events_and_trusted_context(tmp_path)
         "unit_id": "trusted-unit",
         "project_id": "trusted-project",
         "user_id": "trusted-user",
+        "actor_role": "unknown",
     }
     session.close()
 
