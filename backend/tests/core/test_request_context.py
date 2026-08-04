@@ -77,7 +77,7 @@ def test_rejects_unknown_legacy_role_when_modern_roles_are_valid():
     assert response.status_code == 401
 
 
-def test_compatibility_role_only_maps_project_admin_to_admin():
+def test_role_codes_are_a_sorted_immutable_snapshot():
     assert RequestContext(unit_id="unit-1", project_id="project-1", user_id="user-1").role == "user"
     assert RequestContext(unit_id="unit-1", project_id="project-1", user_id="user-1", roles=frozenset({"unit_auditor"})).role == "user"
     assert RequestContext(unit_id="unit-1", project_id="project-1", user_id="user-1", roles=frozenset({"project_admin"})).role == "admin"
@@ -86,8 +86,10 @@ def test_compatibility_role_only_maps_project_admin_to_admin():
         project_id="project-1",
         user_id="user-1",
         roles=frozenset({"user", "project_admin"}),
-    ).actor_role == "project_admin,user"
-    assert RequestContext(unit_id="unit-1", project_id="project-1", user_id="user-1").actor_role == "user"
+    ).role_codes == ("project_admin", "user")
+    assert RequestContext(
+        unit_id="unit-1", project_id="project-1", user_id="user-1"
+    ).role_codes == ("user",)
 
 
 def test_admin_dependency_rejects_unit_auditor_and_accepts_project_admin():

@@ -93,6 +93,7 @@ def build_queued_run(actor_type: str = "agent"):
         trigger_message_id=message.id,
         actor_type=actor_type,
         actor_id="flood",
+        actor_roles_json=["project_admin", "user"],
         status="queued",
     )
     session.add(run)
@@ -588,6 +589,7 @@ def build_integrated_runtime(tmp_path, *, enabled=True, bound=True):
         trigger_message_id=message.id,
         actor_type="agent",
         actor_id="flood",
+        actor_roles_json=["project_admin", "user"],
         status="queued",
     )
     session.add(run)
@@ -643,7 +645,11 @@ def test_integrated_time_tool_loop_persists_events_and_trusted_context(tmp_path)
         "unit_id": "trusted-unit",
         "project_id": "trusted-project",
         "user_id": "trusted-user",
-        "actor_role": "unknown",
+        "actor_roles": ("project_admin", "user"),
+    }
+    audits = list(session.scalars(select(AuditEvent).order_by(AuditEvent.occurred_at)))
+    assert {tuple(event.actor_roles_json) for event in audits} == {
+        ("project_admin", "user")
     }
     session.close()
 

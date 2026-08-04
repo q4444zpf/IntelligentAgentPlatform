@@ -21,6 +21,10 @@ def session():
 def make_request(**overrides):
     values = {
         "unit_id": "unit-1",
+        "project_id": "project-1",
+        "actor_roles": (),
+        "authorization_scope": "project",
+        "event_scope": "project",
         "category": "runtime",
         "source": "agent",
         "action": "forecast.run",
@@ -36,9 +40,9 @@ def make_request(**overrides):
 def test_request_has_required_fields_and_safe_defaults():
     request = make_request()
 
-    assert request.project_id is None
     assert request.user_id is None
-    assert request.actor_role is None
+    assert request.actor_roles == ()
+    assert request.auth_method is None
     assert request.trace_id is None
     assert request.run_id is None
     assert request.parent_event_id is None
@@ -85,7 +89,7 @@ def test_record_redacts_flushes_and_leaves_transaction_to_caller(session, monkey
         "file_path": "result.nc",
     }
     assert session.get(AuditEvent, event.id) is event
-    assert event.actor_role == "unknown"
+    assert event.actor_roles_json == []
     assert session.in_transaction()
     assert commit_calls == 0
 
@@ -132,14 +136,77 @@ def test_record_rejects_values_outside_strict_enums(session, field, value):
         AuditRecorder().record(session, make_request(**{field: value}))
 
 
-@pytest.mark.parametrize("actor_role", ["admin", "agent", "user,project_admin", "user,user", ""])
-def test_record_rejects_invalid_or_non_deterministic_actor_roles(session, actor_role):
-    with pytest.raises(ValueError, match="actor_role"):
-        AuditRecorder().record(session, make_request(actor_role=actor_role))
+@pytest.mark.parametrize(
+    "actor_roles",
+    [(" user",), ("user ",), ("User",), ("user,admin",), ("",), (7,), ["user"]],
+)
+def test_record_rejects_invalid_actor_role_formatting(session, actor_roles):
+    with pytest.raises(ValueError, match="actor_roles"):
+        AuditRecorder().record(session, make_request(actor_roles=actor_roles))
 
 
-def test_record_preserves_deterministic_multi_role_snapshot(session):
-    assert AuditRecorder().record(session, make_request(actor_role="project_admin,user")).actor_role == "project_admin,user"
+def test_record_sorts_and_deduplicates_role_snapshot(session):
+    event = AuditRecorder().record(
+        session,
+        make_request(actor_roles=("user", "unit_admin", "user")),
+    )
+    assert event.actor_roles_json == ["unit_admin", "user"]
+
+
+def test_record_accepts_authentication_event_contract_without_committing(session):
+    request = make_request(
+        project_id=None,
+        user_id="user-1",
+        actor_roles=("unit_admin",),
+        authorization_scope="unit",
+        event_scope="unit",
+        auth_method="oidc",
+        category="security",
+        source="auth",
+        action="auth.login.succeeded",
+        risk_level="medium",
+        idempotency_key="auth:login:tx-1:succeeded",
+    )
+
+    event = AuditRecorder().record(session, request)
+
+    assert event.actor_roles_json == ["unit_admin"]
+    assert event.authorization_scope == "unit"
+    assert event.event_scope == "unit"
+    assert event.auth_method == "oidc"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "field"),
+    [
+        ({"authorization_scope": "tenant"}, "authorization_scope"),
+        ({"event_scope": "own"}, "event_scope"),
+        ({"event_scope": "platform"}, "unit_id"),
+        ({"event_scope": "unit"}, "project_id"),
+        ({"unit_id": None}, "unit_id"),
+        ({"event_scope": "project", "project_id": None}, "project_id"),
+        ({"event_scope": "platform", "unit_id": None}, "project_id"),
+    ],
+)
+def test_record_rejects_invalid_scope_values_and_id_combinations(
+    session, overrides, field
+):
+    with pytest.raises(ValueError, match=field):
+        AuditRecorder().record(session, make_request(**overrides))
+
+
+def test_record_accepts_platform_scope_only_without_unit_or_project(session):
+    event = AuditRecorder().record(
+        session,
+        make_request(
+            unit_id=None,
+            project_id=None,
+            authorization_scope="platform",
+            event_scope="platform",
+        ),
+    )
+    assert event.unit_id is None
+    assert event.project_id is None
 
 
 @pytest.mark.parametrize(
@@ -234,7 +301,6 @@ def test_unrelated_integrity_error_is_not_swallowed():
 @pytest.mark.parametrize(
     "field",
     [
-        "unit_id",
         "category",
         "source",
         "action",

@@ -77,7 +77,11 @@ class AgentRun(Base):
     trigger_message_id: Mapped[str] = mapped_column(ForeignKey("messages.id"))
     actor_type: Mapped[str] = mapped_column(String(20))
     actor_id: Mapped[str] = mapped_column(String(64))
-    actor_role: Mapped[str] = mapped_column(String(40), nullable=False, default="unknown")
+    actor_roles_json: Mapped[list[str]] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+    )
     status: Mapped[str] = mapped_column(String(30), index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

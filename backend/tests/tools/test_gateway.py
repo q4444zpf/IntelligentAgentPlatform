@@ -53,6 +53,7 @@ def context(**overrides):
         unit_id="unit-1",
         project_id="project-1",
         user_id="user-1",
+        actor_roles=("project_admin", "user"),
         timezone="Asia/Shanghai",
     )
     values.update(overrides)
@@ -71,6 +72,9 @@ def test_records_tool_started_and_succeeded_with_context_and_parent(runtime):
     assert events[1].parent_event_id == events[0].id
     assert events[0].idempotency_key == f"tool:{result.invocation_id}:started"
     assert (events[0].unit_id, events[0].project_id, events[0].user_id) == ("unit-1", "project-1", "user-1")
+    assert events[0].actor_roles_json == ["project_admin", "user"]
+    assert events[0].authorization_scope == "project"
+    assert events[0].event_scope == "project"
 
 
 def test_records_tool_failure_without_arguments_or_raw_error(runtime, monkeypatch):

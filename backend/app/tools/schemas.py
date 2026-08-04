@@ -46,7 +46,7 @@ class ToolExecutionContext:
     conversation_id: str
     project_id: str
     user_id: str
-    actor_role: str = "unknown"
+    actor_roles: tuple[str, ...]
     timezone: str = "Asia/Shanghai"
 
 

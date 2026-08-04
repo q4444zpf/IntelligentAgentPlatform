@@ -78,7 +78,8 @@ class McpService:
         try:
             self.audit_recorder.record(session, AuditRecordRequest(
                 unit_id=context.unit_id, project_id=context.project_id,
-                user_id=context.user_id, actor_role=context.actor_role,
+                user_id=context.user_id, actor_roles=context.role_codes,
+                authorization_scope="project", event_scope="project",
                 trace_id=management_trace_id(request_id), category="management", source="mcp", action=action,
                 status="succeeded", risk_level=risk_level,
                 resource_type="mcp_client", resource_id=key, resource_name=name,
@@ -114,7 +115,8 @@ class McpService:
             record = self.store.create_in_session(session, request.key, request.model_dump(exclude={"key"}))
             self.audit_recorder.record(session, AuditRecordRequest(
                 unit_id=context.unit_id, project_id=context.project_id,
-                user_id=context.user_id, actor_role=context.actor_role,
+                user_id=context.user_id, actor_roles=context.role_codes,
+                authorization_scope="project", event_scope="project",
                 trace_id=management_trace_id(request_id), category="management", source="mcp", action="resource.created",
                 status="succeeded", risk_level="medium", resource_type="mcp_client",
                 resource_id=request.key, resource_name=request.name,

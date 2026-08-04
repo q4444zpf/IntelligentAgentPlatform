@@ -48,7 +48,7 @@ python -m uvicorn app.main:app --reload --port 8000
 
 读取范围由服务端角色约束：`unit_auditor` 可读当前单位，`project_admin` 可读当前项目，普通 `user` 仅可读当前项目中的本人事件；客户端筛选不能扩大该范围。详情和关联事件对“不存在”与“越权”统一返回安全 404，避免暴露资源是否存在。
 
-审计事件的 `actor_role` 是发生时角色快照：真实角色按字典序用逗号连接（如 `project_admin,user`），历史身份无法可靠还原时为 `unknown`；不得写入兼容值 `admin` 或 Agent 的 `actor_type`。
+审计事件和 Agent 运行使用排序稳定的 `actor_roles` 角色代码数组作为发生时快照；历史身份无法可靠还原时保存空数组，不得伪造管理员角色或写入 Agent 的 `actor_type`。审计事件同时持久化 `authorization_scope` 与 `event_scope`；平台事件不带单位/项目，单位事件只带单位，项目事件同时带单位和项目。认证事件使用 `category=security`、`source=auth`，并可记录 `auth_method`。
 
 审计记录是追加写入的独立事件，不提供更新或删除 API。写入前仅保留显式允许的元数据字段，并按敏感字段名递归脱敏、限制层级与大小；不得将凭据、口令、客户数据或原始 Prompt 写入摘要或元数据。当前已接入 Agent、tool、LLM 运行事件及 Agent、MCP、Tool、模型供应商等选定管理操作。知识库真实审计、真实 MCP 执行、沙箱审计、导出、保留期自动化和事件总线尚未实现。
 

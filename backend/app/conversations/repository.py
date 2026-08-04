@@ -213,12 +213,12 @@ class ConversationRepository:
     def get_run_by_id(self, run_id: str) -> AgentRun | None:
         return self.session.get(AgentRun, run_id)
 
-    def get_run_execution_context(self, run_id: str) -> dict[str, str] | None:
+    def get_run_execution_context(self, run_id: str) -> dict[str, object] | None:
         row = (
             self.session.execute(
                 select(
                     AgentRun.id.label("run_id"),
-                    AgentRun.actor_role,
+                    AgentRun.actor_roles_json,
                     Conversation.id.label("conversation_id"),
                     Conversation.unit_id,
                     Conversation.project_id,
@@ -230,7 +230,11 @@ class ConversationRepository:
             .mappings()
             .one_or_none()
         )
-        return dict(row) if row is not None else None
+        if row is None:
+            return None
+        context = dict(row)
+        context["actor_roles"] = tuple(context.pop("actor_roles_json"))
+        return context
 
     def get_run_messages(self, run_id: str) -> list[Message]:
         run = self.get_run_by_id(run_id)

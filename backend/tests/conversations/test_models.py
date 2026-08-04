@@ -46,6 +46,7 @@ def test_persists_project_scoped_conversation_graph():
             trigger_message_id=message.id,
             actor_type="agent",
             actor_id="flood",
+            actor_roles_json=["project_admin", "user"],
             status="queued",
         )
         session.add(run)
@@ -60,6 +61,10 @@ def test_persists_project_scoped_conversation_graph():
         )
         session.commit()
         assert session.scalar(select(Conversation)).project_id == "p1"
+        assert session.scalar(select(AgentRun)).actor_roles_json == [
+            "project_admin",
+            "user",
+        ]
         assert session.scalar(select(RunEvent)).sequence == 1
 
 
@@ -82,6 +87,7 @@ def test_persists_tool_invocation_for_agent_run():
             trigger_message_id=message.id,
             actor_type="agent",
             actor_id="default",
+            actor_roles_json=[],
             status="running",
         )
         session.add(run)
@@ -105,3 +111,12 @@ def test_persists_tool_invocation_for_agent_run():
         assert invocation.tool_id == "system.get_current_time"
         assert invocation.status == "started"
         assert invocation.error_code == "tool_execution_failed"
+
+
+def test_agent_run_uses_json_role_snapshot_without_singular_compatibility_column():
+    table = Base.metadata.tables["agent_runs"]
+
+    assert "actor_roles_json" in table.c
+    assert table.c.actor_roles_json.nullable is False
+    assert table.c.actor_roles_json.default is not None
+    assert "actor_role" not in table.c

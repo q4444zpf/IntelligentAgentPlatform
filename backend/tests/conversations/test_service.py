@@ -91,8 +91,13 @@ def test_message_creation_records_agent_run_in_same_transaction():
     event = session.scalar(select(AuditEvent))
     assert event.idempotency_key == f"agent:{accepted.run.id}:created"
     assert (event.action, event.unit_id, event.project_id, event.user_id) == ("agent.run.created", "unit-1", "p1", "u1")
-    assert session.get(AgentRun, accepted.run.id).actor_role == "project_admin,user"
-    assert event.actor_role == "project_admin,user"
+    assert session.get(AgentRun, accepted.run.id).actor_roles_json == [
+        "project_admin",
+        "user",
+    ]
+    assert event.actor_roles_json == ["project_admin", "user"]
+    assert event.authorization_scope == "project"
+    assert event.event_scope == "project"
 
 
 def test_audit_failure_rolls_back_message_and_run():

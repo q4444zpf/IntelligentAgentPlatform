@@ -3,24 +3,26 @@ from typing import Any, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field
 
-AuditCategory: TypeAlias = Literal["runtime", "management"]
-AuditSource: TypeAlias = Literal["agent", "tool", "mcp", "knowledge", "sandbox", "llm", "system"]
+AuditCategory: TypeAlias = Literal["runtime", "management", "security"]
+AuditSource: TypeAlias = Literal["agent", "tool", "mcp", "knowledge", "sandbox", "llm", "system", "auth"]
 AuditStatus: TypeAlias = Literal["started", "succeeded", "failed", "cancelled"]
 AuditRisk: TypeAlias = Literal["low", "medium", "high", "critical"]
-AuditActorRole: TypeAlias = Literal[
-    "unknown", "user", "project_admin", "unit_auditor",
-    "project_admin,user", "project_admin,unit_auditor", "unit_auditor,user",
-    "project_admin,unit_auditor,user",
+AuditAuthorizationScope: TypeAlias = Literal[
+    "platform", "unit", "project", "own", "emergency", "system",
 ]
+AuditEventScope: TypeAlias = Literal["platform", "unit", "project"]
 
 
 class AuditEventListItem(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
-    unit_id: str
+    unit_id: str | None
     project_id: str | None
     user_id: str | None
-    actor_role: AuditActorRole
+    actor_roles: list[str] = Field(validation_alias="actor_roles_json")
+    authorization_scope: AuditAuthorizationScope
+    event_scope: AuditEventScope
+    auth_method: str | None
     category: AuditCategory
     source: AuditSource
     action: str

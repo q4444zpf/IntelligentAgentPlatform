@@ -1,19 +1,21 @@
 import { request } from './client';
 
-export type AuditCategory = 'runtime' | 'management';
-export type AuditSource = 'agent' | 'tool' | 'mcp' | 'knowledge' | 'sandbox' | 'llm' | 'system';
+export type AuditCategory = 'runtime' | 'management' | 'security';
+export type AuditSource = 'agent' | 'tool' | 'mcp' | 'knowledge' | 'sandbox' | 'llm' | 'system' | 'auth';
 export type AuditStatus = 'started' | 'succeeded' | 'failed' | 'cancelled';
 export type AuditRisk = 'low' | 'medium' | 'high' | 'critical';
-export type AuditActorRole = 'unknown' | 'user' | 'project_admin' | 'unit_auditor'
-  | 'project_admin,user' | 'project_admin,unit_auditor' | 'unit_auditor,user'
-  | 'project_admin,unit_auditor,user';
+export type AuditAuthorizationScope = 'platform' | 'unit' | 'project' | 'own' | 'emergency' | 'system';
+export type AuditEventScope = 'platform' | 'unit' | 'project';
 
 export interface AuditEventListItem {
   id: string;
-  unit_id: string;
+  unit_id: string | null;
   project_id: string | null;
   user_id: string | null;
-  actor_role: AuditActorRole;
+  actor_roles: string[];
+  authorization_scope: AuditAuthorizationScope;
+  event_scope: AuditEventScope;
+  auth_method: string | null;
   category: AuditCategory;
   source: AuditSource;
   action: string;

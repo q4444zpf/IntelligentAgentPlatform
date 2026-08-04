@@ -1,4 +1,4 @@
-from sqlalchemy import DateTime, String
+from sqlalchemy import DateTime, JSON, String
 
 from app.db.base import Base
 
@@ -7,7 +7,8 @@ def test_audit_event_model_has_complete_schema_and_defaults():
     assert "audit_events" in Base.metadata.tables
     table = Base.metadata.tables["audit_events"]
     assert set(table.columns.keys()) == {
-        "id", "unit_id", "project_id", "user_id", "actor_role", "category",
+        "id", "unit_id", "project_id", "user_id", "actor_roles_json",
+        "authorization_scope", "event_scope", "auth_method", "category",
         "source", "action", "status", "risk_level", "trace_id", "run_id",
         "parent_event_id", "resource_type", "resource_id", "resource_name",
         "summary", "metadata_json", "error_code", "duration_ms",
@@ -15,7 +16,10 @@ def test_audit_event_model_has_complete_schema_and_defaults():
     }
     assert isinstance(table.c.id.type, String) and table.c.id.type.length == 36
     assert table.c.id.primary_key and table.c.id.default is not None
-    assert table.c.unit_id.nullable is False
+    assert table.c.unit_id.nullable is True
+    assert isinstance(table.c.actor_roles_json.type, JSON)
+    assert table.c.actor_roles_json.nullable is False
+    assert table.c.actor_roles_json.default is not None
     assert table.c.summary.nullable is False and table.c.summary.default is not None
     assert table.c.metadata_json.nullable is False
     assert table.c.metadata_json.default is not None
@@ -26,7 +30,7 @@ def test_audit_event_model_has_complete_schema_and_defaults():
     assert table.c.created_at.server_default is not None
     assert "updated_at" not in table.c
     assert {column.name for column in table.c if column.nullable} == {
-        "project_id", "user_id", "trace_id", "run_id",
+        "unit_id", "project_id", "user_id", "auth_method", "trace_id", "run_id",
         "parent_event_id", "resource_type", "resource_id", "resource_name",
         "error_code", "duration_ms",
     }
@@ -52,6 +56,12 @@ def test_audit_event_model_declares_uniqueness_and_query_indexes():
         "ix_audit_run_time": ("run_id", "occurred_at", "id"),
         "ix_audit_source_action_status": ("source", "action", "status"),
     }
-    assert isinstance(table.c.actor_role.type, String)
-    assert table.c.actor_role.type.length == 40
-    assert table.c.actor_role.nullable is False
+    checks = {constraint.name for constraint in table.constraints}
+    assert {
+        "ck_audit_authorization_scope",
+        "ck_audit_event_scope",
+        "ck_audit_event_scope_ids",
+        "ck_audit_category",
+        "ck_audit_source",
+    } <= checks
+    assert "ck_audit_actor_role" not in checks

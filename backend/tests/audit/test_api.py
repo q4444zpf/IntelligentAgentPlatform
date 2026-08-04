@@ -21,7 +21,9 @@ def build_client():
     Base.metadata.create_all(engine)
     session = Session(engine)
     session.add(AuditEvent(
-        id="visible", unit_id="u1", project_id="p1", user_id="alice", actor_role="user",
+        id="visible", unit_id="u1", project_id="p1", user_id="alice",
+        actor_roles_json=["user"], authorization_scope="project",
+        event_scope="project", auth_method=None,
         category="runtime", source="agent", action="agent.run.completed", status="succeeded",
         risk_level="low", trace_id="trace", run_id="run-1", resource_type="agent",
         resource_id="agent-1", resource_name="Flood", summary="done", metadata_json={"safe": True},
@@ -41,6 +43,8 @@ def test_api_lists_gets_and_relates_events():
     related = client.get("/api/audit/events/visible/related", headers=HEADERS)
     assert page.status_code == detail.status_code == related.status_code == 200
     assert page.json()["items"][0]["id"] == "visible"
+    assert page.json()["items"][0]["actor_roles"] == ["user"]
+    assert page.json()["items"][0]["event_scope"] == "project"
     assert detail.json()["metadata"] == {"safe": True}
     assert [item["id"] for item in related.json()] == ["visible"]
 
@@ -89,7 +93,8 @@ def test_api_detail_never_returns_sensitive_summary_fragments():
     event = AuditRecorder().record(
         session,
         AuditRecordRequest(
-            unit_id="u1", project_id="p1", user_id="alice", actor_role="user",
+            unit_id="u1", project_id="p1", user_id="alice", actor_roles=("user",),
+            authorization_scope="project", event_scope="project",
             category="management", source="system", action="resource.updated",
             status="failed", risk_level="high", idempotency_key="sensitive-detail",
             occurred_at=datetime.now(timezone.utc),
