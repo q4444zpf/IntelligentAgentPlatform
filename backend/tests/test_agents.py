@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.agents.router import create_router
 from app.agents.schemas import AgentConfig, AgentCreateRequest, AgentDefaultRequest
-from app.agents.service import BUILTIN_AGENT_ID, AgentService
+from app.agents.service import AgentConflictError, BUILTIN_AGENT_ID, AgentService
 from app.agents.store import AgentConcurrentUpdateError, DEFAULT_SETTING_KEY, AgentStore
 from app.db.base import Base
 from app.db.platform_models import PlatformSettingRecord, RegisteredToolRecord
@@ -349,6 +349,63 @@ def test_creates_and_lists_runtime_specific_agent(client):
         BUILTIN_AGENT_ID,
         body["id"],
     }
+
+
+def test_create_rejects_preexisting_workspace_without_deleting_contents(client):
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+
+    service = client.app.state.agent_service
+    workspace = service.workspace_root / "reservoir-dispatch"
+    workspace.mkdir()
+    marker = workspace / "owned-by-other-process.txt"
+    marker.write_text("preserve", encoding="utf-8")
+
+    response = client.post(
+        "/api/agents",
+        json=agent_payload(),
+        headers={**AUTH_HEADERS, "X-Request-ID": "workspace-conflict-preexisting"},
+    )
+
+    assert response.status_code == 409
+    assert service.store.get("reservoir-dispatch") is None
+    assert marker.read_text(encoding="utf-8") == "preserve"
+    with service.store.session_factory() as session:
+        event = session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.trace_id == "workspace-conflict-preexisting"
+            )
+        )
+    assert event.status == "failed"
+    assert event.error_code == "AGENT_CONFLICT"
+
+
+def test_create_handles_workspace_mkdir_race_without_deleting_winner(
+    tmp_path, monkeypatch,
+):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'agent-race.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    store = AgentStore(factory)
+    service = AgentService(store, workspace_root=tmp_path / "workspaces")
+    workspace = service.workspace_root / "reservoir-dispatch"
+    original_mkdir = type(workspace).mkdir
+
+    def competing_mkdir(path, *args, **kwargs):
+        if path == workspace:
+            original_mkdir(path, *args, **kwargs)
+            (path / "winner.txt").write_text("winner", encoding="utf-8")
+            raise FileExistsError(str(path))
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(workspace), "mkdir", competing_mkdir)
+
+    with pytest.raises(AgentConflictError, match="already exists"):
+        service.create(AgentCreateRequest(**agent_payload(skill_names=[])))
+
+    assert store.get("reservoir-dispatch") is None
+    assert (workspace / "winner.txt").read_text(encoding="utf-8") == "winner"
+    assert not (workspace / "AGENTS.md").exists()
 
 
 def test_initializes_one_enabled_builtin_default_agent(tmp_path):

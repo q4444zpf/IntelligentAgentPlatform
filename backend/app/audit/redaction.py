@@ -13,6 +13,30 @@ _SENSITIVE_KEYS = {
     "api_key", "authorization", "token", "password", "secret", "cookie",
 }
 _WINDOWS_ABSOLUTE_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+_AUTHORIZATION_VALUE = re.compile(
+    r'''(?ix)
+    (?P<prefix>["']?authorization["']?\s*[:=]\s*)
+    (?:["'](?:bearer\s+)?[^"'\r\n]+["']|bearer\s+[^,;&\s}\r\n]+|[^,;&\s}\r\n]+)
+    ''',
+)
+_SENSITIVE_SUMMARY_VALUE = re.compile(
+    r'''(?ix)
+    (?P<prefix>
+        ["']?(?:
+            api[-_]?key|password|secret|token|prompt|raw[-_]?prompt|
+            system[-_]?prompt|context[-_]?prompt|user[-_]?prompt
+        )["']?\s*[:=]\s*
+    )
+    (?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^,;&}\r\n]+)
+    ''',
+)
+_OPENAI_STYLE_KEY = re.compile(r"(?i)\bsk-[a-z0-9_-]{16,}\b")
+
+
+def _redact_summary_text(value: str) -> str:
+    value = _AUTHORIZATION_VALUE.sub(r"\g<prefix>[REDACTED]", value)
+    value = _SENSITIVE_SUMMARY_VALUE.sub(r"\g<prefix>[REDACTED]", value)
+    return _OPENAI_STYLE_KEY.sub(_REDACTED, value)
 
 
 def _is_sensitive_key(value: str) -> bool:
@@ -29,7 +53,9 @@ def _is_sensitive_key(value: str) -> bool:
 def redact_summary(value: str, *, max_chars: int = 500) -> str:
     if max_chars < 0:
         raise ValueError("max_chars must be non-negative")
-    escaped = html.escape(str(value), quote=True)
+    # Redact raw separators before HTML escaping changes query and JSON syntax.
+    redacted = _redact_summary_text(str(value))
+    escaped = html.escape(redacted, quote=True)
     if len(escaped) <= max_chars:
         return escaped
     if max_chars <= 3:

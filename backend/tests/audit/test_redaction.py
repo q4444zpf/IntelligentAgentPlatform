@@ -13,6 +13,52 @@ def test_redact_summary_escapes_html_and_truncates_stably():
     assert "<script" not in redacted
 
 
+def test_redact_summary_masks_sensitive_text_before_html_escaping():
+    secrets = [
+        "bearer-secret-123",
+        "query-secret-456",
+        "json-secret-789",
+        "password-secret-012",
+        "raw-prompt-secret-345",
+        "system-prompt-secret-678",
+        "sk-abcdefghijklmnopqrstuvwxyz012345",
+    ]
+    value = (
+        '<b>request</b> Authorization: Bearer bearer-secret-123\n'
+        'api_key=query-secret-456&safe=true\n'
+        '{"API-Key":"json-secret-789","password":"password-secret-012",'
+        '"raw_prompt":"raw-prompt-secret-345",'
+        '"system_prompt":"system-prompt-secret-678"}\n'
+        'credential sk-abcdefghijklmnopqrstuvwxyz012345'
+    )
+
+    redacted = redact_summary(value, max_chars=2000)
+
+    assert redacted.count("[REDACTED]") == 7
+    assert "&lt;b&gt;request&lt;/b&gt;" in redacted
+    for secret in secrets:
+        assert secret not in redacted
+
+
+def test_redact_summary_handles_case_and_common_key_value_formats():
+    value = (
+        "TOKEN: token-value; Secret='secret value'; PaSsWoRd=password-value\n"
+        'prompt="private prompt" context-prompt: context private'
+    )
+
+    redacted = redact_summary(value, max_chars=1000)
+
+    assert redacted.count("[REDACTED]") == 5
+    assert all(fragment not in redacted for fragment in (
+        "token-value", "secret value", "password-value", "private prompt", "context private",
+    ))
+
+
+def test_redact_summary_does_not_over_redact_usage_or_safe_words():
+    value = "Token usage is safe: prompt_tokens=12 total_tokens=20; static summary"
+    assert redact_summary(value) == value
+
+
 def test_redact_metadata_filters_and_recursively_redacts_without_mutation():
     value = {
         "nested": {

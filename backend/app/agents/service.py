@@ -340,7 +340,12 @@ class AgentService:
 
     def _initialize_workspace(self, agent_id: str, config: AgentConfig) -> Path:
         workspace = self.workspace_root / agent_id
-        workspace.mkdir()
+        try:
+            workspace.mkdir()
+        except FileExistsError as error:
+            raise AgentConflictError(
+                f"Agent '{agent_id}' workspace already exists"
+            ) from error
         (workspace / "AGENTS.md").write_text(
             f"# {config.name}\n\n{config.system_prompt or config.description}\n",
             encoding="utf-8",

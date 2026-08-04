@@ -29,6 +29,7 @@ def build_client():
     session.commit()
     app = FastAPI()
     app.state.allow_dev_identity = True
+    app.state.audit_session = session
     app.include_router(create_router(lambda _session: AuditService(AuditRepository(session))), prefix="/api/audit")
     return TestClient(app)
 
@@ -77,3 +78,24 @@ def test_api_uses_same_safe_404_for_missing_and_unauthorized():
         assert related_response.status_code == 404
         assert detail_response.json() == expected
         assert related_response.json() == expected
+
+
+def test_api_detail_never_returns_sensitive_summary_fragments():
+    from app.audit.recorder import AuditRecorder, AuditRecordRequest
+
+    client = build_client()
+    session = client.app.state.audit_session
+    secret = "api-detail-secret-value"
+    event = AuditRecorder().record(
+        session,
+        AuditRecordRequest(
+            unit_id="u1", project_id="p1", user_id="alice", actor_role="user",
+            category="management", source="system", action="resource.updated",
+            status="failed", risk_level="high", idempotency_key="sensitive-detail",
+            occurred_at=datetime.now(timezone.utc),
+            summary=f"api_key={secret}&safe=true",
+        ),
+    )
+    session.commit()
+    response = client.get(f"/api/audit/events/{event.id}", headers=HEADERS)
+    assert response.json()["summary"] == "api_key=[REDACTED]&amp;safe=true"

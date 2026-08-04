@@ -90,6 +90,19 @@ def test_record_redacts_flushes_and_leaves_transaction_to_caller(session, monkey
     assert commit_calls == 0
 
 
+def test_record_persists_only_redacted_summary_text(session):
+    secret = "recorder-secret-value"
+    event = AuditRecorder().record(
+        session,
+        make_request(summary=f"Authorization: Bearer {secret}; status=failed"),
+    )
+
+    session.flush()
+    persisted = session.get(AuditEvent, event.id)
+    assert persisted.summary == "Authorization: [REDACTED]; status=failed"
+    assert secret not in persisted.summary
+
+
 def test_record_is_idempotent_without_committing(session):
     recorder = AuditRecorder()
     first = recorder.record(session, make_request())
