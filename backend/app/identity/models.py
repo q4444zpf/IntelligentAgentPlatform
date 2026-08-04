@@ -407,7 +407,9 @@ class Menu(Base):
         CheckConstraint(
             "(kind = 'group' AND route_key IS NULL AND visibility_target IS NULL "
             "AND requires_current_project = false) OR "
-            f"(kind = 'route' AND ((route_key IN ({_sql_values(UNIT_ROUTE_KEYS)}) "
+            "(kind = 'route' AND route_key IS NOT NULL "
+            "AND visibility_target IS NOT NULL AND "
+            f"((route_key IN ({_sql_values(UNIT_ROUTE_KEYS)}) "
             "AND visibility_target = 'unit' AND "
             "requires_current_project = (route_key = 'chat')) OR "
             f"(route_key IN ({_sql_values(CURRENT_PROJECT_ROUTE_KEYS)}) "

@@ -65,7 +65,9 @@ def _sql_values(values: tuple[str, ...]) -> str:
 MENU_CATALOGUE_CHECK = (
     "(kind = 'group' AND route_key IS NULL AND visibility_target IS NULL "
     "AND requires_current_project = false) OR "
-    f"(kind = 'route' AND ((route_key IN ({_sql_values(UNIT_ROUTE_KEYS)}) "
+    "(kind = 'route' AND route_key IS NOT NULL "
+    "AND visibility_target IS NOT NULL AND "
+    f"((route_key IN ({_sql_values(UNIT_ROUTE_KEYS)}) "
     "AND visibility_target = 'unit' AND "
     "requires_current_project = (route_key = 'chat')) OR "
     f"(route_key IN ({_sql_values(CURRENT_PROJECT_ROUTE_KEYS)}) "
@@ -462,14 +464,17 @@ def upgrade() -> None:
         RETURNS trigger
         LANGUAGE plpgsql
         AS $$
+        DECLARE
+            grant_data_scope varchar(24);
         BEGIN
-            IF NOT EXISTS (
-                SELECT 1
-                FROM role_permissions
+            SELECT data_scope
+            INTO grant_data_scope
+            FROM role_permissions
                 WHERE id = NEW.role_permission_id
                   AND unit_id = NEW.unit_id
-                  AND data_scope = 'custom_projects'
-            ) THEN
+            FOR UPDATE;
+
+            IF grant_data_scope IS DISTINCT FROM 'custom_projects' THEN
                 RAISE EXCEPTION
                     USING ERRCODE = '23514',
                           CONSTRAINT = 'ck_role_permission_projects_custom_scope',

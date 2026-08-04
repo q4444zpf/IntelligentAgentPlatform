@@ -6,8 +6,8 @@ import sys
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import create_engine, inspect
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import create_engine, inspect, select, text, update
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 pytestmark = pytest.mark.skipif(
@@ -178,6 +178,96 @@ def login_transaction(
     )
 
 
+def seed_role_permission_project_scope(
+    session: Session,
+    *,
+    prefix: str,
+    data_scope: str = "custom_projects",
+) -> tuple[RolePermission, Project]:
+    user_id = f"{prefix}-user"
+    unit_id = f"{prefix}-unit"
+    project_id = f"{prefix}-project"
+    role_id = f"{prefix}-role"
+    permission_code = f"{prefix}.read"
+    seed_unit_member(session, user_id=user_id, unit_id=unit_id)
+    seed_project(session, project_id=project_id, unit_id=unit_id)
+    session.add_all([
+        Role(
+            id=role_id,
+            code=role_id,
+            name=role_id,
+            scope_type="unit",
+            unit_id=unit_id,
+            built_in=False,
+            status="active",
+        ),
+        Permission(
+            id=f"{prefix}-permission",
+            code=permission_code,
+            resource="project",
+            action="read",
+            risk_level="low",
+            status="active",
+        ),
+    ])
+    session.flush()
+    grant = RolePermission(
+        id=f"{prefix}-grant",
+        role_id=role_id,
+        permission_code=permission_code,
+        unit_id=unit_id,
+        data_scope=data_scope,
+    )
+    session.add(grant)
+    session.flush()
+    return grant, session.get(Project, project_id)
+
+
+def consume_login_transaction(
+    session: Session,
+    *,
+    state_hash: str,
+    consumed_at: datetime,
+) -> str | None:
+    return session.execute(
+        update(OidcLoginTransaction)
+        .where(
+            OidcLoginTransaction.state_hash == state_hash,
+            OidcLoginTransaction.consumed_at.is_(None),
+            OidcLoginTransaction.expires_at > consumed_at,
+        )
+        .values(consumed_at=consumed_at)
+        .returning(OidcLoginTransaction.id)
+    ).scalar_one_or_none()
+
+
+def delete_role_permission_project_scope_fixture(connection, prefix: str) -> None:
+    connection.execute(text(
+        "DELETE FROM role_permission_projects WHERE id = :mapping_id"
+    ), {"mapping_id": f"{prefix}-mapping"})
+    connection.execute(text(
+        "DELETE FROM role_permissions WHERE id = :grant_id"
+    ), {"grant_id": f"{prefix}-grant"})
+    connection.execute(text(
+        "DELETE FROM permissions WHERE id = :permission_id"
+    ), {"permission_id": f"{prefix}-permission"})
+    connection.execute(text(
+        "DELETE FROM roles WHERE id = :role_id"
+    ), {"role_id": f"{prefix}-role"})
+    connection.execute(text(
+        "DELETE FROM projects WHERE id = :project_id"
+    ), {"project_id": f"{prefix}-project"})
+    connection.execute(text(
+        "DELETE FROM unit_memberships WHERE id = :membership_id"
+    ), {"membership_id": f"um-{prefix}-user-{prefix}-unit"})
+    connection.execute(text(
+        "DELETE FROM units WHERE id = :unit_id"
+    ), {"unit_id": f"{prefix}-unit"})
+    connection.execute(text(
+        "DELETE FROM users WHERE id = :user_id"
+    ), {"user_id": f"{prefix}-user"})
+
+
 def test_identity_revision_upgrades_downgrades_and_reupgrades(postgres_engine):
     inspector = inspect(postgres_engine)
     assert IDENTITY_TABLES <= set(inspector.get_table_names())
@@ -334,6 +424,110 @@ def test_non_custom_grant_cannot_have_custom_projects(postgres_session):
         postgres_session.flush()
 
 
+def test_existing_custom_project_mapping_prevents_scope_change(postgres_engine):
+    prefix = "rev"
+    with Session(postgres_engine) as seed_session:
+        grant, project = seed_role_permission_project_scope(
+            seed_session,
+            prefix=prefix,
+        )
+        seed_session.add(RolePermissionProject(
+            id=f"{prefix}-mapping",
+            role_permission_id=grant.id,
+            unit_id=grant.unit_id,
+            project_id=project.id,
+        ))
+        seed_session.commit()
+
+    try:
+        with Session(postgres_engine) as update_session:
+            stored_grant = update_session.get(
+                RolePermission,
+                f"{prefix}-grant",
+            )
+            stored_grant.data_scope = "unit"
+            with pytest.raises(IntegrityError):
+                update_session.flush()
+            update_session.rollback()
+
+        with Session(postgres_engine) as verify_session:
+            stored_grant = verify_session.get(
+                RolePermission,
+                f"{prefix}-grant",
+            )
+            stored_mapping = verify_session.get(
+                RolePermissionProject,
+                f"{prefix}-mapping",
+            )
+            assert stored_grant.data_scope == "custom_projects"
+            assert stored_mapping is not None
+    finally:
+        with postgres_engine.begin() as connection:
+            delete_role_permission_project_scope_fixture(connection, prefix)
+
+
+def test_custom_project_insert_takes_parent_update_lock(
+    postgres_engine,
+):
+    prefix = "conc"
+    with Session(postgres_engine) as seed_session:
+        seed_role_permission_project_scope(seed_session, prefix=prefix)
+        seed_session.commit()
+
+    updater = postgres_engine.connect()
+    mapper = postgres_engine.connect()
+    updater_transaction = updater.begin()
+    mapper_transaction = mapper.begin()
+    try:
+        mapper.execute(text("""
+            INSERT INTO role_permission_projects (
+                id, role_permission_id, unit_id, project_id
+            ) VALUES (
+                :id, :grant_id, :unit_id, :project_id
+            )
+        """), {
+            "id": f"{prefix}-mapping",
+            "grant_id": f"{prefix}-grant",
+            "unit_id": f"{prefix}-unit",
+            "project_id": f"{prefix}-project",
+        })
+        updater.execute(text("SET LOCAL lock_timeout = '250ms'"))
+
+        with pytest.raises(OperationalError) as lock_error:
+            updater.execute(text(
+                "SELECT id FROM role_permissions "
+                "WHERE id = :grant_id FOR NO KEY UPDATE"
+            ), {"grant_id": f"{prefix}-grant"}).all()
+        assert lock_error.value.orig.sqlstate == "55P03"
+        updater_transaction.rollback()
+        mapper_transaction.commit()
+
+        with Session(postgres_engine) as verify_session:
+            stored_grant = verify_session.get(
+                RolePermission,
+                f"{prefix}-grant",
+            )
+            mapping_count = (
+                verify_session.query(RolePermissionProject)
+                .filter(
+                    RolePermissionProject.role_permission_id
+                    == f"{prefix}-grant"
+                )
+                .count()
+            )
+            assert stored_grant.data_scope == "custom_projects"
+            assert mapping_count == 1
+    finally:
+        if mapper_transaction.is_active:
+            mapper_transaction.rollback()
+        if updater_transaction.is_active:
+            updater_transaction.rollback()
+        mapper.close()
+        updater.close()
+        with postgres_engine.begin() as connection:
+            delete_role_permission_project_scope_fixture(connection, prefix)
+
+
 def test_duplicate_external_identity_is_rejected_without_case_normalization(
     postgres_session,
 ):
@@ -449,6 +643,9 @@ def test_menu_catalogue_accepts_all_exact_route_targets(postgres_session):
     ("kind", "route_key", "visibility_target", "requires_project"),
     [
         ("group", "dashboard", None, False),
+        ("route", None, "unit", False),
+        ("route", "dashboard", None, False),
+        ("route", None, None, False),
         ("route", "unknown-route", "unit", False),
         ("route", "dashboard", "current_project", True),
         ("route", "collaboration", "unit", False),
@@ -481,28 +678,98 @@ def test_menu_catalogue_rejects_shape_target_and_project_requirement_drift(
 
 
 @pytest.mark.parametrize("lifecycle", ["consumed", "expired"])
-def test_login_transactions_remain_queryable_but_cannot_be_reused(
-    postgres_session,
+def test_consumed_and_expired_login_transactions_are_auditable_not_claimable(
+    postgres_engine,
     lifecycle,
 ):
     now = datetime.now(UTC)
+    transaction_id = f"transaction-{lifecycle}"
+    state_hash = f"state-{lifecycle}"
     consumed_at = now if lifecycle == "consumed" else None
-    expires_at = now + timedelta(minutes=5) if lifecycle == "consumed" else now - timedelta(seconds=1)
+    expires_at = (
+        now + timedelta(minutes=5)
+        if lifecycle == "consumed"
+        else now - timedelta(seconds=1)
+    )
     original = login_transaction(
-        f"transaction-{lifecycle}",
-        f"state-{lifecycle}",
+        transaction_id,
+        state_hash,
         expires_at=expires_at,
         consumed_at=consumed_at,
     )
-    postgres_session.add(original)
-    postgres_session.flush()
-    assert postgres_session.get(OidcLoginTransaction, original.id) is original
+    with Session(postgres_engine) as seed_session:
+        seed_session.add(original)
+        seed_session.commit()
 
-    postgres_session.add(login_transaction(
-        f"transaction-{lifecycle}-reuse",
-        f"state-{lifecycle}",
+    try:
+        with Session(postgres_engine) as audit_session:
+            audited = audit_session.execute(
+                select(OidcLoginTransaction)
+                .where(OidcLoginTransaction.id == transaction_id)
+            ).scalar_one()
+            assert audited is not original
+            assert audited.id == transaction_id
+            assert audited.expires_at == expires_at
+            assert audited.consumed_at == consumed_at
+
+            claimed_id = consume_login_transaction(
+                audit_session,
+                state_hash=state_hash,
+                consumed_at=now,
+            )
+            audit_session.commit()
+            assert claimed_id is None
+
+        with Session(postgres_engine) as verify_session:
+            retained = verify_session.get(OidcLoginTransaction, transaction_id)
+            assert retained is not None
+            assert retained.consumed_at == consumed_at
+    finally:
+        with postgres_engine.begin() as connection:
+            connection.execute(text(
+                "DELETE FROM oidc_login_transactions WHERE id = :id"
+            ), {"id": transaction_id})
+
+
+def test_login_transaction_atomic_claim_is_one_time(postgres_engine):
+    now = datetime.now(UTC)
+    transaction_id = "transaction-active"
+    state_hash = "state-active"
+    original = login_transaction(
+        transaction_id,
+        state_hash,
         expires_at=now + timedelta(minutes=5),
         consumed_at=None,
-    ))
-    with pytest.raises(IntegrityError):
-        postgres_session.flush()
+    )
+    with Session(postgres_engine) as seed_session:
+        seed_session.add(original)
+        seed_session.commit()
+
+    try:
+        with Session(postgres_engine) as first_session:
+            first_claim = consume_login_transaction(
+                first_session,
+                state_hash=state_hash,
+                consumed_at=now,
+            )
+            first_session.commit()
+            assert first_claim == transaction_id
+
+        with Session(postgres_engine) as second_session:
+            second_claim = consume_login_transaction(
+                second_session,
+                state_hash=state_hash,
+                consumed_at=now + timedelta(seconds=1),
+            )
+            second_session.commit()
+            assert second_claim is None
+
+        with Session(postgres_engine) as audit_session:
+            retained = audit_session.get(OidcLoginTransaction, transaction_id)
+            assert retained is not None
+            assert retained.consumed_at == now
+    finally:
+        with postgres_engine.begin() as connection:
+            connection.execute(text(
+                "DELETE FROM oidc_login_transactions WHERE id = :id"
+            ), {"id": transaction_id})
