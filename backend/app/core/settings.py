@@ -21,7 +21,8 @@ def read_secret(name: str) -> str | None:
     try:
         return Path(file_path).read_text(encoding="utf-8").strip()
     except (OSError, UnicodeError):
-        raise ValueError(f"unable to read secret file for {name}") from None
+        pass
+    raise ValueError(f"unable to read secret file for {name}")
 
 
 def _read_bool(name: str, default: bool) -> bool:
@@ -62,7 +63,8 @@ def _decode_base64url_key(value: str) -> bytes:
         padded = value + "=" * (-len(value) % 4)
         return base64.b64decode(padded.encode("ascii"), altchars=b"-_", validate=True)
     except (UnicodeEncodeError, ValueError):
-        raise ValueError("encryption key must be base64url encoded") from None
+        pass
+    raise ValueError("encryption key must be base64url encoded")
 
 
 def _read_encryption_keys(value: str | None) -> dict[str, bytes]:
@@ -93,7 +95,8 @@ def _origin(value: str) -> tuple[str, str, int | None]:
     parsed = urlsplit(value)
     scheme = parsed.scheme.lower()
     default_port = 443 if scheme == "https" else 80 if scheme == "http" else None
-    return scheme, (parsed.hostname or "").lower(), parsed.port or default_port
+    port = parsed.port
+    return scheme, (parsed.hostname or "").lower(), default_port if port is None else port
 
 
 @dataclass(frozen=True)

@@ -21,6 +21,25 @@ def _configure_production(monkeypatch):
     monkeypatch.setenv("OIDC_REDIRECT_URI", "https://console.example.test/auth/callback")
 
 
+def _assert_exception_chain_excludes_secret(
+    error: BaseException,
+    secret: str | bytes,
+) -> None:
+    pending = [error]
+    visited: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in visited:
+            continue
+        visited.add(id(current))
+        if isinstance(secret, str):
+            assert secret not in str(current)
+            assert secret not in repr(current)
+        assert getattr(current, "object", None) != secret
+        assert current.__cause__ is None
+        assert current.__context__ is None
+
+
 def test_requires_database_url(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("IAP_ALLOW_DEV_IDENTITY", raising=False)
@@ -140,17 +159,17 @@ def test_invalid_non_ascii_encryption_key_does_not_retain_secret_in_exception():
     secret = "not-a-base64-secret-with-a-non-ascii-character-密"
     with pytest.raises(ValueError, match="base64url") as error:
         settings_module._decode_base64url_key(secret)
-    assert error.value.__cause__ is None
-    assert secret not in repr(error.value)
+    _assert_exception_chain_excludes_secret(error.value, secret)
 
 
 def test_invalid_utf8_secret_file_does_not_retain_secret_in_exception(monkeypatch, tmp_path):
     secret_file = tmp_path / "secret.txt"
-    secret_file.write_bytes(b"\xff\xfe\x00")
+    secret = b"\xff\xfe\x00"
+    secret_file.write_bytes(secret)
     monkeypatch.setenv("OIDC_CLIENT_SECRET_FILE", str(secret_file))
     with pytest.raises(ValueError, match="secret file") as error:
         read_secret("OIDC_CLIENT_SECRET")
-    assert error.value.__cause__ is None
+    _assert_exception_chain_excludes_secret(error.value, secret)
 
 
 def test_production_accepts_redirect_uri_with_default_https_port(monkeypatch):
@@ -160,6 +179,16 @@ def test_production_accepts_redirect_uri_with_default_https_port(monkeypatch):
         "https://console.example.test:443/auth/callback",
     )
     Settings.from_env().validate_startup()
+
+
+def test_production_rejects_redirect_uri_with_explicit_zero_port(monkeypatch):
+    _configure_production(monkeypatch)
+    monkeypatch.setenv(
+        "OIDC_REDIRECT_URI",
+        "https://console.example.test:0/auth/callback",
+    )
+    with pytest.raises(ValueError, match="redirect origin"):
+        Settings.from_env().validate_startup()
 
 
 def test_settings_repr_redacts_secret_values(monkeypatch):
