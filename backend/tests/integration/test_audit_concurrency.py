@@ -67,7 +67,7 @@ def make_request(*, key: str, run_id: str) -> AuditRecordRequest:
         unit_id="integration-unit",
         project_id="integration-project",
         user_id="integration-user",
-        actor_role="agent",
+        actor_role="unknown",
         category="runtime",
         source="agent",
         action="agent.run_snapshot",
