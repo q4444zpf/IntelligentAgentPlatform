@@ -183,6 +183,7 @@ def test_backfill_returns_zero_when_another_transaction_wins_the_unique_key():
                     title="race fixture",
                 )
             )
+            seed.flush()
             seed.add(
                 Message(
                     id=message_id,
@@ -192,6 +193,7 @@ def test_backfill_returns_zero_when_another_transaction_wins_the_unique_key():
                     content="race fixture",
                 )
             )
+            seed.flush()
             seed.add(
                 AgentRun(
                     id=run_id,
