@@ -9,13 +9,13 @@
       <a-select v-model:value="status" aria-label="审计状态" data-test="status-filter" :options="statusOptions" @change="applyFilters" />
       <a-select v-model:value="risk" aria-label="风险等级" data-test="risk-filter" :options="riskOptions" @change="applyFilters" />
       <a-input v-model:value="action" aria-label="操作类型" placeholder="操作类型" @press-enter="applyFilters" />
-      <a-input v-model:value="projectId" aria-label="项目 ID" placeholder="项目 ID" @press-enter="applyFilters" />
-      <a-input v-model:value="userId" aria-label="用户 ID" placeholder="用户 ID" @press-enter="applyFilters" />
+      <a-input v-if="canFilterProject" v-model:value="projectId" aria-label="项目 ID" placeholder="项目 ID" @press-enter="applyFilters" />
+      <a-input v-if="canFilterUser" v-model:value="userId" aria-label="用户 ID" placeholder="用户 ID" @press-enter="applyFilters" />
       <a-range-picker aria-label="发生日期" @change="changeDates" />
       <a-input-search v-model:value="query" aria-label="关键词" placeholder="事件、Trace 或资源 ID" @search="applyFilters" />
     </section>
     <a-spin :spinning="loading">
-      <div v-if="events.length" class="table-shell"><table><thead><tr><th>时间</th><th>状态</th><th>风险</th><th>来源</th><th>操作</th><th>资源</th><th>Trace / Run</th><th>操作</th></tr></thead><tbody><tr v-for="item in events" :key="item.id"><td>{{ formatTime(item.occurred_at) }}</td><td><a-tag :color="statusColor(item.status)">{{ enumLabel(statusLabels,item.status) }}</a-tag></td><td><a-tag :color="riskColor(item.risk_level)">{{ enumLabel(riskLabels,item.risk_level) }}</a-tag></td><td>{{ enumLabel(sourceLabels,item.source) }}</td><td><strong>{{ item.action }}</strong><small>{{ item.id }}</small></td><td><span>{{ item.resource_name || item.resource_id || '-' }}</span><small>{{ item.resource_type || '-' }}</small></td><td><code>{{ item.trace_id || '-' }}</code><button v-if="item.source==='agent'&&item.run_id" class="run-link" :aria-label="`打开运行 ${item.run_id}`" @click="openRun(item.run_id)">{{ item.run_id }}</button><small v-else>{{ item.run_id || '-' }}</small></td><td><a-button type="text" :aria-label="`查看审计事件 ${item.id}`" @click="openEvent(item.id)"><template #icon><EyeOutlined /></template></a-button></td></tr></tbody></table></div>
+      <div v-if="events.length" class="table-shell"><table><thead><tr><th>时间</th><th>类别</th><th>来源</th><th>动作</th><th>操作人</th><th>项目</th><th>对象</th><th>结果</th><th>风险</th><th>耗时</th><th>详情</th></tr></thead><tbody><tr v-for="item in events" :key="item.id"><td>{{ formatTime(item.occurred_at) }}</td><td>{{ item.category==='runtime'?'运行':'管理' }}</td><td>{{ enumLabel(sourceLabels,item.source) }}</td><td :title="`${item.action} · ${item.id}`"><strong>{{ item.action }}</strong><small>{{ item.id }}</small></td><td :title="item.actor_role"><span>{{ item.user_id || '-' }}</span><small>{{ item.actor_role }}</small></td><td>{{ item.project_id || '-' }}</td><td :title="`Trace: ${item.trace_id||'-'} · Run: ${item.run_id||'-'}`"><span>{{ item.resource_name || item.resource_id || '-' }}</span><button v-if="item.source==='agent'&&item.run_id" class="run-link" :aria-label="`打开运行 ${item.run_id}`" @click="openRun(item.run_id)">{{ item.run_id }}</button><small v-else>{{ item.resource_type || '-' }}</small></td><td><a-tag :color="statusColor(item.status)">{{ enumLabel(statusLabels,item.status) }}</a-tag></td><td><a-tag :color="riskColor(item.risk_level)">{{ enumLabel(riskLabels,item.risk_level) }}</a-tag></td><td>{{ item.duration_ms===null?'-':`${item.duration_ms} ms` }}</td><td><a-button type="text" :aria-label="`查看审计事件 ${item.id}`" @click="openEvent(item.id)"><template #icon><EyeOutlined /></template></a-button></td></tr></tbody></table></div>
       <a-empty v-else-if="!loading&&!listError" description="暂无符合条件的审计事件" />
     </a-spin>
     <footer><span>共 {{ total }} 条</span><a-pagination :current="page" :page-size="pageSize" :total="total" show-size-changer @change="changePage" /></footer>
@@ -37,6 +37,11 @@ import { ApiError } from '@/api/client';
 type Resource<T>={data:T|null;loading:boolean;error:string};
 type DateBoundary={startOf:(unit:'day')=>{toISOString:()=>string};endOf:(unit:'day')=>{toISOString:()=>string}};
 const router=useRouter();
+const roles=new Set((import.meta.env.VITE_DEV_USER_ROLES||(
+  import.meta.env.VITE_DEV_USER_ROLE==='admin'?'project_admin':'user'
+)).split(',').map((role:string)=>role.trim()).filter(Boolean));
+const canFilterProject=roles.has('unit_auditor');
+const canFilterUser=canFilterProject||roles.has('project_admin');
 const events=ref<AuditEventListItem[]>([]),total=ref(0),page=ref(1),pageSize=ref(20),loading=ref(false),listError=ref('');
 const summary=ref({total:0,failed:0,high_risk:0,runtime:0,management:0,by_source:{}});
 const category=ref('all'),source=ref('all'),status=ref('all'),risk=ref('all'),action=ref(''),projectId=ref(''),userId=ref(''),query=ref(''),occurredAfter=ref(''),occurredBefore=ref('');
@@ -52,6 +57,9 @@ const sourceLabels:Record<string,string>={agent:'Agent',tool:'工具',mcp:'MCP',
 let listController:AbortController|undefined,listGeneration=0,drawerGeneration=0;
 const detailRequest={controller:undefined as AbortController|undefined,generation:0};
 const relatedRequest={controller:undefined as AbortController|undefined,generation:0};
+type CacheEntry<T>={data:T;expiresAt:number};
+const CACHE_TTL_MS=60_000;
+const detailCache=new Map<string,CacheEntry<AuditEventDetail>>(),relatedCache=new Map<string,CacheEntry<AuditEventListItem[]>>();
 const isAbort=(error:unknown)=>error instanceof DOMException&&error.name==='AbortError';
 const errorText=(error:unknown)=>error instanceof ApiError&&error.status===404?'记录不存在或无权访问':error instanceof Error?error.message:'加载失败';
 const enumLabel=(labels:Record<string,string>,value:string)=>labels[value]||'未知';
@@ -61,10 +69,11 @@ function applyFilters(){page.value=1;loadEvents();}
 function changeDates(dates:[DateBoundary,DateBoundary]|null){occurredAfter.value=dates?.[0]?.startOf('day').toISOString()||'';occurredBefore.value=dates?.[1]?.endOf('day').toISOString()||'';applyFilters();}
 function changePage(next:number,size:number){const changed=size!==pageSize.value;pageSize.value=size;page.value=changed?1:next;loadEvents();}
 function cancelDrawer(){drawerGeneration++;for(const state of [detailRequest,relatedRequest]){state.controller?.abort();state.controller=undefined;state.generation++;}}
-function requestResource<T>(state:typeof detailRequest,target:Resource<T>,request:(signal:AbortSignal)=>Promise<T>){state.controller?.abort();const controller=new AbortController(),generation=++state.generation,drawer=drawerGeneration,eventId=activeId.value;state.controller=controller;target.loading=true;target.error='';request(controller.signal).then(data=>{if(drawer===drawerGeneration&&eventId===activeId.value&&generation===state.generation&&state.controller===controller)target.data=data;}).catch(error=>{if(drawer===drawerGeneration&&eventId===activeId.value&&generation===state.generation&&!isAbort(error))target.error=errorText(error);}).finally(()=>{if(drawer===drawerGeneration&&generation===state.generation&&state.controller===controller){target.loading=false;state.controller=undefined;}});}
-function retryDetail(){detail.value.data=null;requestResource(detailRequest,detail.value,signal=>auditApi.get(activeId.value,signal));}
-function retryRelated(){related.value.data=null;requestResource(relatedRequest,related.value,signal=>auditApi.related(activeId.value,signal));}
-function openEvent(id:string){cancelDrawer();activeId.value=id;drawerOpen.value=true;detail.value={data:null,loading:true,error:''};related.value={data:null,loading:true,error:''};retryDetail();retryRelated();}
+function cached<T>(cache:Map<string,CacheEntry<T>>,id:string){const entry=cache.get(id);if(!entry||entry.expiresAt<=Date.now()){cache.delete(id);return null;}return entry.data;}
+function requestResource<T>(state:typeof detailRequest,target:Resource<T>,cache:Map<string,CacheEntry<T>>,request:(signal:AbortSignal)=>Promise<T>){state.controller?.abort();const controller=new AbortController(),generation=++state.generation,drawer=drawerGeneration,eventId=activeId.value;state.controller=controller;target.loading=true;target.error='';request(controller.signal).then(data=>{if(drawer===drawerGeneration&&eventId===activeId.value&&generation===state.generation&&state.controller===controller){target.data=data;cache.set(eventId,{data,expiresAt:Date.now()+CACHE_TTL_MS});}}).catch(error=>{if(drawer===drawerGeneration&&eventId===activeId.value&&generation===state.generation&&!isAbort(error))target.error=errorText(error);}).finally(()=>{if(drawer===drawerGeneration&&generation===state.generation&&state.controller===controller){target.loading=false;state.controller=undefined;}});}
+function retryDetail(){detail.value.data=null;requestResource(detailRequest,detail.value,detailCache,signal=>auditApi.get(activeId.value,signal));}
+function retryRelated(){related.value.data=null;requestResource(relatedRequest,related.value,relatedCache,signal=>auditApi.related(activeId.value,signal));}
+function openEvent(id:string){cancelDrawer();activeId.value=id;drawerOpen.value=true;const cachedDetail=cached(detailCache,id),cachedRelated=cached(relatedCache,id);detail.value={data:cachedDetail,loading:false,error:''};related.value={data:cachedRelated,loading:false,error:''};if(!cachedDetail)retryDetail();if(!cachedRelated)retryRelated();}
 function closeDrawer(){drawerOpen.value=false;activeId.value='';cancelDrawer();}
 function openRun(runId:string){router.push({path:'/runs',query:{run_id:runId}});}
 const sortedRelated=computed(()=>[...(related.value.data||[])].sort((a,b)=>{const av=String((a as AuditEventListItem&{created_at?:string}).created_at||a.occurred_at),bv=String((b as AuditEventListItem&{created_at?:string}).created_at||b.occurred_at);return av.localeCompare(bv)||a.id.localeCompare(b.id);}));
