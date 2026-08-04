@@ -87,7 +87,7 @@ PostgreSQL
 1. 校验 `return_to` 是站内相对路径，拒绝绝对地址、协议相对地址和控制字符。
 2. 生成高熵 `state`、`nonce`、PKCE `code_verifier` 和独立浏览器关联值。
 3. 将 `state` 哈希、`nonce` 哈希、浏览器关联值哈希、加密 `code_verifier`、预期 issuer/client/redirect URI、安全回跳路径和五分钟过期时间写入 `oidc_login_transactions`。
-4. 把浏览器关联值写入五分钟有效、`HttpOnly`、`Secure`、`SameSite=Lax` 且 Path 仅限回调地址的 `__Host-iap_oidc_tx` 临时 Cookie。
+4. 把浏览器关联值写入五分钟有效、`HttpOnly`、`Secure`、`SameSite=Lax`、不设置 `Domain` 且 Path 仅限 `/api/auth/callback` 的 `__Secure-iap_oidc_tx` 临时 Cookie。`__Host-` 前缀强制要求 `Path=/`，因此不能用于此路径受限 Cookie。
 5. 使用 PKCE S256 跳转授权端点。
 
 登录事务一次性消费。过期、重复使用或不存在的 `state`，以及浏览器关联 Cookie 不匹配时，一律终止流程。这一绑定防止攻击者把自己的回调地址交给其他浏览器造成 Login CSRF。
@@ -151,7 +151,7 @@ Token 交换、验证失败或身份未绑定时，回到登录页并携带稳�
 - 项目停用或成员关系失效：清空当前项目。
 - `current_project=null`：只允许单位级页面和项目选择接口。
 
-实现时必须把现有不可空的 `RequestContext.project_id` 改为显式可空，并由每个项目型 API 强制要求项目上下文。
+实现时必须把 Web 请求入口和业务服务授权统一迁移到 `AuthorizationContext.current_project_id: str | None`，并由每个项目型 API 强制要求项目上下文。旧 `RequestContext.project_id/role/roles` 不保留隐式兼容属性，避免单位级请求把空项目伪装成默认项目，或让服务层继续按角色名称授权。运行时持久化的 `ToolExecutionContext` 仍是独立值对象，继续携带非空项目、会话、运行、时区和角色快照；它只能由已经完成授权的 Conversation/Run 记录构造，不能被 `AuthorizationContext` 替代，也不能反向充当 Web API 授权依据。
 
 ### 5.7 本地退出和上游退出
 
@@ -183,18 +183,35 @@ Token 交换、验证失败或身份未绑定时，回到登录页并携带稳�
 {
   "user": {"id": "user-id", "display_name": "用户名称"},
   "unit": {"id": "unit-id", "name": "单位名称"},
-  "current_project": null,
+  "current_project": {"id": "project-id", "name": "项目名称"},
   "projects": [{"id": "project-id", "name": "项目名称"}],
   "roles": ["project_admin"],
-  "permissions": ["agent.read", "agent.run"],
-  "menus": [{"route_key": "chat", "children": []}],
+  "permissions": [
+    {"code": "agent.read", "target": "current_project"},
+    {"code": "project.read", "target": "current_project"}
+  ],
+  "menus": [
+    {
+      "kind": "group",
+      "key": "resources",
+      "title": "资源中心",
+      "children": [
+        {
+          "kind": "route",
+          "key": "project-resources",
+          "route_key": "project-resources",
+          "title": "项目资源"
+        }
+      ]
+    }
+  ],
   "authorization_version": 12,
   "csrf_token": "memory-only-token",
   "session": {"idle_expires_at": "2026-08-04T15:30:00+08:00", "absolute_expires_at": "2026-08-04T23:00:00+08:00"}
 }
 ```
 
-`current_project` 可以为空；前端不得把项目列表第一项静默当成授权上下文。
+`current_project` 可以为空；前端不得把项目列表第一项静默当成授权上下文。`permissions` 是去重并稳定排序的 `(code, target)` 能力对，`target` 只允许 `unit/current_project`；`current_project` 为空时不返回项目目标能力。单位授权在已选择项目时可以同时产生 `unit` 与 `current_project` 能力，但两者不能在前端被拆分或推导。`menus` 只使用上例的严格 `group/route` 判别联合结构，未知字段组合、未知 Key、重复路径或固定路由覆盖都使整棵菜单失败关闭。
 
 每个普通 Web 会话生成独立 CSRF Secret，并在 `auth_sessions` 加密保存。`/api/auth/me` 返回 `base64url(HMAC(csrf_secret, session_internal_id || "csrf-v1"))`；同一会话的多个标签页可以重复取得相同 Token，页面刷新不会使其他标签页立即失效。新会话、会话轮换和撤销会使旧 Token 失效。前端只把 Token 放在内存中，通过 `X-CSRF-Token` 提交。
 
@@ -229,8 +246,8 @@ CSRF 要求只适用于“使用浏览器会话 Cookie 的 POST、PUT、PATCH、
 | `unit_membership_roles` | 用户、单位、角色和固定 `scope_type=unit` |
 | `project_membership_roles` | 用户、单位、项目、角色和固定 `scope_type=project` |
 | `role_permission_projects` | 授权元组、单位和项目；仅用于 `custom_projects` |
-| `menus` | `route_key`、父节点、标题、排序、状态；不保存可执行组件路径 |
-| `menu_permissions` | 菜单与权限码映射；只决定导航可见性 |
+| `menus` | `kind=group/route`、稳定 `node_key`、可空且唯一的 `route_key`、父节点、标题、排序、状态、`visibility_target=unit/current_project`、`requires_current_project`；不保存可执行组件路径 |
+| `menu_permissions` | 路由菜单与权限码映射；与 `visibility_target` 组成导航可见性要求，不作为 API 边界 |
 
 数据库迁移必须落实以下可验收约束：
 
@@ -239,6 +256,7 @@ CSRF 要求只适用于“使用浏览器会话 Cookie 的 POST、PUT、PATCH、
 - `project_memberships(user_id, unit_id)` 复合 FK 指向 `unit_memberships`，`(project_id, unit_id)` 复合 FK 指向 `projects`。
 - `role_permission_projects(project_id, unit_id)` 复合 FK 指向同单位项目，并通过授权元组中的 `unit_id` 防止跨单位自定义范围。
 - 跨表状态和范围条件由事务内 Service 校验；PostgreSQL 无法用普通 CHECK 表达的规则使用复合 FK 或约束触发器，不能只依赖前端。
+- 菜单组必须 `route_key/visibility_target IS NULL` 且 `requires_current_project=false`；路由节点的 `route_key/visibility_target` 必须非空。所有 `visibility_target=current_project` 的路由及单位目标的 `chat` 必须 `requires_current_project=true`，其他单位路由必须为 false；数据库 CHECK 和种子白名单共同阻止组节点伪装路由、重复路径及项目门槛漂移。
 
 第一期初始化 `unit_admin`、`project_admin`、`business_operator`、`model_expert`、`unit_auditor` 和 `viewer`。内置角色不能删除或改 Code；平台范围角色为后续多单位运维保留，第一期页面不能创建或分配。
 
@@ -313,12 +331,18 @@ effective_grants =
 
 ## 9. 菜单、按钮、API 和对象权限
 
-- 菜单：后端按授权过滤 `menus`，只返回稳定 `route_key`；未知 route key 拒绝。多个映射权限按“任一满足”显示；无映射菜单只能是显式公共登录页。
+- 菜单：后端以 `(permission_code, visibility_target)` 过滤路由节点，只返回闭合白名单内的稳定 `route_key`；组节点无路由且仅在至少一个子节点可见时返回。多个映射权限按“任一完整要求满足”显示，权限码相同但目标范围不匹配仍隐藏。未知组/路由 Key、重复路径或覆盖固定路由时拒绝整个菜单响应，不能部分安装。
 - 路由：守卫负责体验，直接输入 URL 仍由目标 API 决定。
 - 按钮：前端权限指令只显示或禁用操作，不能代替后端。
-- API：FastAPI 统一执行 `require_session` 和 `require_permission(code, scope)`。
+- API：FastAPI 统一执行 `require_session` 和 `require_permission(code, target)`；路由准入不能替代实际对象的范围谓词。
 - 对象：查询包含 `unit_id/project_id` 和允许范围；具体对象越权返回安全 404，列表和统计不泄露。
 - 客户端上下文：生产不得读取单位、项目和角色 Header 生成身份。
+
+当前 Agent、MCP、Tool、LLM Provider 和 Skill 仍是平台全局配置，尚未具备单位/项目/发布授权字段。为防止项目角色通过猜测全局 Agent ID 调用其模型、知识或工具，本阶段 `POST /api/conversations` 和消息提交必须同时满足“已选择项目”与“单位目标的 `agent.run`”。Chat 菜单以 `(agent.run, unit)` 过滤并额外要求当前项目非空；`current_project=null` 时后端不返回 Chat 菜单，前端直接访问 `/chat` 或 `/chat/focus` 都进入项目选择，不能先挂载 Chat 组件再依赖 API 的 409。只有后续 `business-resource-authorization` 为可执行 Agent 建立项目级目录及实际资源谓词后，才能放宽为项目目标。
+
+审计 API 使用专用的“存在 `audit.read` 授权元组”准入，不把项目/own 授权误判成单位授权。列表 SQL 必须把每个 `audit.read` 元组各自编译为谓词后取并集；详情先用同一谓词加载锚点，关联事件也逐条保持同一授权范围。`own` 仅匹配本人的审计事件，未授权详情统一返回 404。
+
+`/`、`/login`、`/select-project`、`/403`、`/404`、`/chat/focus`、`/tenant/resources`、`/system/tenant-projects` 和 catch-all 是前端固定路由，不由数据库菜单创建或删除。`/chat/focus` 仍要求当前项目和单位目标的 `agent.run`；两个旧地址只保留一个版本，目标动态路由未获授权时进入 403。未知 URL 进入 404，权限不足进入 403，二者都不能静默跳回工作台。`current_project=null` 时项目路由进入项目选择页，但已授权单位页面仍可直接访问。
 
 `POST /api/auth/context/project` 只允许切换到有效项目。切换写入服务端会话，增加上下文代次并返回新的 `/api/auth/me` 结构。当前项目是便利上下文，不是授权来源。
 
@@ -331,7 +355,7 @@ effective_grants =
 → GET /api/auth/me
 → 已登录：加载用户、项目、权限和菜单
 → 安装静态 route_key 对应路由
-→ 有项目上下文时进入项目页，否则进入项目选择
+→ 优先进入首个已授权单位页面；进入项目页面前必须已有项目上下文，否则进入项目选择
 
 未登录
 → 保存安全站内 return_to
@@ -362,7 +386,7 @@ effective_grants =
 
 默认关闭时返回 404。生产启动时缺少截止时间、允许网段、凭据或 TOTP 时拒绝开放应急登录。
 
-Nginx 必须清除外部传入的 `Forwarded/X-Forwarded-For/X-Real-IP`，只写入经过连接确认的客户端地址。FastAPI 只信任 `TRUSTED_PROXY_CIDRS` 内最后一跳代理；来自其他地址的转发 Header 一律忽略。测试必须覆盖伪造转发头。
+Nginx 必须清除外部传入的 `Forwarded/X-Forwarded-For/X-Real-IP`，并把连接确认的客户端地址覆盖写为单值 `X-Forwarded-For`。Uvicorn 禁用通用代理头重写；应用级客户端地址解析器先校验直接对端属于 `TRUSTED_PROXY_CIDRS`，随后只接受一个语法有效、无逗号链和无重复 Header 的 `X-Forwarded-For`。来自其他对端的 `Forwarded/X-Forwarded-For/X-Real-IP` 一律忽略，可信对端的多值或畸形 XFF 也失败关闭。测试必须同时覆盖不可信对端伪造三类 Header、可信对端单值 XFF，以及可信对端多值/重复 XFF。
 
 ### 11.2 身份隔离和固定能力
 
@@ -471,6 +495,7 @@ CI 启动符合 OIDC 的模拟 Provider，生成测试专用签名密钥和 Disc
 | 多项目 | 伪造项目或资源 ID 不能横向访问，列表和统计也不泄露 |
 | 数据范围 | unit、assigned_projects、project、own、custom_projects 正确过滤 |
 | 菜单/API | 菜单按钮匹配权限，直接 URL 和 API 仍由后端拒绝 |
+| 全局 Agent 过渡门禁 | 项目级 `agent.run` 即使猜中 Agent ID 也不能创建运行；已选项目加单位级 `agent.run` 才能运行 |
 | 项目切换 | 可空初始上下文、有效切换、旧请求和缓存清理 |
 | 退出 | 本地会话和前端状态全部失效；按 Provider 能力复验上游退出 |
 | 应急 | 默认关闭、可信代理、伪造转发头、TOTP、恢复对象和普通路由拒绝 |
