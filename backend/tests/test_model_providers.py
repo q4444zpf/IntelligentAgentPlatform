@@ -267,6 +267,16 @@ def test_missing_provider_management_attempt_records_failed_audit(tmp_path, monk
     assert event.trace_id == "provider-missing-1"
 
 
+def test_unit_auditor_cannot_configure_model_provider(tmp_path, monkeypatch):
+    client, _service = provider_api_client(tmp_path, monkeypatch)
+    response = client.put(
+        "/api/providers/ollama/config",
+        json={"base_url": "http://localhost:11434/v1"},
+        headers={"X-User-Roles": "unit_auditor"},
+    )
+    assert response.status_code == 403
+
+
 def test_invalid_provider_body_records_failed_audit_without_request_secrets(tmp_path, monkeypatch):
     from sqlalchemy import select
     from app.audit.models import AuditEvent

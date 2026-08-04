@@ -1,7 +1,11 @@
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
-from app.core.request_context import RequestContext, require_request_context
+from app.core.request_context import (
+    RequestContext,
+    require_admin_context,
+    require_request_context,
+)
 
 
 def build_client(allow_dev_identity: bool) -> TestClient:
@@ -10,6 +14,10 @@ def build_client(allow_dev_identity: bool) -> TestClient:
     @app.get("/context")
     def context(value: RequestContext = Depends(require_request_context)):
         return value
+
+    @app.post("/admin")
+    def admin(_value: RequestContext = Depends(require_admin_context)):
+        return {"ok": True}
 
     app.state.allow_dev_identity = allow_dev_identity
     return TestClient(app)
@@ -69,6 +77,14 @@ def test_rejects_unknown_legacy_role_when_modern_roles_are_valid():
     assert response.status_code == 401
 
 
-def test_compatibility_role_maps_elevated_roles_to_admin():
+def test_compatibility_role_only_maps_project_admin_to_admin():
     assert RequestContext(unit_id="unit-1", project_id="project-1", user_id="user-1").role == "user"
-    assert RequestContext(unit_id="unit-1", project_id="project-1", user_id="user-1", roles=frozenset({"unit_auditor"})).role == "admin"
+    assert RequestContext(unit_id="unit-1", project_id="project-1", user_id="user-1", roles=frozenset({"unit_auditor"})).role == "user"
+    assert RequestContext(unit_id="unit-1", project_id="project-1", user_id="user-1", roles=frozenset({"project_admin"})).role == "admin"
+
+
+def test_admin_dependency_rejects_unit_auditor_and_accepts_project_admin():
+    client = build_client(True)
+    base = {"X-Unit-ID": "unit-1", "X-User-ID": "user-1", "X-Project-ID": "project-1"}
+    assert client.post("/admin", headers={**base, "X-User-Roles": "unit_auditor"}).status_code == 403
+    assert client.post("/admin", headers={**base, "X-User-Roles": "project_admin"}).status_code == 200

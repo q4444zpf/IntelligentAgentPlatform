@@ -76,6 +76,15 @@ def remote_payload(**overrides):
     return payload
 
 
+def test_unit_auditor_cannot_create_mcp_client(client):
+    response = client.post(
+        "/api/mcp",
+        json=remote_payload(),
+        headers={"X-User-Roles": "unit_auditor"},
+    )
+    assert response.status_code == 403
+
+
 def test_validates_transport_specific_configuration(client):
     response = client.post(
         "/api/mcp",

@@ -44,6 +44,16 @@ def test_api_lists_gets_and_relates_events():
     assert [item["id"] for item in related.json()] == ["visible"]
 
 
+def test_unit_auditor_can_list_events_in_own_unit():
+    client = build_client()
+    response = client.get(
+        "/api/audit/events",
+        headers={**HEADERS, "X-User-Roles": "unit_auditor"},
+    )
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["items"]] == ["visible"]
+
+
 def test_api_validates_enums_dates_and_pagination():
     client = build_client()
     invalid = [

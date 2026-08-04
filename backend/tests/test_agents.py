@@ -155,6 +155,15 @@ def agent_payload(**overrides):
     return payload
 
 
+def test_unit_auditor_cannot_create_agent(client):
+    response = client.post(
+        "/api/agents",
+        json=agent_payload(),
+        headers={"X-User-Roles": "unit_auditor"},
+    )
+    assert response.status_code == 403
+
+
 BUILTIN_TOOL_IDS = [
     "system.get_current_time",
     "system.get_runtime_context",

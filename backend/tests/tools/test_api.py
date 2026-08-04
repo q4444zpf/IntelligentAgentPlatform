@@ -93,6 +93,14 @@ def test_regular_user_cannot_toggle_tool(client):
     assert event.trace_id == "tool-denied-1"
 
 
+def test_unit_auditor_cannot_toggle_tool(client):
+    response = client.patch(
+        "/api/tools/system.get_current_time/toggle",
+        headers={**AUTH_HEADERS, "X-User-Roles": "unit_auditor"},
+    )
+    assert response.status_code == 403
+
+
 def test_authenticated_regular_user_can_read_tools(client):
     assert client.get("/api/tools", headers=AUTH_HEADERS).status_code == 200
     assert client.get(

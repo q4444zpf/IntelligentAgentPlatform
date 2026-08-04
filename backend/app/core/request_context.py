@@ -14,7 +14,7 @@ class RequestContext(BaseModel):
 
     @property
     def role(self) -> Literal["user", "admin"]:
-        return "admin" if self.roles & {"project_admin", "unit_auditor"} else "user"
+        return "admin" if "project_admin" in self.roles else "user"
 
 
 def require_request_context(
