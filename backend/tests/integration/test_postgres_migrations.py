@@ -25,7 +25,10 @@ def test_upgrade_command_uses_backend_alembic_config():
 def test_upgrade_head_creates_conversation_tables():
     env = os.environ | {"DATABASE_URL": os.environ["TEST_DATABASE_URL"]}
     subprocess.run(ALEMBIC_UPGRADE_COMMAND, check=True, env=env)
-    inspector = inspect(create_engine(env["DATABASE_URL"]))
+    engine = create_engine(env["DATABASE_URL"])
+    inspector = inspect(engine)
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260804_09"
     tables = set(inspector.get_table_names())
     assert {
         "conversations",
@@ -103,6 +106,7 @@ def test_upgrade_head_creates_conversation_tables():
     assert {
         name: audit_indexes[name] for name in expected_audit_indexes
     } == expected_audit_indexes
+    engine.dispose()
 
 
 @pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="requires PostgreSQL")
