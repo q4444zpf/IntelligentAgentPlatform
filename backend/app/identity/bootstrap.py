@@ -6,9 +6,9 @@ import os
 from pathlib import Path
 import stat
 import subprocess
-from typing import Any
 
-from sqlalchemy import event, func, select
+from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
@@ -57,36 +57,6 @@ def _validate_request(request: BootstrapRequest) -> None:
             raise ValueError(f"{field_name} must be a non-empty string")
         if len(value) > max_length:
             raise ValueError(f"{field_name} exceeds {max_length} characters")
-
-
-def _reject_second_active_unit_membership(
-    session: Session,
-    flush_context: Any,
-    instances: Any,
-) -> None:
-    candidates = [
-        membership
-        for membership in session.new.union(session.dirty)
-        if isinstance(membership, UnitMembership)
-        and membership not in session.deleted
-        and membership.status == "active"
-    ]
-    checked_users: set[str] = set()
-    for membership in candidates:
-        if membership.user_id in checked_users:
-            raise ValueError("a user may have only one active unit membership")
-        checked_users.add(membership.user_id)
-        statement = select(func.count()).select_from(UnitMembership).where(
-            UnitMembership.user_id == membership.user_id,
-            UnitMembership.status == "active",
-        )
-        if membership.id is not None:
-            statement = statement.where(UnitMembership.id != membership.id)
-        if session.scalar(statement):
-            raise ValueError("a user may have only one active unit membership")
-
-
-event.listen(Session, "before_flush", _reject_second_active_unit_membership)
 
 
 def bootstrap_initial_unit_admin(
@@ -206,6 +176,9 @@ def bootstrap_initial_unit_admin(
         )
         session.commit()
         return user_id
+    except SQLAlchemyError:
+        session.rollback()
+        raise RuntimeError("identity bootstrap failed") from None
     except Exception:
         session.rollback()
         raise
@@ -213,20 +186,21 @@ def bootstrap_initial_unit_admin(
 
 def _windows_acl_is_protected(path: Path) -> bool:
     script = """
-$acl = Get-Acl -LiteralPath $env:IAP_BOOTSTRAP_ACL_PATH
-$allowed = @($acl.Access | Where-Object {
+$acl = [System.IO.File]::GetAccessControl($env:IAP_BOOTSTRAP_ACL_PATH)
+$allowed = @($acl.GetAccessRules(
+    $true,
+    $true,
+    [System.Security.Principal.SecurityIdentifier]
+) | Where-Object {
     $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow
 } | ForEach-Object {
-    try {
-        $_.IdentityReference.Translate(
-            [System.Security.Principal.SecurityIdentifier]
-        ).Value
-    } catch {
-        $_.IdentityReference.Value
-    }
+    $_.IdentityReference.Value
 })
 [PSCustomObject]@{
     current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    owner = $acl.GetOwner(
+        [System.Security.Principal.SecurityIdentifier]
+    ).Value
     allowed = $allowed
 } | ConvertTo-Json -Compress
 """
@@ -248,30 +222,84 @@ $allowed = @($acl.Access | Where-Object {
     allowed = acl.get("allowed", [])
     if isinstance(allowed, str):
         allowed = [allowed]
-    safe_sids = {
+    safe_owner_sids = {
         acl.get("current"),
         "S-1-5-18",       # Local System
         "S-1-5-32-544",  # Built-in Administrators
+    }
+    safe_allow_sids = {
+        *safe_owner_sids,
         "S-1-3-4",        # Owner Rights
     }
-    return bool(allowed) and set(allowed) <= safe_sids
+    return (
+        acl.get("owner") in safe_owner_sids
+        and bool(allowed)
+        and set(allowed) <= safe_allow_sids
+    )
+
+
+def _read_protected_json_file(path: Path) -> str:
+    if path.suffix.casefold() != ".json":
+        raise ValueError("bootstrap request must be a protected JSON file")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    if os.name != "nt":
+        no_follow = getattr(os, "O_NOFOLLOW", None)
+        if no_follow is None:
+            raise ValueError("bootstrap request must be a protected JSON file")
+        flags |= no_follow
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        raise ValueError("bootstrap request must be a protected JSON file") from None
+
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError("bootstrap request must be a protected JSON file")
+        if os.name == "nt":
+            if not _windows_acl_is_protected(path):
+                raise ValueError("bootstrap request must be a protected JSON file")
+            try:
+                current_path = path.stat()
+            except OSError:
+                raise ValueError(
+                    "bootstrap request must be a protected JSON file"
+                ) from None
+            if (opened.st_dev, opened.st_ino) != (
+                current_path.st_dev,
+                current_path.st_ino,
+            ):
+                raise ValueError("bootstrap request must be a protected JSON file")
+        elif (
+            stat.S_IMODE(opened.st_mode) & 0o077
+            or opened.st_uid != os.geteuid()
+        ):
+            raise ValueError("bootstrap request must be a protected JSON file")
+
+        try:
+            with os.fdopen(descriptor, "r", encoding="utf-8") as request_file:
+                descriptor = -1
+                return request_file.read()
+        except (OSError, UnicodeError):
+            raise ValueError("unable to read bootstrap request JSON") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _is_protected_json_file(path: Path) -> bool:
-    if path.suffix.casefold() != ".json" or not path.is_file():
+    try:
+        _read_protected_json_file(path)
+    except ValueError:
         return False
-    if os.name == "nt":
-        return _windows_acl_is_protected(path)
-    return stat.S_IMODE(path.stat().st_mode) & 0o077 == 0
+    return True
 
 
 def _request_from_json(path: Path) -> BootstrapRequest:
-    if not _is_protected_json_file(path):
-        raise ValueError("bootstrap request must be a protected JSON file")
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ValueError("unable to read bootstrap request JSON") from error
+        payload = json.loads(_read_protected_json_file(path))
+    except json.JSONDecodeError:
+        raise ValueError("unable to read bootstrap request JSON") from None
     expected_fields = {field.name for field in fields(BootstrapRequest)}
     if not isinstance(payload, dict) or set(payload) != expected_fields:
         raise ValueError("bootstrap request JSON fields do not match the contract")

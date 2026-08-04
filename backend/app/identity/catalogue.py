@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from sqlalchemy import event, inspect, select
+from sqlalchemy import inspect, select
 from sqlalchemy.orm import Session
 
 from app.identity.models import (
@@ -9,6 +9,8 @@ from app.identity.models import (
     Permission,
     Role,
     RolePermission,
+    UnitMembership,
+    User,
     new_id,
 )
 
@@ -215,10 +217,25 @@ _GROUP_ROUTES = {
 
 def _protect_builtin_codes(session: Session, flush_context, instances) -> None:
     for value in session.deleted:
-        if isinstance(value, Permission) and value.code in PERMISSION_CODES:
-            raise ValueError("built-in permission codes cannot be deleted")
-        if isinstance(value, Role) and value.built_in:
-            raise ValueError("built-in role codes cannot be deleted")
+        state = inspect(value)
+        if isinstance(value, Permission):
+            known_codes = {value.code, *state.attrs.code.history.deleted}
+            if not known_codes.intersection(PERMISSION_CODES) and value.id:
+                persisted_code = session.scalar(
+                    select(Permission.code).where(Permission.id == value.id)
+                )
+                if persisted_code:
+                    known_codes.add(persisted_code)
+            if known_codes.intersection(PERMISSION_CODES):
+                raise ValueError("built-in permission codes cannot be deleted")
+        if isinstance(value, Role):
+            was_builtin = value.built_in or True in state.attrs.built_in.history.deleted
+            if not was_builtin and value.id:
+                was_builtin = bool(
+                    session.scalar(select(Role.built_in).where(Role.id == value.id))
+                )
+            if was_builtin:
+                raise ValueError("built-in role codes cannot be deleted")
 
     for value in session.dirty:
         state = inspect(value)
@@ -235,7 +252,75 @@ def _protect_builtin_codes(session: Session, flush_context, instances) -> None:
                 raise ValueError("built-in role codes cannot be renamed")
 
 
-event.listen(Session, "before_flush", _protect_builtin_codes)
+def _protect_bulk_role_and_permission_mutations(execute_state) -> None:
+    if not (execute_state.is_update or execute_state.is_delete):
+        return
+    description = getattr(execute_state.statement, "entity_description", {})
+    if description.get("entity") in {Role, Permission}:
+        raise ValueError("bulk role and permission mutations are not allowed")
+
+
+def _enforce_single_active_unit_membership(
+    session: Session,
+    flush_context,
+    instances,
+) -> None:
+    tracked = {
+        id(value): value
+        for collection in (session.new, session.dirty, session.deleted)
+        for value in collection
+        if isinstance(value, UnitMembership)
+    }
+    if not tracked:
+        return
+
+    user_ids: set[str] = set()
+    for membership in tracked.values():
+        if membership.user_id:
+            user_ids.add(membership.user_id)
+        user_ids.update(
+            value
+            for value in inspect(membership).attrs.user_id.history.deleted
+            if value
+        )
+    if not user_ids:
+        return
+
+    session.execute(
+        select(User.id)
+        .where(User.id.in_(sorted(user_ids)))
+        .order_by(User.id)
+        .with_for_update()
+    ).all()
+    persisted = session.execute(
+        select(UnitMembership.id, UnitMembership.user_id).where(
+            UnitMembership.user_id.in_(user_ids),
+            UnitMembership.status == "active",
+        )
+    ).all()
+    active_by_user = {user_id: set() for user_id in user_ids}
+    for membership_id, user_id in persisted:
+        active_by_user[user_id].add(membership_id)
+
+    for membership in tracked.values():
+        if membership.id is not None:
+            for active_ids in active_by_user.values():
+                active_ids.discard(membership.id)
+        if membership not in session.deleted and membership.status == "active":
+            marker = membership.id or f"pending:{id(membership)}"
+            active_by_user[membership.user_id].add(marker)
+
+    if any(len(active_ids) > 1 for active_ids in active_by_user.values()):
+        raise ValueError("a user may have only one active unit membership")
+
+
+def enforce_identity_before_flush(session: Session, flush_context, instances) -> None:
+    _protect_builtin_codes(session, flush_context, instances)
+    _enforce_single_active_unit_membership(session, flush_context, instances)
+
+
+def enforce_identity_orm_execute(execute_state) -> None:
+    _protect_bulk_role_and_permission_mutations(execute_state)
 
 
 def _seed_permissions(session: Session) -> None:
@@ -270,6 +355,16 @@ def _seed_roles(session: Session, unit_id: str) -> dict[str, Role]:
         role.code: role
         for role in session.scalars(select(Role).where(Role.unit_id == unit_id))
     }
+    expected_codes = {definition[0] for definition in _ROLE_DEFINITIONS}
+    unexpected_builtin = sorted(
+        code
+        for code, role in existing.items()
+        if role.built_in and code not in expected_codes
+    )
+    if unexpected_builtin:
+        raise ValueError(
+            f"unexpected built-in role code: {unexpected_builtin[0]}"
+        )
     roles: dict[str, Role] = {}
     for code, name, scope_type in _ROLE_DEFINITIONS:
         role = existing.get(code)
@@ -295,12 +390,11 @@ def _seed_roles(session: Session, unit_id: str) -> dict[str, Role]:
 
 def _seed_grants(session: Session, unit_id: str, roles: dict[str, Role]) -> None:
     role_ids = tuple(role.id for role in roles.values())
-    existing = {
-        (grant.role_id, grant.permission_code, grant.data_scope)
-        for grant in session.scalars(
+    existing_grants = list(
+        session.scalars(
             select(RolePermission).where(RolePermission.role_id.in_(role_ids))
         )
-    }
+    )
     expected: list[tuple[Role, str, str]] = [
         (roles["unit_admin"], code, "unit") for code in PERMISSION_CODES
     ]
@@ -308,6 +402,18 @@ def _seed_grants(session: Session, unit_id: str, roles: dict[str, Role]) -> None
         scope = "unit" if role_code == "unit_auditor" else "project"
         expected.extend((roles[role_code], code, scope) for code in codes)
     expected.append((roles["business_operator"], "conversation.manage", "own"))
+
+    expected_keys = {
+        (role.id, permission_code, data_scope)
+        for role, permission_code, data_scope in expected
+    }
+    existing = {
+        (grant.role_id, grant.permission_code, grant.data_scope): grant
+        for grant in existing_grants
+    }
+    for key, grant in existing.items():
+        if key not in expected_keys:
+            session.delete(grant)
 
     for role, permission_code, data_scope in expected:
         key = (role.id, permission_code, data_scope)
@@ -414,18 +520,27 @@ def _seed_menus(session: Session) -> None:
             )
 
     session.flush()
-    mappings = {
-        (mapping.menu_id, mapping.permission_code)
-        for mapping in session.scalars(
+    existing_mappings = list(
+        session.scalars(
             select(MenuPermission).where(
                 MenuPermission.menu_id.in_(tuple(menu.id for menu in existing.values()))
             )
         )
-    }
+    )
     all_routes = (
         *_ROOT_ROUTES,
         *(route for routes in _GROUP_ROUTES.values() for route in routes),
     )
+    expected_mappings = {
+        (existing[route.key].id, route.permission_code) for route in all_routes
+    }
+    mappings = {
+        (mapping.menu_id, mapping.permission_code): mapping
+        for mapping in existing_mappings
+    }
+    for key, mapping in mappings.items():
+        if key not in expected_mappings:
+            session.delete(mapping)
     for route in all_routes:
         key = (existing[route.key].id, route.permission_code)
         if key not in mappings:

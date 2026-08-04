@@ -1,17 +1,24 @@
 from dataclasses import replace
 import json
 import os
+from pathlib import Path
+import stat
 import subprocess
+import sys
+from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine, event, func, select
+from sqlalchemy import create_engine, delete, event, func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.audit.models import AuditEvent
 from app.db.base import Base
+from app.identity import bootstrap as bootstrap_module
 from app.identity.bootstrap import (
     BootstrapRequest,
     _request_from_json,
+    _windows_acl_is_protected,
     bootstrap_initial_unit_admin,
 )
 from app.identity.catalogue import seed_builtin_catalogue
@@ -147,6 +154,12 @@ MENU_PARENTS = {
 class CountingSession(Session):
     commit_calls = 0
     rollback_calls = 0
+    user_lock_calls = 0
+
+    def execute(self, statement, *args, **kwargs):
+        if getattr(statement, "_for_update_arg", None) is not None:
+            self.user_lock_calls += 1
+        return super().execute(statement, *args, **kwargs)
 
     def commit(self):
         self.commit_calls += 1
@@ -180,6 +193,70 @@ def make_request(index=1, **overrides):
 
 def _count(session, model):
     return session.scalar(select(func.count()).select_from(model))
+
+
+@pytest.mark.parametrize("import_target", ["app.db.base", "app.identity.models"])
+def test_fresh_import_registers_identity_invariants_without_a_cycle(import_target):
+    backend_dir = Path(__file__).parents[2]
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(backend_dir)
+    probe = f"import importlib\nimportlib.import_module({import_target!r})\n" + r'''
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+
+from app.db.base import Base
+from app.identity.models import Permission, Role, Unit, UnitMembership, User
+
+engine = create_engine("sqlite:///:memory:")
+Base.metadata.create_all(engine)
+with Session(engine) as session:
+    unit_1 = Unit(id="unit-1", code="unit-1", name="Unit 1", status="active")
+    unit_2 = Unit(id="unit-2", code="unit-2", name="Unit 2", status="active")
+    user = User(id="user-1", display_name="User", status="active")
+    role = Role(
+        id="role-1", unit_id="unit-1", code="unit_admin", name="Admin",
+        scope_type="unit", built_in=True, status="active",
+    )
+    permission = Permission(
+        id="permission-1", code="platform.read", resource="platform",
+        action="read", risk_level="medium", status="active",
+    )
+    session.add_all([unit_1, unit_2, user, role, permission])
+    session.add(UnitMembership(
+        id="membership-1", user_id="user-1", unit_id="unit-1", status="active",
+    ))
+    session.commit()
+
+    role.built_in = False
+    session.delete(role)
+    try:
+        session.commit()
+    except ValueError:
+        session.rollback()
+    else:
+        raise SystemExit("built-in role guard was not registered")
+
+    session.add(UnitMembership(
+        id="membership-2", user_id="user-1", unit_id="unit-2", status="active",
+    ))
+    try:
+        session.commit()
+    except ValueError:
+        session.rollback()
+    else:
+        raise SystemExit("active membership guard was not registered")
+'''
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=backend_dir.parent,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
 
 
 def test_seed_is_idempotent_and_uses_exact_role_grants(session_factory):
@@ -225,6 +302,88 @@ def test_seed_is_idempotent_and_uses_exact_role_grants(session_factory):
             *((permission, "project") for permission in ROLE_PERMISSION_CODES["business_operator"]),
             ("conversation.manage", "own"),
         }
+
+
+def test_seed_removes_unexpected_builtin_and_menu_grants_but_keeps_custom_role(
+    session_factory,
+):
+    with session_factory() as session:
+        unit = Unit(code="unit-1", name="测试单位", status="active")
+        session.add(unit)
+        session.flush()
+        seed_builtin_catalogue(session, unit.id)
+        session.flush()
+
+        roles = {role.code: role for role in session.scalars(select(Role))}
+        menus = {menu.node_key: menu for menu in session.scalars(select(Menu))}
+        custom_role = Role(
+            code="custom_operator",
+            name="自定义操作员",
+            scope_type="project",
+            unit_id=unit.id,
+            built_in=False,
+            status="active",
+        )
+        session.add(custom_role)
+        session.flush()
+        custom_grant = RolePermission(
+            role_id=custom_role.id,
+            permission_code="identity.manage",
+            unit_id=unit.id,
+            data_scope="unit",
+        )
+        unexpected_viewer_grant = RolePermission(
+            role_id=roles["viewer"].id,
+            permission_code="identity.manage",
+            unit_id=unit.id,
+            data_scope="unit",
+        )
+        extra_dashboard_mapping = MenuPermission(
+            menu_id=menus["dashboard"].id,
+            permission_code="dashboard.read",
+        )
+        extra_chat_mapping = MenuPermission(
+            menu_id=menus["chat"].id,
+            permission_code="identity.read",
+        )
+        session.add_all(
+            [
+                custom_grant,
+                unexpected_viewer_grant,
+                extra_dashboard_mapping,
+                extra_chat_mapping,
+            ]
+        )
+        session.flush()
+
+        seed_builtin_catalogue(session, unit.id)
+        session.flush()
+
+        assert session.get(RolePermission, custom_grant.id) is not None
+        assert session.get(RolePermission, unexpected_viewer_grant.id) is None
+        assert session.get(MenuPermission, extra_dashboard_mapping.id) is None
+        assert session.get(MenuPermission, extra_chat_mapping.id) is None
+
+
+def test_seed_rejects_an_unexpected_builtin_role_code(session_factory):
+    with session_factory() as session:
+        unit = Unit(code="unit-1", name="测试单位", status="active")
+        session.add(unit)
+        session.flush()
+        session.add(
+            Role(
+                code="unexpected_builtin",
+                name="未登记内置角色",
+                scope_type="unit",
+                unit_id=unit.id,
+                built_in=True,
+                status="active",
+            )
+        )
+        session.flush()
+
+        with pytest.raises(ValueError, match="unexpected built-in role"):
+            seed_builtin_catalogue(session, unit.id)
 
 
 def test_seed_uses_closed_menu_catalogue_hierarchy_and_order(session_factory):
@@ -298,6 +457,57 @@ def test_builtin_role_and_permission_codes_cannot_be_renamed_or_deleted(
         with pytest.raises(ValueError, match="built-in"):
             session.commit()
         session.rollback()
+
+
+def test_permission_rename_then_delete_cannot_bypass_builtin_guard(session_factory):
+    with session_factory() as session:
+        unit = Unit(code="unit-1", name="测试单位", status="active")
+        session.add(unit)
+        session.flush()
+        seed_builtin_catalogue(session, unit.id)
+        session.commit()
+        permission = session.scalar(
+            select(Permission).where(Permission.code == "platform.read")
+        )
+
+        permission.code = "renamed"
+        session.delete(permission)
+
+        with pytest.raises(ValueError, match="built-in"):
+            session.commit()
+
+
+def test_builtin_false_then_delete_cannot_bypass_role_guard(session_factory):
+    with session_factory() as session:
+        unit = Unit(code="unit-1", name="测试单位", status="active")
+        session.add(unit)
+        session.flush()
+        seed_builtin_catalogue(session, unit.id)
+        session.commit()
+        role = session.scalar(select(Role).where(Role.code == "unit_admin"))
+
+        role.built_in = False
+        session.delete(role)
+
+        with pytest.raises(ValueError, match="built-in"):
+            session.commit()
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        update(Role).values(code="bulk_renamed"),
+        delete(Role),
+        update(Permission).values(code="bulk.renamed"),
+        delete(Permission),
+    ],
+)
+def test_orm_bulk_role_and_permission_mutations_fail_closed(
+    session_factory, statement
+):
+    with session_factory() as session:
+        with pytest.raises(ValueError, match="bulk"):
+            session.execute(statement)
 
 
 def test_bootstrap_creates_exact_binding_memberships_admin_role_and_redacted_audit(
@@ -375,6 +585,41 @@ def test_second_active_unit_membership_for_same_user_is_rejected(session_factory
         assert _count(session, UnitMembership) == 1
 
 
+def test_active_unit_membership_can_move_atomically_while_locking_user(
+    session_factory,
+):
+    with session_factory() as session:
+        user_id = bootstrap_initial_unit_admin(session, make_request())
+        second_unit = Unit(code="unit-2", name="第二单位", status="active")
+        session.add(second_unit)
+        session.flush()
+        session.user_lock_calls = 0
+        current_membership = session.scalar(
+            select(UnitMembership).where(UnitMembership.user_id == user_id)
+        )
+        current_membership.status = "inactive"
+        session.add(
+            UnitMembership(
+                user_id=user_id,
+                unit_id=second_unit.id,
+                status="active",
+            )
+        )
+
+        session.commit()
+
+        active_units = set(
+            session.scalars(
+                select(UnitMembership.unit_id).where(
+                    UnitMembership.user_id == user_id,
+                    UnitMembership.status == "active",
+                )
+            )
+        )
+        assert active_units == {second_unit.id}
+        assert session.user_lock_calls >= 1
+
+
 @pytest.mark.parametrize(
     "bootstrap_request",
     [
@@ -444,6 +689,36 @@ def test_audit_failure_rolls_back_catalogue_and_identity(session_factory):
         event.remove(AuditEvent, "before_insert", reject_audit)
 
 
+def test_database_error_is_rolled_back_and_sanitized_without_identity_values(
+    session_factory,
+):
+    secret = "secret-issuer-subject-marker"
+
+    def reject_identity(mapper, connection, target):
+        raise IntegrityError(
+            "INSERT external identity",
+            {"issuer": secret, "subject": secret},
+            Exception("simulated constraint failure"),
+        )
+
+    event.listen(ExternalIdentity, "before_insert", reject_identity)
+    try:
+        with session_factory() as session:
+            request = make_request(issuer=secret, subject=secret)
+
+            with pytest.raises(RuntimeError, match="^identity bootstrap failed$") as raised:
+                bootstrap_initial_unit_admin(session, request)
+
+            assert secret not in str(raised.value)
+            assert raised.value.__cause__ is None
+            assert raised.value.__suppress_context__ is True
+            assert session.rollback_calls == 1
+            assert _count(session, User) == 0
+            assert _count(session, ExternalIdentity) == 0
+    finally:
+        event.remove(ExternalIdentity, "before_insert", reject_identity)
+
+
 def test_cli_rejects_an_unprotected_json_request_file(tmp_path):
     request_file = tmp_path / "bootstrap.json"
     request_file.write_text(
@@ -468,6 +743,109 @@ def test_cli_rejects_an_unprotected_json_request_file(tmp_path):
         )
     else:
         request_file.chmod(0o644)
+
+    with pytest.raises(ValueError, match="protected JSON"):
+        _request_from_json(request_file)
+
+
+@pytest.mark.parametrize(
+    ("owner_sid", "expected"),
+    [
+        ("S-1-5-21-current", True),
+        ("S-1-5-21-arbitrary-owner", False),
+    ],
+)
+def test_windows_acl_requires_a_fixed_safe_owner(
+    monkeypatch, owner_sid, expected
+):
+    completed = SimpleNamespace(
+        stdout=json.dumps(
+            {
+                "current": "S-1-5-21-current",
+                "owner": owner_sid,
+                "allowed": ["S-1-5-21-current"],
+            }
+        )
+    )
+    monkeypatch.setattr(
+        bootstrap_module.subprocess,
+        "run",
+        lambda *args, **kwargs: completed,
+    )
+
+    assert _windows_acl_is_protected(Path("bootstrap.json")) is expected
+
+
+def test_protected_json_is_read_from_the_already_checked_descriptor(
+    tmp_path, monkeypatch
+):
+    request_file = tmp_path / "bootstrap.json"
+    request_file.write_text(
+        json.dumps(
+            {
+                "unit_code": "unit-1",
+                "unit_name": "测试单位",
+                "user_display_name": "初始管理员",
+                "issuer": "https://id.example/issuer/",
+                "subject": "Subject-1",
+                "initial_project_code": "project-1",
+                "initial_project_name": "初始项目",
+            }
+        ),
+        encoding="utf-8",
+    )
+    if os.name != "nt":
+        request_file.chmod(0o600)
+
+    def forbid_reopen(*args, **kwargs):
+        raise AssertionError("Path.read_text reopened the checked file")
+
+    monkeypatch.setattr(Path, "read_text", forbid_reopen)
+
+    request = _request_from_json(request_file)
+
+    assert request.subject == "Subject-1"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership and symlink contract")
+def test_posix_protected_json_rejects_a_symlink(tmp_path):
+    target = tmp_path / "target.json"
+    target.write_text("{}", encoding="utf-8")
+    target.chmod(0o600)
+    link = tmp_path / "bootstrap.json"
+    link.symlink_to(target)
+
+    with pytest.raises(ValueError, match="protected JSON"):
+        _request_from_json(link)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle identity contract")
+def test_windows_rejects_path_replacement_after_open(tmp_path, monkeypatch):
+    request_file = tmp_path / "bootstrap.json"
+    request_file.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        bootstrap_module,
+        "_windows_acl_is_protected",
+        lambda path: True,
+    )
+    monkeypatch.setattr(
+        bootstrap_module.os,
+        "fstat",
+        lambda descriptor: SimpleNamespace(
+            st_dev=1,
+            st_ino=1,
+            st_mode=stat.S_IFREG | 0o600,
+        ),
+    )
+    monkeypatch.setattr(
+        Path,
+        "stat",
+        lambda self, *args, **kwargs: SimpleNamespace(
+            st_dev=2,
+            st_ino=2,
+            st_mode=stat.S_IFREG | 0o600,
+        ),
+    )
 
     with pytest.raises(ValueError, match="protected JSON"):
         _request_from_json(request_file)
