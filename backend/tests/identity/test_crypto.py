@@ -1,4 +1,7 @@
+import base64
+
 import pytest
+from cryptography.exceptions import InvalidTag
 
 from app.identity.crypto import EnvelopeCipher, hash_opaque_token
 
@@ -23,8 +26,10 @@ def test_cipher_decrypts_ciphertext_written_by_a_previous_key():
 def test_tampered_aes_gcm_ciphertext_fails_authentication():
     cipher = EnvelopeCipher(current_key_id="k1", keys={"k1": bytes(range(32))})
     encrypted = cipher.encrypt(b"csrf-secret")
-    encrypted["ciphertext"] = encrypted["ciphertext"][:-1] + "A"
-    with pytest.raises(Exception):
+    ciphertext = bytearray(base64.urlsafe_b64decode(encrypted["ciphertext"] + "="))
+    ciphertext[0] ^= 1
+    encrypted["ciphertext"] = base64.urlsafe_b64encode(ciphertext).decode().rstrip("=")
+    with pytest.raises(InvalidTag):
         cipher.decrypt(encrypted)
 
 
