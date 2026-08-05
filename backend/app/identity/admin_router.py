@@ -31,6 +31,7 @@ from .schemas import (
     AdminUser,
     AssignIdentityRoleRequest, BindExternalIdentityRequest, CreateIdentityUserRequest,
     IdentityStatusRequest, UpdateIdentityUserRequest,
+    CreateProjectRequest, UpdateProjectRequest, ProjectStatusRequest,
 )
 
 router = APIRouter()
@@ -229,7 +230,7 @@ def assign_role(
     return {"user_id": user_id, "role_id": role.id, "project_id": project.id if project else None}
 @router.get("/units", response_model=list[AdminUnit])
 def list_units(
-    context: Annotated[RequestContext, Depends(identity_admin_context)],
+    context: RequestContext = Depends(identity_admin_context),
     session: Session = Depends(get_session),
 ) -> list[AdminUnit]:
     unit = session.scalar(select(Unit).where(Unit.id == context.unit_id))
@@ -238,7 +239,7 @@ def list_units(
 
 @router.get("/projects", response_model=list[AdminProject])
 def list_projects(
-    context: Annotated[RequestContext, Depends(identity_admin_context)],
+    context: RequestContext = Depends(identity_admin_context),
     session: Session = Depends(get_session),
 ) -> list[AdminProject]:
     rows = session.scalars(
@@ -247,9 +248,36 @@ def list_projects(
     return [AdminProject.model_validate(project, from_attributes=True) for project in rows]
 
 
+@router.post("/projects", response_model=AdminProject, status_code=status.HTTP_201_CREATED)
+def create_project(body: CreateProjectRequest, context: RequestContext = Depends(identity_admin_context), session: Session = Depends(get_session)) -> AdminProject:
+    if session.scalar(select(Project).where(Project.unit_id == context.unit_id, Project.code == body.code)) is not None:
+        raise HTTPException(status_code=409, detail="项目编码已存在")
+    project = Project(id=new_id(), unit_id=context.unit_id, code=body.code, name=body.name, status="active")
+    session.add(project); session.commit()
+    return AdminProject.model_validate(project, from_attributes=True)
+
+
+@router.patch("/projects/{project_id}", response_model=AdminProject)
+def update_project(project_id: str, body: UpdateProjectRequest, context: RequestContext = Depends(identity_admin_context), session: Session = Depends(get_session)) -> AdminProject:
+    project = _ensure_project(session, project_id, context.unit_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在或不属于当前单位")
+    project.name = body.name; session.commit()
+    return AdminProject.model_validate(project, from_attributes=True)
+
+
+@router.post("/projects/{project_id}/status", response_model=AdminProject)
+def set_project_status(project_id: str, body: ProjectStatusRequest, context: RequestContext = Depends(identity_admin_context), session: Session = Depends(get_session)) -> AdminProject:
+    project = _ensure_project(session, project_id, context.unit_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在或不属于当前单位")
+    project.status = body.status; session.commit()
+    return AdminProject.model_validate(project, from_attributes=True)
+
+
 @router.get("/roles", response_model=list[AdminRole])
 def list_roles(
-    context: Annotated[RequestContext, Depends(identity_admin_context)],
+    context: RequestContext = Depends(identity_admin_context),
     session: Session = Depends(get_session),
 ) -> list[AdminRole]:
     rows = session.scalars(
@@ -262,9 +290,8 @@ def list_roles(
 
 @router.get("/permissions", response_model=list[AdminPermission])
 def list_permissions(
-    context: Annotated[RequestContext, Depends(identity_admin_context)],
+    context: RequestContext = Depends(identity_admin_context),
     session: Session = Depends(get_session),
 ) -> list[AdminPermission]:
     rows = session.scalars(select(Permission).order_by(Permission.resource, Permission.action, Permission.code)).all()
     return [AdminPermission.model_validate(permission, from_attributes=True) for permission in rows]
-

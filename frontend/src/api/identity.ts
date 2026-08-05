@@ -63,3 +63,8 @@ export function createIdentityUser(body: { display_name: string; email?: string 
 export function setIdentityUserStatus(userId: string, status: 'active' | 'inactive'): Promise<IdentityUser> {
   return request<IdentityUser>(`/identity/users/${encodeURIComponent(userId)}/status`, { method: 'POST', body: JSON.stringify({ status }) });
 }
+
+export interface IdentityProject { id: string; unit_id: string; code: string; name: string; status: string }
+export function listIdentityProjects(signal?: AbortSignal): Promise<IdentityProject[]> { return request<IdentityProject[]>('/identity/projects', { signal }); }
+export function createIdentityProject(body: { code: string; name: string }): Promise<IdentityProject> { return request<IdentityProject>('/identity/projects', { method: 'POST', body: JSON.stringify(body) }); }
+export function setIdentityProjectStatus(projectId: string, status: 'active' | 'inactive'): Promise<IdentityProject> { return request<IdentityProject>(`/identity/projects/${encodeURIComponent(projectId)}/status`, { method: 'POST', body: JSON.stringify({ status }) }); }

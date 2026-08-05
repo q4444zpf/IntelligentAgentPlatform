@@ -135,3 +135,16 @@ class BindExternalIdentityRequest(BaseModel):
 class AssignIdentityRoleRequest(BaseModel):
     role_id: str = Field(min_length=1, max_length=36)
     project_id: str | None = None
+
+
+class CreateProjectRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=160)
+
+
+class UpdateProjectRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+
+
+class ProjectStatusRequest(BaseModel):
+    status: Literal["active", "inactive"]
