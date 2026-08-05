@@ -31,6 +31,8 @@ services:
         condition: service_healthy
     volumes:
       - model-provider-data:/data
+    ports:
+      - "8000:8000"
     restart: unless-stopped
     healthcheck:
       test:
