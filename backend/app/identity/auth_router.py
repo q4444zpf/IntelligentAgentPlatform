@@ -1,5 +1,9 @@
 import hashlib
 import secrets
+import base64
+import hashlib as _hashlib
+from urllib.parse import urlencode
+import httpx
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
@@ -10,7 +14,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_session
 from app.core.settings import settings
 
-from .models import AuthSession, Project, UnitMembership, User, new_id
+from .models import AuthSession, OidcLoginTransaction, Project, UnitMembership, User, new_id
 
 router = APIRouter()
 SESSION_COOKIE = "iap_session"
@@ -18,12 +22,26 @@ SESSION_COOKIE = "iap_session"
 def _hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
+async def _oidc_metadata() -> dict:
+    if not settings.oidc_issuer:
+        raise HTTPException(status_code=503, detail="OIDC is not configured")
+    url = settings.oidc_issuer.rstrip("/") + "/.well-known/openid-configuration"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(settings.oidc_read_timeout_seconds, connect=settings.oidc_connect_timeout_seconds)) as client:
+            response = await client.get(url); response.raise_for_status(); payload = response.json()
+    except (httpx.HTTPError, ValueError) as error:
+        raise HTTPException(status_code=503, detail="OIDC discovery failed") from error
+    if payload.get("issuer") != settings.oidc_issuer:
+        raise HTTPException(status_code=503, detail="OIDC issuer mismatch")
+    return payload
+
 @router.get("/login")
-def oidc_login() -> dict[str, str]:
+async def oidc_login() -> dict[str, str]:
     if not settings.oidc_issuer or not settings.oidc_client_id or not settings.oidc_redirect_uri:
         raise HTTPException(status_code=503, detail="OIDC is not configured")
-    state = secrets.token_urlsafe(32)
-    return {"status": "oidc_configuration_ready", "issuer": settings.oidc_issuer, "client_id": settings.oidc_client_id, "state": state}
+    metadata = await _oidc_metadata(); state = secrets.token_urlsafe(32); nonce = secrets.token_urlsafe(32); verifier = secrets.token_urlsafe(48)
+    challenge = base64.urlsafe_b64encode(_hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    return {"status": "oidc_authorization_ready", "state": state, "nonce": nonce, "code_challenge": challenge, "authorization_url": metadata["authorization_endpoint"] + "?" + urlencode({"response_type": "code", "client_id": settings.oidc_client_id, "redirect_uri": settings.oidc_redirect_uri, "scope": settings.oidc_scope, "state": state, "nonce": nonce, "code_challenge": challenge, "code_challenge_method": "S256"})}
 
 @router.get("/callback")
 def oidc_callback() -> dict[str, str]:
