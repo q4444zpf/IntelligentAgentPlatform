@@ -8,7 +8,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine, delete, event, func, select, update
+from sqlalchemy import create_engine, delete, event, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -508,6 +508,75 @@ def test_orm_bulk_role_and_permission_mutations_fail_closed(
     with session_factory() as session:
         with pytest.raises(ValueError, match="bulk"):
             session.execute(statement)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        update(UnitMembership).values(status="active"),
+        delete(UnitMembership),
+    ],
+)
+def test_orm_bulk_unit_membership_mutations_cannot_bypass_single_active_rule(
+    session_factory, statement
+):
+    with session_factory() as session:
+        user_id = bootstrap_initial_unit_admin(session, make_request())
+        second_unit = Unit(code="unit-2", name="第二单位", status="active")
+        session.add(second_unit)
+        session.flush()
+        session.add(
+            UnitMembership(
+                user_id=user_id,
+                unit_id=second_unit.id,
+                status="inactive",
+            )
+        )
+        session.commit()
+
+        with pytest.raises(
+            ValueError,
+            match="^bulk unit membership mutations are not allowed$",
+        ):
+            session.execute(statement)
+
+
+def test_orm_bulk_unit_membership_insert_cannot_bypass_single_active_rule(
+    session_factory,
+):
+    with session_factory() as session:
+        user_id = bootstrap_initial_unit_admin(session, make_request())
+        second_unit = Unit(code="unit-2", name="第二单位", status="active")
+        session.add(second_unit)
+        session.commit()
+
+        with pytest.raises(
+            ValueError,
+            match="^bulk unit membership mutations are not allowed$",
+        ):
+            session.execute(
+                insert(UnitMembership),
+                [
+                    {
+                        "id": "bulk-membership",
+                        "user_id": user_id,
+                        "unit_id": second_unit.id,
+                        "status": "active",
+                    }
+                ],
+            )
+
+
+def test_project_membership_bulk_update_is_not_blocked_by_unit_single_active_rule(
+    session_factory,
+):
+    with session_factory() as session:
+        bootstrap_initial_unit_admin(session, make_request())
+
+        session.execute(update(ProjectMembership).values(status="inactive"))
+        session.commit()
+
+        assert session.scalar(select(ProjectMembership)).status == "inactive"
 
 
 def test_bootstrap_creates_exact_binding_memberships_admin_role_and_redacted_audit(

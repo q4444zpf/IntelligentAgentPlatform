@@ -253,10 +253,20 @@ def _protect_builtin_codes(session: Session, flush_context, instances) -> None:
 
 
 def _protect_bulk_role_and_permission_mutations(execute_state) -> None:
-    if not (execute_state.is_update or execute_state.is_delete):
+    if not (
+        execute_state.is_insert
+        or execute_state.is_update
+        or execute_state.is_delete
+    ):
         return
     description = getattr(execute_state.statement, "entity_description", {})
-    if description.get("entity") in {Role, Permission}:
+    entity = description.get("entity")
+    if entity is UnitMembership:
+        raise ValueError("bulk unit membership mutations are not allowed")
+    if (execute_state.is_update or execute_state.is_delete) and entity in {
+        Role,
+        Permission,
+    }:
         raise ValueError("bulk role and permission mutations are not allowed")
 
 
