@@ -110,3 +110,28 @@ class AdminPermission(BaseModel):
     action: str
     risk_level: str
     status: str
+
+
+class CreateIdentityUserRequest(BaseModel):
+    display_name: str = Field(min_length=1, max_length=160)
+    email: str | None = Field(default=None, max_length=320)
+    project_id: str | None = None
+
+
+class UpdateIdentityUserRequest(BaseModel):
+    display_name: str = Field(min_length=1, max_length=160)
+    email: str | None = Field(default=None, max_length=320)
+
+
+class IdentityStatusRequest(BaseModel):
+    status: Literal["active", "inactive"]
+
+
+class BindExternalIdentityRequest(BaseModel):
+    issuer: str = Field(min_length=1, max_length=512)
+    subject: str = Field(min_length=1, max_length=255)
+
+
+class AssignIdentityRoleRequest(BaseModel):
+    role_id: str = Field(min_length=1, max_length=36)
+    project_id: str | None = None

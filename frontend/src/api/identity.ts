@@ -55,3 +55,11 @@ export function listIdentityRoles(signal?: AbortSignal): Promise<IdentityRole[]>
 export function listIdentityPermissions(signal?: AbortSignal): Promise<IdentityPermission[]> {
   return request<IdentityPermission[]>('/identity/permissions', { signal });
 }
+
+export function createIdentityUser(body: { display_name: string; email?: string | null; project_id?: string | null }): Promise<IdentityUser> {
+  return request<IdentityUser>('/identity/users', { method: 'POST', body: JSON.stringify(body) });
+}
+
+export function setIdentityUserStatus(userId: string, status: 'active' | 'inactive'): Promise<IdentityUser> {
+  return request<IdentityUser>(`/identity/users/${encodeURIComponent(userId)}/status`, { method: 'POST', body: JSON.stringify({ status }) });
+}

@@ -8,7 +8,7 @@
         </div>
         <a-space>
           <a-button :loading="loading" @click="loadUsers">刷新</a-button>
-          <a-button type="primary" disabled>新建用户</a-button>
+          <a-button type="primary" @click="openCreate">新建用户</a-button>
         </a-space>
       </div>
 
@@ -47,8 +47,9 @@
             {{ statusText(record.membership_status) }}
           </a-tag>
           <a-space v-else-if="column.key === 'action'">
-            <a class="disabled-action">查看</a>
-            <a class="disabled-action">授权</a>
+            <a-popconfirm title="确认切换用户状态？" @confirm="toggleStatus(record)">
+              <a :class="{ 'disabled-action': savingId === record.id }">{{ record.status === 'active' ? '停用' : '启用' }}</a>
+            </a-popconfirm>
           </a-space>
         </template>
         <template #emptyText>
@@ -56,6 +57,12 @@
         </template>
       </a-table>
     </a-card>
+    <a-modal v-model:open="createOpen" title="新建用户" :confirm-loading="creating" @ok="submitCreate">
+      <a-form layout="vertical">
+        <a-form-item label="用户名称"><a-input v-model:value="createForm.display_name" /></a-form-item>
+        <a-form-item label="邮箱"><a-input v-model:value="createForm.email" /></a-form-item>
+      </a-form>
+    </a-modal>
   </div>
 </template>
 
@@ -63,12 +70,16 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 
 import { ApiError } from '@/api/client';
-import { listIdentityUsers, type IdentityUser } from '@/api/identity';
+import { createIdentityUser, listIdentityUsers, setIdentityUserStatus, type IdentityUser } from '@/api/identity';
 
 const users = ref<IdentityUser[]>([]);
 const loading = ref(false);
 const errorMessage = ref('');
 let controller: AbortController | null = null;
+const createOpen = ref(false);
+const creating = ref(false);
+const savingId = ref<string | null>(null);
+const createForm = ref({ display_name: '', email: '' });
 
 const metrics = computed(() => [
   { label: '用户数', value: users.value.length, hint: '当前单位', color: 'blue' },
@@ -90,6 +101,23 @@ function statusText(status: string): string {
 
 function statusColor(status: string): string {
   return status === 'active' ? 'green' : 'default';
+}
+
+function openCreate(): void { createForm.value = { display_name: '', email: '' }; createOpen.value = true; }
+
+async function submitCreate(): Promise<void> {
+  if (!createForm.value.display_name.trim()) return;
+  creating.value = true;
+  try { await createIdentityUser({ display_name: createForm.value.display_name.trim(), email: createForm.value.email || null }); createOpen.value = false; await loadUsers(); }
+  catch (error) { errorMessage.value = error instanceof ApiError ? error.message : '创建用户失败'; }
+  finally { creating.value = false; }
+}
+
+async function toggleStatus(user: IdentityUser): Promise<void> {
+  savingId.value = user.id;
+  try { await setIdentityUserStatus(user.id, user.status === 'active' ? 'inactive' : 'active'); await loadUsers(); }
+  catch (error) { errorMessage.value = error instanceof ApiError ? error.message : '更新用户状态失败'; }
+  finally { savingId.value = null; }
 }
 
 async function loadUsers(): Promise<void> {
