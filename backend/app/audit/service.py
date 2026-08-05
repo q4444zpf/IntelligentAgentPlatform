@@ -1,5 +1,6 @@
 from app.core.request_context import RequestContext
 
+from .models import AuditEvent
 from .policy import audit_scope_filters
 from .repository import AuditRepository
 from .schemas import AuditEventDetail, AuditEventListItem, AuditEventPage
@@ -13,10 +14,14 @@ class AuditService:
     def __init__(self, repository: AuditRepository):
         self.repository = repository
 
+    @staticmethod
+    def _list_item(event: AuditEvent) -> AuditEventListItem:
+        return AuditEventListItem.model_validate(event)
+
     def list_events(self, context: RequestContext, **filters) -> AuditEventPage:
         result = self.repository.list_events(audit_scope_filters(context), **filters)
         return AuditEventPage(
-            items=[AuditEventListItem.model_validate(item) for item in result.items],
+            items=[self._list_item(item) for item in result.items],
             page=result.page, page_size=result.page_size, total=result.total,
             summary=result.summary,
         )
@@ -32,4 +37,4 @@ class AuditService:
         related = self.repository.list_related(event_id, scope)
         if not related:
             raise AuditEventNotFound(event_id)
-        return [AuditEventListItem.model_validate(item) for item in related]
+        return [self._list_item(item) for item in related]

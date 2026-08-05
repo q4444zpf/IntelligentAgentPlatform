@@ -24,7 +24,9 @@ class ProviderService:
         try:
             self.audit_recorder.record(session, AuditRecordRequest(
                 unit_id=context.unit_id, project_id=context.project_id, user_id=context.user_id,
-                actor_role=context.actor_role, trace_id=management_trace_id(request_id), category="management", source="llm", action=action,
+                actor_roles=context.role_codes, authorization_scope="project",
+                event_scope="project", trace_id=management_trace_id(request_id),
+                category="management", source="llm", action=action,
                 status="succeeded", risk_level=risk_level, resource_type="model_provider",
                 resource_id=resource_id, resource_name=resource_name,
                 summary=f"Model provider resource {resource_id} management operation succeeded",
@@ -114,7 +116,9 @@ class ProviderService:
             self.store.save_in_session(session, state)
             self.audit_recorder.record(session, AuditRecordRequest(
                 unit_id=context.unit_id, project_id=context.project_id, user_id=context.user_id,
-                actor_role=context.actor_role, trace_id=management_trace_id(request_id), category="management", source="llm",
+                actor_roles=context.role_codes, authorization_scope="project",
+                event_scope="project", trace_id=management_trace_id(request_id),
+                category="management", source="llm",
                 action="resource.updated", status="succeeded", risk_level="high",
                 resource_type="model_provider", resource_id=provider_id,
                 resource_name=provider.name, summary=f"Model provider {provider_id} was updated",

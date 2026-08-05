@@ -67,7 +67,9 @@ def make_request(*, key: str, run_id: str) -> AuditRecordRequest:
         unit_id="integration-unit",
         project_id="integration-project",
         user_id="integration-user",
-        actor_role="unknown",
+        actor_roles=(),
+        authorization_scope="project",
+        event_scope="project",
         category="runtime",
         source="agent",
         action="agent.run_snapshot",
@@ -201,6 +203,7 @@ def test_backfill_returns_zero_when_another_transaction_wins_the_unique_key():
                     trigger_message_id=message_id,
                     actor_type="agent",
                     actor_id="integration-agent",
+                    actor_roles_json=[],
                     status="completed",
                 )
             )

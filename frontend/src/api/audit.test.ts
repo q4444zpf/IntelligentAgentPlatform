@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { auditApi } from './audit';
+import { auditApi, type AuditEventListItem } from './audit';
 import { ApiError, request } from './client';
 
 vi.mock('./client', async (importOriginal) => {
@@ -10,6 +10,20 @@ vi.mock('./client', async (importOriginal) => {
 
 describe('auditApi', () => {
   beforeEach(() => vi.clearAllMocks());
+
+  it('preserves the stable role snapshot and authentication scope fields', async () => {
+    const event: AuditEventListItem = {
+      id: 'event-1', unit_id: 'unit-1', project_id: null, user_id: 'user-1',
+      actor_roles: ['unit_admin', 'user'], authorization_scope: 'unit',
+      event_scope: 'unit', auth_method: 'oidc', category: 'security', source: 'auth',
+      action: 'auth.login.succeeded', status: 'succeeded', risk_level: 'medium',
+      trace_id: null, run_id: null, resource_type: 'user', resource_id: 'user-1',
+      resource_name: null, duration_ms: null, occurred_at: '2026-08-04T00:00:00Z',
+    };
+    vi.mocked(request).mockResolvedValue(event);
+
+    await expect(auditApi.get('event-1')).resolves.toEqual(event);
+  });
 
   it('omits absent and empty filters without a trailing question mark', async () => {
     vi.mocked(request).mockResolvedValue({});

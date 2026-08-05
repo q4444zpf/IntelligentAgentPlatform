@@ -1,6 +1,7 @@
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
+import re
 from typing import Any
 
 from sqlalchemy import select
@@ -12,9 +13,14 @@ from app.audit.redaction import redact_metadata, redact_summary
 
 
 _ENUMS = {
-    "category": {"runtime", "management"},
+    "authorization_scope": {
+        "platform", "unit", "project", "own", "emergency", "system",
+    },
+    "event_scope": {"platform", "unit", "project"},
+    "category": {"runtime", "management", "security"},
     "source": {
         "agent", "tool", "mcp", "knowledge", "sandbox", "llm", "system",
+        "auth",
     },
     "status": {"started", "succeeded", "failed", "cancelled"},
     "risk_level": {"low", "medium", "high", "critical"},
@@ -23,7 +29,9 @@ _LENGTHS = {
     "unit_id": 64,
     "project_id": 64,
     "user_id": 64,
-    "actor_role": 40,
+    "authorization_scope": 20,
+    "event_scope": 20,
+    "auth_method": 20,
     "category": 30,
     "source": 30,
     "action": 100,
@@ -38,27 +46,28 @@ _LENGTHS = {
     "error_code": 120,
     "idempotency_key": 180,
 }
-_ACTOR_ROLES = frozenset({"user", "project_admin", "unit_auditor"})
+_ROLE_CODE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 
 
-def normalize_actor_role(value: str | None) -> str:
-    if value is None or value == "unknown":
-        return "unknown"
-    roles = value.split(",")
-    if any(not role or role.strip() != role for role in roles):
-        raise ValueError("invalid actor_role")
-    role_set = frozenset(roles)
-    if len(role_set) != len(roles) or not role_set <= _ACTOR_ROLES:
-        raise ValueError("invalid actor_role")
-    normalized = ",".join(sorted(role_set))
-    if value != normalized:
-        raise ValueError("actor_role must use deterministic sorted roles")
-    return normalized
+def normalize_actor_roles(value: tuple[str, ...]) -> list[str]:
+    if not isinstance(value, tuple):
+        raise ValueError("actor_roles must be a tuple of role codes")
+    for role in value:
+        if (
+            not isinstance(role, str)
+            or role.strip() != role
+            or _ROLE_CODE.fullmatch(role) is None
+        ):
+            raise ValueError("actor_roles contains an invalid role code")
+    return sorted(set(value))
 
 
 @dataclass(frozen=True)
 class AuditRecordRequest:
-    unit_id: str
+    unit_id: str | None
+    actor_roles: tuple[str, ...]
+    authorization_scope: str
+    event_scope: str
     category: str
     source: str
     action: str
@@ -68,7 +77,7 @@ class AuditRecordRequest:
     occurred_at: datetime
     project_id: str | None = None
     user_id: str | None = None
-    actor_role: str | None = None
+    auth_method: str | None = None
     trace_id: str | None = None
     run_id: str | None = None
     parent_event_id: str | None = None
@@ -89,10 +98,10 @@ class AuditRecordResult:
 
 
 def _validate(request: AuditRecordRequest) -> None:
-    normalize_actor_role(request.actor_role)
+    normalize_actor_roles(request.actor_roles)
     required_strings = (
-        "unit_id", "category", "source", "action", "status", "risk_level",
-        "idempotency_key",
+        "authorization_scope", "event_scope", "category", "source", "action",
+        "status", "risk_level", "idempotency_key",
     )
     for field_name in required_strings:
         value = getattr(request, field_name)
@@ -117,6 +126,23 @@ def _validate(request: AuditRecordRequest) -> None:
     for field_name, allowed in _ENUMS.items():
         if getattr(request, field_name) not in allowed:
             raise ValueError(f"invalid {field_name}")
+    if request.event_scope == "platform":
+        if request.unit_id is not None:
+            raise ValueError("unit_id must be null for platform events")
+        if request.project_id is not None:
+            raise ValueError("project_id must be null for platform events")
+    elif request.event_scope == "unit":
+        if not isinstance(request.unit_id, str) or not request.unit_id:
+            raise ValueError("unit_id is required for unit events")
+        if request.project_id is not None:
+            raise ValueError("project_id must be null for unit events")
+    else:
+        if not isinstance(request.unit_id, str) or not request.unit_id:
+            raise ValueError("unit_id is required for project events")
+        if not isinstance(request.project_id, str) or not request.project_id:
+            raise ValueError("project_id is required for project events")
+    if request.auth_method == "":
+        raise ValueError("auth_method must be null or a non-empty string")
     for field_name, max_length in _LENGTHS.items():
         value = getattr(request, field_name)
         if value is not None and len(value) > max_length:
@@ -164,7 +190,10 @@ class AuditRecorder:
             unit_id=request.unit_id,
             project_id=request.project_id,
             user_id=request.user_id,
-            actor_role=normalize_actor_role(request.actor_role),
+            actor_roles_json=normalize_actor_roles(request.actor_roles),
+            authorization_scope=request.authorization_scope,
+            event_scope=request.event_scope,
+            auth_method=request.auth_method,
             category=request.category,
             source=request.source,
             action=request.action,

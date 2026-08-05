@@ -10,7 +10,7 @@ const mocks = vi.hoisted(() => ({ list: vi.fn(), get: vi.fn(), related: vi.fn(),
 vi.mock('@/api/audit', () => ({ auditApi: { list: mocks.list, get: mocks.get, related: mocks.related } }));
 vi.mock('vue-router', () => ({ useRouter: () => ({ push: mocks.push }) }));
 
-const event = (id = 'audit-1', overrides = {}) => ({ id, unit_id: 'unit-1', project_id: 'project-1', user_id: 'operator-1', actor_role: 'project_admin,user', category: 'runtime', source: 'agent', action: 'agent.run', status: 'succeeded', risk_level: 'low', trace_id: 'trace-1', run_id: 'run-1', resource_type: 'agent', resource_id: 'reservoir-agent', resource_name: '水库调度智能体', duration_ms: 320, occurred_at: '2026-08-03T01:02:03Z', ...overrides });
+const event = (id = 'audit-1', overrides = {}) => ({ id, unit_id: 'unit-1', project_id: 'project-1', user_id: 'operator-1', actor_roles: ['project_admin', 'user'], authorization_scope: 'project', event_scope: 'project', auth_method: null, category: 'runtime', source: 'agent', action: 'agent.run', status: 'succeeded', risk_level: 'low', trace_id: 'trace-1', run_id: 'run-1', resource_type: 'agent', resource_id: 'reservoir-agent', resource_name: '水库调度智能体', duration_ms: 320, occurred_at: '2026-08-03T01:02:03Z', ...overrides });
 const page = (items = [event()]) => ({ items, page: 1, page_size: 20, total: items.length, summary: { total: 12, failed: 2, high_risk: 3, runtime: 9, management: 3, by_source: { agent: 7 } } });
 const detail = (id = 'audit-1') => ({ ...event(id), parent_event_id: null, summary: '<script>unsafe</script>', metadata: { token: '[REDACTED]' }, error_code: null, created_at: '2026-08-03T01:02:04Z' });
 function deferred<T>() { let resolve!: (value: T) => void; let reject!: (reason?: unknown) => void; const promise = new Promise<T>((ok, fail) => { resolve = ok; reject = fail; }); return { promise, resolve, reject }; }
@@ -56,8 +56,18 @@ describe('AuditLogView list', () => {
       '时间', '类别', '来源', '动作', '操作人', '项目', '对象', '结果', '风险', '耗时', '详情',
     ]);
     expect(wrapper.text()).toContain('operator-1');
+    expect(wrapper.text()).toContain('project_admin, user');
     expect(wrapper.text()).toContain('project-1');
     expect(wrapper.text()).toContain('320 ms');
+  });
+
+  it('renders an unknown legacy role snapshot without an administrator fallback', async () => {
+    mocks.list.mockResolvedValue(page([event('unknown-role', { actor_roles: [] })]));
+
+    const wrapper = render(); await flushPromises();
+
+    expect(wrapper.get('tbody tr').findAll('td')[4].find('small').text()).toBe('-');
+    expect(wrapper.get('tbody tr').text()).not.toContain('admin');
   });
 
   it.each([

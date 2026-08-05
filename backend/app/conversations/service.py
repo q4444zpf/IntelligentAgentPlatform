@@ -139,7 +139,7 @@ class ConversationService:
                 trigger_message_id=message.id,
                 actor_type=request.actor_type,
                 actor_id=actor_id,
-                actor_role=context.actor_role,
+                actor_roles_json=list(context.role_codes),
                 status="queued",
             )
         )
@@ -158,7 +158,9 @@ class ConversationService:
                     unit_id=context.unit_id,
                     project_id=context.project_id,
                     user_id=context.user_id,
-                    actor_role=context.actor_role,
+                    actor_roles=context.role_codes,
+                    authorization_scope="project",
+                    event_scope="project",
                     category="runtime",
                     source="agent",
                     action="agent.run.created",

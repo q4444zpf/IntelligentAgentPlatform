@@ -8,7 +8,9 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from .models import AuditEvent
 
-_AUDIT_SOURCES = ("agent", "tool", "mcp", "knowledge", "sandbox", "llm", "system")
+_AUDIT_SOURCES = (
+    "agent", "tool", "mcp", "knowledge", "sandbox", "llm", "system", "auth",
+)
 
 
 

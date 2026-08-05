@@ -19,6 +19,8 @@ def session():
 def event(event_id, *, minute=0, unit="u1", project="p1", user="alice", **values):
     defaults = dict(
         id=event_id, unit_id=unit, project_id=project, user_id=user,
+        actor_roles_json=["user"], authorization_scope="project",
+        event_scope="project", auth_method=None,
         category="runtime", source="agent", action="agent.run.completed",
         status="succeeded", risk_level="low", trace_id="shared",
         run_id=f"run-{event_id}", resource_type="agent", resource_id=f"res-{event_id}",
@@ -62,15 +64,16 @@ def test_repository_filters_searches_literal_wildcards_and_summarizes_full_set(s
         event("b", minute=2, category="management", source="system", action="resource.updated", duration_ms=None),
         event("c", minute=2, source="llm", risk_level="high"),
         event("d", minute=0, category="management", source="system", risk_level="critical"),
+        event("e", minute=0, category="security", source="auth", action="auth.login.succeeded"),
     ])
     session.commit()
     repository = AuditRepository(session)
     scope = [AuditEvent.unit_id == "u1", AuditEvent.project_id == "p1"]
     page = repository.list_events(scope, page=1, page_size=1)
     assert [item.id for item in page.items] == ["c"]
-    assert page.total == 4
-    assert page.summary == {"total": 4, "failed": 1, "high_risk": 3, "runtime": 2,
-                            "management": 2, "by_source": {"llm": 1, "system": 2, "tool": 1}}
+    assert page.total == 5
+    assert page.summary == {"total": 5, "failed": 1, "high_risk": 3, "runtime": 2,
+                            "management": 2, "by_source": {"auth": 1, "llm": 1, "system": 2, "tool": 1}}
     assert [item.id for item in repository.list_events(scope, page=1, page_size=20, query=r"%_\\").items] == ["a"]
     assert repository.list_events(scope, page=1, page_size=20, query="safe").items == []
 

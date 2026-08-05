@@ -18,6 +18,23 @@ python -m uvicorn app.main:app --reload --port 8000
 
 根目录 Compose 同样默认关闭开发身份。需要在容器化本机环境调试会话或审计页面时，必须同时显式设置 `IAP_ALLOW_DEV_IDENTITY=true`、`VITE_DEV_UNIT_ID`、`VITE_DEV_USER_ID`、`VITE_DEV_PROJECT_ID` 和 `VITE_DEV_USER_ROLES` 并重新构建 Web 镜像；`VITE_DEV_USER_ROLES` 是逗号分隔的 `user`、`project_admin`、`unit_auditor` 集合。这些变量只用于非敏感测试身份，不得用于生产部署。
 
+## 首个单位管理员
+
+数据库迁移完成后，在离线维护窗口执行一次 bootstrap。默认命令逐项交互读取单位、初始项目、显示名以及原始 OIDC issuer/subject，不创建普通用户密码：
+
+```powershell
+cd backend
+python -m app.identity.bootstrap
+```
+
+自动化环境可改用仅限执行账号读取的 JSON 文件，并通过 `--request-file` 传入。文件必须恰好包含 `unit_code`、`unit_name`、`user_display_name`、`issuer`、`subject`、`initial_project_code` 和 `initial_project_name`；不要加入密码或令牌。Windows 上应先移除继承权限并只向执行账号授予读取权限，POSIX 上文件模式必须为 `0600`：
+
+```powershell
+python -m app.identity.bootstrap --request-file .\bootstrap-request.json
+```
+
+命令在一个事务中创建单位、项目、成员关系、原始外部身份绑定、内置授权目录和脱敏安全审计；任何失败都会整体回滚。issuer 与 subject 按输入原文保存，不会修剪、折叠大小写或规范化末尾斜杠。
+
 ## 会话和运行接口
 
 - `POST /api/conversations`
@@ -48,7 +65,7 @@ python -m uvicorn app.main:app --reload --port 8000
 
 读取范围由服务端角色约束：`unit_auditor` 可读当前单位，`project_admin` 可读当前项目，普通 `user` 仅可读当前项目中的本人事件；客户端筛选不能扩大该范围。详情和关联事件对“不存在”与“越权”统一返回安全 404，避免暴露资源是否存在。
 
-审计事件的 `actor_role` 是发生时角色快照：真实角色按字典序用逗号连接（如 `project_admin,user`），历史身份无法可靠还原时为 `unknown`；不得写入兼容值 `admin` 或 Agent 的 `actor_type`。
+审计事件和 Agent 运行使用排序稳定的 `actor_roles` 角色代码数组作为发生时快照；历史身份无法可靠还原时保存空数组，不得伪造管理员角色或写入 Agent 的 `actor_type`。审计事件同时持久化 `authorization_scope` 与 `event_scope`；平台事件不带单位/项目，单位事件只带单位，项目事件同时带单位和项目。认证事件使用 `category=security`、`source=auth`，并可记录 `auth_method`。
 
 审计记录是追加写入的独立事件，不提供更新或删除 API。写入前仅保留显式允许的元数据字段，并按敏感字段名递归脱敏、限制层级与大小；不得将凭据、口令、客户数据或原始 Prompt 写入摘要或元数据。当前已接入 Agent、tool、LLM 运行事件及 Agent、MCP、Tool、模型供应商等选定管理操作。知识库真实审计、真实 MCP 执行、沙箱审计、导出、保留期自动化和事件总线尚未实现。
 

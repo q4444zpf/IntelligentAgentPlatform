@@ -25,6 +25,7 @@ def seed_run(
     project_id: str,
     user_id: str,
     status: str,
+    actor_roles: list[str] | None = None,
 ) -> None:
     conversation_id = f"conversation-{run_id}"
     message_id = f"message-{run_id}"
@@ -53,6 +54,7 @@ def seed_run(
             trigger_message_id=message_id,
             actor_type="agent",
             actor_id=f"agent-{run_id}",
+            actor_roles_json=actor_roles or [],
             status=status,
             created_at=datetime(2026, 8, 1, 8, 30, tzinfo=timezone.utc),
         )
@@ -68,6 +70,7 @@ def test_backfills_terminal_runs_with_scope_status_and_safe_content(session_fact
             project_id="project-river",
             user_id="user-one",
             status="completed",
+            actor_roles=["project_admin", "user"],
         )
         seed_run(
             session,
@@ -108,7 +111,12 @@ def test_backfills_terminal_runs_with_scope_status_and_safe_content(session_fact
         assert "prompt secret" not in serialized
         assert "sensitive trigger input" not in serialized
         assert event.idempotency_key == f"audit-backfill:agent:{event.run_id}"
-        assert event.actor_role == "unknown"
+    assert completed.actor_roles_json == ["project_admin", "user"]
+    assert failed.actor_roles_json == []
+    for event in events:
+        assert event.authorization_scope == "project"
+        assert event.event_scope == "project"
+        assert event.auth_method is None
 
 
 def test_backfill_is_idempotent_and_does_not_skip_runs_at_batch_boundaries(

@@ -26,8 +26,26 @@ class AuditEvent(Base):
     __tablename__ = "audit_events"
     __table_args__ = (
         CheckConstraint(
-            "actor_role IN ('unknown','user','project_admin','unit_auditor','project_admin,user','project_admin,unit_auditor','unit_auditor,user','project_admin,unit_auditor,user')",
-            name="ck_audit_actor_role",
+            "authorization_scope IN ('platform','unit','project','own','emergency','system')",
+            name="ck_audit_authorization_scope",
+        ),
+        CheckConstraint(
+            "event_scope IN ('platform','unit','project')",
+            name="ck_audit_event_scope",
+        ),
+        CheckConstraint(
+            "(event_scope = 'platform' AND unit_id IS NULL AND project_id IS NULL) OR "
+            "(event_scope = 'unit' AND unit_id IS NOT NULL AND project_id IS NULL) OR "
+            "(event_scope = 'project' AND unit_id IS NOT NULL AND project_id IS NOT NULL)",
+            name="ck_audit_event_scope_ids",
+        ),
+        CheckConstraint(
+            "category IN ('runtime','management','security')",
+            name="ck_audit_category",
+        ),
+        CheckConstraint(
+            "source IN ('agent','tool','mcp','knowledge','sandbox','llm','system','auth')",
+            name="ck_audit_source",
         ),
         UniqueConstraint(
             "idempotency_key",
@@ -60,10 +78,17 @@ class AuditEvent(Base):
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    unit_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    unit_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     project_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    actor_role: Mapped[str] = mapped_column(String(40), nullable=False, default="unknown")
+    actor_roles_json: Mapped[list[str]] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+    )
+    authorization_scope: Mapped[str] = mapped_column(String(20), nullable=False)
+    event_scope: Mapped[str] = mapped_column(String(20), nullable=False)
+    auth_method: Mapped[str | None] = mapped_column(String(20), nullable=True)
     category: Mapped[str] = mapped_column(String(30), nullable=False)
     source: Mapped[str] = mapped_column(String(30), nullable=False)
     action: Mapped[str] = mapped_column(String(100), nullable=False)

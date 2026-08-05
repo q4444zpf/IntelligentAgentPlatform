@@ -80,7 +80,8 @@ class ToolService:
             enabled = bool(updated["enabled"])
             self.audit_recorder.record(session, AuditRecordRequest(
                 unit_id=context.unit_id, project_id=context.project_id,
-                user_id=context.user_id, actor_role=context.actor_role,
+                user_id=context.user_id, actor_roles=context.role_codes,
+                authorization_scope="project", event_scope="project",
                 trace_id=management_trace_id(request_id), category="management", source="tool",
                 action="resource.enabled" if enabled else "resource.disabled",
                 status="succeeded", risk_level="medium",
