@@ -21,8 +21,23 @@ from .service import (
 from .store import AgentConcurrentUpdateError
 
 
+class _LazyAgentService:
+    """Defer database-backed service construction until a route is used."""
+
+    def __init__(self) -> None:
+        self._service: AgentService | None = None
+
+    def _get(self) -> AgentService:
+        if self._service is None:
+            self._service = AgentService()
+        return self._service
+
+    def __getattr__(self, name: str):
+        return getattr(self._get(), name)
+
+
 def create_router(service: AgentService | None = None) -> APIRouter:
-    manager = service or AgentService()
+    manager = service or _LazyAgentService()
     router = APIRouter(
         dependencies=[Depends(require_request_context)],
         route_class=management_audit_route_class(

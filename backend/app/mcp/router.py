@@ -7,8 +7,23 @@ from .schemas import McpClientConfig, McpClientCreate, McpClientInfo, McpToolInf
 from .service import McpConflictError, McpNotFoundError, McpService, McpValidationError
 
 
+class _LazyMcpService:
+    """Defer database-backed service construction until a route is used."""
+
+    def __init__(self) -> None:
+        self._service: McpService | None = None
+
+    def _get(self) -> McpService:
+        if self._service is None:
+            self._service = McpService()
+        return self._service
+
+    def __getattr__(self, name: str):
+        return getattr(self._get(), name)
+
+
 def create_router(service: McpService | None = None) -> APIRouter:
-    manager = service or McpService()
+    manager = service or _LazyMcpService()
     router = APIRouter(
         dependencies=[Depends(require_request_context)],
         route_class=management_audit_route_class(
