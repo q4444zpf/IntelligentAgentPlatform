@@ -22,7 +22,7 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     environment:
-      DATABASE_URL: postgresql+psycopg://iap:iap@postgres:5432/iap
+      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://iap:iap@postgres:5432/iap}"
       IAP_ALLOW_DEV_IDENTITY: "${IAP_ALLOW_DEV_IDENTITY:-false}"
       LEGACY_SQLITE_DATA_DIR: /data
       AGENT_WORKSPACE_ROOT: /data/agent-workspaces
