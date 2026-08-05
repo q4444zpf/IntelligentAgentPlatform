@@ -148,3 +148,18 @@ class UpdateProjectRequest(BaseModel):
 
 class ProjectStatusRequest(BaseModel):
     status: Literal["active", "inactive"]
+
+
+class CreateRoleRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_.-]{0,63}$")
+    name: str = Field(min_length=1, max_length=120)
+    scope_type: Literal["unit", "project"]
+
+
+class RoleStatusRequest(BaseModel):
+    status: Literal["active", "inactive"]
+
+
+class GrantPermissionRequest(BaseModel):
+    permission_code: str = Field(min_length=1, max_length=100)
+    data_scope: DataScope

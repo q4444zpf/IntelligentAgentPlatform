@@ -32,6 +32,7 @@ from .schemas import (
     AssignIdentityRoleRequest, BindExternalIdentityRequest, CreateIdentityUserRequest,
     IdentityStatusRequest, UpdateIdentityUserRequest,
     CreateProjectRequest, UpdateProjectRequest, ProjectStatusRequest,
+    CreateRoleRequest, RoleStatusRequest, GrantPermissionRequest,
 )
 
 router = APIRouter()
@@ -286,6 +287,41 @@ def list_roles(
         .order_by(Role.name, Role.id)
     ).all()
     return [AdminRole.model_validate(role, from_attributes=True) for role in rows]
+
+
+@router.post("/roles", response_model=AdminRole, status_code=status.HTTP_201_CREATED)
+def create_role(body: CreateRoleRequest, context: RequestContext = Depends(identity_admin_context), session: Session = Depends(get_session)) -> AdminRole:
+    if session.scalar(select(Role).where(Role.unit_id == context.unit_id, Role.code == body.code)) is not None:
+        raise HTTPException(status_code=409, detail="角色编码已存在")
+    role = Role(id=new_id(), code=body.code, name=body.name, scope_type=body.scope_type, unit_id=context.unit_id, built_in=False, status="active")
+    session.add(role); session.commit()
+    return AdminRole.model_validate(role, from_attributes=True)
+
+
+@router.post("/roles/{role_id}/status", response_model=AdminRole)
+def set_role_status(role_id: str, body: RoleStatusRequest, context: RequestContext = Depends(identity_admin_context), session: Session = Depends(get_session)) -> AdminRole:
+    role = session.scalar(select(Role).where(Role.id == role_id, Role.unit_id == context.unit_id))
+    if role is None:
+        raise HTTPException(status_code=404, detail="角色不存在或不属于当前单位")
+    if role.built_in:
+        raise HTTPException(status_code=409, detail="内置角色不可停用")
+    role.status = body.status; session.commit()
+    return AdminRole.model_validate(role, from_attributes=True)
+
+
+@router.post("/roles/{role_id}/permissions", status_code=status.HTTP_201_CREATED)
+def grant_permission(role_id: str, body: GrantPermissionRequest, context: RequestContext = Depends(identity_admin_context), session: Session = Depends(get_session)) -> dict[str, str]:
+    role = session.scalar(select(Role).where(Role.id == role_id, Role.unit_id == context.unit_id))
+    permission = session.scalar(select(Permission).where(Permission.code == body.permission_code, Permission.status == "active"))
+    if role is None or permission is None:
+        raise HTTPException(status_code=404, detail="角色或权限不存在")
+    if body.data_scope == "project" and role.scope_type != "project":
+        raise HTTPException(status_code=422, detail="项目范围权限只能授予项目角色")
+    existing = session.scalar(select(RolePermission).where(RolePermission.role_id == role.id, RolePermission.permission_code == permission.code, RolePermission.data_scope == body.data_scope))
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="权限已授予")
+    session.add(RolePermission(id=new_id(), role_id=role.id, permission_code=permission.code, unit_id=context.unit_id, data_scope=body.data_scope)); session.commit()
+    return {"role_id": role.id, "permission_code": permission.code, "data_scope": body.data_scope}
 
 
 @router.get("/permissions", response_model=list[AdminPermission])
