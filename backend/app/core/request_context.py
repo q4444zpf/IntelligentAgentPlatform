@@ -3,8 +3,8 @@ from typing import Annotated, Literal, TypeAlias
 from fastapi import Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 
-UserRole: TypeAlias = Literal["user", "project_admin", "unit_auditor"]
-VALID_ROLES = frozenset({"user", "project_admin", "unit_auditor"})
+UserRole: TypeAlias = Literal["user", "project_admin", "unit_admin", "unit_auditor"]
+VALID_ROLES = frozenset({"user", "project_admin", "unit_admin", "unit_auditor"})
 
 
 class RequestContext(BaseModel):
@@ -15,7 +15,7 @@ class RequestContext(BaseModel):
 
     @property
     def role(self) -> Literal["user", "admin"]:
-        return "admin" if "project_admin" in self.roles else "user"
+        return "admin" if self.roles & {"project_admin", "unit_admin"} else "user"
 
     @property
     def role_codes(self) -> tuple[str, ...]:
