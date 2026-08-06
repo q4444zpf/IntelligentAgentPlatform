@@ -4,6 +4,7 @@ import base64
 import hashlib as _hashlib
 from urllib.parse import urlencode
 import httpx
+from authlib.jose import jwt
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
@@ -14,7 +15,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_session
 from app.core.settings import settings
 
-from .models import AuthSession, OidcLoginTransaction, Project, UnitMembership, User, new_id
+from .models import AuthSession, ExternalIdentity, OidcLoginTransaction, Project, UnitMembership, User, new_id
 
 router = APIRouter()
 SESSION_COOKIE = "iap_session"
@@ -35,6 +36,18 @@ async def _oidc_metadata() -> dict:
         raise HTTPException(status_code=503, detail="OIDC issuer mismatch")
     return payload
 
+async def _validate_id_token(token: str, metadata: dict) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(settings.oidc_read_timeout_seconds, connect=settings.oidc_connect_timeout_seconds)) as client:
+            jwks = (await client.get(metadata["jwks_uri"])).json()
+        claims = jwt.decode(token, jwks)
+        claims.validate()
+    except Exception as error:
+        raise HTTPException(status_code=502, detail="OIDC ID token validation failed") from error
+    if claims.get("iss") != settings.oidc_issuer or settings.oidc_client_id not in (claims.get("aud") if isinstance(claims.get("aud"), list) else [claims.get("aud")]):
+        raise HTTPException(status_code=502, detail="OIDC ID token claims are invalid")
+    return dict(claims)
+
 @router.get("/login")
 async def oidc_login(session: Session = Depends(get_session)) -> dict[str, str]:
     if not settings.oidc_issuer or not settings.oidc_client_id or not settings.oidc_redirect_uri:
@@ -46,7 +59,7 @@ async def oidc_login(session: Session = Depends(get_session)) -> dict[str, str]:
     return {"status": "oidc_authorization_ready", "state": state, "nonce": nonce, "code_challenge": challenge, "authorization_url": metadata["authorization_endpoint"] + "?" + urlencode({"response_type": "code", "client_id": settings.oidc_client_id, "redirect_uri": settings.oidc_redirect_uri, "scope": settings.oidc_scope, "state": state, "nonce": nonce, "code_challenge": challenge, "code_challenge_method": "S256"})}
 
 @router.get("/callback")
-async def oidc_callback(code: Annotated[str | None, Query()] = None, state: Annotated[str | None, Query()] = None, session: Session = Depends(get_session)) -> dict[str, str]:
+async def oidc_callback(response: Response, code: Annotated[str | None, Query()] = None, state: Annotated[str | None, Query()] = None, session: Session = Depends(get_session)) -> dict[str, str]:
     if not code or not state:
         raise HTTPException(status_code=400, detail="OIDC callback code and state are required")
     transaction = session.scalar(select(OidcLoginTransaction).where(OidcLoginTransaction.state_hash == _hash(state), OidcLoginTransaction.consumed_at.is_(None)))
@@ -59,8 +72,24 @@ async def oidc_callback(code: Annotated[str | None, Query()] = None, state: Anno
             token_response.raise_for_status()
     except httpx.HTTPError as error:
         raise HTTPException(status_code=502, detail="OIDC token exchange failed") from error
-    transaction.consumed_at = datetime.now(timezone.utc); session.commit()
-    return {"status": "oidc_token_exchanged", "token_type": token_response.json().get("token_type", "Bearer")}
+    token_payload = token_response.json(); id_token = token_payload.get("id_token")
+    if not id_token:
+        raise HTTPException(status_code=502, detail="OIDC response did not contain an ID token")
+    claims = await _validate_id_token(id_token, metadata); issuer, subject = claims.get("iss"), claims.get("sub")
+    external = session.scalar(select(ExternalIdentity).where(ExternalIdentity.issuer == issuer, ExternalIdentity.subject == subject))
+    if external is None:
+        raise HTTPException(status_code=403, detail="External identity is not bound")
+    user = session.scalar(select(User).where(User.id == external.user_id, User.status == "active"))
+    membership = session.scalar(select(UnitMembership).where(UnitMembership.user_id == user.id, UnitMembership.status == "active")) if user else None
+    project = session.scalar(select(Project).where(Project.unit_id == membership.unit_id, Project.status == "active").order_by(Project.created_at)) if membership else None
+    if user is None or membership is None or project is None:
+        raise HTTPException(status_code=403, detail="External identity has no active platform membership")
+    raw = secrets.token_urlsafe(32); now = datetime.now(timezone.utc)
+    session.add(AuthSession(id=new_id(), session_token_hash=_hash(raw), user_id=user.id, unit_id=membership.unit_id, current_project_id=project.id, auth_method="oidc", csrf_secret_encrypted={"ciphertext": secrets.token_urlsafe(24)}, provider_tokens_encrypted=None, provider_sid=claims.get("sid"), authorization_version=user.authorization_version, idle_expires_at=now + timedelta(minutes=30), absolute_expires_at=now + timedelta(hours=8), last_seen_at=now))
+    transaction.consumed_at = now; session.commit()
+    if response is not None:
+        response.set_cookie(SESSION_COOKIE, raw, httponly=True, samesite="lax", secure=settings.session_cookie_secure, max_age=28800, path="/")
+    return {"status": "authenticated", "auth_method": "oidc", "user_id": user.id}
 
 def _dev_identity(
     user_id: Annotated[str | None, Header(alias="X-User-ID")] = None,
