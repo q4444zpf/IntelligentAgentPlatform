@@ -90,3 +90,16 @@ def test_auth_me_renews_idle_expiry_for_valid_session():
     with factory() as session:
         auth = session.get(AuthSession, "session-1")
         assert aware(auth.idle_expires_at) > now + timedelta(minutes=20)
+
+
+def test_oidc_nonce_must_match_transaction_hash():
+    from app.identity.auth_router import _validate_nonce
+
+    _validate_nonce({"nonce": "expected-nonce"}, _hash("expected-nonce"))
+
+    try:
+        _validate_nonce({"nonce": "wrong-nonce"}, _hash("expected-nonce"))
+    except ValueError as error:
+        assert str(error) == "OIDC nonce mismatch"
+    else:
+        raise AssertionError("nonce mismatch should be rejected")

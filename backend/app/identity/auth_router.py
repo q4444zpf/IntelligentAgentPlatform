@@ -26,6 +26,10 @@ def _hash(value: str) -> str:
 def _aware(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
+def _validate_nonce(claims: dict, expected_nonce_hash: str) -> None:
+    if _hash(str(claims.get("nonce", ""))) != expected_nonce_hash:
+        raise ValueError("OIDC nonce mismatch")
+
 async def _oidc_metadata() -> dict:
     if not settings.oidc_issuer:
         raise HTTPException(status_code=503, detail="OIDC is not configured")
@@ -78,7 +82,12 @@ async def oidc_callback(response: Response, code: Annotated[str | None, Query()]
     token_payload = token_response.json(); id_token = token_payload.get("id_token")
     if not id_token:
         raise HTTPException(status_code=502, detail="OIDC response did not contain an ID token")
-    claims = await _validate_id_token(id_token, metadata); issuer, subject = claims.get("iss"), claims.get("sub")
+    claims = await _validate_id_token(id_token, metadata)
+    try:
+        _validate_nonce(claims, transaction.nonce_hash)
+    except ValueError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    issuer, subject = claims.get("iss"), claims.get("sub")
     external = session.scalar(select(ExternalIdentity).where(ExternalIdentity.issuer == issuer, ExternalIdentity.subject == subject))
     if external is None:
         raise HTTPException(status_code=403, detail="External identity is not bound")
