@@ -7,7 +7,7 @@ import httpx
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
-from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Query, Request, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -36,16 +36,31 @@ async def _oidc_metadata() -> dict:
     return payload
 
 @router.get("/login")
-async def oidc_login() -> dict[str, str]:
+async def oidc_login(session: Session = Depends(get_session)) -> dict[str, str]:
     if not settings.oidc_issuer or not settings.oidc_client_id or not settings.oidc_redirect_uri:
         raise HTTPException(status_code=503, detail="OIDC is not configured")
     metadata = await _oidc_metadata(); state = secrets.token_urlsafe(32); nonce = secrets.token_urlsafe(32); verifier = secrets.token_urlsafe(48)
     challenge = base64.urlsafe_b64encode(_hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    session.add(OidcLoginTransaction(id=new_id(), state_hash=_hash(state), nonce_hash=_hash(nonce), browser_correlation_hash=_hash(state), pkce_verifier_encrypted={"value": verifier}, issuer=settings.oidc_issuer, client_id=settings.oidc_client_id, redirect_uri=settings.oidc_redirect_uri, return_to="/dashboard", expires_at=datetime.now(timezone.utc) + timedelta(minutes=5)))
+    session.commit()
     return {"status": "oidc_authorization_ready", "state": state, "nonce": nonce, "code_challenge": challenge, "authorization_url": metadata["authorization_endpoint"] + "?" + urlencode({"response_type": "code", "client_id": settings.oidc_client_id, "redirect_uri": settings.oidc_redirect_uri, "scope": settings.oidc_scope, "state": state, "nonce": nonce, "code_challenge": challenge, "code_challenge_method": "S256"})}
 
 @router.get("/callback")
-def oidc_callback() -> dict[str, str]:
-    raise HTTPException(status_code=501, detail="OIDC provider callback exchange is not enabled in this environment")
+async def oidc_callback(code: Annotated[str | None, Query()] = None, state: Annotated[str | None, Query()] = None, session: Session = Depends(get_session)) -> dict[str, str]:
+    if not code or not state:
+        raise HTTPException(status_code=400, detail="OIDC callback code and state are required")
+    transaction = session.scalar(select(OidcLoginTransaction).where(OidcLoginTransaction.state_hash == _hash(state), OidcLoginTransaction.consumed_at.is_(None)))
+    if transaction is None or transaction.expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="OIDC callback transaction is invalid")
+    metadata = await _oidc_metadata()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(settings.oidc_read_timeout_seconds, connect=settings.oidc_connect_timeout_seconds)) as client:
+            token_response = await client.post(metadata["token_endpoint"], data={"grant_type": "authorization_code", "code": code, "redirect_uri": transaction.redirect_uri, "client_id": transaction.client_id, "code_verifier": transaction.pkce_verifier_encrypted["value"]})
+            token_response.raise_for_status()
+    except httpx.HTTPError as error:
+        raise HTTPException(status_code=502, detail="OIDC token exchange failed") from error
+    transaction.consumed_at = datetime.now(timezone.utc); session.commit()
+    return {"status": "oidc_token_exchanged", "token_type": token_response.json().get("token_type", "Bearer")}
 
 def _dev_identity(
     user_id: Annotated[str | None, Header(alias="X-User-ID")] = None,
