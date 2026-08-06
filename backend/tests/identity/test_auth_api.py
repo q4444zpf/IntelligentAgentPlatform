@@ -1,0 +1,92 @@
+from datetime import datetime, timedelta, timezone
+
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
+from sqlalchemy.orm import sessionmaker
+
+from app.core.database import get_session
+from app.db.base import Base
+from app.identity.auth_router import SESSION_COOKIE, _hash
+from app.identity.models import AuthSession, Project, Unit, UnitMembership, User
+from app.main import app
+
+
+def aware(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def build_client():
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine)
+    with factory() as session:
+        unit = Unit(id="unit-1", code="u1", name="Unit 1", status="active")
+        project = Project(id="project-1", unit_id=unit.id, code="p1", name="Project 1", status="active")
+        user = User(id="user-1", display_name="Alice", email=None, status="active", authorization_version=1)
+        session.add_all([unit, project, user, UnitMembership(id="um-1", user_id=user.id, unit_id=unit.id, status="active")])
+        session.commit()
+    app.dependency_overrides[get_session] = lambda: factory()
+    return TestClient(app), factory
+
+
+def test_auth_me_rejects_idle_expired_session():
+    client, factory = build_client()
+    token = "expired-token"
+    now = datetime.now(timezone.utc)
+    with factory() as session:
+        session.add(AuthSession(
+            id="session-1",
+            session_token_hash=_hash(token),
+            user_id="user-1",
+            unit_id="unit-1",
+            current_project_id="project-1",
+            auth_method="oidc",
+            csrf_secret_encrypted={"ciphertext": "csrf"},
+            provider_tokens_encrypted=None,
+            provider_sid=None,
+            authorization_version=1,
+            idle_expires_at=now - timedelta(seconds=1),
+            absolute_expires_at=now + timedelta(hours=1),
+            last_seen_at=now - timedelta(minutes=31),
+        ))
+        session.commit()
+
+    client.cookies.set(SESSION_COOKIE, token)
+
+    response = client.get("/api/auth/me")
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Session has expired"
+
+
+def test_auth_me_renews_idle_expiry_for_valid_session():
+    client, factory = build_client()
+    token = "valid-token"
+    now = datetime.now(timezone.utc)
+    with factory() as session:
+        session.add(AuthSession(
+            id="session-1",
+            session_token_hash=_hash(token),
+            user_id="user-1",
+            unit_id="unit-1",
+            current_project_id="project-1",
+            auth_method="oidc",
+            csrf_secret_encrypted={"ciphertext": "csrf"},
+            provider_tokens_encrypted=None,
+            provider_sid=None,
+            authorization_version=1,
+            idle_expires_at=now + timedelta(minutes=1),
+            absolute_expires_at=now + timedelta(hours=1),
+            last_seen_at=now - timedelta(minutes=10),
+        ))
+        session.commit()
+
+    client.cookies.set(SESSION_COOKIE, token)
+
+    response = client.get("/api/auth/me")
+
+    assert response.status_code == 200
+    with factory() as session:
+        auth = session.get(AuthSession, "session-1")
+        assert aware(auth.idle_expires_at) > now + timedelta(minutes=20)

@@ -23,6 +23,9 @@ SESSION_COOKIE = "iap_session"
 def _hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
 async def _oidc_metadata() -> dict:
     if not settings.oidc_issuer:
         raise HTTPException(status_code=503, detail="OIDC is not configured")
@@ -126,9 +129,18 @@ def auth_me(session_cookie: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] 
     auth = session.scalar(select(AuthSession).where(AuthSession.session_token_hash == _hash(session_cookie), AuthSession.revoked_at.is_(None)))
     if auth is None:
         raise HTTPException(status_code=401, detail="Session is invalid")
+    now = datetime.now(timezone.utc)
+    if _aware(auth.idle_expires_at) <= now or _aware(auth.absolute_expires_at) <= now:
+        auth.revoked_at = now
+        auth.revoke_reason = "expired"
+        session.commit()
+        raise HTTPException(status_code=401, detail="Session has expired")
     user = session.scalar(select(User).where(User.id == auth.user_id))
     if user is None or user.status != "active" or user.authorization_version != auth.authorization_version:
         raise HTTPException(status_code=401, detail="Session authorization is stale")
+    auth.last_seen_at = now
+    auth.idle_expires_at = min(now + timedelta(minutes=30), _aware(auth.absolute_expires_at))
+    session.commit()
     return {"user": {"id": user.id, "display_name": user.display_name}, "unit_id": auth.unit_id, "current_project_id": auth.current_project_id, "auth_method": auth.auth_method, "authorization_version": user.authorization_version}
 
 @router.post("/logout")
