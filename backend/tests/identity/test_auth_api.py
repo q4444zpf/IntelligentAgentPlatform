@@ -23,8 +23,9 @@ def build_client():
     with factory() as session:
         unit = Unit(id="unit-1", code="u1", name="Unit 1", status="active")
         project = Project(id="project-1", unit_id=unit.id, code="p1", name="Project 1", status="active")
+        other_project = Project(id="project-2", unit_id=unit.id, code="p2", name="Project 2", status="active")
         user = User(id="user-1", display_name="Alice", email=None, status="active", authorization_version=1)
-        session.add_all([unit, project, user, UnitMembership(id="um-1", user_id=user.id, unit_id=unit.id, status="active")])
+        session.add_all([unit, project, other_project, user, UnitMembership(id="um-1", user_id=user.id, unit_id=unit.id, status="active")])
         session.commit()
     app.dependency_overrides[get_session] = lambda: factory()
     return TestClient(app), factory
@@ -90,6 +91,40 @@ def test_auth_me_renews_idle_expiry_for_valid_session():
     with factory() as session:
         auth = session.get(AuthSession, "session-1")
         assert aware(auth.idle_expires_at) > now + timedelta(minutes=20)
+
+
+def test_auth_me_returns_current_project_and_project_list():
+    client, factory = build_client()
+    token = "context-token"
+    now = datetime.now(timezone.utc)
+    with factory() as session:
+        session.add(AuthSession(
+            id="session-1",
+            session_token_hash=_hash(token),
+            user_id="user-1",
+            unit_id="unit-1",
+            current_project_id="project-1",
+            auth_method="oidc",
+            csrf_secret_encrypted={"ciphertext": "csrf"},
+            provider_tokens_encrypted=None,
+            provider_sid=None,
+            authorization_version=1,
+            idle_expires_at=now + timedelta(minutes=30),
+            absolute_expires_at=now + timedelta(hours=1),
+            last_seen_at=now,
+        ))
+        session.commit()
+    client.cookies.set(SESSION_COOKIE, token)
+
+    response = client.get("/api/auth/me")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["current_project"] == {"id": "project-1", "name": "Project 1"}
+    assert payload["projects"] == [
+        {"id": "project-1", "name": "Project 1"},
+        {"id": "project-2", "name": "Project 2"},
+    ]
 
 
 def test_oidc_nonce_must_match_transaction_hash():

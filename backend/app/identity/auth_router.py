@@ -149,8 +149,28 @@ def auth_me(session_cookie: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] 
         raise HTTPException(status_code=401, detail="Session authorization is stale")
     auth.last_seen_at = now
     auth.idle_expires_at = min(now + timedelta(minutes=30), _aware(auth.absolute_expires_at))
+    projects = session.scalars(
+        select(Project)
+        .where(Project.unit_id == auth.unit_id, Project.status == "active")
+        .order_by(Project.name, Project.id)
+    ).all()
+    current_project = next(
+        (project for project in projects if project.id == auth.current_project_id),
+        None,
+    )
     session.commit()
-    return {"user": {"id": user.id, "display_name": user.display_name}, "unit_id": auth.unit_id, "current_project_id": auth.current_project_id, "auth_method": auth.auth_method, "authorization_version": user.authorization_version}
+    return {
+        "user": {"id": user.id, "display_name": user.display_name},
+        "unit_id": auth.unit_id,
+        "current_project_id": auth.current_project_id,
+        "current_project": (
+            {"id": current_project.id, "name": current_project.name}
+            if current_project is not None else None
+        ),
+        "projects": [{"id": project.id, "name": project.name} for project in projects],
+        "auth_method": auth.auth_method,
+        "authorization_version": user.authorization_version,
+    }
 
 @router.post("/logout")
 def logout(response: Response, session_cookie: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None, session: Session = Depends(get_session)) -> dict[str, str]:
