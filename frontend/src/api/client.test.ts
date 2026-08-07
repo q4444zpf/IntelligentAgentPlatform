@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { request } from './client';
+import { request, setCsrfToken } from './client';
 
 beforeEach(() => {
   vi.stubGlobal('window', {
@@ -10,6 +10,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  setCsrfToken('');
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
@@ -80,6 +81,15 @@ describe('request headers', () => {
     });
 
     expect(capturedHeaders(fetchMock.mock.calls[0]?.[1]).get('Content-Type')).toBe('application/json');
+  });
+
+  it('adds the CSRF token to state-changing requests', async () => {
+    setCsrfToken('csrf-test-token');
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{}'));
+
+    await request('/identity/users', { method: 'POST', body: '{}' });
+
+    expect(capturedHeaders(fetchMock.mock.calls[0]?.[1]).get('X-CSRF-Token')).toBe('csrf-test-token');
   });
 
   it('preserves an explicit content type', async () => {

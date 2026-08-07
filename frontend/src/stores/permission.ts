@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia';
 
 import { authApi, type AuthContext, type AuthPermission } from '@/api/auth';
+import { setCsrfToken } from '@/api/client';
 
 export type UserRole = 'user' | 'admin';
 
@@ -106,6 +107,7 @@ export const usePermissionStore = defineStore('permission', {
       this.role = context.roles.includes('unit_admin') ? 'admin' : 'user';
       this.permissions = legacyPermissions(context.permissions);
       this.csrfToken = context.csrf_token;
+      setCsrfToken(context.csrf_token);
       this.sessionRestored = true;
       localStorage.removeItem('iap_token');
       localStorage.removeItem('iap_user_role');
@@ -116,6 +118,7 @@ export const usePermissionStore = defineStore('permission', {
       this.token = '';
       this.authContext = null;
       this.csrfToken = '';
+      setCsrfToken('');
       this.sessionRestored = true;
       this.switchRole('user');
       localStorage.removeItem('iap_token');

@@ -14,6 +14,9 @@ export const identityHeaders: Record<string, string> =
       }
     : {};
 
+let csrfToken = '';
+export function setCsrfToken(token: string) { csrfToken = token; }
+
 export class ApiError extends Error {
   constructor(message: string, public readonly status: number) {
     super(message);
@@ -34,6 +37,9 @@ export async function request<T>(path: string, init: RequestInit = {}, timeoutMs
     controller.abort();
   }, timeoutMs);
   const headers = new Headers({ Accept: 'application/json', ...identityHeaders, ...init.headers });
+  if (csrfToken && ['POST', 'PUT', 'PATCH', 'DELETE'].includes((init.method || 'GET').toUpperCase())) {
+    headers.set('X-CSRF-Token', csrfToken);
+  }
   if (typeof init.body === 'string' && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
   }
