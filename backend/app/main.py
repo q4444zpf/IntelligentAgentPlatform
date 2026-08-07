@@ -37,6 +37,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def disable_auth_response_caching(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/api/auth/"):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+    return response
 app.include_router(model_router, prefix="/api/models", tags=["models"])
 app.include_router(agents_router, prefix="/api/agents", tags=["agents"])
 app.include_router(mcp_router, prefix="/api/mcp", tags=["mcp"])
