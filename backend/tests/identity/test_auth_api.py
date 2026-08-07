@@ -196,6 +196,19 @@ def test_auth_me_returns_authorization_menu_and_session_context():
     assert payload["session"]["absolute_expires_at"]
 
 
+def test_auth_responses_disable_caching(monkeypatch):
+    from dataclasses import replace
+    import app.identity.auth_router as auth_router
+    monkeypatch.setattr(auth_router, "settings", replace(auth_router.settings, allow_dev_identity=True, environment="development"))
+    client, _factory = build_client()
+    response = client.post(
+        "/api/auth/dev/login",
+        headers={"X-User-ID": "user-1", "X-Unit-ID": "unit-1", "X-Project-ID": "project-1"},
+    )
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+
+
 def test_oidc_nonce_must_match_transaction_hash():
     from app.identity.auth_router import _validate_nonce
 
