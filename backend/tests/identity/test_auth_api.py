@@ -209,6 +209,21 @@ def test_auth_responses_disable_caching(monkeypatch):
     assert response.headers["cache-control"] == "no-store"
 
 
+def test_logout_rejects_cross_origin_cookie_request(monkeypatch):
+    from dataclasses import replace
+    import app.identity.auth_router as auth_router
+
+    client, factory = build_client()
+    monkeypatch.setattr(auth_router, "settings", replace(auth_router.settings, allow_dev_identity=True, environment="development", public_base_url="http://127.0.0.1"))
+    login = client.post("/api/auth/dev/login", headers={"X-User-ID": "user-1", "X-Unit-ID": "unit-1", "X-Project-ID": "project-1"})
+    assert login.status_code == 200
+
+    response = client.post("/api/auth/logout", headers={"Origin": "https://evil.example"})
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Origin is not allowed"
+
+
 def test_oidc_nonce_must_match_transaction_hash():
     from app.identity.auth_router import _validate_nonce
 
