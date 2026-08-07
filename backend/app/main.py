@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,6 +41,17 @@ app.add_middleware(
 
 @app.middleware("http")
 async def disable_auth_response_caching(request, call_next):
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.cookies.get("iap_session"):
+        origin = request.headers.get("origin")
+        configured = settings.public_base_url
+        if origin and configured:
+            actual = urlsplit(origin)
+            expected = urlsplit(configured)
+            actual_port = actual.port or (443 if actual.scheme.lower() == "https" else 80)
+            expected_port = expected.port or (443 if expected.scheme.lower() == "https" else 80)
+            if (actual.scheme.lower(), (actual.hostname or "").lower(), actual_port) != (expected.scheme.lower(), (expected.hostname or "").lower(), expected_port):
+                from starlette.responses import JSONResponse
+                return JSONResponse({"detail": "Origin is not allowed"}, status_code=403)
     response = await call_next(request)
     if request.url.path.startswith("/api/auth/"):
         response.headers["Cache-Control"] = "no-store"
