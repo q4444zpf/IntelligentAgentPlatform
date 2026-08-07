@@ -224,6 +224,25 @@ def test_logout_rejects_cross_origin_cookie_request(monkeypatch):
     assert response.json()["detail"] == "Origin is not allowed"
 
 
+def test_cookie_backed_identity_admin_request_rejects_cross_origin(monkeypatch):
+    from dataclasses import replace
+    import app.identity.auth_router as auth_router
+    import app.main as main_module
+
+    client, _factory = build_client()
+    configured = replace(auth_router.settings, allow_dev_identity=True, environment="development", public_base_url="http://127.0.0.1", session_cookie_secure=False)
+    monkeypatch.setattr(auth_router, "settings", configured)
+    monkeypatch.setattr(main_module, "settings", configured)
+    login = client.post("/api/auth/dev/login", headers={"X-User-ID": "user-1", "X-Unit-ID": "unit-1", "X-Project-ID": "project-1"})
+    assert login.status_code == 200
+    client.cookies.set(SESSION_COOKIE, "session-for-origin-test")
+
+    response = client.post("/api/identity/users", headers={"Origin": "https://evil.example", "X-User-ID": "user-1", "X-Unit-ID": "unit-1", "X-Project-ID": "project-1", "X-User-Role": "unit_admin"})
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Origin is not allowed"
+
+
 def test_oidc_nonce_must_match_transaction_hash():
     from app.identity.auth_router import _validate_nonce
 
