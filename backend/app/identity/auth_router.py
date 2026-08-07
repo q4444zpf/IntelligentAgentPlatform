@@ -33,6 +33,13 @@ def _validate_nonce(claims: dict, expected_nonce_hash: str) -> None:
         raise ValueError("OIDC nonce mismatch")
 
 
+def _validate_client_claims(claims: dict, client_id: str) -> None:
+    audience = claims.get("aud")
+    audiences = audience if isinstance(audience, list) else [audience]
+    if client_id not in audiences or claims.get("azp") != client_id:
+        raise ValueError("OIDC client claims are invalid")
+
+
 def _validate_browser_correlation(raw_value: str | None, expected_hash: str) -> None:
     if not raw_value or _hash(raw_value) != expected_hash:
         raise ValueError("OIDC browser correlation mismatch")
@@ -104,8 +111,12 @@ async def _validate_id_token(token: str, metadata: dict) -> dict:
         claims.validate()
     except Exception as error:
         raise HTTPException(status_code=502, detail="OIDC ID token validation failed") from error
-    if claims.get("iss") != settings.oidc_issuer or settings.oidc_client_id not in (claims.get("aud") if isinstance(claims.get("aud"), list) else [claims.get("aud")]):
+    if claims.get("iss") != settings.oidc_issuer:
         raise HTTPException(status_code=502, detail="OIDC ID token claims are invalid")
+    try:
+        _validate_client_claims(claims, settings.oidc_client_id or "")
+    except ValueError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
     return dict(claims)
 
 @router.get("/login")
