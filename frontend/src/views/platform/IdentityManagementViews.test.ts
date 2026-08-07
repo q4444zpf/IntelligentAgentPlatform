@@ -15,6 +15,12 @@ const stubs = {
   'a-typography-text': { template: '<span><slot /></span>' }, 'a-tag': { template: '<span><slot /></span>' },
   'a-alert': { props: ['message'], template: '<div>{{ message }}</div>' }, 'a-empty': { props: ['description'], template: '<div>{{ description }}</div>' },
   'a-button': { emits: ['click'], template: '<button @click="$emit(\'click\')"><slot /></button>' },
+  'a-popconfirm': { emits: ['confirm'], template: '<div><slot /><slot name="title" /></div>' },
+  'a-input': { props: ['value'], template: '<input />' },
+  'a-form': { template: '<form><slot /></form>' },
+  'a-form-item': { template: '<div><slot /></div>' },
+  'a-modal': { props: ['open'], template: '<div v-if="open"><slot /><slot name="title" /></div>' },
+  'a-select': { template: '<select><slot /></select>' },
   'a-table': { props: ['dataSource', 'loading'], template: '<div><span v-if="loading">加载中</span><div v-for="row in dataSource" :key="row.id">{{ row.display_name || row.name }}</div><slot name="emptyText" /></div>' },
 };
 const wrappers: ReturnType<typeof mount>[] = [];
