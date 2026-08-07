@@ -52,6 +52,9 @@ async def disable_auth_response_caching(request, call_next):
             if (actual.scheme.lower(), (actual.hostname or "").lower(), actual_port) != (expected.scheme.lower(), (expected.hostname or "").lower(), expected_port):
                 from starlette.responses import JSONResponse
                 return JSONResponse({"detail": "Origin is not allowed"}, status_code=403)
+        if not request.url.path.startswith("/api/auth/") and not request.headers.get("x-csrf-token"):
+            from starlette.responses import JSONResponse
+            return JSONResponse({"detail": "CSRF token is required"}, status_code=403)
     response = await call_next(request)
     if request.url.path.startswith("/api/auth/"):
         response.headers["Cache-Control"] = "no-store"
