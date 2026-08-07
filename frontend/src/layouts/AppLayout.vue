@@ -148,7 +148,7 @@ function switchRole(role: 'user' | 'admin') {
   const permission = route.meta.permission as string | undefined;
   if (permission && !permissionStore.hasPermission(permission)) router.push('/chat');
 }
-function logout() { permissionStore.logout(); router.replace('/login'); }
+async function logout() { await permissionStore.logout(); router.replace('/login'); }
 </script>
 
 <style scoped>

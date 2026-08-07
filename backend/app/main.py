@@ -15,6 +15,8 @@ from .mcp.router import router as mcp_router
 from .platform.router import router as platform_router
 from .skills.router import router as skills_router
 from .tools.router import router as tools_router
+from .identity.admin_router import router as identity_admin_router
+from .identity.auth_router import router as identity_auth_router
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -43,6 +45,8 @@ app.include_router(skills_router, prefix="/api/skills", tags=["skills"])
 app.include_router(tools_router, prefix="/api/tools", tags=["tools"])
 app.include_router(conversations_router, prefix="/api", tags=["conversations"])
 app.include_router(audit_router, prefix="/api/audit", tags=["audit"])
+app.include_router(identity_admin_router, prefix="/api/identity", tags=["identity"])
+app.include_router(identity_auth_router, prefix="/api/auth", tags=["auth"])
 
 
 @app.get("/api/health")
