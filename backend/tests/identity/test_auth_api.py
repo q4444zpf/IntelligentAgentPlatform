@@ -18,6 +18,8 @@ from app.identity.models import (
     UnitMembershipRole,
     User,
     Role,
+    ExternalIdentity,
+    OidcLoginTransaction,
 )
 from app.main import app
 
@@ -205,3 +207,109 @@ def test_oidc_nonce_must_match_transaction_hash():
         assert str(error) == "OIDC nonce mismatch"
     else:
         raise AssertionError("nonce mismatch should be rejected")
+
+
+def test_oidc_browser_correlation_requires_matching_transaction_cookie():
+    from app.identity.auth_router import _validate_browser_correlation
+
+    _validate_browser_correlation("browser-token", _hash("browser-token"))
+
+    try:
+        _validate_browser_correlation("wrong-token", _hash("browser-token"))
+    except ValueError as error:
+        assert str(error) == "OIDC browser correlation mismatch"
+    else:
+        raise AssertionError("browser correlation mismatch should be rejected")
+
+
+def test_oidc_login_sets_browser_correlation_cookie_and_pkce(monkeypatch):
+    from dataclasses import replace
+    from unittest.mock import AsyncMock
+    import app.identity.auth_router as auth_router
+
+    client, factory = build_client()
+    monkeypatch.setattr(auth_router, "settings", replace(auth_router.settings, oidc_issuer="https://mock-oidc.example.test", oidc_client_id="iap-console", oidc_redirect_uri="http://127.0.0.1/auth/callback", oidc_scope="openid profile"))
+    monkeypatch.setattr(auth_router, "_oidc_metadata", AsyncMock(return_value={"authorization_endpoint": "https://mock-oidc.example.test/authorize"}))
+
+    response = client.get("/api/auth/login")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["code_challenge"]
+    assert "state=" in payload["authorization_url"]
+    assert "code_challenge_method=S256" in payload["authorization_url"]
+    assert "iap_oidc_browser=" in response.headers["set-cookie"]
+    with factory() as session:
+        transaction = session.query(auth_router.OidcLoginTransaction).one()
+        assert transaction.browser_correlation_hash
+
+
+def test_oidc_callback_rejects_missing_browser_cookie_before_token_exchange(monkeypatch):
+    import app.identity.auth_router as auth_router
+    from app.identity.models import OidcLoginTransaction
+
+    client, factory = build_client()
+    now = datetime.now(timezone.utc)
+    with factory() as session:
+        session.add(OidcLoginTransaction(
+            id="oidc-tx-1", state_hash=_hash("state-1"), nonce_hash=_hash("nonce-1"),
+            browser_correlation_hash=_hash("browser-1"), pkce_verifier_encrypted={"value": "verifier"},
+            issuer="https://mock-oidc.example.test", client_id="iap-console",
+            redirect_uri="http://127.0.0.1/auth/callback", return_to="/dashboard",
+            expires_at=now + timedelta(minutes=5),
+        ))
+        session.commit()
+
+    metadata = lambda: (_ for _ in ()).throw(AssertionError("token exchange must not start"))
+    monkeypatch.setattr(auth_router, "_oidc_metadata", metadata)
+
+    response = client.get("/api/auth/callback?code=code-1&state=state-1")
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "OIDC browser correlation mismatch"
+
+
+def test_oidc_callback_creates_platform_session_for_bound_identity(monkeypatch):
+    import app.identity.auth_router as auth_router
+    from unittest.mock import AsyncMock
+    from dataclasses import replace
+
+    client, factory = build_client()
+    monkeypatch.setattr(auth_router, "settings", replace(auth_router.settings, session_cookie_secure=False))
+    now = datetime.now(timezone.utc)
+    with factory() as session:
+        session.add_all([
+            ExternalIdentity(id="external-1", user_id="user-1", issuer="https://mock-oidc.example.test", subject="subject-1", last_login_at=now),
+            OidcLoginTransaction(id="oidc-tx-2", state_hash=_hash("state-2"), nonce_hash=_hash("nonce-2"), browser_correlation_hash=_hash("browser-2"), pkce_verifier_encrypted={"value": "verifier"}, issuer="https://mock-oidc.example.test", client_id="iap-console", redirect_uri="http://127.0.0.1/auth/callback", return_to="/dashboard", expires_at=now + timedelta(minutes=5)),
+        ])
+        session.commit()
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"id_token": "mock-id-token"}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(auth_router, "_oidc_metadata", AsyncMock(return_value={"token_endpoint": "https://mock-oidc.example.test/token"}))
+    monkeypatch.setattr(auth_router, "_validate_id_token", AsyncMock(return_value={"iss": "https://mock-oidc.example.test", "sub": "subject-1", "nonce": "nonce-2"}))
+    monkeypatch.setattr(auth_router.httpx, "AsyncClient", lambda **_kwargs: FakeClient())
+    client.cookies.set(auth_router.OIDC_BROWSER_COOKIE, "browser-2")
+
+    response = client.get("/api/auth/callback?code=code-2&state=state-2")
+
+    assert response.status_code == 200
+    assert response.json()["auth_method"] == "oidc"
+    me = client.get("/api/auth/me")
+    assert me.status_code == 200
+    assert me.json()["user"]["id"] == "user-1"

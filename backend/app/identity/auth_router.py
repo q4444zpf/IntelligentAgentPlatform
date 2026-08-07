@@ -20,6 +20,7 @@ from .models import AuthSession, ExternalIdentity, Menu, MenuPermission, OidcLog
 
 router = APIRouter()
 SESSION_COOKIE = "iap_session"
+OIDC_BROWSER_COOKIE = "iap_oidc_browser"
 
 def _hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
@@ -30,6 +31,11 @@ def _aware(value: datetime) -> datetime:
 def _validate_nonce(claims: dict, expected_nonce_hash: str) -> None:
     if _hash(str(claims.get("nonce", ""))) != expected_nonce_hash:
         raise ValueError("OIDC nonce mismatch")
+
+
+def _validate_browser_correlation(raw_value: str | None, expected_hash: str) -> None:
+    if not raw_value or _hash(raw_value) != expected_hash:
+        raise ValueError("OIDC browser correlation mismatch")
 
 
 def _csrf_token(auth: AuthSession) -> str:
@@ -103,22 +109,27 @@ async def _validate_id_token(token: str, metadata: dict) -> dict:
     return dict(claims)
 
 @router.get("/login")
-async def oidc_login(session: Session = Depends(get_session)) -> dict[str, str]:
+async def oidc_login(response: Response, session: Session = Depends(get_session)) -> dict[str, str]:
     if not settings.oidc_issuer or not settings.oidc_client_id or not settings.oidc_redirect_uri:
         raise HTTPException(status_code=503, detail="OIDC is not configured")
-    metadata = await _oidc_metadata(); state = secrets.token_urlsafe(32); nonce = secrets.token_urlsafe(32); verifier = secrets.token_urlsafe(48)
+    metadata = await _oidc_metadata(); state = secrets.token_urlsafe(32); nonce = secrets.token_urlsafe(32); verifier = secrets.token_urlsafe(48); browser_token = secrets.token_urlsafe(32)
     challenge = base64.urlsafe_b64encode(_hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
-    session.add(OidcLoginTransaction(id=new_id(), state_hash=_hash(state), nonce_hash=_hash(nonce), browser_correlation_hash=_hash(state), pkce_verifier_encrypted={"value": verifier}, issuer=settings.oidc_issuer, client_id=settings.oidc_client_id, redirect_uri=settings.oidc_redirect_uri, return_to="/dashboard", expires_at=datetime.now(timezone.utc) + timedelta(minutes=5)))
+    session.add(OidcLoginTransaction(id=new_id(), state_hash=_hash(state), nonce_hash=_hash(nonce), browser_correlation_hash=_hash(browser_token), pkce_verifier_encrypted={"value": verifier}, issuer=settings.oidc_issuer, client_id=settings.oidc_client_id, redirect_uri=settings.oidc_redirect_uri, return_to="/dashboard", expires_at=datetime.now(timezone.utc) + timedelta(minutes=5)))
     session.commit()
+    response.set_cookie(OIDC_BROWSER_COOKIE, browser_token, httponly=True, samesite="lax", secure=settings.session_cookie_secure, max_age=300, path="/")
     return {"status": "oidc_authorization_ready", "state": state, "nonce": nonce, "code_challenge": challenge, "authorization_url": metadata["authorization_endpoint"] + "?" + urlencode({"response_type": "code", "client_id": settings.oidc_client_id, "redirect_uri": settings.oidc_redirect_uri, "scope": settings.oidc_scope, "state": state, "nonce": nonce, "code_challenge": challenge, "code_challenge_method": "S256"})}
 
 @router.get("/callback")
-async def oidc_callback(response: Response, code: Annotated[str | None, Query()] = None, state: Annotated[str | None, Query()] = None, session: Session = Depends(get_session)) -> dict[str, str]:
+async def oidc_callback(response: Response, code: Annotated[str | None, Query()] = None, state: Annotated[str | None, Query()] = None, browser_cookie: Annotated[str | None, Cookie(alias=OIDC_BROWSER_COOKIE)] = None, session: Session = Depends(get_session)) -> dict[str, str]:
     if not code or not state:
         raise HTTPException(status_code=400, detail="OIDC callback code and state are required")
     transaction = session.scalar(select(OidcLoginTransaction).where(OidcLoginTransaction.state_hash == _hash(state), OidcLoginTransaction.consumed_at.is_(None)))
-    if transaction is None or transaction.expires_at <= datetime.now(timezone.utc):
+    if transaction is None or _aware(transaction.expires_at) <= datetime.now(timezone.utc):
         raise HTTPException(status_code=400, detail="OIDC callback transaction is invalid")
+    try:
+        _validate_browser_correlation(browser_cookie, transaction.browser_correlation_hash)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
     metadata = await _oidc_metadata()
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(settings.oidc_read_timeout_seconds, connect=settings.oidc_connect_timeout_seconds)) as client:
@@ -148,6 +159,7 @@ async def oidc_callback(response: Response, code: Annotated[str | None, Query()]
     transaction.consumed_at = now; session.commit()
     if response is not None:
         response.set_cookie(SESSION_COOKIE, raw, httponly=True, samesite="lax", secure=settings.session_cookie_secure, max_age=28800, path="/")
+        response.delete_cookie(OIDC_BROWSER_COOKIE, path="/")
     return {"status": "authenticated", "auth_method": "oidc", "user_id": user.id}
 
 def _dev_identity(
