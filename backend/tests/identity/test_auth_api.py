@@ -209,6 +209,20 @@ def test_oidc_nonce_must_match_transaction_hash():
         raise AssertionError("nonce mismatch should be rejected")
 
 
+def test_oidc_client_claims_require_matching_audience_and_azp():
+    from app.identity.auth_router import _validate_client_claims
+
+    _validate_client_claims({"aud": ["iap-console"], "azp": "iap-console"}, "iap-console")
+
+    for claims in ({"aud": ["other-client"], "azp": "iap-console"}, {"aud": ["iap-console"], "azp": "other-client"}):
+        try:
+            _validate_client_claims(claims, "iap-console")
+        except ValueError as error:
+            assert str(error) == "OIDC client claims are invalid"
+        else:
+            raise AssertionError("invalid client claims should be rejected")
+
+
 def test_oidc_browser_correlation_requires_matching_transaction_cookie():
     from app.identity.auth_router import _validate_browser_correlation
 
