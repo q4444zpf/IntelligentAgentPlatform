@@ -2,7 +2,7 @@ import hashlib
 import secrets
 import base64
 import hashlib as _hashlib
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 import httpx
 from authlib.jose import jwt
 from datetime import datetime, timedelta, timezone
@@ -59,6 +59,16 @@ def _validate_time_claims(claims: dict, *, now: float, clock_skew: int) -> None:
 def _validate_browser_correlation(raw_value: str | None, expected_hash: str) -> None:
     if not raw_value or _hash(raw_value) != expected_hash:
         raise ValueError("OIDC browser correlation mismatch")
+
+
+def _validate_origin(origin: str | None) -> None:
+    configured = settings.public_base_url
+    if not origin or not configured:
+        return
+    expected = urlsplit(configured)
+    actual = urlsplit(origin)
+    if (actual.scheme.lower(), (actual.hostname or "").lower(), actual.port or (443 if actual.scheme == "https" else 80)) != (expected.scheme.lower(), (expected.hostname or "").lower(), expected.port or (443 if expected.scheme == "https" else 80)):
+        raise HTTPException(status_code=403, detail="Origin is not allowed")
 
 
 def _csrf_token(auth: AuthSession) -> str:
@@ -276,7 +286,8 @@ def auth_me(session_cookie: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] 
     }
 
 @router.post("/logout")
-def logout(response: Response, session_cookie: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None, session: Session = Depends(get_session)) -> dict[str, str]:
+def logout(response: Response, origin: Annotated[str | None, Header(alias="Origin")] = None, session_cookie: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None, session: Session = Depends(get_session)) -> dict[str, str]:
+    _validate_origin(origin)
     if session_cookie:
         auth = session.scalar(select(AuthSession).where(AuthSession.session_token_hash == _hash(session_cookie), AuthSession.revoked_at.is_(None)))
         if auth is not None:
