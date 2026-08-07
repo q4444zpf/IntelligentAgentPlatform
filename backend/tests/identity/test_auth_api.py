@@ -223,6 +223,28 @@ def test_oidc_client_claims_require_matching_audience_and_azp():
             raise AssertionError("invalid client claims should be rejected")
 
 
+def test_oidc_algorithm_and_time_claims_are_strictly_validated():
+    from app.identity.auth_router import _validate_algorithm, _validate_time_claims
+
+    _validate_algorithm({"alg": "RS256"})
+    try:
+        _validate_algorithm({"alg": "none"})
+    except ValueError as error:
+        assert str(error) == "OIDC signing algorithm is invalid"
+    else:
+        raise AssertionError("unsafe signing algorithm should be rejected")
+
+    now = datetime.now(timezone.utc).timestamp()
+    _validate_time_claims({"iat": now - 10, "exp": now + 300}, now=now, clock_skew=60)
+    for claims in ({"iat": now + 120, "exp": now + 300}, {"iat": now - 10, "exp": now - 120}, {"iat": now - 10, "exp": now + 300, "nbf": now + 120}):
+        try:
+            _validate_time_claims(claims, now=now, clock_skew=60)
+        except ValueError as error:
+            assert str(error) == "OIDC time claims are invalid"
+        else:
+            raise AssertionError("invalid time claims should be rejected")
+
+
 def test_oidc_browser_correlation_requires_matching_transaction_cookie():
     from app.identity.auth_router import _validate_browser_correlation
 

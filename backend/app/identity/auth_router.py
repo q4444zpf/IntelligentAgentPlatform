@@ -40,6 +40,22 @@ def _validate_client_claims(claims: dict, client_id: str) -> None:
         raise ValueError("OIDC client claims are invalid")
 
 
+def _validate_algorithm(header: dict) -> None:
+    if header.get("alg") not in {"RS256", "RS384", "RS512"}:
+        raise ValueError("OIDC signing algorithm is invalid")
+
+
+def _validate_time_claims(claims: dict, *, now: float, clock_skew: int) -> None:
+    try:
+        issued_at = float(claims["iat"])
+        expires_at = float(claims["exp"])
+        not_before = float(claims.get("nbf", issued_at))
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("OIDC time claims are invalid") from None
+    if issued_at > now + clock_skew or expires_at < now - clock_skew or not_before > now + clock_skew or expires_at <= issued_at:
+        raise ValueError("OIDC time claims are invalid")
+
+
 def _validate_browser_correlation(raw_value: str | None, expected_hash: str) -> None:
     if not raw_value or _hash(raw_value) != expected_hash:
         raise ValueError("OIDC browser correlation mismatch")
@@ -108,12 +124,14 @@ async def _validate_id_token(token: str, metadata: dict) -> dict:
         async with httpx.AsyncClient(timeout=httpx.Timeout(settings.oidc_read_timeout_seconds, connect=settings.oidc_connect_timeout_seconds)) as client:
             jwks = (await client.get(metadata["jwks_uri"])).json()
         claims = jwt.decode(token, jwks)
+        _validate_algorithm(getattr(claims, "header", {}))
         claims.validate()
     except Exception as error:
         raise HTTPException(status_code=502, detail="OIDC ID token validation failed") from error
     if claims.get("iss") != settings.oidc_issuer:
         raise HTTPException(status_code=502, detail="OIDC ID token claims are invalid")
     try:
+        _validate_time_claims(claims, now=datetime.now(timezone.utc).timestamp(), clock_skew=settings.oidc_clock_skew_seconds)
         _validate_client_claims(claims, settings.oidc_client_id or "")
     except ValueError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
