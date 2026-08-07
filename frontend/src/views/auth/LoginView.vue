@@ -69,7 +69,11 @@
           </div>
 
           <a-button type="primary" html-type="submit" size="large" block :loading="submitting">
-            登录
+            {{ hasDevIdentity ? '开发身份登录' : '统一认证登录' }}
+          </a-button>
+
+          <a-button v-if="hasDevIdentity" class="oidc-button" size="large" block :loading="oidcSubmitting" @click="handleOidcLogin">
+            统一认证登录
           </a-button>
         </a-form>
 
@@ -77,8 +81,8 @@
           class="login-tip"
           type="info"
           show-icon
-          message="演示账号"
-          description="管理员可查看全部菜单，普通用户仅展示工作台、AI 对话、资源空间和大模型配置。"
+          message="认证模式"
+          description="本地功能测试优先使用开发身份；生产环境通过统一认证登录，浏览器仅保存 HttpOnly 会话 Cookie。"
         />
       </div>
     </section>
@@ -97,12 +101,15 @@ import { message } from 'ant-design-vue';
 import { reactive, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
+import { identityHeaders } from '@/api/client';
 import { usePermissionStore, type UserRole } from '@/stores/permission';
 
 const router = useRouter();
 const route = useRoute();
 const permissionStore = usePermissionStore();
 const submitting = ref(false);
+const oidcSubmitting = ref(false);
+const hasDevIdentity = Object.keys(identityHeaders).length > 0;
 
 const form = reactive({
   username: 'admin',
@@ -136,16 +143,31 @@ const capabilities = [
 
 async function handleLogin() {
   submitting.value = true;
-  await new Promise((resolve) => window.setTimeout(resolve, 350));
-  permissionStore.login({
-    username: form.username,
-    role: form.role,
-    remember: form.remember,
-  });
-  message.success('登录成功');
-  const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/dashboard';
-  router.replace(redirect);
-  submitting.value = false;
+  try {
+    if (hasDevIdentity) {
+      await permissionStore.loginWithDevelopmentIdentity();
+    } else {
+      await permissionStore.startOidcLogin();
+      return;
+    }
+    message.success('登录成功');
+    const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/dashboard';
+    router.replace(redirect);
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '登录失败');
+  } finally {
+    submitting.value = false;
+  }
+}
+
+async function handleOidcLogin() {
+  oidcSubmitting.value = true;
+  try {
+    await permissionStore.startOidcLogin();
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '统一认证不可用');
+    oidcSubmitting.value = false;
+  }
 }
 </script>
 
@@ -286,6 +308,10 @@ async function handleLogin() {
 
 .login-tip {
   margin-top: 20px;
+}
+
+.oidc-button {
+  margin-top: 12px;
 }
 
 @media (max-width: 960px) {

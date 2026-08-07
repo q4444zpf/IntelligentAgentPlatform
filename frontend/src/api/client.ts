@@ -43,6 +43,7 @@ export async function request<T>(path: string, init: RequestInit = {}, timeoutMs
       ...init,
       signal: controller.signal,
       headers,
+      credentials: init.credentials ?? 'include',
     });
     if (!response.ok) {
       const payload = await response.json().catch(() => ({}));

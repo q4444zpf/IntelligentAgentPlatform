@@ -8,7 +8,17 @@ from sqlalchemy.orm import sessionmaker
 from app.core.database import get_session
 from app.db.base import Base
 from app.identity.auth_router import SESSION_COOKIE, _hash
-from app.identity.models import AuthSession, Project, Unit, UnitMembership, User
+from app.identity.catalogue import seed_builtin_catalogue
+from app.identity.models import (
+    AuthSession,
+    Project,
+    ProjectMembership,
+    Unit,
+    UnitMembership,
+    UnitMembershipRole,
+    User,
+    Role,
+)
 from app.main import app
 
 
@@ -125,6 +135,63 @@ def test_auth_me_returns_current_project_and_project_list():
         {"id": "project-1", "name": "Project 1"},
         {"id": "project-2", "name": "Project 2"},
     ]
+
+
+def test_auth_me_returns_authorization_menu_and_session_context():
+    client, factory = build_client()
+    token = "authorization-context-token"
+    now = datetime.now(timezone.utc)
+    with factory() as session:
+        seed_builtin_catalogue(session, "unit-1")
+        unit_admin = session.scalar(
+            session.query(Role).where(Role.unit_id == "unit-1", Role.code == "unit_admin").statement
+        )
+        session.add_all([
+            ProjectMembership(
+                id="pm-1",
+                user_id="user-1",
+                unit_id="unit-1",
+                project_id="project-1",
+                status="active",
+            ),
+            UnitMembershipRole(
+                id="umr-1",
+                user_id="user-1",
+                unit_id="unit-1",
+                role_id=unit_admin.id,
+                scope_type="unit",
+            ),
+            AuthSession(
+                id="session-1",
+                session_token_hash=_hash(token),
+                user_id="user-1",
+                unit_id="unit-1",
+                current_project_id="project-1",
+                auth_method="oidc",
+                csrf_secret_encrypted={"ciphertext": "csrf-secret"},
+                provider_tokens_encrypted=None,
+                provider_sid=None,
+                authorization_version=1,
+                idle_expires_at=now + timedelta(minutes=30),
+                absolute_expires_at=now + timedelta(hours=1),
+                last_seen_at=now,
+            ),
+        ])
+        session.commit()
+    client.cookies.set(SESSION_COOKIE, token)
+
+    response = client.get("/api/auth/me")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["roles"] == ["unit_admin"]
+    assert {"code": "identity.read", "target": "unit"} in payload["permissions"]
+    assert {"code": "agent.run", "target": "current_project"} in payload["permissions"]
+    assert any(menu["route_key"] == "users" for menu in payload["menus"])
+    assert any(menu["route_key"] == "chat" for menu in payload["menus"])
+    assert payload["csrf_token"]
+    assert payload["session"]["idle_expires_at"]
+    assert payload["session"]["absolute_expires_at"]
 
 
 def test_oidc_nonce_must_match_transaction_hash():

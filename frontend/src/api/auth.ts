@@ -1,0 +1,49 @@
+import { request } from './client';
+
+export interface AuthPermission {
+  code: string;
+  target: 'unit' | 'current_project';
+}
+
+export interface AuthProject {
+  id: string;
+  name: string;
+}
+
+export interface AuthMenu {
+  id: string;
+  node_key: string;
+  kind: 'group' | 'route';
+  route_key: string | null;
+  parent_id: string | null;
+  title: string;
+  sort_order: number;
+}
+
+export interface AuthContext {
+  user: {
+    id: string;
+    display_name: string;
+  };
+  unit_id: string;
+  current_project_id: string | null;
+  current_project: AuthProject | null;
+  projects: AuthProject[];
+  auth_method: 'oidc' | 'dev_test';
+  authorization_version: number;
+  roles: string[];
+  permissions: AuthPermission[];
+  menus: AuthMenu[];
+  csrf_token: string;
+  session: {
+    idle_expires_at: string;
+    absolute_expires_at: string;
+  };
+}
+
+export const authApi = {
+  login: () => request<{ authorization_url: string }>('/auth/login'),
+  devLogin: () => request<{ status: string; auth_method: string }>('/auth/dev/login', { method: 'POST' }),
+  me: () => request<AuthContext>('/auth/me'),
+  logout: () => request<{ status: string }>('/auth/logout', { method: 'POST' }),
+};

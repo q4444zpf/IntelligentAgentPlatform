@@ -15,7 +15,8 @@ from sqlalchemy.orm import Session
 from app.core.database import get_session
 from app.core.settings import settings
 
-from .models import AuthSession, ExternalIdentity, OidcLoginTransaction, Project, UnitMembership, User, new_id
+from .authorization import AuthorizationService
+from .models import AuthSession, ExternalIdentity, Menu, MenuPermission, OidcLoginTransaction, Project, UnitMembership, User, new_id
 
 router = APIRouter()
 SESSION_COOKIE = "iap_session"
@@ -29,6 +30,52 @@ def _aware(value: datetime) -> datetime:
 def _validate_nonce(claims: dict, expected_nonce_hash: str) -> None:
     if _hash(str(claims.get("nonce", ""))) != expected_nonce_hash:
         raise ValueError("OIDC nonce mismatch")
+
+
+def _csrf_token(auth: AuthSession) -> str:
+    secret = str(auth.csrf_secret_encrypted.get("ciphertext", ""))
+    return _hash(f"{auth.id}:{secret}")
+
+
+def _visible_menus(session: Session, authz: AuthorizationService, context) -> list[dict]:
+    rows = session.execute(
+        select(Menu, MenuPermission.permission_code)
+        .join(MenuPermission, MenuPermission.menu_id == Menu.id, isouter=True)
+        .where(Menu.status == "active")
+        .order_by(Menu.sort_order, Menu.node_key)
+    ).all()
+    permissions_by_menu: dict[str, set[str]] = {}
+    menus: dict[str, Menu] = {}
+    for menu, permission_code in rows:
+        menus[menu.id] = menu
+        if permission_code:
+            permissions_by_menu.setdefault(menu.id, set()).add(permission_code)
+
+    visible_ids: set[str] = set()
+    for menu_id, menu in menus.items():
+        if menu.kind != "route":
+            continue
+        if menu.requires_current_project and context.current_project_id is None:
+            continue
+        target = menu.visibility_target or "unit"
+        if any(authz.allows_entry(context, code, target) for code in permissions_by_menu.get(menu_id, ())):
+            visible_ids.add(menu_id)
+            if menu.parent_id:
+                visible_ids.add(menu.parent_id)
+
+    return [
+        {
+            "id": menu.id,
+            "node_key": menu.node_key,
+            "kind": menu.kind,
+            "route_key": menu.route_key,
+            "parent_id": menu.parent_id,
+            "title": menu.title,
+            "sort_order": menu.sort_order,
+        }
+        for menu in menus.values()
+        if menu.id in visible_ids
+    ]
 
 async def _oidc_metadata() -> dict:
     if not settings.oidc_issuer:
@@ -158,6 +205,10 @@ def auth_me(session_cookie: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] 
         (project for project in projects if project.id == auth.current_project_id),
         None,
     )
+    authz = AuthorizationService()
+    context = authz.load_context(session, auth.id)
+    capabilities = authz.entry_capabilities(context)
+    menus = _visible_menus(session, authz, context)
     session.commit()
     return {
         "user": {"id": user.id, "display_name": user.display_name},
@@ -170,6 +221,17 @@ def auth_me(session_cookie: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] 
         "projects": [{"id": project.id, "name": project.name} for project in projects],
         "auth_method": auth.auth_method,
         "authorization_version": user.authorization_version,
+        "roles": list(context.role_codes),
+        "permissions": [
+            {"code": capability.code, "target": capability.target}
+            for capability in capabilities
+        ],
+        "menus": menus,
+        "csrf_token": _csrf_token(auth),
+        "session": {
+            "idle_expires_at": auth.idle_expires_at,
+            "absolute_expires_at": auth.absolute_expires_at,
+        },
     }
 
 @router.post("/logout")

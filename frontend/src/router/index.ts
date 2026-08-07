@@ -9,9 +9,9 @@ export const router = createRouter({
   routes,
 });
 
-router.beforeEach((to) => {
+router.beforeEach(async (to) => {
   const permissionStore = usePermissionStore();
-  permissionStore.restoreSession();
+  await permissionStore.restoreSession();
 
   if (to.meta.public) {
     return permissionStore.isAuthenticated && to.path === '/login' ? '/dashboard' : true;
