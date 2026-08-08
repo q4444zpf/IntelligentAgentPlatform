@@ -26,6 +26,7 @@
                 <a-menu-divider />
                 <a-menu-item @click="switchRole('user')">切换为普通用户</a-menu-item>
                 <a-menu-item @click="switchRole('admin')">切换为管理员</a-menu-item>
+                <a-menu-item @click="router.push('/system/sessions')">登录会话</a-menu-item>
                 <a-menu-divider />
                 <a-menu-item @click="logout">退出登录</a-menu-item>
               </a-menu>

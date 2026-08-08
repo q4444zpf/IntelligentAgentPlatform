@@ -20,6 +20,7 @@ IDENTITY_TABLES = {
     "users",
     "external_identities",
     "external_identity_history",
+    "local_credentials",
     "units",
     "projects",
     "unit_memberships",
@@ -45,6 +46,7 @@ def _alembic(*arguments: str) -> None:
 def _load_models() -> None:
     global AuthSession
     global ExternalIdentity
+    global LocalCredential
     global Menu
     global OidcLoginTransaction
     global Permission
@@ -61,6 +63,7 @@ def _load_models() -> None:
     from app.identity.models import (
         AuthSession,
         ExternalIdentity,
+        LocalCredential,
         Menu,
         OidcLoginTransaction,
         Permission,

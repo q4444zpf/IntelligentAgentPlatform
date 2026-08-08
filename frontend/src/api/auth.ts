@@ -41,9 +41,28 @@ export interface AuthContext {
   };
 }
 
+export interface AuthSessionSummary {
+  session_id: string;
+  auth_method: 'local' | 'oidc' | 'dev_test' | string;
+  created_at: string;
+  last_seen_at: string;
+  current_project: { id: string; name: string } | null;
+  is_current_session: boolean;
+}
+
+export interface AuthSessionListResponse {
+  sessions: AuthSessionSummary[];
+}
+
 export const authApi = {
   login: () => request<{ authorization_url: string }>('/auth/login'),
   devLogin: () => request<{ status: string; auth_method: string }>('/auth/dev/login', { method: 'POST' }),
   me: () => request<AuthContext>('/auth/me'),
   logout: () => request<{ status: string }>('/auth/logout', { method: 'POST' }),
+};
+
+export const sessionApi = {
+  list: (signal?: AbortSignal) => request<AuthSessionListResponse>('/auth/sessions', { signal }),
+  revoke: (sessionId: string) => request<{ status: string; revoked: number }>(`/auth/sessions/${encodeURIComponent(sessionId)}/revoke`, { method: 'POST' }),
+  revokeOthers: () => request<{ status: string; revoked: number }>('/auth/sessions/revoke-others', { method: 'POST' }),
 };

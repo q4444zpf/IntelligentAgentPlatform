@@ -2,6 +2,7 @@ import hashlib
 import secrets
 import base64
 import hashlib as _hashlib
+import hmac
 from urllib.parse import urlencode, urlsplit
 import httpx
 from authlib.jose import jwt
@@ -9,14 +10,18 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Query, Request, Response
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.audit.recorder import AuditRecordRequest, AuditRecorder
 from app.core.database import get_session
 from app.core.settings import settings
 
 from .authorization import AuthorizationService
-from .models import AuthSession, ExternalIdentity, Menu, MenuPermission, OidcLoginTransaction, Project, UnitMembership, User, new_id
+from .models import AuthSession, ExternalIdentity, LocalCredential, Menu, MenuPermission, OidcLoginTransaction, Project, UnitMembership, User, new_id
+from .passwords import hash_password, verify_password
+from .schemas import ChangePasswordRequest, LocalLoginRequest
+from .session_lifecycle import revoke_user_sessions
 
 router = APIRouter()
 SESSION_COOKIE = "iap_session"
@@ -74,6 +79,121 @@ def _validate_origin(origin: str | None) -> None:
 def _csrf_token(auth: AuthSession) -> str:
     secret = str(auth.csrf_secret_encrypted.get("ciphertext", ""))
     return _hash(f"{auth.id}:{secret}")
+
+
+def _set_session_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        SESSION_COOKIE,
+        token,
+        httponly=True,
+        samesite="lax",
+        secure=settings.session_cookie_secure,
+        max_age=28800,
+        path="/",
+    )
+
+
+def _local_login_target(session: Session, email: str) -> tuple[User | None, LocalCredential | None]:
+    normalized_email = email.strip().lower()
+    user = session.scalar(
+        select(User).where(func.lower(User.email) == normalized_email, User.status == "active")
+    )
+    return user, session.get(LocalCredential, user.id) if user is not None else None
+
+
+def _is_oidc_bound(session: Session, user_id: str) -> bool:
+    return session.scalar(
+        select(ExternalIdentity.id).where(ExternalIdentity.user_id == user_id)
+    ) is not None
+
+
+def _require_active_session(session: Session, session_cookie: str | None) -> tuple[AuthSession, User]:
+    if not session_cookie:
+        raise HTTPException(status_code=401, detail="Authentication is required")
+    auth = session.scalar(
+        select(AuthSession).where(
+            AuthSession.session_token_hash == _hash(session_cookie),
+            AuthSession.revoked_at.is_(None),
+        )
+    )
+    if auth is None:
+        raise HTTPException(status_code=401, detail="Session is invalid")
+    now = datetime.now(timezone.utc)
+    user = session.get(User, auth.user_id)
+    if (
+        _aware(auth.idle_expires_at) <= now
+        or _aware(auth.absolute_expires_at) <= now
+        or user is None
+        or user.status != "active"
+        or user.authorization_version != auth.authorization_version
+    ):
+        raise HTTPException(status_code=401, detail="Session is invalid")
+    return auth, user
+
+
+def _require_session_csrf(
+    session: Session,
+    session_cookie: str | None,
+    origin: str | None,
+    csrf_header: str | None,
+) -> tuple[AuthSession, User]:
+    if session_cookie and not origin:
+        raise HTTPException(status_code=403, detail="Origin is required")
+    _validate_origin(origin)
+    auth, user = _require_active_session(session, session_cookie)
+    if not csrf_header:
+        raise HTTPException(status_code=403, detail="CSRF token is required")
+    if not hmac.compare_digest(csrf_header, _csrf_token(auth)):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+    return auth, user
+
+
+def _session_summary(session: Session, auth: AuthSession, current_session_id: str) -> dict:
+    project = session.get(Project, auth.current_project_id) if auth.current_project_id else None
+    return {
+        "session_id": auth.id,
+        "auth_method": auth.auth_method,
+        "created_at": auth.created_at,
+        "last_seen_at": auth.last_seen_at,
+        "current_project": (
+            {"id": project.id, "name": project.name}
+            if project is not None and project.unit_id == auth.unit_id
+            else None
+        ),
+        "is_current_session": auth.id == current_session_id,
+    }
+
+
+def _record_session_revocation(
+    session: Session,
+    actor: AuthSession,
+    revoked_session: AuthSession,
+    now: datetime,
+) -> None:
+    AuditRecorder().record(
+        session,
+        AuditRecordRequest(
+            unit_id=actor.unit_id,
+            project_id=None,
+            user_id=actor.user_id,
+            actor_roles=(),
+            authorization_scope="own",
+            event_scope="unit",
+            auth_method=actor.auth_method,
+            category="security",
+            source="auth",
+            action="auth.session.revoked",
+            status="succeeded",
+            risk_level="medium",
+            resource_type="auth_session",
+            resource_id=revoked_session.id,
+            summary="User revoked an authentication session",
+            metadata={"target_session_id": revoked_session.id, "reason": "user_revoked"},
+            allowed_metadata_keys=frozenset({"target_session_id", "reason"}),
+            idempotency_key=f"auth-session-revoked:{revoked_session.id}",
+            occurred_at=now,
+        ),
+    )
 
 
 def _visible_menus(session: Session, authz: AuthorizationService, context) -> list[dict]:
@@ -229,6 +349,98 @@ def dev_login(
     session.commit(); response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax", secure=settings.session_cookie_secure, max_age=28800, path="/")
     return {"status": "ok", "auth_method": "dev_test"}
 
+
+@router.post("/local/login")
+def local_login(
+    body: LocalLoginRequest,
+    response: Response,
+    session: Session = Depends(get_session),
+) -> dict[str, str | bool]:
+    user, credential = _local_login_target(session, body.email)
+    if user is not None and _is_oidc_bound(session, user.id):
+        raise HTTPException(status_code=403, detail="OIDC users must use unified login")
+    if credential is None:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    now = datetime.now(timezone.utc)
+    if credential.locked_until is not None and _aware(credential.locked_until) > now:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not verify_password(body.password, credential.password_hash):
+        credential.failed_attempts += 1
+        if credential.failed_attempts >= 5:
+            credential.locked_until = now + timedelta(minutes=15)
+        session.commit()
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    membership = session.scalar(
+        select(UnitMembership).where(
+            UnitMembership.user_id == user.id,
+            UnitMembership.status == "active",
+        ).order_by(UnitMembership.created_at)
+    )
+    project = session.scalar(
+        select(Project).where(
+            Project.unit_id == membership.unit_id,
+            Project.status == "active",
+        ).order_by(Project.created_at)
+    ) if membership else None
+    if membership is None or project is None:
+        raise HTTPException(status_code=403, detail="Local user has no active platform membership")
+    credential.failed_attempts = 0
+    credential.locked_until = None
+    token = secrets.token_urlsafe(32)
+    session.add(AuthSession(
+        id=new_id(),
+        session_token_hash=_hash(token),
+        user_id=user.id,
+        unit_id=membership.unit_id,
+        current_project_id=project.id,
+        auth_method="local",
+        csrf_secret_encrypted={"ciphertext": secrets.token_urlsafe(24)},
+        provider_tokens_encrypted=None,
+        provider_sid=None,
+        authorization_version=user.authorization_version,
+        idle_expires_at=now + timedelta(minutes=30),
+        absolute_expires_at=now + timedelta(hours=8),
+        last_seen_at=now,
+    ))
+    session.commit()
+    _set_session_cookie(response, token)
+    return {"status": "ok", "auth_method": "local", "must_change_password": credential.must_change_password}
+
+
+@router.post("/password/change")
+def change_password(
+    body: ChangePasswordRequest,
+    response: Response,
+    origin: Annotated[str | None, Header(alias="Origin")] = None,
+    csrf_header: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+    session_cookie: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
+    session: Session = Depends(get_session),
+) -> dict[str, str]:
+    if session_cookie and not origin:
+        raise HTTPException(status_code=403, detail="Origin is required")
+    _validate_origin(origin)
+    auth, user = _require_active_session(session, session_cookie)
+    if not csrf_header:
+        raise HTTPException(status_code=403, detail="CSRF token is required")
+    if not hmac.compare_digest(csrf_header, _csrf_token(auth)):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+    if auth.auth_method != "local" or _is_oidc_bound(session, user.id):
+        raise HTTPException(status_code=403, detail="OIDC users must use unified login")
+    credential = session.get(LocalCredential, user.id)
+    if credential is None or not verify_password(body.current_password, credential.password_hash):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    now = datetime.now(timezone.utc)
+    credential.password_hash = hash_password(body.new_password)
+    credential.password_changed_at = now
+    credential.must_change_password = False
+    credential.failed_attempts = 0
+    credential.locked_until = None
+    user.authorization_version += 1
+    revoke_user_sessions(session, user.id, "password_changed", now=now)
+    session.commit()
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return {"status": "ok"}
+
 @router.get("/me")
 def auth_me(session_cookie: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None, session: Session = Depends(get_session)) -> dict:
     if not session_cookie:
@@ -284,6 +496,87 @@ def auth_me(session_cookie: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] 
             "absolute_expires_at": auth.absolute_expires_at,
         },
     }
+
+
+@router.get("/sessions")
+def list_sessions(
+    session_cookie: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
+    session: Session = Depends(get_session),
+) -> dict[str, list[dict]]:
+    current_session, user = _require_active_session(session, session_cookie)
+    sessions = session.scalars(
+        select(AuthSession)
+        .where(
+            AuthSession.user_id == user.id,
+            AuthSession.revoked_at.is_(None),
+        )
+        .order_by(AuthSession.last_seen_at.desc(), AuthSession.id)
+    ).all()
+    return {
+        "sessions": [
+            _session_summary(session, auth, current_session.id)
+            for auth in sessions
+        ]
+    }
+
+
+@router.post("/sessions/{session_id}/revoke")
+def revoke_session(
+    session_id: str,
+    response: Response,
+    origin: Annotated[str | None, Header(alias="Origin")] = None,
+    csrf_header: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+    session_cookie: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
+    session: Session = Depends(get_session),
+) -> dict[str, str | int]:
+    current_session, user = _require_session_csrf(
+        session, session_cookie, origin, csrf_header,
+    )
+    target_session = session.scalar(
+        select(AuthSession).where(
+            AuthSession.id == session_id,
+            AuthSession.user_id == user.id,
+            AuthSession.revoked_at.is_(None),
+        )
+    )
+    if target_session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    now = datetime.now(timezone.utc)
+    target_session.revoked_at = now
+    target_session.revoke_reason = "user_revoked"
+    _record_session_revocation(session, current_session, target_session, now)
+    session.commit()
+    if target_session.id == current_session.id:
+        response.delete_cookie(SESSION_COOKIE, path="/")
+    return {"status": "ok", "revoked": 1}
+
+
+@router.post("/sessions/revoke-others")
+def revoke_other_sessions(
+    origin: Annotated[str | None, Header(alias="Origin")] = None,
+    csrf_header: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+    session_cookie: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
+    session: Session = Depends(get_session),
+) -> dict[str, str | int]:
+    current_session, user = _require_session_csrf(
+        session, session_cookie, origin, csrf_header,
+    )
+    targets = session.scalars(
+        select(AuthSession).where(
+            AuthSession.user_id == user.id,
+            AuthSession.id != current_session.id,
+            AuthSession.revoked_at.is_(None),
+        )
+    ).all()
+    now = datetime.now(timezone.utc)
+    for target_session in targets:
+        target_session.revoked_at = now
+        target_session.revoke_reason = "user_revoked"
+        _record_session_revocation(session, current_session, target_session, now)
+    session.commit()
+    return {"status": "ok", "revoked": len(targets)}
+
 
 @router.post("/logout")
 def logout(response: Response, origin: Annotated[str | None, Header(alias="Origin")] = None, session_cookie: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None, session: Session = Depends(get_session)) -> dict[str, str]:

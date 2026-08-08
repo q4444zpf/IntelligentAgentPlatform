@@ -35,7 +35,7 @@ class AuthorizationContext(BaseModel):
     user_id: str
     unit_id: str
     current_project_id: str | None
-    auth_method: Literal["oidc", "dev_test"]
+    auth_method: Literal["oidc", "dev_test", "local"]
     authorization_version: int
     role_codes: tuple[str, ...]
     grants: tuple[PermissionGrant, ...]
@@ -47,17 +47,31 @@ class AdminUser(BaseModel):
     email: str | None
     status: str
     membership_status: str
+    # Only populated by the create response; never persisted or returned by list/update.
+    initial_password: str | None = None
+    invitation_status: Literal["pending", "not_required"] | None = None
     project_memberships: list["AdminProjectMembership"] = Field(default_factory=list)
     role_summaries: list["AdminRoleSummary"] = Field(default_factory=list)
 
     @classmethod
-    def from_row(cls, user, membership_status: str, project_memberships=(), role_summaries=()):
+    def from_row(
+        cls,
+        user,
+        membership_status: str,
+        project_memberships=(),
+        role_summaries=(),
+        *,
+        initial_password: str | None = None,
+        invitation_status: Literal["pending", "not_required"] | None = None,
+    ):
         return cls(
             id=user.id,
             display_name=user.display_name,
             email=user.email,
             status=user.status,
             membership_status=membership_status,
+            initial_password=initial_password,
+            invitation_status=invitation_status,
             project_memberships=list(project_memberships),
             role_summaries=list(role_summaries),
         )
@@ -112,15 +126,38 @@ class AdminPermission(BaseModel):
     status: str
 
 
+class AdminRolePermission(BaseModel):
+    id: str
+    role_id: str
+    permission_code: str
+    data_scope: DataScope
+
+
 class CreateIdentityUserRequest(BaseModel):
     display_name: str = Field(min_length=1, max_length=160)
     email: str | None = Field(default=None, max_length=320)
     project_id: str | None = None
+    initial_password: str | None = Field(default=None, min_length=12, max_length=256)
+    invite: bool | None = None
 
 
 class UpdateIdentityUserRequest(BaseModel):
     display_name: str = Field(min_length=1, max_length=160)
     email: str | None = Field(default=None, max_length=320)
+
+
+class LocalLoginRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=1, max_length=256)
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=12, max_length=256)
+
+
+class PasswordResetRequest(BaseModel):
+    new_password: str = Field(min_length=12, max_length=256)
 
 
 class IdentityStatusRequest(BaseModel):
@@ -134,6 +171,11 @@ class BindExternalIdentityRequest(BaseModel):
 
 class AssignIdentityRoleRequest(BaseModel):
     role_id: str = Field(min_length=1, max_length=36)
+    project_id: str | None = None
+
+
+class ReplaceIdentityRolesRequest(BaseModel):
+    role_ids: list[str] = Field(default_factory=list, max_length=64)
     project_id: str | None = None
 
 
