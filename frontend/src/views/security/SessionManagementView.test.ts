@@ -96,5 +96,5 @@ describe('会话管理', () => {
 });
 
 it('routes system sessions to the real session management view', () => {
-  expect(routesSource).toContain("path: 'system/sessions', name: 'Sessions', component: () => import('@/views/security/SessionManagementView.vue')");
+  expect(routesSource).toContain("path: 'system/sessions', name: 'Sessions', component: () => import('@/views/security/SessionManagementView.vue'), meta: { title: '登录会话' }");
 });
