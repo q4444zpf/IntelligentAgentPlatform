@@ -1,10 +1,10 @@
 // @vitest-environment happy-dom
 
 import { createPinia, setActivePinia } from 'pinia';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { usePermissionStore } from './permission';
-import type { AuthContext } from '@/api/auth';
+import { authApi, type AuthContext } from '@/api/auth';
 
 describe('permission store auth context', () => {
   beforeEach(() => {
@@ -44,5 +44,33 @@ describe('permission store auth context', () => {
     expect(store.hasPermission('chat:view')).toBe(true);
     expect(store.hasPermission('dashboard:view')).toBe(true);
     expect(store.csrfToken).toBe('csrf-token');
+  });
+
+  it('logs in with local credentials before restoring the server session', async () => {
+    const store = usePermissionStore();
+    const localLogin = vi.spyOn(authApi, 'localLogin').mockResolvedValue({
+      status: 'ok',
+      auth_method: 'local',
+      must_change_password: false,
+    });
+    const restore = vi.spyOn(store, 'refreshSession').mockResolvedValue({
+      user: { id: 'user-1', display_name: '本地用户' },
+      unit_id: 'unit-1',
+      current_project_id: null,
+      current_project: null,
+      projects: [],
+      auth_method: 'local',
+      authorization_version: 1,
+      roles: ['viewer'],
+      permissions: [],
+      menus: [],
+      csrf_token: 'csrf-local',
+      session: { idle_expires_at: '2026-08-08T10:00:00Z', absolute_expires_at: '2026-08-08T18:00:00Z' },
+    });
+
+    await store.loginWithLocalCredentials('alice@example.test', 'Password123!');
+
+    expect(localLogin).toHaveBeenCalledWith({ email: 'alice@example.test', password: 'Password123!' });
+    expect(restore).toHaveBeenCalledTimes(1);
   });
 });

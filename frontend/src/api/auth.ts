@@ -29,7 +29,7 @@ export interface AuthContext {
   current_project_id: string | null;
   current_project: AuthProject | null;
   projects: AuthProject[];
-  auth_method: 'oidc' | 'dev_test';
+  auth_method: 'local' | 'oidc' | 'dev_test';
   authorization_version: number;
   roles: string[];
   permissions: AuthPermission[];
@@ -54,8 +54,23 @@ export interface AuthSessionListResponse {
   sessions: AuthSessionSummary[];
 }
 
+export interface LocalLoginPayload {
+  email: string;
+  password: string;
+}
+
+export interface LocalLoginResponse {
+  status: string;
+  auth_method: string;
+  must_change_password: boolean;
+}
+
 export const authApi = {
   login: () => request<{ authorization_url: string }>('/auth/login'),
+  localLogin: (payload: LocalLoginPayload) => request<LocalLoginResponse>('/auth/local/login', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  }),
   devLogin: () => request<{ status: string; auth_method: string }>('/auth/dev/login', { method: 'POST' }),
   me: () => request<AuthContext>('/auth/me'),
   logout: () => request<{ status: string }>('/auth/logout', { method: 'POST' }),
