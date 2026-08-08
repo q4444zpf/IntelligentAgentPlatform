@@ -39,7 +39,7 @@
             name="username"
             :rules="[{ required: true, message: '请输入账号' }]"
           >
-            <a-input v-model:value="form.username" size="large" autocomplete="username" placeholder="admin 或 user">
+            <a-input v-model:value="form.username" size="large" autocomplete="username" placeholder="邮箱地址">
               <template #prefix>
                 <UserOutlined />
               </template>
@@ -55,7 +55,7 @@
               v-model:value="form.password"
               size="large"
               autocomplete="current-password"
-              placeholder="任意密码均可登录"
+              placeholder="请输入密码"
             >
               <template #prefix>
                 <LockOutlined />
@@ -69,10 +69,10 @@
           </div>
 
           <a-button type="primary" html-type="submit" size="large" block :loading="submitting">
-            {{ hasDevIdentity ? '开发身份登录' : '统一认证登录' }}
+            {{ hasDevIdentity ? '开发身份登录' : '本地账号登录' }}
           </a-button>
 
-          <a-button v-if="hasDevIdentity" class="oidc-button" size="large" block :loading="oidcSubmitting" @click="handleOidcLogin">
+          <a-button class="oidc-button" size="large" block :loading="oidcSubmitting" @click="handleOidcLogin">
             统一认证登录
           </a-button>
         </a-form>
@@ -147,8 +147,7 @@ async function handleLogin() {
     if (hasDevIdentity) {
       await permissionStore.loginWithDevelopmentIdentity();
     } else {
-      await permissionStore.startOidcLogin();
-      return;
+      await permissionStore.loginWithLocalCredentials(form.username, form.password);
     }
     message.success('登录成功');
     const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/dashboard';

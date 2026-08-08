@@ -5,6 +5,7 @@
 ## 当前可验证内容
 
 - `POST /api/auth/dev/login`：使用预置开发身份创建 HttpOnly 会话 Cookie。
+- `POST /api/auth/local/login`：使用平台本地账号密码创建 HttpOnly 会话 Cookie；OIDC 绑定用户不能走此入口。
 - `GET /api/auth/me`：从 PostgreSQL 会话和授权数据恢复用户、单位、项目、角色、权限和菜单。
 - `POST /api/auth/logout`：撤销会话并清理 Cookie。
 - `GET /api/auth/login`：当配置 OIDC Provider 后生成 Authorization Code + PKCE 请求，并设置 `iap_oidc_browser` 浏览器关联 Cookie。
@@ -17,6 +18,7 @@
 ```powershell
 $env:PYTHONPATH='.'
 pytest -q tests/identity/test_auth_api.py
+pytest -q tests/identity/test_oidc_client.py tests/integration/test_oidc_mock_flow.py
 ```
 
 该测试覆盖会话过期、续期、项目上下文、授权菜单、nonce 和浏览器关联校验。
