@@ -130,7 +130,7 @@ export const routes: RouteRecordRaw[] = [
       { path: 'workflow', name: 'WorkflowManage', component: genericView, meta: { title: '流程编排', module: 'workflow', permission: 'workflow:view' } },
       { path: 'collaboration', name: 'CollaborationManage', component: genericView, meta: { title: '多智能体协同', module: 'collaboration', permission: 'collaboration:view' } },
       { path: 'llm', name: 'LlmProviders', component: () => import('@/views/settings/ModelProviderView.vue'), meta: { title: '大模型配置', permission: 'platform:llm' } },
-      { path: 'integration', name: 'Integration', component: genericView, meta: { title: '系统集成', module: 'integration', permission: 'integration:view' } },
+      { path: 'integration', name: 'Integration', component: () => import('@/views/platform/IntegrationView.vue'), meta: { title: '系统集成', permission: 'integration:view' } },
       { path: 'external-agents', name: 'ExternalAgents', component: genericView, meta: { title: '外部智能体管理', module: 'integration', permission: 'integration:view' } },
       { path: 'project/resources', name: 'ProjectResources', component: resourceView, meta: { title: '项目资源', permission: 'resources:personal' } },
       { path: 'resources/topology', name: 'HydraulicTopology', component: () => import('@/views/resources/TopologyDataView.vue'), meta: { title: '水利拓扑数据', permission: 'resources:personal' } },
