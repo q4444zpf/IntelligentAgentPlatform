@@ -69,13 +69,42 @@
           </div>
 
           <a-button type="primary" html-type="submit" size="large" block :loading="submitting">
-            {{ hasDevIdentity ? '开发身份登录' : '本地账号登录' }}
+            本地账号登录
+          </a-button>
+
+          <a-button v-if="hasDevIdentity" class="dev-button" size="large" block :loading="devSubmitting" @click="handleDevLogin">
+            开发身份登录（仅开发环境）
           </a-button>
 
           <a-button class="oidc-button" size="large" block :loading="oidcSubmitting" @click="handleOidcLogin">
             统一认证登录
           </a-button>
         </a-form>
+
+        <a-modal
+          v-model:open="passwordChangeOpen"
+          title="首次登录需要修改密码"
+          :confirm-loading="passwordChanging"
+          ok-text="修改密码并继续"
+          cancel-text="退出登录"
+          :closable="false"
+          :mask-closable="false"
+          @ok="handlePasswordChange"
+          @cancel="handlePasswordChangeCancel"
+        >
+          <a-alert type="warning" message="为了保护账号安全，请先设置新密码。" show-icon />
+          <a-form layout="vertical" class="password-change-form">
+            <a-form-item label="当前密码">
+              <a-input-password v-model:value="passwordForm.currentPassword" autocomplete="current-password" />
+            </a-form-item>
+            <a-form-item label="新密码">
+              <a-input-password v-model:value="passwordForm.newPassword" autocomplete="new-password" />
+            </a-form-item>
+            <a-form-item label="确认新密码">
+              <a-input-password v-model:value="passwordForm.confirmPassword" autocomplete="new-password" />
+            </a-form-item>
+          </a-form>
+        </a-modal>
 
         <a-alert
           class="login-tip"
@@ -102,13 +131,18 @@ import { reactive, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
 import { identityHeaders } from '@/api/client';
+import { authApi } from '@/api/auth';
 import { usePermissionStore, type UserRole } from '@/stores/permission';
 
 const router = useRouter();
 const route = useRoute();
 const permissionStore = usePermissionStore();
 const submitting = ref(false);
+const devSubmitting = ref(false);
 const oidcSubmitting = ref(false);
+const passwordChangeOpen = ref(false);
+const passwordChanging = ref(false);
+const passwordForm = reactive({ currentPassword: '', newPassword: '', confirmPassword: '' });
 const hasDevIdentity = Object.keys(identityHeaders).length > 0;
 
 const form = reactive({
@@ -144,10 +178,13 @@ const capabilities = [
 async function handleLogin() {
   submitting.value = true;
   try {
-    if (hasDevIdentity) {
-      await permissionStore.loginWithDevelopmentIdentity();
-    } else {
-      await permissionStore.loginWithLocalCredentials(form.username, form.password);
+    const result = await permissionStore.loginWithLocalCredentials(form.username, form.password);
+    if (result?.must_change_password) {
+      passwordForm.currentPassword = form.password;
+      passwordForm.newPassword = '';
+      passwordForm.confirmPassword = '';
+      passwordChangeOpen.value = true;
+      return;
     }
     message.success('登录成功');
     const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/dashboard';
@@ -156,6 +193,56 @@ async function handleLogin() {
     message.error(error instanceof Error ? error.message : '登录失败');
   } finally {
     submitting.value = false;
+  }
+}
+
+async function handlePasswordChange() {
+  if (!passwordForm.currentPassword) {
+    message.error('请输入当前密码');
+    return;
+  }
+  if (passwordForm.newPassword.length < 8) {
+    message.error('新密码至少需要 8 位');
+    return;
+  }
+  if (passwordForm.newPassword !== passwordForm.confirmPassword) {
+    message.error('两次输入的新密码不一致');
+    return;
+  }
+  passwordChanging.value = true;
+  try {
+    await authApi.changePassword({
+      current_password: passwordForm.currentPassword,
+      new_password: passwordForm.newPassword,
+    });
+    await permissionStore.loginWithLocalCredentials(form.username, passwordForm.newPassword);
+    passwordChangeOpen.value = false;
+    message.success('密码修改成功');
+    const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/dashboard';
+    router.replace(redirect);
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '密码修改失败');
+  } finally {
+    passwordChanging.value = false;
+  }
+}
+
+async function handlePasswordChangeCancel() {
+  passwordChangeOpen.value = false;
+  await permissionStore.logout();
+}
+
+async function handleDevLogin() {
+  devSubmitting.value = true;
+  try {
+    await permissionStore.loginWithDevelopmentIdentity();
+    message.success('开发身份登录成功');
+    const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/dashboard';
+    router.replace(redirect);
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '开发身份登录失败');
+  } finally {
+    devSubmitting.value = false;
   }
 }
 
@@ -311,6 +398,14 @@ async function handleOidcLogin() {
 
 .oidc-button {
   margin-top: 12px;
+}
+
+.dev-button {
+  margin-top: 12px;
+}
+
+.password-change-form {
+  margin-top: 18px;
 }
 
 @media (max-width: 960px) {

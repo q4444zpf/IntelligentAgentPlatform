@@ -100,6 +100,22 @@ def test_admin_cannot_create_case_insensitive_duplicate_email():
     assert response.json()["detail"] == "邮箱已存在"
 
 
+def test_admin_cannot_create_case_insensitive_duplicate_display_name():
+    client = build_client()
+    response = client.post('/api/identity/users', headers=headers(), json={'display_name': 'alice', 'email': 'unique@example.com'})
+    assert response.status_code == 409
+    assert response.json()['detail'] == '用户名已存在'
+
+
+def test_admin_can_delete_another_user():
+    client = build_client()
+    created = client.post('/api/identity/users', headers=headers(), json={'display_name': 'Temporary User', 'email': 'temporary@example.com'})
+    assert created.status_code == 201
+    deleted = client.delete(f"/api/identity/users/{created.json()['id']}", headers=headers())
+    assert deleted.status_code == 200
+    assert deleted.json()['deleted'] is True
+
+
 def test_admin_create_local_user_returns_one_time_initial_password_and_stores_only_hash():
     client = build_client()
     initial_password = "Initial-password-123"
@@ -159,6 +175,36 @@ def test_admin_lists_nested_users_and_isolates_unit():
     assert [item['id'] for item in payload] == ['user-1']
     assert payload[0]['project_memberships'][0]['project_code'] == 'p1'
     assert payload[0]['role_summaries'][0]['code'] == 'unit_admin'
+
+
+def test_updating_user_profile_keeps_existing_session_authorization_valid():
+    client = build_client()
+    with app.dependency_overrides[get_session]() as session:
+        now = datetime.now(timezone.utc)
+        session.add(AuthSession(
+            id='profile-session', session_token_hash=_hash('profile-token'), user_id='user-1',
+            unit_id='unit-1', current_project_id='project-1', auth_method='dev_test',
+            csrf_secret_encrypted={'ciphertext': 'csrf'}, provider_tokens_encrypted=None,
+            provider_sid=None, authorization_version=1,
+            idle_expires_at=now + timedelta(minutes=30), absolute_expires_at=now + timedelta(hours=1),
+            last_seen_at=now,
+        ))
+        session.commit()
+    client.cookies.set(SESSION_COOKIE, 'profile-token')
+
+    response = client.patch(
+        '/api/identity/users/user-1',
+        headers={'Origin': 'http://testserver', 'X-CSRF-Token': 'csrf'},
+        json={'display_name': 'Alice Updated', 'email': 'alice.updated@example.com'},
+    )
+
+    assert response.status_code == 200
+    with app.dependency_overrides[get_session]() as session:
+        user = session.get(User, 'user-1')
+        auth = session.get(AuthSession, 'profile-session')
+        assert user.display_name == 'Alice Updated'
+        assert user.authorization_version == 1
+        assert auth.revoked_at is None
 
 
 def test_admin_requires_authentication_and_admin_role():

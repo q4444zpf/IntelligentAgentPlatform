@@ -53,7 +53,12 @@ export async function request<T>(path: string, init: RequestInit = {}, timeoutMs
     });
     if (!response.ok) {
       const payload = await response.json().catch(() => ({}));
-      throw new ApiError(payload.detail || `请求失败（HTTP ${response.status}）`, response.status);
+      const detail = payload.detail || `请求失败（HTTP ${response.status}）`;
+      if (response.status === 401 && !path.startsWith('/auth/')) {
+        csrfToken = '';
+        window.dispatchEvent(new CustomEvent('iap:session-invalid', { detail }));
+      }
+      throw new ApiError(detail, response.status);
     }
     return (await response.json()) as T;
   } catch (error) {

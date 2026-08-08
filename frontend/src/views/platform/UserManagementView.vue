@@ -49,6 +49,7 @@
           <a-space v-else-if="column.key === 'action'">
             <a @click="openEdit(record)">编辑</a>
             <a v-if="!isOidcUser(record)" @click="openReset(record)">重置密码</a>
+            <a-popconfirm title="确认删除该用户？" @confirm="deleteUser(record)"><a>删除</a></a-popconfirm>
             <a @click="openRoles(record)">角色管理</a>
             <a-popconfirm title="确认切换用户状态？" @confirm="toggleStatus(record)">
               <a :class="{ 'disabled-action': savingId === record.id }">{{ record.status === 'active' ? '停用' : '启用' }}</a>
@@ -74,7 +75,7 @@
     </a-modal>
     <a-modal v-model:open="resetOpen" title="重置密码" :confirm-loading="resetting" @ok="submitReset">
       <a-form layout="vertical">
-        <a-form-item label="新密码"><a-input-password v-model:value="resetForm.new_password" /></a-form-item>
+        <a-form-item label="随机密码"><a-input-password v-model:value="resetForm.new_password" readonly /><a-button @click="generateResetPassword">重新生成</a-button><a-button @click="copyResetPassword">复制</a-button></a-form-item>
       </a-form>
     </a-modal>
     <a-modal v-model:open="rolesOpen" title="角色管理" :confirm-loading="rolesSaving || rolesLoading" @ok="submitRoles">
@@ -99,6 +100,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { ApiError } from '@/api/client';
 import {
   createIdentityUser,
+  deleteIdentityUser,
   listIdentityProjects,
   listIdentityRoles,
   listIdentityUserRoles,
@@ -175,7 +177,18 @@ function statusColor(status: string): string {
 function openCreate(): void { createForm.value = { display_name: '', email: '' }; createOpen.value = true; }
 function openEdit(user: IdentityUser): void { editUserId.value = user.id; editForm.value = { display_name: user.display_name, email: user.email || '' }; editOpen.value = true; }
 function isOidcUser(user: IdentityUser): boolean { return user.auth_method === 'oidc' || user.external_identity === true; }
-function openReset(user: IdentityUser): void { resetUserId.value = user.id; resetForm.value = { new_password: '' }; resetOpen.value = true; }
+function randomPassword(): string {
+  const sets = ['ABCDEFGHJKLMNPQRSTUVWXYZ', 'abcdefghijkmnopqrstuvwxyz', '23456789', '!@#$%^&*'];
+  const pick = (chars: string) => chars[crypto.getRandomValues(new Uint32Array(1))[0] % chars.length];
+  const chars = sets.map(pick);
+  const all = sets.join('');
+  while (chars.length < 16) chars.push(pick(all));
+  return chars.sort(() => Math.random() - 0.5).join('');
+}
+function openReset(user: IdentityUser): void { resetUserId.value = user.id; resetForm.value = { new_password: randomPassword() }; resetOpen.value = true; }
+function generateResetPassword(): void { resetForm.value.new_password = randomPassword(); }
+async function copyResetPassword(): Promise<void> { if (resetForm.value.new_password) await navigator.clipboard.writeText(resetForm.value.new_password); }
+async function deleteUser(user: IdentityUser): Promise<void> { try { await deleteIdentityUser(user.id); await loadUsers(); } catch (error) { errorMessage.value = error instanceof ApiError ? error.message : '删除用户失败'; } }
 function openRoles(user: IdentityUser): void {
   roleUserId.value = user.id;
   roleScope.value = 'unit';

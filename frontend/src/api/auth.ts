@@ -71,6 +71,10 @@ export const authApi = {
     method: 'POST',
     body: JSON.stringify(payload),
   }),
+  changePassword: (payload: { current_password: string; new_password: string }) => request<{ status: string }>('/auth/password/change', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  }),
   devLogin: () => request<{ status: string; auth_method: string }>('/auth/dev/login', { method: 'POST' }),
   me: () => request<AuthContext>('/auth/me'),
   logout: () => request<{ status: string }>('/auth/logout', { method: 'POST' }),

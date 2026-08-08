@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   deleteRole: vi.fn(),
   listPermissions: vi.fn(),
   grantRolePermission: vi.fn(),
+  deleteUser: vi.fn(),
 }));
 vi.mock('@/api/identity', () => ({
   listIdentityUsers: mocks.listUsers,
@@ -28,6 +29,7 @@ vi.mock('@/api/identity', () => ({
   deleteIdentityRole: mocks.deleteRole,
   listIdentityPermissions: mocks.listPermissions,
   grantIdentityRolePermission: mocks.grantRolePermission,
+  deleteIdentityUser: mocks.deleteUser,
 }));
 
 const stubs = {

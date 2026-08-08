@@ -27,6 +27,7 @@
                 <a-menu-item @click="switchRole('user')">切换为普通用户</a-menu-item>
                 <a-menu-item @click="switchRole('admin')">切换为管理员</a-menu-item>
                 <a-menu-item @click="router.push('/system/sessions')">登录会话</a-menu-item>
+                <a-menu-item v-if="permissionStore.authContext?.auth_method === 'local'" @click="passwordOpen = true">修改密码</a-menu-item>
                 <a-menu-divider />
                 <a-menu-item @click="logout">退出登录</a-menu-item>
               </a-menu>
@@ -92,6 +93,13 @@
         </section>
       </div>
     </a-drawer>
+    <a-modal v-model:open="passwordOpen" title="修改密码" :confirm-loading="passwordSaving" @ok="changeOwnPassword">
+      <a-form layout="vertical">
+        <a-form-item label="当前密码"><a-input-password v-model:value="passwordForm.current" /></a-form-item>
+        <a-form-item label="新密码"><a-input-password v-model:value="passwordForm.next" /></a-form-item>
+        <a-form-item label="确认新密码"><a-input-password v-model:value="passwordForm.confirm" /></a-form-item>
+      </a-form>
+    </a-modal>
   </a-layout>
 </template>
 
@@ -113,17 +121,22 @@ import {
   SearchOutlined,
   SettingOutlined,
 } from '@ant-design/icons-vue';
-import { computed, ref } from 'vue';
+import { computed, reactive, ref } from 'vue';
+import { message } from 'ant-design-vue';
 import { useRoute, useRouter } from 'vue-router';
 
 import { appMenus, type AppMenuItem } from '@/router/routes';
 import { usePermissionStore } from '@/stores/permission';
+import { authApi } from '@/api/auth';
 
 const route = useRoute();
 const router = useRouter();
 const permissionStore = usePermissionStore();
 const assistantOpen = ref(false);
 const mobileNavOpen = ref(false);
+const passwordOpen = ref(false);
+const passwordSaving = ref(false);
+const passwordForm = reactive({ current: '', next: '', confirm: '' });
 
 const iconMap = {
   chat: MessageOutlined, dashboard: DashboardOutlined, agent: ClusterOutlined, capability: ExperimentOutlined,
@@ -150,6 +163,20 @@ function switchRole(role: 'user' | 'admin') {
   if (permission && !permissionStore.hasPermission(permission)) router.push('/chat');
 }
 async function logout() { await permissionStore.logout(); router.replace('/login'); }
+async function changeOwnPassword() {
+  if (!passwordForm.current) return message.error('请输入当前密码');
+  if (passwordForm.next.length < 12) return message.error('新密码至少需要 12 位');
+  if (passwordForm.next !== passwordForm.confirm) return message.error('两次输入的新密码不一致');
+  passwordSaving.value = true;
+  try {
+    await authApi.changePassword({ current_password: passwordForm.current, new_password: passwordForm.next });
+    permissionStore.clearSession();
+    message.success('密码修改成功，请重新登录');
+    router.replace('/login');
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '密码修改失败');
+  } finally { passwordSaving.value = false; }
+}
 </script>
 
 <style scoped>

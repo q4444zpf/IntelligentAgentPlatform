@@ -1,4 +1,6 @@
 from typing import Annotated
+import secrets
+import string
 
 from datetime import datetime, timezone
 
@@ -11,7 +13,7 @@ from app.core.request_context import RequestContext, require_request_context
 from app.audit.recorder import AuditRecordRequest, AuditRecorder
 
 from .models import (
-    ExternalIdentity, LocalCredential, Permission,
+    AuthSession, ExternalIdentity, LocalCredential, Permission,
     Project,
     ProjectMembership,
     ProjectMembershipRole,
@@ -109,6 +111,20 @@ def _ensure_email_available(session: Session, email: str | None, *, exclude_user
         raise HTTPException(status_code=409, detail="邮箱已存在")
     return normalized
 
+def _ensure_display_name_available(session: Session, display_name: str, *, exclude_user_id: str | None = None) -> str:
+    normalized = display_name.strip()
+    query = select(User.id).where(func.lower(User.display_name) == normalized.lower())
+    if exclude_user_id is not None:
+        query = query.where(User.id != exclude_user_id)
+    if session.scalar(query) is not None:
+        raise HTTPException(status_code=409, detail="用户名已存在")
+    return normalized
+
+def _generate_password() -> str:
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+    chars = [secrets.choice(string.ascii_uppercase), secrets.choice(string.ascii_lowercase), secrets.choice(string.digits), secrets.choice("!@#$%^&*")]
+    return ''.join(chars + [secrets.choice(alphabet) for _ in range(12)])
+
 
 @router.get("/users", response_model=list[AdminUser])
 def list_users(
@@ -169,9 +185,10 @@ def create_user(
 ) -> AdminUser:
     if body.initial_password is not None and body.invite is True:
         raise HTTPException(status_code=422, detail="初始密码和邀请状态不能同时设置")
+    display_name = _ensure_display_name_available(session, body.display_name)
     email = _ensure_email_available(session, body.email)
     project = _ensure_project(session, body.project_id, context.unit_id)
-    user = User(id=new_id(), display_name=body.display_name, email=email, status="active", authorization_version=1)
+    user = User(id=new_id(), display_name=display_name, email=email, status="active", authorization_version=1)
     session.add(user)
     session.flush()
     session.add(UnitMembership(id=new_id(), user_id=user.id, unit_id=context.unit_id, status="active"))
@@ -208,8 +225,8 @@ def update_user(
     user = session.scalar(select(User).where(User.id == user_id))
     if membership is None or user is None:
         raise HTTPException(status_code=404, detail="用户不存在或不属于当前单位")
-    user.display_name, user.email = body.display_name, _ensure_email_available(session, body.email, exclude_user_id=user.id)
-    _bump(user)
+    user.display_name = _ensure_display_name_available(session, body.display_name, exclude_user_id=user.id)
+    user.email = _ensure_email_available(session, body.email, exclude_user_id=user.id)
     session.commit()
     return AdminUser.from_row(user, membership.status)
 
@@ -296,6 +313,26 @@ def reset_user_password(
     revoke_user_sessions(session, user.id, "password_reset", now=now)
     session.commit()
     return {"user_id": user.id, "must_change_password": True}
+
+@router.post("/users/{user_id}/password-generate")
+def generate_user_password(user_id: str, context: RequestContext = Depends(identity_admin_context), session: Session = Depends(get_session)) -> dict[str, str | bool]:
+    password = _generate_password()
+    result = reset_user_password(PasswordResetRequest(new_password=password), user_id, context, session)
+    result["generated_password"] = password
+    return result
+
+@router.delete("/users/{user_id}")
+def delete_user(user_id: str, context: RequestContext = Depends(identity_admin_context), session: Session = Depends(get_session)) -> dict[str, str | bool]:
+    if user_id == context.user_id:
+        raise HTTPException(status_code=409, detail="不能删除当前登录用户")
+    membership = _unit_member(session, user_id, context.unit_id)
+    user = session.scalar(select(User).where(User.id == user_id))
+    if membership is None or user is None:
+        raise HTTPException(status_code=404, detail="用户不存在或不属于当前单位")
+    for model in (UnitMembershipRole, ProjectMembershipRole, ProjectMembership, LocalCredential, ExternalIdentity, AuthSession):
+        session.execute(delete(model).where(model.user_id == user_id))
+    session.delete(membership); session.delete(user); session.commit()
+    return {"user_id": user_id, "deleted": True}
 
 
 @router.post("/users/{user_id}/external-identities", status_code=status.HTTP_201_CREATED)

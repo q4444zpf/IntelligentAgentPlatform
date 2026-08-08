@@ -76,6 +76,12 @@ export function resetIdentityUserPassword(userId: string, body: { new_password: 
     body: JSON.stringify(body),
   });
 }
+export function generateIdentityUserPassword(userId: string): Promise<{ user_id: string; must_change_password: boolean; generated_password: string }> {
+  return request(`/identity/users/${encodeURIComponent(userId)}/password-generate`, { method: 'POST' });
+}
+export function deleteIdentityUser(userId: string): Promise<{ user_id: string; deleted: boolean }> {
+  return request(`/identity/users/${encodeURIComponent(userId)}`, { method: 'DELETE' });
+}
 
 export function listIdentityUserRoles(userId: string, projectId?: string | null, signal?: AbortSignal): Promise<IdentityRoleSummary[]> {
   const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';

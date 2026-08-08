@@ -144,8 +144,9 @@ export const usePermissionStore = defineStore('permission', {
       await this.refreshSession();
     },
     async loginWithLocalCredentials(email: string, password: string) {
-      await authApi.localLogin({ email, password });
+      const result = await authApi.localLogin({ email, password });
       await this.refreshSession();
+      return result;
     },
     async startOidcLogin() {
       const { authorization_url: authorizationUrl } = await authApi.login();
