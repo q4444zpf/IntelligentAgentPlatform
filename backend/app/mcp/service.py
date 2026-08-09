@@ -11,8 +11,10 @@ from sqlalchemy.orm import Session
 from app.audit.management import management_event_id, management_trace_id
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.core.request_context import RequestContext
+from app.tools.store import ToolStore
 from .schemas import McpClientConfig, McpClientCreate, McpClientInfo, McpToolInfo
 from .store import McpConcurrentUpdateError, McpStore
+from .tool_registry import McpToolRegistrySynchronizer
 
 
 MASK = "********"
@@ -43,10 +45,19 @@ def _is_sensitive_header(name: str) -> bool:
 
 
 class McpService:
-    def __init__(self, store: McpStore | None = None, http_client: httpx.Client | None = None, *, audit_recorder: AuditRecorder | None = None):
+    def __init__(
+        self,
+        store: McpStore | None = None,
+        http_client: httpx.Client | None = None,
+        *,
+        audit_recorder: AuditRecorder | None = None,
+        tool_store: ToolStore | None = None,
+    ):
         self.store = store or McpStore()
         self.http_client = http_client or httpx.Client(timeout=15, follow_redirects=False)
         self.audit_recorder = audit_recorder or AuditRecorder()
+        self.tool_store = tool_store or ToolStore(self.store.session_factory)
+        self.tool_registry = McpToolRegistrySynchronizer(self.tool_store)
 
     @staticmethod
     def _cas(operation):
@@ -223,6 +234,7 @@ class McpService:
             self._cas(lambda: self.store.update_tools(key, tools, synced_at, record["version"]))
         else:
             self._cas(lambda: self.store.update_in_session(session, key, expected_version=record["version"], tool_records=tools, last_synced_at=synced_at))
+            self.tool_registry.sync(session, key, tools)
             self._commit_management(context, session, request_id, action="resource.updated", key=key, name=record["name"], metadata={"tool_count": len(tools)})
         return self.list_tools(key)
 

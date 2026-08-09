@@ -67,6 +67,37 @@ class ToolStore:
             row = session.execute(statement).scalar_one()
             return self._decode(row)
 
+    def upsert_mcp_in_session(
+        self,
+        session: Session,
+        definition: dict[str, Any],
+    ) -> dict[str, Any]:
+        dialect = session.get_bind().dialect.name
+        if dialect == "postgresql":
+            statement = postgresql_insert(RegisteredToolRecord).values(**definition)
+        elif dialect == "sqlite":
+            statement = sqlite_insert(RegisteredToolRecord).values(**definition)
+        else:
+            raise RuntimeError(f"Unsupported tool registry dialect: {dialect}")
+        statement = statement.on_conflict_do_update(
+            index_elements=[RegisteredToolRecord.tool_id],
+            set_={
+                "version": statement.excluded.version,
+                "name": statement.excluded.name,
+                "description": statement.excluded.description,
+                "source": statement.excluded.source,
+                "input_schema": statement.excluded.input_schema,
+                "output_schema": statement.excluded.output_schema,
+                "source_resource_id": statement.excluded.source_resource_id,
+                "source_capability_id": statement.excluded.source_capability_id,
+                "source_available": True,
+                "updated_at": func.now(),
+            },
+        ).returning(RegisteredToolRecord)
+        row = session.execute(statement).scalar_one()
+        session.flush()
+        return self._decode(row)
+
     def set_enabled(self, tool_id: str, enabled: bool) -> dict[str, Any] | None:
         with self.session_factory.begin() as session:
             row = session.get(RegisteredToolRecord, tool_id)

@@ -299,6 +299,12 @@ def test_sync_rolls_back_tool_records_when_audit_recorder_fails(client):
 
     reloaded = McpService(McpStore(service.store.session_factory)).get("water-data")
     assert reloaded.tool_count == 0
+    registered = [
+        tool
+        for tool in service.tool_store.list()
+        if tool["source"] == "mcp" and tool["source_resource_id"] == "water-data"
+    ]
+    assert registered == []
 
 def test_invalid_mcp_body_records_failed_audit_without_request_secrets(client):
     from sqlalchemy import select
