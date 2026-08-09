@@ -18,6 +18,13 @@ from .store import McpConcurrentUpdateError, McpStore
 MASK = "********"
 
 
+def _management_audit_scope(context: RequestContext) -> tuple[str, str, str | None]:
+    """MCP is unit-scoped; retain project scope only when a project is selected."""
+    if context.project_id:
+        return "project", "project", context.project_id
+    return "unit", "unit", None
+
+
 class McpNotFoundError(Exception):
     pass
 
@@ -75,11 +82,12 @@ class McpService:
         metadata: dict | None = None,
     ) -> None:
         metadata = metadata or {}
+        authorization_scope, event_scope, project_id = _management_audit_scope(context)
         try:
             self.audit_recorder.record(session, AuditRecordRequest(
-                unit_id=context.unit_id, project_id=context.project_id,
+                unit_id=context.unit_id, project_id=project_id,
                 user_id=context.user_id, actor_roles=context.role_codes,
-                authorization_scope="project", event_scope="project",
+                authorization_scope=authorization_scope, event_scope=event_scope,
                 trace_id=management_trace_id(request_id), category="management", source="mcp", action=action,
                 status="succeeded", risk_level=risk_level,
                 resource_type="mcp_client", resource_id=key, resource_name=name,
@@ -113,10 +121,11 @@ class McpService:
             return self._info(record)
         try:
             record = self.store.create_in_session(session, request.key, request.model_dump(exclude={"key"}))
+            authorization_scope, event_scope, project_id = _management_audit_scope(context)
             self.audit_recorder.record(session, AuditRecordRequest(
-                unit_id=context.unit_id, project_id=context.project_id,
+                unit_id=context.unit_id, project_id=project_id,
                 user_id=context.user_id, actor_roles=context.role_codes,
-                authorization_scope="project", event_scope="project",
+                authorization_scope=authorization_scope, event_scope=event_scope,
                 trace_id=management_trace_id(request_id), category="management", source="mcp", action="resource.created",
                 status="succeeded", risk_level="medium", resource_type="mcp_client",
                 resource_id=request.key, resource_name=request.name,

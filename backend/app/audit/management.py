@@ -21,6 +21,12 @@ _SAFE_CORRELATION = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 _logger = logging.getLogger(__name__)
 
 
+def _management_scope(context: RequestContext) -> tuple[str, str, str | None]:
+    if context.project_id:
+        return "project", "project", context.project_id
+    return "unit", "unit", None
+
+
 @dataclass(frozen=True)
 class ManagementAuditIdentity:
     event_id: str
@@ -66,15 +72,16 @@ def record_failed_management(
     risk_level: str = "high",
 ) -> None:
     event_id = management_event_id(request_id)
+    authorization_scope, event_scope, project_id = _management_scope(context)
     try:
         with session_factory.begin() as session:
             recorder.record(session, AuditRecordRequest(
                 unit_id=context.unit_id,
-                project_id=context.project_id,
+                project_id=project_id,
                 user_id=context.user_id,
                 actor_roles=context.role_codes,
-                authorization_scope="project",
-                event_scope="project",
+                authorization_scope=authorization_scope,
+                event_scope=event_scope,
                 trace_id=management_trace_id(request_id),
                 category="management",
                 source=source,

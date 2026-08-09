@@ -192,6 +192,63 @@ def test_create_commits_mcp_and_redacted_management_audit_together(tmp_path):
     assert secret not in event.summary
     assert secret not in str(event.metadata_json)
 
+
+def test_create_without_current_project_records_unit_management_audit(tmp_path):
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+    from app.core.request_context import RequestContext
+
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'mcp-unit-audit.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    service = McpService(McpStore(factory))
+    context = RequestContext(unit_id="unit-1", project_id="", user_id="u1")
+    with factory() as session:
+        created = service.create(
+            McpClientCreate.model_validate(remote_payload(key="unit-mcp")),
+            context=context,
+            session=session,
+            request_id="mcp-unit-create-1",
+        )
+        event = session.scalar(select(AuditEvent))
+
+    assert created.key == "unit-mcp"
+    assert event.authorization_scope == "unit"
+    assert event.event_scope == "unit"
+    assert event.project_id is None
+
+
+def test_failed_mcp_management_without_current_project_records_unit_audit(tmp_path):
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+    from app.audit.management import record_failed_management
+    from app.audit.recorder import AuditRecorder
+    from app.core.request_context import RequestContext
+
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'mcp-failed-unit-audit.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    context = RequestContext(unit_id="unit-1", project_id="", user_id="u1")
+
+    record_failed_management(
+        factory,
+        AuditRecorder(),
+        context,
+        source="mcp",
+        action="resource.created",
+        resource_type="mcp_client",
+        resource_id="unit-mcp",
+        error_code="MCP_CONFLICT",
+        request_id="mcp-unit-failed-1",
+    )
+
+    with factory() as session:
+        event = session.scalar(select(AuditEvent))
+    assert event.status == "failed"
+    assert event.authorization_scope == "unit"
+    assert event.event_scope == "unit"
+    assert event.project_id is None
+
 def test_mcp_create_route_requires_request_context(tmp_path):
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'mcp-auth.db'}")
     Base.metadata.create_all(engine)
