@@ -106,6 +106,37 @@ def test_sync_registers_mcp_tools_as_available_unpublished(registry_service):
     assert {item["source_resource_id"] for item in tools} == {"water-data"}
 
 
+def test_sync_defaults_missing_input_schema_to_object(registry_service):
+    service, factory = registry_service
+    service.http_client = httpx.Client(transport=httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200,
+            json={"result": {"tools": [{"name": "query_reservoir_level"}]}},
+        )
+    ))
+    context = RequestContext(
+        unit_id="unit-1",
+        project_id="project-1",
+        user_id="admin",
+        roles=frozenset({"unit_admin"}),
+    )
+    request = McpClientCreate.model_validate({
+        "key": "water-data",
+        "name": "水情 MCP",
+        "transport": "streamable_http",
+        "url": "https://water.example.com/mcp",
+        "headers": {},
+        "enabled": True,
+    })
+    with factory() as session:
+        service.create(request, context=context, session=session, request_id="create-water")
+    with factory() as session:
+        service.sync_tools("water-data", context=context, session=session, request_id="sync-water")
+
+    tool = next(item for item in ToolStore(factory).list() if item["source"] == "mcp")
+    assert tool["input_schema"] == {"type": "object"}
+
+
 def test_resync_preserves_administrator_governance_fields(registry_service):
     service, factory = registry_service
     context = RequestContext(

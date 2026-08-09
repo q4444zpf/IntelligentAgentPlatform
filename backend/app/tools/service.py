@@ -10,7 +10,7 @@ from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.core.request_context import RequestContext
 from .builtins import BUILTIN_TOOL_DEFINITIONS
 from .schemas import ToolInfo
-from .store import ToolStore
+from .store import ToolSourceUnavailableError, ToolStore
 
 TOOL_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$")
 
@@ -115,11 +115,6 @@ class ToolService:
         request_id: str | None = None,
     ) -> ToolInfo:
         self._validate_tool_id(tool_id)
-        current = self.store.get(tool_id)
-        if current is None:
-            raise ToolNotFoundError(tool_id)
-        if published and not current["source_available"]:
-            raise ToolValidationError("Tool source is unavailable")
         try:
             updated = self.store.set_published_in_session(
                 session, tool_id, published
@@ -153,6 +148,9 @@ class ToolService:
                     occurred_at=datetime.now(UTC),
                 ))
             session.commit()
+        except ToolSourceUnavailableError as error:
+            session.rollback()
+            raise ToolValidationError("Tool source is unavailable") from error
         except Exception:
             session.rollback()
             raise

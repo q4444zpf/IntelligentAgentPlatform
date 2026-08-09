@@ -225,7 +225,7 @@ class McpService:
                 {
                     "name": tool["name"],
                     "description": tool.get("description", ""),
-                    "input_schema": tool.get("inputSchema", {}),
+                    "input_schema": tool.get("inputSchema") or {"type": "object"},
                 }
                 for tool in raw_tools
                 if isinstance(tool, dict) and tool.get("name")

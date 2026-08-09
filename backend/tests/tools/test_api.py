@@ -19,6 +19,8 @@ from app.tools.store import ToolStore
 
 AUTH_HEADERS = {"X-Unit-ID": "unit-1", "X-User-ID": "u1", "X-Project-ID": "p1"}
 ADMIN_HEADERS = {**AUTH_HEADERS, "X-User-Role": "admin"}
+UNIT_ADMIN_HEADERS = {**AUTH_HEADERS, "X-User-Roles": "unit_admin"}
+PROJECT_ADMIN_HEADERS = {**AUTH_HEADERS, "X-User-Roles": "project_admin"}
 
 
 @pytest.fixture
@@ -101,21 +103,39 @@ def test_unit_auditor_cannot_toggle_tool(client):
     assert response.status_code == 403
 
 
-def test_admin_can_publish_tool_and_regular_user_cannot(client):
+def test_only_unit_admin_can_publish_tool(client):
     denied = client.patch(
         "/api/tools/system.get_current_time/publication",
         json={"published": False},
-        headers=AUTH_HEADERS,
+        headers=PROJECT_ADMIN_HEADERS,
     )
     assert denied.status_code == 403
 
     updated = client.patch(
         "/api/tools/system.get_current_time/publication",
         json={"published": False},
-        headers=ADMIN_HEADERS,
+        headers=UNIT_ADMIN_HEADERS,
     )
     assert updated.status_code == 200
     assert updated.json()["published"] is False
+
+
+def test_failed_publication_records_publication_audit_action(client):
+    from sqlalchemy import select
+    from app.audit.models import AuditEvent
+
+    response = client.patch(
+        "/api/tools/system.get_current_time/publication",
+        json={"published": False},
+        headers={**PROJECT_ADMIN_HEADERS, "X-Request-ID": "publish-denied-1"},
+    )
+
+    assert response.status_code == 403
+    with client.app.state.tool_service.store.session_factory() as session:
+        event = session.scalar(
+            select(AuditEvent).where(AuditEvent.trace_id == "publish-denied-1")
+        )
+    assert event.action == "resource.unpublished"
 
 
 def test_authenticated_regular_user_can_read_tools(client):

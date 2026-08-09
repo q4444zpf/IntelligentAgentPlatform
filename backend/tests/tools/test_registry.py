@@ -97,6 +97,47 @@ def test_cannot_publish_source_unavailable_mcp_tool(tool_store):
             )
 
 
+def test_source_disappearing_before_publication_cannot_be_republished(tool_store):
+    store, factory = tool_store
+    definition = {
+        "tool_id": "mcp.water.query_level_abcd1234",
+        "version": "1.0.0",
+        "name": "查询水位",
+        "description": "读取水位",
+        "source": "mcp",
+        "risk_level": "medium",
+        "input_schema": {"type": "object"},
+        "output_schema": {"type": "object"},
+        "source_resource_id": "water",
+        "source_capability_id": "query_level",
+        "source_available": True,
+        "requires_approval": False,
+        "published": False,
+        "enabled": True,
+    }
+    with factory.begin() as session:
+        store.upsert_mcp_in_session(session, definition)
+
+    class SourceDisappearsBeforePublicationStore(ToolStore):
+        def set_published_in_session(self, session, tool_id, published):
+            with self.session_factory.begin() as competing_session:
+                row = competing_session.get(RegisteredToolRecord, tool_id)
+                row.source_available = False
+                row.published = False
+            return super().set_published_in_session(session, tool_id, published)
+
+    racing_service = ToolService(SourceDisappearsBeforePublicationStore(factory))
+    with factory() as session:
+        with pytest.raises(ToolValidationError, match="source is unavailable"):
+            racing_service.set_published(
+                definition["tool_id"], True, context=None, session=session
+            )
+
+    current = store.get(definition["tool_id"])
+    assert current["source_available"] is False
+    assert current["published"] is False
+
+
 def test_publish_without_current_project_records_unit_audit(tool_store):
     from sqlalchemy import select
 

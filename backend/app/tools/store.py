@@ -9,6 +9,10 @@ from app.core.database import SessionFactory
 from app.db.platform_models import RegisteredToolRecord
 
 
+class ToolSourceUnavailableError(Exception):
+    pass
+
+
 class ToolStore:
     def __init__(self, session_factory: sessionmaker[Session] | None = None):
         self.session_factory = session_factory or SessionFactory
@@ -156,9 +160,15 @@ class ToolStore:
         tool_id: str,
         published: bool,
     ) -> dict[str, Any] | None:
-        row = session.get(RegisteredToolRecord, tool_id)
+        row = session.scalar(
+            select(RegisteredToolRecord)
+            .where(RegisteredToolRecord.tool_id == tool_id)
+            .with_for_update()
+        )
         if row is None:
             return None
+        if published and not row.source_available:
+            raise ToolSourceUnavailableError(tool_id)
         row.published = published
         session.flush()
         session.refresh(row)
