@@ -140,6 +140,49 @@ def test_updates_masked_secrets_and_toggles_client(client):
     assert toggled.json()["enabled"] is False
 
 
+def test_client_disable_marks_registry_tools_unavailable_and_unpublished(client):
+    from app.db.platform_models import RegisteredToolRecord
+    from app.mcp.tool_registry import build_mcp_tool_id
+
+    assert client.post("/api/mcp", json=remote_payload()).status_code == 201
+    assert client.post("/api/mcp/water-data/tools/sync").status_code == 200
+    service = client.app.state.mcp_service
+    tool_id = build_mcp_tool_id("water-data", "query_reservoir_level")
+    with service.store.session_factory.begin() as session:
+        session.get(RegisteredToolRecord, tool_id).published = True
+
+    assert client.patch("/api/mcp/water-data/toggle").status_code == 200
+
+    tool = service.tool_store.get(tool_id)
+    assert tool["source_available"] is False
+    assert tool["published"] is False
+    assert tool["enabled"] is True
+
+
+def test_config_update_disable_marks_registry_tools_unavailable(client):
+    from app.mcp.tool_registry import build_mcp_tool_id
+
+    assert client.post("/api/mcp", json=remote_payload()).status_code == 201
+    assert client.post("/api/mcp/water-data/tools/sync").status_code == 200
+    response = client.put(
+        "/api/mcp/water-data",
+        json={
+            "name": "水情数据 MCP",
+            "description": "查询水库与河道实时数据",
+            "transport": "streamable_http",
+            "url": "https://water.example.com/mcp",
+            "headers": {"Authorization": "********", "X-Project": "demo"},
+            "enabled": False,
+        },
+    )
+    assert response.status_code == 200
+
+    tool = client.app.state.mcp_service.tool_store.get(
+        build_mcp_tool_id("water-data", "query_reservoir_level")
+    )
+    assert tool["source_available"] is False
+
+
 def test_syncs_tools_and_updates_whitelist(client):
     client.post("/api/mcp", json=remote_payload())
 
@@ -166,11 +209,116 @@ def test_syncs_tools_and_updates_whitelist(client):
     assert invalid.status_code == 422
 
 
+def test_whitelist_removal_marks_only_removed_registry_tool_unavailable(client):
+    from app.db.platform_models import RegisteredToolRecord
+    from app.mcp.tool_registry import build_mcp_tool_id
+
+    assert client.post("/api/mcp", json=remote_payload()).status_code == 201
+    assert client.post("/api/mcp/water-data/tools/sync").status_code == 200
+    service = client.app.state.mcp_service
+    dispatch_id = build_mcp_tool_id("water-data", "dispatch_gate")
+    with service.store.session_factory.begin() as session:
+        session.get(RegisteredToolRecord, dispatch_id).published = True
+
+    response = client.put(
+        "/api/mcp/water-data/tools",
+        json={"tools": ["query_reservoir_level"]},
+    )
+    assert response.status_code == 200
+
+    query = service.tool_store.get(
+        build_mcp_tool_id("water-data", "query_reservoir_level")
+    )
+    dispatch = service.tool_store.get(dispatch_id)
+    assert query["source_available"] is True
+    assert dispatch["source_available"] is False
+    assert dispatch["published"] is False
+
+
+def test_missing_and_reappearing_remote_tool_requires_republication(client):
+    from app.db.platform_models import RegisteredToolRecord
+    from app.mcp.tool_registry import build_mcp_tool_id
+
+    assert client.post("/api/mcp", json=remote_payload()).status_code == 201
+    assert client.post("/api/mcp/water-data/tools/sync").status_code == 200
+    service = client.app.state.mcp_service
+    dispatch_id = build_mcp_tool_id("water-data", "dispatch_gate")
+    with service.store.session_factory.begin() as session:
+        session.get(RegisteredToolRecord, dispatch_id).published = True
+
+    service.http_client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "tools": [
+                            {
+                                "name": "query_reservoir_level",
+                                "inputSchema": {"type": "object"},
+                            }
+                        ]
+                    }
+                },
+            )
+        )
+    )
+    assert client.post("/api/mcp/water-data/tools/sync").status_code == 200
+    missing = service.tool_store.get(dispatch_id)
+    assert missing["source_available"] is False
+    assert missing["published"] is False
+
+    service.http_client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "tools": [
+                            {
+                                "name": "query_reservoir_level",
+                                "inputSchema": {"type": "object"},
+                            },
+                            {
+                                "name": "dispatch_gate",
+                                "inputSchema": {"type": "object"},
+                            },
+                        ]
+                    }
+                },
+            )
+        )
+    )
+    assert client.post("/api/mcp/water-data/tools/sync").status_code == 200
+    restored = service.tool_store.get(dispatch_id)
+    assert restored["source_available"] is True
+    assert restored["published"] is False
+
+
 def test_deletes_client(client):
     client.post("/api/mcp", json=remote_payload())
     deleted = client.delete("/api/mcp/water-data")
     assert deleted.status_code == 200
     assert client.get("/api/mcp/water-data").status_code == 404
+
+
+def test_client_delete_retires_registry_tools_without_deleting_them(client):
+    from app.db.platform_models import RegisteredToolRecord
+    from app.mcp.tool_registry import build_mcp_tool_id
+
+    assert client.post("/api/mcp", json=remote_payload()).status_code == 201
+    assert client.post("/api/mcp/water-data/tools/sync").status_code == 200
+    service = client.app.state.mcp_service
+    tool_id = build_mcp_tool_id("water-data", "query_reservoir_level")
+    with service.store.session_factory.begin() as session:
+        session.get(RegisteredToolRecord, tool_id).published = True
+
+    assert client.delete("/api/mcp/water-data").status_code == 200
+
+    tool = service.tool_store.get(tool_id)
+    assert tool is not None
+    assert tool["source_available"] is False
+    assert tool["published"] is False
 
 def test_create_commits_mcp_and_redacted_management_audit_together(tmp_path):
     from sqlalchemy import select

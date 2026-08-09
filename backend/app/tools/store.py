@@ -98,6 +98,30 @@ class ToolStore:
         session.flush()
         return self._decode(row)
 
+    def update_mcp_source_state_in_session(
+        self,
+        session: Session,
+        client_key: str,
+        available_tool_names: set[str],
+        *,
+        client_enabled: bool,
+    ) -> None:
+        rows = session.scalars(
+            select(RegisteredToolRecord).where(
+                RegisteredToolRecord.source == "mcp",
+                RegisteredToolRecord.source_resource_id == client_key,
+            )
+        )
+        for row in rows:
+            available = (
+                client_enabled
+                and row.source_capability_id in available_tool_names
+            )
+            row.source_available = available
+            if not available:
+                row.published = False
+        session.flush()
+
     def set_enabled(self, tool_id: str, enabled: bool) -> dict[str, Any] | None:
         with self.session_factory.begin() as session:
             row = session.get(RegisteredToolRecord, tool_id)

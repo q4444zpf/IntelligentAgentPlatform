@@ -167,6 +167,7 @@ class McpService:
             record = self._cas(lambda: self.store.update_config(key, config, current["version"]))
         else:
             record = self._cas(lambda: self.store.update_in_session(session, key, expected_version=current["version"], config=config))
+            self.tool_registry.apply_client_state(session, record)
             self._commit_management(context, session, request_id, action="resource.updated", key=key, name=request.name, metadata={"transport": request.transport, "enabled": request.enabled})
         return self._info(record)
 
@@ -180,6 +181,7 @@ class McpService:
             record = self._cas(lambda: self.store.update_config(key, config, current["version"]))
         else:
             record = self._cas(lambda: self.store.update_in_session(session, key, expected_version=current["version"], config=config))
+            self.tool_registry.apply_client_state(session, record)
             self._commit_management(context, session, request_id, action="resource.enabled" if config["enabled"] else "resource.disabled", key=key, name=current["name"], metadata={"enabled": config["enabled"]})
         return self._info(record)
 
@@ -190,6 +192,7 @@ class McpService:
         if context is None or session is None:
             self.store.delete(key)
         else:
+            self.tool_registry.retire_client(session, key)
             self.store.delete_in_session(session, key)
             self._commit_management(context, session, request_id, action="resource.deleted", key=key, name=current["name"], risk_level="high")
 
@@ -233,8 +236,9 @@ class McpService:
         if context is None or session is None:
             self._cas(lambda: self.store.update_tools(key, tools, synced_at, record["version"]))
         else:
-            self._cas(lambda: self.store.update_in_session(session, key, expected_version=record["version"], tool_records=tools, last_synced_at=synced_at))
+            updated = self._cas(lambda: self.store.update_in_session(session, key, expected_version=record["version"], tool_records=tools, last_synced_at=synced_at))
             self.tool_registry.sync(session, key, tools)
+            self.tool_registry.apply_client_state(session, updated)
             self._commit_management(context, session, request_id, action="resource.updated", key=key, name=record["name"], metadata={"tool_count": len(tools)})
         return self.list_tools(key)
 
@@ -249,6 +253,7 @@ class McpService:
         if context is None or session is None:
             self._cas(lambda: self.store.update_whitelist(key, tools, record["version"]))
         else:
-            self._cas(lambda: self.store.update_in_session(session, key, expected_version=record["version"], whitelist=tools))
+            updated = self._cas(lambda: self.store.update_in_session(session, key, expected_version=record["version"], whitelist=tools))
+            self.tool_registry.apply_client_state(session, updated)
             self._commit_management(context, session, request_id, action="resource.permission_changed", key=key, name=record["name"], risk_level="high", metadata={"tool_count": len(tools or [])})
         return self.list_tools(key)

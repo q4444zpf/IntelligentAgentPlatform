@@ -67,3 +67,22 @@ class McpToolRegistrySynchronizer:
             )
             tool_ids.append(tool_id)
         return tool_ids
+
+    def apply_client_state(self, session: Session, client_record: dict) -> None:
+        discovered = {tool["name"] for tool in client_record["tool_records"]}
+        whitelist = client_record["tools"]
+        available = discovered if whitelist is None else discovered & set(whitelist)
+        self.tool_store.update_mcp_source_state_in_session(
+            session,
+            client_record["key"],
+            available,
+            client_enabled=client_record["enabled"],
+        )
+
+    def retire_client(self, session: Session, client_key: str) -> None:
+        self.tool_store.update_mcp_source_state_in_session(
+            session,
+            client_key,
+            set(),
+            client_enabled=False,
+        )
