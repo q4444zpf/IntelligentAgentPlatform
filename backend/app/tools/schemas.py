@@ -28,6 +28,10 @@ class ToolInfo(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+
+class ToolPublicationRequest(BaseModel):
+    published: bool
+
 @dataclass(frozen=True)
 class ToolDefinition:
     tool_id: str

@@ -101,6 +101,23 @@ def test_unit_auditor_cannot_toggle_tool(client):
     assert response.status_code == 403
 
 
+def test_admin_can_publish_tool_and_regular_user_cannot(client):
+    denied = client.patch(
+        "/api/tools/system.get_current_time/publication",
+        json={"published": False},
+        headers=AUTH_HEADERS,
+    )
+    assert denied.status_code == 403
+
+    updated = client.patch(
+        "/api/tools/system.get_current_time/publication",
+        json={"published": False},
+        headers=ADMIN_HEADERS,
+    )
+    assert updated.status_code == 200
+    assert updated.json()["published"] is False
+
+
 def test_authenticated_regular_user_can_read_tools(client):
     assert client.get("/api/tools", headers=AUTH_HEADERS).status_code == 200
     assert client.get(

@@ -9,7 +9,7 @@ from app.core.request_context import (
     require_request_context,
 )
 
-from .schemas import ToolInfo
+from .schemas import ToolInfo, ToolPublicationRequest
 from .service import ToolNotFoundError, ToolService, ToolValidationError
 
 
@@ -84,6 +84,29 @@ def create_router(service: ToolService | None = None) -> APIRouter:
         service_instance = manager()
         with service_instance.store.session_factory() as session:
             return call_management(lambda: service_instance.toggle(tool_id, context=context, session=session, request_id=request_id), session, context, request_id, tool_id)
+
+    @router.patch("/{tool_id}/publication", response_model=ToolInfo)
+    def set_tool_publication(
+        tool_id: str,
+        request: ToolPublicationRequest,
+        context: RequestContext = Depends(require_tool_admin),
+        request_id: str = Depends(management_request_id),
+    ):
+        service_instance = manager()
+        with service_instance.store.session_factory() as session:
+            return call_management(
+                lambda: service_instance.set_published(
+                    tool_id,
+                    request.published,
+                    context=context,
+                    session=session,
+                    request_id=request_id,
+                ),
+                session,
+                context,
+                request_id,
+                tool_id,
+            )
 
     return router
 

@@ -40,7 +40,12 @@ class ToolStore:
 
     def get_executable(self, tool_id: str) -> dict[str, Any] | None:
         item = self.get(tool_id)
-        if item is None or not item["published"] or not item["enabled"]:
+        if (
+            item is None
+            or not item["published"]
+            or not item["enabled"]
+            or not item["source_available"]
+        ):
             return None
         return item
 
@@ -144,3 +149,17 @@ class ToolStore:
     def toggle(self, tool_id: str) -> dict[str, Any] | None:
         with self.session_factory.begin() as session:
             return self.toggle_in_session(session, tool_id)
+
+    def set_published_in_session(
+        self,
+        session: Session,
+        tool_id: str,
+        published: bool,
+    ) -> dict[str, Any] | None:
+        row = session.get(RegisteredToolRecord, tool_id)
+        if row is None:
+            return None
+        row.published = published
+        session.flush()
+        session.refresh(row)
+        return self._decode(row)
