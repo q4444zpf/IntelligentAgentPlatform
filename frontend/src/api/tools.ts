@@ -15,6 +15,9 @@ export interface ToolInfo {
   requires_approval: boolean;
   published: boolean;
   enabled: boolean;
+  source_resource_id: string | null;
+  source_capability_id: string | null;
+  source_available: boolean;
   is_builtin: boolean;
   created_at: string;
   updated_at: string;
@@ -39,6 +42,10 @@ export const toolsApi = {
   list: (signal?: AbortSignal) => request<ToolInfo[]>('/tools', { signal }),
   get: (toolId: string) => request<ToolInfo>(`/tools/${encodeURIComponent(toolId)}`),
   toggle: (toolId: string) => request<ToolInfo>(`/tools/${encodeURIComponent(toolId)}/toggle`, { method: 'PATCH' }),
+  setPublished: (toolId: string, published: boolean) => request<ToolInfo>(
+    `/tools/${encodeURIComponent(toolId)}/publication`,
+    { method: 'PATCH', body: JSON.stringify({ published }), headers: { 'Content-Type': 'application/json' } },
+  ),
   listInvocations: (runId: string, signal?: AbortSignal) =>
     request<ToolInvocationInfo[]>(`/agent-runs/${encodeURIComponent(runId)}/tool-invocations`, { signal }),
 };

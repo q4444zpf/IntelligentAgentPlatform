@@ -46,14 +46,17 @@
             <div class="tool-title">
               <strong>{{ tool.name }}</strong>
               <a-tag v-if="tool.is_builtin" color="blue">系统内置</a-tag>
+              <a-tag v-if="tool.source === 'mcp'" color="cyan">MCP</a-tag>
               <a-tag :color="riskColor[tool.risk_level]">{{ riskLabel[tool.risk_level] }}</a-tag>
               <a-tag v-if="tool.requires_approval" color="gold">需审批</a-tag>
+              <a-tag v-if="tool.source === 'mcp' && !tool.source_available" color="red">来源不可用</a-tag>
             </div>
             <p>{{ tool.description }}</p>
             <div class="tool-meta">
               <code>{{ tool.tool_id }}</code>
               <span>v{{ tool.version }}</span>
               <span>{{ sourceLabel[tool.source] }}</span>
+              <span v-if="tool.source === 'mcp'">{{ tool.source_resource_id }} / {{ tool.source_capability_id }}</span>
             </div>
           </div>
           <div class="schema-summary">
@@ -71,6 +74,24 @@
               un-checked-children="停用"
               @change="toggleTool(tool)"
             />
+            <a-button
+              v-if="!tool.published"
+              size="small"
+              type="link"
+              aria-label="发布工具"
+              :loading="isPublicationPending(tool.tool_id)"
+              :disabled="!tool.source_available || isPublicationPending(tool.tool_id)"
+              @click="setPublication(tool, true)"
+            >发布工具</a-button>
+            <a-button
+              v-else
+              size="small"
+              type="link"
+              aria-label="取消发布工具"
+              :loading="isPublicationPending(tool.tool_id)"
+              :disabled="isPublicationPending(tool.tool_id)"
+              @click="setPublication(tool, false)"
+            >取消发布</a-button>
             <span>{{ tool.published ? '已发布' : '未发布' }}</span>
           </div>
         </article>
@@ -94,6 +115,7 @@ const sourceFilter = ref<'all' | ToolSource>('all');
 const riskFilter = ref<'all' | ToolRisk>('all');
 const statusFilter = ref<'all' | 'enabled' | 'disabled'>('all');
 const pendingToolIds = ref(new Set<string>());
+const pendingPublicationIds = ref(new Set<string>());
 let loadRequestId = 0;
 let loadController: AbortController | undefined;
 
@@ -184,6 +206,33 @@ function isToolPending(toolId: string) {
   return pendingToolIds.value.has(toolId);
 }
 
+function isPublicationPending(toolId: string) {
+  return pendingPublicationIds.value.has(toolId);
+}
+
+const publicationRequests = new Map<string, symbol>();
+
+async function setPublication(tool: ToolInfo, published: boolean) {
+  if (isPublicationPending(tool.tool_id) || (published && !tool.source_available)) return;
+  const requestToken = Symbol(tool.tool_id);
+  publicationRequests.set(tool.tool_id, requestToken);
+  pendingPublicationIds.value.add(tool.tool_id);
+  try {
+    const updated = await toolsApi.setPublished(tool.tool_id, published);
+    if (publicationRequests.get(tool.tool_id) !== requestToken) return;
+    tools.value = tools.value.map((item) => item.tool_id === updated.tool_id ? updated : item);
+    message.success(updated.published ? '工具已发布' : '工具已取消发布');
+  } catch (error) {
+    if (publicationRequests.get(tool.tool_id) !== requestToken) return;
+    message.error(error instanceof Error ? error.message : '更新发布状态失败');
+  } finally {
+    if (publicationRequests.get(tool.tool_id) === requestToken) {
+      publicationRequests.delete(tool.tool_id);
+      pendingPublicationIds.value.delete(tool.tool_id);
+    }
+  }
+}
+
 async function toggleTool(tool: ToolInfo) {
   if (isToolPending(tool.tool_id)) return;
   const requestToken = Symbol(tool.tool_id);
@@ -210,7 +259,9 @@ onBeforeUnmount(() => {
   loadRequestId += 1;
   loadController?.abort();
   toggleRequests.clear();
+  publicationRequests.clear();
   pendingToolIds.value.clear();
+  pendingPublicationIds.value.clear();
 });
 </script>
 
