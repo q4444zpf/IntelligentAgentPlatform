@@ -18,6 +18,9 @@ class ToolInfo(BaseModel):
     risk_level: ToolRisk
     input_schema: dict[str, Any]
     output_schema: dict[str, Any]
+    source_resource_id: str | None
+    source_capability_id: str | None
+    source_available: bool
     requires_approval: bool
     published: bool
     enabled: bool

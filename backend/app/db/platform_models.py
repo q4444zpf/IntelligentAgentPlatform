@@ -70,6 +70,9 @@ class RegisteredToolRecord(Base):
     risk_level: Mapped[str] = mapped_column(String(32), nullable=False)
     input_schema: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     output_schema: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    source_resource_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    source_capability_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    source_available: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     requires_approval: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )

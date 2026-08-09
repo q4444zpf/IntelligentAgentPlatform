@@ -30,6 +30,15 @@ def test_service_initialization_is_idempotent_and_sorted(tool_store):
         assert session.query(RegisteredToolRecord).count() == 2
 
 
+def test_builtin_tools_expose_empty_source_mapping_and_available_source(tool_store):
+    store, _ = tool_store
+    tool = ToolService(store).get("system.get_current_time")
+
+    assert tool.source_resource_id is None
+    assert tool.source_capability_id is None
+    assert tool.source_available is True
+
+
 def test_initialization_repairs_builtin_contract_and_preserves_enabled(tool_store):
     store, factory = tool_store
     ToolService(store)

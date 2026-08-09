@@ -28,7 +28,7 @@ def test_upgrade_head_creates_conversation_tables():
     engine = create_engine(env["DATABASE_URL"])
     inspector = inspect(engine)
     with engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260804_10"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260809_13"
     tables = set(inspector.get_table_names())
     assert {
         "conversations",
@@ -69,7 +69,13 @@ def test_upgrade_head_creates_conversation_tables():
     mcp_columns = {
         column["name"]: column for column in inspector.get_columns("mcp_clients")
     }
+    tool_columns = {
+        column["name"]: column for column in inspector.get_columns("registered_tools")
+    }
     assert mcp_columns["version"]["nullable"] is False
+    assert tool_columns["source_resource_id"]["nullable"] is True
+    assert tool_columns["source_capability_id"]["nullable"] is True
+    assert tool_columns["source_available"]["nullable"] is False
     assert audit_columns["unit_id"]["nullable"] is True
     assert audit_columns["metadata_json"]["nullable"] is False
     assert audit_columns["actor_roles_json"]["nullable"] is False
@@ -128,6 +134,25 @@ def test_upgrade_head_creates_conversation_tables():
         name: audit_indexes[name] for name in expected_audit_indexes
     } == expected_audit_indexes
     engine.dispose()
+
+
+@pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="requires PostgreSQL")
+def test_mcp_tool_registry_migration_downgrade_removes_source_columns():
+    database_url = os.environ["TEST_DATABASE_URL"]
+    env = os.environ | {"DATABASE_URL": database_url}
+    subprocess.run(ALEMBIC_UPGRADE_COMMAND, check=True, env=env)
+    downgrade = (*ALEMBIC_UPGRADE_COMMAND[:-2], "downgrade", "20260808_12")
+    try:
+        subprocess.run(downgrade, check=True, env=env)
+        columns = {
+            column["name"]
+            for column in inspect(create_engine(database_url)).get_columns("registered_tools")
+        }
+        assert "source_resource_id" not in columns
+        assert "source_capability_id" not in columns
+        assert "source_available" not in columns
+    finally:
+        subprocess.run(ALEMBIC_UPGRADE_COMMAND, check=True, env=env)
 
 
 @pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="requires PostgreSQL")
