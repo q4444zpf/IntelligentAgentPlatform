@@ -19,9 +19,17 @@ AUTH_HEADERS = {"X-Unit-ID": "unit-1", "X-User-ID": "u1", "X-Project-ID": "p1", 
 def client(tmp_path):
     def remote_handler(request: httpx.Request) -> httpx.Response:
         assert request.url == "https://water.example.com/mcp"
-        assert request.headers["authorization"] == "Bearer secret-token"
         payload = request.read().decode()
-        assert '"method":"tools/list"' in payload
+        body = __import__("json").loads(payload)
+        assert request.headers["authorization"] == "Bearer secret-token"
+        if body["method"] == "initialize":
+            return httpx.Response(
+                200,
+                headers={"mcp-session-id": "test-session"},
+                json={"jsonrpc": "2.0", "id": body["id"], "result": {"protocolVersion": "2025-03-26"}},
+            )
+        if body["method"] == "notifications/initialized":
+            return httpx.Response(202)
         return httpx.Response(
             200,
             json={

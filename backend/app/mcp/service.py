@@ -12,6 +12,7 @@ from app.audit.management import management_event_id, management_trace_id
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.core.request_context import RequestContext
 from app.tools.store import ToolStore
+from .protocol import McpProtocolClient, McpProtocolError
 from .schemas import McpClientConfig, McpClientCreate, McpClientInfo, McpToolInfo
 from .store import McpConcurrentUpdateError, McpStore
 from .tool_registry import McpToolRegistrySynchronizer
@@ -55,6 +56,7 @@ class McpService:
     ):
         self.store = store or McpStore()
         self.http_client = http_client or httpx.Client(timeout=15, follow_redirects=False)
+        self.protocol_client = McpProtocolClient(self.http_client)
         self.audit_recorder = audit_recorder or AuditRecorder()
         self.tool_store = tool_store or ToolStore(self.store.session_factory)
         self.tool_registry = McpToolRegistrySynchronizer(self.tool_store)
@@ -213,25 +215,19 @@ class McpService:
         if record["transport"] == "stdio":
             raise McpValidationError("stdio MCP must be synchronized by a sandbox worker")
         try:
-            response = self.http_client.post(
-                record["url"],
-                headers={**record["headers"], "Accept": "application/json, text/event-stream"},
-                json={"jsonrpc": "2.0", "id": "tools-sync", "method": "tools/list", "params": {}},
-            )
-            response.raise_for_status()
-            payload = response.json()
-            raw_tools = payload.get("result", {}).get("tools", [])
+            self.protocol_client.http_client = self.http_client
+            raw_tools = self.protocol_client.list_tools(record["url"], record["transport"], record["headers"])
             tools = [
                 {
                     "name": tool["name"],
                     "description": tool.get("description", ""),
-                    "input_schema": tool.get("inputSchema") or {"type": "object"},
+                    "input_schema": tool.get("inputSchema") or tool.get("input_schema") or {"type": "object"},
                 }
                 for tool in raw_tools
                 if isinstance(tool, dict) and tool.get("name")
             ]
-        except (httpx.HTTPError, ValueError, TypeError) as error:
-            raise McpValidationError(f"Unable to synchronize MCP tools: {error}") from error
+        except McpProtocolError as error:
+            raise McpValidationError(str(error)) from error
         synced_at = datetime.now(UTC).isoformat()
         if context is None or session is None:
             self._cas(lambda: self.store.update_tools(key, tools, synced_at, record["version"]))
