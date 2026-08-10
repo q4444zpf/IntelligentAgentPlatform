@@ -14,6 +14,8 @@ from sqlalchemy.exc import IntegrityError
 
 from app.audit.models import AuditEvent
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
+from app.approvals.service import ApprovalService
+from app.core.request_context import RequestContext
 from app.conversations.models import ToolInvocation
 from app.conversations.repository import ConversationRepository
 from app.mcp.protocol import McpProtocolClient, McpProtocolError
@@ -304,6 +306,8 @@ class ToolGateway:
             raise ToolRuntimeError("tool_duplicate_call", "工具调用标识重复。")
 
         self._validate(tool["input_schema"], call.arguments, "tool_invalid_arguments", "工具参数无效。")
+        if tool["requires_approval"] or tool["risk_level"] in {"high", "critical"}:
+            return self._pause_for_approval(call, tool, context)
         invocation = ToolInvocation(
             run_id=context.run_id,
             tool_call_id=call.id,
@@ -364,6 +368,106 @@ class ToolGateway:
             result=value, context=context, parent_event_id=started_audit.id,
         )
         return ToolExecutionResult(invocation_id=invocation_id, value=value)
+
+    def _pause_for_approval(
+        self,
+        call: ToolCall,
+        tool: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolExecutionResult:
+        invocation = ToolInvocation(
+            run_id=context.run_id,
+            tool_call_id=call.id,
+            tool_id=call.name,
+            tool_version=tool["version"],
+            status="waiting_approval",
+            arguments_summary=self.summarize(call.arguments),
+        )
+        self.repository.add_tool_invocation(invocation)
+        approval = ApprovalService(self.repository.session, clock=self.clock).create_request(
+            run=self.repository.get_run_by_id(context.run_id),
+            invocation=invocation,
+            context=RequestContext(
+                user_id=context.user_id,
+                unit_id=context.unit_id,
+                project_id=context.project_id,
+                roles=frozenset(context.actor_roles),
+            ),
+            risk_level=tool["risk_level"],
+        )
+        self.repository.append_event(
+            context.run_id,
+            "approval.requested",
+            {
+                "approval_id": approval.id,
+                "invocation_id": invocation.id,
+                "tool_id": call.name,
+                "risk_level": tool["risk_level"],
+                "expires_at": approval.expires_at.isoformat(),
+            },
+        )
+        run = self.repository.get_run_by_id(context.run_id)
+        if run is not None:
+            run.status = "waiting_approval"
+        self.repository.append_event(context.run_id, "run.status", {"status": "waiting_approval"})
+        self.repository.session.commit()
+        raise ToolRuntimeError("approval_required", "该工具需要人工审批后才能执行。")
+
+    def execute_approved(self, approval_id: str, context: ToolExecutionContext) -> ToolExecutionResult:
+        approval, invocation = ApprovalService(self.repository.session, clock=self.clock).prepare_execution(
+            approval_id,
+            RequestContext(
+                user_id=context.user_id,
+                unit_id=context.unit_id,
+                project_id=context.project_id,
+                roles=frozenset(context.actor_roles),
+            ),
+        )
+        tool = self.tool_store.get_executable(invocation.tool_id)
+        if tool is None:
+            raise ToolRuntimeError("tool_not_authorized", "该工具当前不可用。")
+        executor = BUILTIN_EXECUTORS.get(invocation.tool_id)
+        if executor is None and tool["source"] != "mcp":
+            raise ToolRuntimeError("tool_execution_failed", "工具执行失败。")
+        invocation.status = "started"
+        self.repository.append_event(
+            invocation.run_id,
+            "tool.started",
+            {"invocation_id": invocation.id, "tool_id": invocation.tool_id, "display_name": tool["name"], "approval_id": approval.id},
+        )
+        started_audit = self.audit_recorder.record(
+            self.repository.session,
+            AuditRecordRequest(
+                unit_id=context.unit_id, project_id=context.project_id, user_id=context.user_id,
+                actor_roles=context.actor_roles, authorization_scope="project", event_scope="project",
+                category="runtime", source="tool", action="tool.invoke.started", status="started",
+                risk_level="high", trace_id=context.run_id, run_id=context.run_id,
+                resource_type="tool", resource_id=invocation.tool_id, resource_name=tool["name"],
+                idempotency_key=f"tool:{invocation.id}:resumed", occurred_at=datetime.now(timezone.utc),
+            ),
+        )
+        self.repository.session.commit()
+        started_at = time.perf_counter()
+        try:
+            if tool["source"] == "builtin":
+                if executor is None:
+                    raise ToolRuntimeError("tool_execution_failed", "工具执行失败。")
+                value = executor(invocation.arguments_summary, context, self.clock)
+            else:
+                value = self._execute_mcp(tool, invocation.arguments_summary, context)
+            self._validate(tool["output_schema"], value, "tool_execution_failed", "工具执行失败。")
+        except ToolRuntimeError as error:
+            duration_ms = max(0, round((time.perf_counter() - started_at) * 1000))
+            self._commit_finished(invocation, tool["name"], status="failed", duration_ms=duration_ms, error=error, context=context, parent_event_id=started_audit.id)
+            raise
+        except Exception as error:
+            safe_error = ToolRuntimeError("tool_execution_failed", "工具执行失败。")
+            duration_ms = max(0, round((time.perf_counter() - started_at) * 1000))
+            self._commit_finished(invocation, tool["name"], status="failed", duration_ms=duration_ms, error=safe_error, context=context, parent_event_id=started_audit.id)
+            raise safe_error from error
+        duration_ms = max(0, round((time.perf_counter() - started_at) * 1000))
+        self._commit_finished(invocation, tool["name"], status="completed", duration_ms=duration_ms, result=value, context=context, parent_event_id=started_audit.id)
+        return ToolExecutionResult(invocation_id=str(invocation.id), value=value)
 
     def _execute_mcp(
         self, tool: dict[str, Any], arguments: dict[str, Any], context: ToolExecutionContext

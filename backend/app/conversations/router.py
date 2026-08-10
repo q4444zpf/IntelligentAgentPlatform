@@ -139,7 +139,7 @@ def create_router(
     def list_runs(
         page: Annotated[int, Query(ge=1)] = 1,
         page_size: Annotated[int, Query(ge=1, le=100)] = 20,
-        status: Literal["queued", "running", "completed", "failed"] | None = None,
+        status: Literal["queued", "running", "waiting_approval", "completed", "failed"] | None = None,
         actor_id: Annotated[
             str | None,
             Query(
