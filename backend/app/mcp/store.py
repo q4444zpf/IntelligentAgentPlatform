@@ -26,6 +26,15 @@ class McpStore:
         return {
             "key": row.client_key,
             "client_id": row.client_id,
+            "unit_id": row.unit_id,
+            "status": row.status,
+            "health_status": row.health_status,
+            "last_checked_at": row.last_checked_at,
+            "last_success_at": row.last_success_at,
+            "last_latency_ms": row.last_latency_ms,
+            "failure_count": row.failure_count,
+            "last_error_code": row.last_error_code,
+            "last_error_message": row.last_error_message,
             **config,
             "tool_records": row.tool_records,
             "tools": row.whitelist,
@@ -35,9 +44,14 @@ class McpStore:
             "updated_at": row.updated_at,
         }
 
-    def list(self) -> list[dict[str, Any]]:
+    def list(self, *, unit_id: str | None = None, include_archived: bool = False) -> list[dict[str, Any]]:
         with self.session_factory() as session:
-            rows = session.scalars(select(McpClientRecord).order_by(McpClientRecord.created_at, McpClientRecord.client_key))
+            statement = select(McpClientRecord)
+            if unit_id is not None:
+                statement = statement.where(McpClientRecord.unit_id == unit_id)
+            if not include_archived:
+                statement = statement.where(McpClientRecord.status == "active")
+            rows = session.scalars(statement.order_by(McpClientRecord.created_at, McpClientRecord.client_key))
             return [self._decode(row) for row in rows]
 
     def get(self, key: str) -> dict[str, Any] | None:
@@ -48,8 +62,8 @@ class McpStore:
         with self.session_factory.begin() as session:
             return self.create_in_session(session, key, config)
 
-    def create_in_session(self, session: Session, key: str, config: dict[str, Any]) -> dict[str, Any]:
-        row = McpClientRecord(client_key=key, client_id=key, credential_id=config.get("credential_id"), config=config, tool_records=[])
+    def create_in_session(self, session: Session, key: str, config: dict[str, Any], *, unit_id: str | None = None) -> dict[str, Any]:
+        row = McpClientRecord(client_key=key, client_id=key, unit_id=unit_id, credential_id=config.get("credential_id"), config=config, tool_records=[])
         session.add(row)
         session.flush()
         session.refresh(row)
@@ -121,3 +135,13 @@ class McpStore:
         session.delete(row)
         session.flush()
         return True
+
+    def set_status_in_session(self, session: Session, key: str, status: str) -> dict[str, Any] | None:
+        row = session.get(McpClientRecord, key)
+        if row is None:
+            return None
+        row.status = status
+        row.version += 1
+        session.flush()
+        session.refresh(row)
+        return self._decode(row)

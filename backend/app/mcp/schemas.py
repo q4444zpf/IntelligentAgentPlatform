@@ -38,6 +38,9 @@ class McpClientCreate(McpClientConfig):
 
 class McpClientInfo(McpClientConfig):
     key: str
+    client_id: str
+    status: str = "active"
+    health_status: str = "not_checked"
     tools: list[str] | None = None
     tool_count: int = 0
     enabled_tool_count: int = 0
@@ -55,3 +58,34 @@ class McpToolInfo(BaseModel):
 
 class McpToolWhitelistRequest(BaseModel):
     tools: list[str] | None = None
+
+
+class McpProjectGrantRequest(BaseModel):
+    project_ids: list[str] = Field(default_factory=list)
+
+
+class McpProjectGrantInfo(BaseModel):
+    project_ids: list[str]
+
+
+class McpOperationInfo(BaseModel):
+    id: str
+    client_id: str
+    operation_type: str
+    status: str
+    phase: str
+    result: dict[str, Any] | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    created_at: datetime
+    completed_at: datetime | None = None
+
+
+class McpHealthInfo(BaseModel):
+    health_status: str
+    last_checked_at: datetime | None = None
+    last_success_at: datetime | None = None
+    last_latency_ms: int | None = None
+    failure_count: int = 0
+    last_error_code: str | None = None
+    last_error_message: str | None = None

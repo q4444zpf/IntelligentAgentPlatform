@@ -11,7 +11,7 @@ from app.mcp.service import McpService
 from app.mcp.store import McpStore
 from app.db.base import Base
 
-AUTH_HEADERS = {"X-Unit-ID": "unit-1", "X-User-ID": "u1", "X-Project-ID": "p1", "X-User-Role": "admin"}
+AUTH_HEADERS = {"X-Unit-ID": "unit-1", "X-User-ID": "u1", "X-Project-ID": "p1", "X-User-Roles": "unit_admin"}
 
 
 
@@ -503,6 +503,60 @@ def test_repeated_mcp_whitelist_without_request_id_records_each_mutation(client)
         )))
     assert len(events) == 2
     assert len({event.idempotency_key for event in events}) == 2
+
+
+def test_health_test_operation_and_status_endpoints(client):
+    assert client.post("/api/mcp", json=remote_payload()).status_code == 201
+
+    started = client.post("/api/mcp/water-data/test")
+    assert started.status_code == 202
+    operation = started.json()
+    assert operation["operation_type"] == "manual_test"
+    assert operation["status"] == "succeeded"
+
+    fetched = client.get(f"/api/mcp/operations/{operation['id']}")
+    assert fetched.status_code == 200
+    assert fetched.json()["id"] == operation["id"]
+
+    health = client.get("/api/mcp/water-data/health")
+    assert health.status_code == 200
+    assert health.json()["health_status"] == "healthy"
+
+
+def test_unit_admin_manages_project_grants(client):
+    assert client.post("/api/mcp", json=remote_payload()).status_code == 201
+    updated = client.put("/api/mcp/water-data/projects", json={"project_ids": ["p1", "p2"]})
+    assert updated.status_code == 200
+    assert updated.json() == {"project_ids": ["p1", "p2"]}
+    assert client.get("/api/mcp/water-data/projects").json() == {"project_ids": ["p1", "p2"]}
+
+
+def test_project_admin_cannot_modify_connection_or_project_grants(client):
+    assert client.post("/api/mcp", json=remote_payload()).status_code == 201
+    project_admin = {"X-User-Roles": "project_admin"}
+    assert client.put("/api/mcp/water-data", json=remote_payload()).status_code == 200
+    assert client.put("/api/mcp/water-data", json=remote_payload(), headers=project_admin).status_code == 403
+    assert client.put("/api/mcp/water-data/projects", json={"project_ids": ["p1"]}, headers=project_admin).status_code == 403
+
+
+def test_mcp_clients_are_isolated_by_unit(client):
+    assert client.post("/api/mcp", json=remote_payload()).status_code == 201
+    other_unit = {"X-Unit-ID": "unit-2", "X-Project-ID": "p2", "X-User-ID": "u2", "X-User-Roles": "unit_admin"}
+    assert client.get("/api/mcp", headers=other_unit).json() == []
+    assert client.get("/api/mcp/water-data", headers=other_unit).status_code == 404
+    assert client.get("/api/mcp/water-data/tools", headers=other_unit).status_code == 404
+
+
+def test_archive_and_restore_preserve_client_record(client):
+    assert client.post("/api/mcp", json=remote_payload()).status_code == 201
+    archived = client.post("/api/mcp/water-data/archive")
+    assert archived.status_code == 200
+    assert archived.json()["status"] == "archived"
+    assert client.get("/api/mcp").json() == []
+
+    restored = client.post("/api/mcp/water-data/restore")
+    assert restored.status_code == 200
+    assert restored.json()["status"] == "active"
 
 
 def test_mcp_store_rejects_stale_config_update(tmp_path):
