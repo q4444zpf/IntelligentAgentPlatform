@@ -69,8 +69,8 @@ def create_router(service: McpService | None = None) -> APIRouter:
         return context
 
     @router.get("", response_model=list[McpClientInfo])
-    def list_clients(context: RequestContext = Depends(require_request_context)):
-        return manager.list(context=context)
+    def list_clients(include_archived: bool = False, context: RequestContext = Depends(require_request_context)):
+        return manager.list(context=context, include_archived=include_archived)
 
     @router.post("", response_model=McpClientInfo, status_code=201)
     def create_client(

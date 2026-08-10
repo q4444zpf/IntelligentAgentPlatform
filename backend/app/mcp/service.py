@@ -126,8 +126,8 @@ class McpService:
             session.rollback()
             raise
 
-    def list(self, *, context: RequestContext | None = None) -> list[McpClientInfo]:
-        return [self._info(record) for record in self.store.list(unit_id=context.unit_id if context else None)]
+    def list(self, *, context: RequestContext | None = None, include_archived: bool = False) -> list[McpClientInfo]:
+        return [self._info(record) for record in self.store.list(unit_id=context.unit_id if context else None, include_archived=include_archived)]
 
     def _owned_record(self, key: str, context: RequestContext | None) -> dict:
         record = self.store.get(key)

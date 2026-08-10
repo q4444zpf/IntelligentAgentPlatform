@@ -553,6 +553,7 @@ def test_archive_and_restore_preserve_client_record(client):
     assert archived.status_code == 200
     assert archived.json()["status"] == "archived"
     assert client.get("/api/mcp").json() == []
+    assert client.get("/api/mcp?include_archived=true").json()[0]["status"] == "archived"
 
     restored = client.post("/api/mcp/water-data/restore")
     assert restored.status_code == 200
