@@ -27,6 +27,76 @@ class McpProtocolClient:
         except (httpx.HTTPError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
             raise McpProtocolError("remote MCP request failed") from error
 
+    def call_tool(
+        self,
+        url: str,
+        transport: str,
+        headers: dict[str, str],
+        name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Invoke one remote MCP capability and return its structured result."""
+        try:
+            request_headers = {**headers, "Accept": "application/json, text/event-stream"}
+            if transport == "streamable_http":
+                initialize = self._rpc(
+                    url,
+                    request_headers,
+                    "initialize",
+                    {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": {"name": "IntelligentAgentPlatform", "version": "1.0"},
+                    },
+                    1,
+                )
+                if initialize[1]:
+                    request_headers["Mcp-Session-Id"] = initialize[1]
+                self._rpc(url, request_headers, "notifications/initialized", {}, None, allow_empty=True)
+                response, _ = self._rpc(
+                    url,
+                    request_headers,
+                    "tools/call",
+                    {"name": name, "arguments": arguments},
+                    2,
+                )
+            elif transport == "sse":
+                response = self._call_sse(url, request_headers, name, arguments)
+            else:
+                raise McpProtocolError(f"Unsupported MCP transport: {transport}")
+            result = response.get("result")
+            if not isinstance(result, dict):
+                raise McpProtocolError("remote MCP request failed")
+            structured = result.get("structuredContent")
+            if isinstance(structured, dict):
+                return structured
+            return result
+        except McpProtocolError:
+            raise
+        except (httpx.HTTPError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
+            raise McpProtocolError("remote MCP request failed") from error
+
+    def _call_sse(
+        self, url: str, headers: dict[str, str], name: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        response = self.http_client.get(url, headers={**headers, "Accept": "text/event-stream"})
+        response.raise_for_status()
+        endpoint = self._endpoint_from_sse(response.text)
+        if not endpoint:
+            raise McpProtocolError("remote MCP request failed")
+        endpoint = urljoin(url, endpoint)
+        initialize, session_id = self._rpc(endpoint, headers, "initialize", {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "IntelligentAgentPlatform", "version": "1.0"},
+        }, 1)
+        request_headers = dict(headers)
+        if session_id:
+            request_headers["Mcp-Session-Id"] = session_id
+        self._rpc(endpoint, request_headers, "notifications/initialized", {}, None, allow_empty=True)
+        result, _ = self._rpc(endpoint, request_headers, "tools/call", {"name": name, "arguments": arguments}, 2, sse_response=True)
+        return result
+
     def _list_streamable_http(self, url: str, headers: dict[str, str]) -> list[dict[str, Any]]:
         request_headers = {**headers, "Accept": "application/json, text/event-stream"}
         session_id: str | None = None

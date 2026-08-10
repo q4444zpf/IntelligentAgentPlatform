@@ -249,6 +249,50 @@ def test_missing_builtin_executor_is_execution_failure(runtime, monkeypatch):
         session.close()
 
 
+def test_mcp_tool_executes_remote_capability_and_records_result(runtime):
+    factory, store = runtime
+    mcp_tool_id = "mcp.water.read_wiki_abcd1234"
+    with factory.begin() as db:
+        db.add(RegisteredToolRecord(
+            tool_id=mcp_tool_id, version="1.0.0", name="read_wiki",
+            description="Read wiki", source="mcp", risk_level="medium",
+            input_schema={"type": "object"}, output_schema={"type": "object"},
+            source_resource_id="water", source_capability_id="read_wiki",
+            source_available=True, requires_approval=False, published=True, enabled=True,
+        ))
+
+    class FakeMcpStore:
+        def get(self, key):
+            assert key == "water"
+            return {"key": "water", "url": "https://example.test/mcp", "transport": "streamable_http", "headers": {}, "enabled": True}
+
+    class FakeProtocol:
+        def call_tool(self, url, transport, headers, name, arguments):
+            assert (url, transport, headers, name, arguments) == (
+                "https://example.test/mcp", "streamable_http", {}, "read_wiki", {"repo": "github"}
+            )
+            return {"answer": "ok"}
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        mcp_store=FakeMcpStore(),
+        mcp_protocol_client=FakeProtocol(),
+    )
+    try:
+        result = execute(
+            gateway, name=mcp_tool_id, arguments={"repo": "github"},
+            authorized={mcp_tool_id},
+        )
+        assert result.value == {"answer": "ok"}
+        invocation = session.scalar(select(ToolInvocation))
+        assert invocation.status == "completed"
+        assert invocation.tool_id == mcp_tool_id
+    finally:
+        session.close()
+
+
 def test_nonduplicate_integrity_error_when_starting_is_execution_failure(
     runtime, monkeypatch
 ):

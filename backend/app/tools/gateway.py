@@ -16,6 +16,9 @@ from app.audit.models import AuditEvent
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.conversations.models import ToolInvocation
 from app.conversations.repository import ConversationRepository
+from app.mcp.protocol import McpProtocolClient, McpProtocolError
+from app.mcp.store import McpStore
+from app.mcp.credential_resolver import McpCredentialResolver, CredentialNotFoundError, CredentialScopeError
 
 from .builtins import BUILTIN_EXECUTORS
 from .schemas import ToolCall, ToolExecutionContext, ToolExecutionResult, ToolRuntimeError
@@ -36,11 +39,17 @@ class ToolGateway:
         repository: ConversationRepository,
         clock: Callable[[], datetime] | None = None,
         audit_recorder: AuditRecorder | None = None,
+        mcp_store: McpStore | None = None,
+        mcp_protocol_client: McpProtocolClient | None = None,
+        mcp_credential_resolver: McpCredentialResolver | None = None,
     ):
         self.tool_store = tool_store
         self.repository = repository
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.audit_recorder = audit_recorder or AuditRecorder()
+        self.mcp_store = mcp_store
+        self.mcp_protocol_client = mcp_protocol_client
+        self.mcp_credential_resolver = mcp_credential_resolver
 
     @staticmethod
     def _validate(schema: dict[str, Any], value: Any, code: str, message: str) -> None:
@@ -289,7 +298,7 @@ class ToolGateway:
         if tool is None:
             raise ToolRuntimeError("tool_not_authorized", "该工具当前不可用。")
         executor = BUILTIN_EXECUTORS.get(call.name)
-        if executor is None or tool["source"] != "builtin":
+        if executor is None and tool["source"] != "mcp":
             raise ToolRuntimeError("tool_execution_failed", "工具执行失败。")
         if self.repository.get_tool_invocation(context.run_id, call.id) is not None:
             raise ToolRuntimeError("tool_duplicate_call", "工具调用标识重复。")
@@ -326,7 +335,12 @@ class ToolGateway:
         invocation_id = str(invocation.id)
         started_at = time.perf_counter()
         try:
-            value = executor(call.arguments, context, self.clock)
+            if tool["source"] == "builtin":
+                if executor is None:
+                    raise ToolRuntimeError("tool_execution_failed", "工具执行失败。")
+                value = executor(call.arguments, context, self.clock)
+            else:
+                value = self._execute_mcp(tool, call.arguments, context)
             self._validate(tool["output_schema"], value, "tool_execution_failed", "工具执行失败。")
         except ToolRuntimeError as error:
             duration_ms = max(0, round((time.perf_counter() - started_at) * 1000))
@@ -350,3 +364,32 @@ class ToolGateway:
             result=value, context=context, parent_event_id=started_audit.id,
         )
         return ToolExecutionResult(invocation_id=invocation_id, value=value)
+
+    def _execute_mcp(
+        self, tool: dict[str, Any], arguments: dict[str, Any], context: ToolExecutionContext
+    ) -> dict[str, Any]:
+        if self.mcp_store is None or self.mcp_protocol_client is None:
+            raise ToolRuntimeError("tool_execution_failed", "工具执行失败。")
+        client_key = tool.get("source_resource_id")
+        capability = tool.get("source_capability_id")
+        client = self.mcp_store.get(client_key) if client_key else None
+        if not client or not client.get("enabled") or client.get("status", "active") != "active":
+            raise ToolRuntimeError("tool_execution_failed", "工具执行失败。")
+        headers = client.get("headers") or {}
+        credential_id = client.get("credential_id")
+        if credential_id:
+            if self.mcp_credential_resolver is None:
+                raise ToolRuntimeError("tool_execution_failed", "工具执行失败。")
+            try:
+                headers = self.mcp_credential_resolver.resolve(credential_id, unit_id=context.unit_id)
+            except (CredentialNotFoundError, CredentialScopeError) as error:
+                raise ToolRuntimeError("tool_execution_failed", "工具执行失败。") from error
+        try:
+            result = self.mcp_protocol_client.call_tool(
+                client["url"], client["transport"], headers, capability, arguments
+            )
+        except McpProtocolError as error:
+            raise ToolRuntimeError("tool_execution_failed", "工具执行失败。") from error
+        if not isinstance(result, dict):
+            raise ToolRuntimeError("tool_execution_failed", "工具执行失败。")
+        return result

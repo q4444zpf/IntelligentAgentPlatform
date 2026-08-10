@@ -14,6 +14,8 @@ from app.runtime.model_gateway import ModelGateway, OpenAICompatibleModelGateway
 from app.tools.gateway import ToolGateway
 from app.tools.service import ToolService
 from app.tools.store import ToolStore
+from app.mcp.protocol import McpProtocolClient
+from app.mcp.store import McpStore
 
 from .repository import ConversationRepository
 
@@ -78,6 +80,8 @@ class ThreadRunDispatcher(RunDispatcher):
                 tool_gateway=ToolGateway(
                     tool_store=tool_store,
                     repository=repository,
+                    mcp_store=McpStore(self.session_factory),
+                    mcp_protocol_client=McpProtocolClient(),
                 ),
             ).execute(run_id)
 

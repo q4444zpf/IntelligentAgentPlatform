@@ -62,3 +62,34 @@ def test_protocol_errors_are_sanitized():
     with pytest.raises(McpProtocolError, match="remote MCP request failed") as error:
         client.list_tools("https://example.test/mcp", "streamable_http", {"Authorization": "Bearer top-secret"})
     assert "top-secret" not in str(error.value)
+
+
+def test_streamable_http_calls_remote_tool_after_initializing_session():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        calls.append((body, request.headers.get("mcp-session-id")))
+        if body["method"] == "initialize":
+            return httpx.Response(
+                200,
+                headers={"mcp-session-id": "session-2"},
+                json={"jsonrpc": "2.0", "id": body["id"], "result": {}},
+            )
+        if body["method"] == "notifications/initialized":
+            return httpx.Response(202)
+        return httpx.Response(200, json={"result": {"answer": "ok"}})
+
+    client = McpProtocolClient(httpx.Client(transport=httpx.MockTransport(handler)))
+    result = client.call_tool(
+        "https://example.test/mcp", "streamable_http", {}, "read_wiki", {"repo": "github"}
+    )
+
+    assert result == {"answer": "ok"}
+    assert [item[0]["method"] for item in calls] == [
+        "initialize", "notifications/initialized", "tools/call"
+    ]
+    assert calls[-1][0]["params"] == {
+        "name": "read_wiki", "arguments": {"repo": "github"}
+    }
+    assert calls[-1][1] == "session-2"
