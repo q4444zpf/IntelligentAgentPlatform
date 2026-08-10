@@ -13,6 +13,7 @@ from .conversations.router import (
 from .core.settings import settings
 from .model_providers.router import router as model_router
 from .mcp.router import router as mcp_router
+from .mcp.scheduler import default_mcp_health_scheduler
 from .platform.router import router as platform_router
 from .skills.router import router as skills_router
 from .tools.router import router as tools_router
@@ -21,8 +22,13 @@ from .identity.auth_router import router as identity_auth_router
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    yield
-    default_run_dispatcher.shutdown(wait=False, cancel_futures=True)
+    default_mcp_health_scheduler.start()
+    try:
+        yield
+    finally:
+        default_mcp_health_scheduler.cancel()
+        await default_mcp_health_scheduler.wait_closed()
+        default_run_dispatcher.shutdown(wait=False, cancel_futures=True)
 
 
 app = FastAPI(
