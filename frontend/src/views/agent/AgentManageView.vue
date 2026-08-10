@@ -35,7 +35,7 @@
             <a-tooltip v-if="agent.enabled && !agent.is_default" title="设为平台默认智能体"><a-button size="small" :loading="busyId === agent.id" @click="setDefaultAgent(agent)">设为默认</a-button></a-tooltip>
             <a-tooltip title="编辑配置"><a-button aria-label="编辑智能体" @click="openEdit(agent)"><template #icon><SettingOutlined /></template></a-button></a-tooltip>
             <a-tooltip :title="agent.is_default ? '平台默认智能体不能停用或删除' : '切换启用状态'"><a-switch :checked="agent.enabled" :disabled="agent.is_default" :loading="busyId === agent.id" checked-children="开" un-checked-children="关" @change="toggleAgent(agent)" /></a-tooltip>
-            <a-tooltip :title="agent.is_builtin ? '系统内置智能体不能删除' : agent.is_default ? '平台默认智能体不能停用或删除' : '删除智能体'"><a-popconfirm :disabled="agent.is_builtin || agent.is_default" title="删除后将同时移除智能体工作空间，确定继续？" ok-text="删除" cancel-text="取消" @confirm="deleteAgent(agent)"><a-button danger aria-label="删除智能体" :disabled="agent.is_builtin || agent.is_default"><template #icon><DeleteOutlined /></template></a-button></a-popconfirm></a-tooltip>
+            <a-tooltip :title="agent.is_builtin ? '系统内置智能体不能删除' : agent.is_default ? '平台默认智能体不能停用或删除' : '删除智能体'"><a-button danger aria-label="删除智能体" :disabled="agent.is_builtin || agent.is_default" @click="requestDelete(agent)"><template #icon><DeleteOutlined /></template></a-button></a-tooltip>
           </div>
         </article>
       </div>
@@ -100,6 +100,10 @@
       </a-tabs>
     </a-modal>
 
+    <a-modal v-model:open="deleteConfirmOpen" title="删除智能体" ok-text="删除" cancel-text="取消" :confirm-loading="deleting" @ok="confirmDelete">
+      <p>删除后将同时移除智能体工作空间，确定继续？</p>
+    </a-modal>
+
     <a-modal v-model:open="copyOpen" title="复制智能体" :confirm-loading="copying" ok-text="创建副本" cancel-text="取消" @ok="copyAgent">
       <a-alert type="info" show-icon :message="`复制 ${copySource?.name || ''} 的模型、提示词和运行配置`" />
       <a-form layout="vertical" class="copy-form"><a-form-item label="新智能体 ID" required><a-input v-model:value="copyForm.id" placeholder="agent-copy" /></a-form-item><a-form-item label="显示名称" required><a-input v-model:value="copyForm.name" /></a-form-item><a-form-item><a-checkbox v-model:checked="copyForm.copy_skills">复制 Skill 绑定</a-checkbox></a-form-item></a-form>
@@ -121,6 +125,7 @@ const agents = ref<AgentInfo[]>([]); const providers = ref<ApiProvider[]>([]); c
 const editorOpen = ref(false); const editorTab = ref('basic'); const editingId = ref(''); const saving = ref(false); const form = reactive(emptyForm()); const formErrors = reactive({ id: '', name: '' });
 const skillQuery = ref(''); const skillTag = ref('all');
 const copyOpen = ref(false); const copying = ref(false); const copySource = ref<AgentInfo>(); const copyForm = reactive({ id: '', name: '', copy_skills: true });
+const deleteConfirmOpen = ref(false); const deleting = ref(false); const deleteTarget = ref<AgentInfo>();
 const runtimeFilterOptions = [{ label: '全部形态', value: 'all' }, { label: 'Web', value: 'web' }, { label: 'Desktop', value: 'desktop' }, { label: 'Common', value: 'common' }]; const runtimeOptions = [{ label: 'Web 页面', value: 'web' }, { label: '桌面客户端', value: 'desktop' }, { label: '通用服务', value: 'common' }]; const languageOptions = [{ label: '简体中文', value: 'zh-CN' }, { label: 'English', value: 'en-US' }];
 const enabledCount = computed(() => agents.value.filter((item) => item.enabled).length); const boundSkillCount = computed(() => new Set(agents.value.flatMap((item) => item.skill_names)).size); const approvalCount = computed(() => agents.value.filter((item) => item.approval_policy !== 'never').length);
 const filteredAgents = computed(() => { const term = query.value.trim().toLowerCase(); return agents.value.filter((item) => (!term || `${item.name} ${item.id} ${item.description}`.toLowerCase().includes(term)) && (runtimeFilter.value === 'all' || item.runtime_form === runtimeFilter.value)); });
@@ -160,7 +165,14 @@ async function saveAgent() { if (!validateForm()) return; if (unavailableToolIds
 async function setDefaultAgent(agent: AgentInfo) { busyId.value = agent.id; try { await agentsApi.setDefault(agent.id); message.success('平台默认智能体已更新'); await loadAgents(); } catch (error) { message.error(error instanceof Error ? error.message : '设置默认智能体失败'); } finally { busyId.value = ''; } }
 async function toggleAgent(agent: AgentInfo) { if (agent.is_default) return; busyId.value = agent.id; try { await agentsApi.toggle(agent.id, !agent.enabled); await loadAgents(); } catch (error) { message.error(error instanceof Error ? error.message : '切换状态失败'); } finally { busyId.value = ''; } }
 async function pinAgent(agent: AgentInfo) { try { await agentsApi.pin(agent.id, !agent.pinned); await loadAgents(); } catch (error) { message.error(error instanceof Error ? error.message : '置顶失败'); } }
-async function deleteAgent(agent: AgentInfo) { try { await agentsApi.remove(agent.id); message.success('智能体已删除'); await loadAgents(); } catch (error) { message.error(error instanceof Error ? error.message : '删除失败'); } }
+function requestDelete(agent: AgentInfo) { if (agent.is_builtin || agent.is_default) return; deleteTarget.value = agent; deleteConfirmOpen.value = true; }
+async function confirmDelete() {
+  if (!deleteTarget.value) return;
+  deleting.value = true;
+  try { await agentsApi.remove(deleteTarget.value.id); message.success('智能体已删除'); deleteConfirmOpen.value = false; deleteTarget.value = undefined; await loadAgents(); }
+  catch (error) { message.error(error instanceof Error ? error.message : '删除失败'); }
+  finally { deleting.value = false; }
+}
 function openCopy(agent: AgentInfo) { copySource.value = agent; Object.assign(copyForm, { id: `${agent.id}-copy`, name: `${agent.name}副本`, copy_skills: true }); copyOpen.value = true; }
 async function copyAgent() { if (!copySource.value || !/^[a-z][a-z0-9_-]{0,63}$/.test(copyForm.id) || !copyForm.name.trim()) { message.error('请输入有效的副本 ID 和名称'); return; } copying.value = true; try { await agentsApi.copy(copySource.value.id, copyForm); message.success('智能体副本已创建，默认处于停用状态'); copyOpen.value = false; await loadAgents(); } catch (error) { message.error(error instanceof Error ? error.message : '复制失败'); } finally { copying.value = false; } }
 function onProviderChange() { if (!modelOptions.value.some((item) => item.value === form.model)) form.model = ''; }

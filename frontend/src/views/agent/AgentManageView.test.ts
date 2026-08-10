@@ -7,9 +7,9 @@ import source from './AgentManageView.vue?raw';
 
 const mocks = vi.hoisted(() => ({
   agentsList: vi.fn(), providersList: vi.fn(), skillsList: vi.fn(), toolsList: vi.fn(),
-  update: vi.fn(), create: vi.fn(), copy: vi.fn(), showError: vi.fn(), showSuccess: vi.fn(),
+  update: vi.fn(), create: vi.fn(), copy: vi.fn(), remove: vi.fn(), showError: vi.fn(), showSuccess: vi.fn(),
 }));
-vi.mock('@/api/agents', () => ({ agentsApi: { list: mocks.agentsList, update: mocks.update, create: mocks.create, copy: mocks.copy, setDefault: vi.fn(), toggle: vi.fn(), pin: vi.fn(), remove: vi.fn() } }));
+vi.mock('@/api/agents', () => ({ agentsApi: { list: mocks.agentsList, update: mocks.update, create: mocks.create, copy: mocks.copy, setDefault: vi.fn(), toggle: vi.fn(), pin: vi.fn(), remove: mocks.remove } }));
 vi.mock('@/api/modelProviders', () => ({ modelProviderApi: { list: mocks.providersList } }));
 vi.mock('@/api/skills', () => ({ skillsApi: { list: mocks.skillsList } }));
 vi.mock('@/api/tools', () => ({ toolsApi: { list: mocks.toolsList } }));
@@ -23,7 +23,7 @@ const stubs = {
   'a-input': { template: '<input />' }, 'a-textarea': { template: '<textarea />' }, 'a-select': { template: '<div />' }, 'a-segmented': { template: '<div />' },
   'a-button': { props: ['disabled'], emits: ['click'], template: '<button v-bind="$attrs" :disabled="disabled" @click="$emit(\'click\', $event)"><slot name="icon" /><slot /></button>' },
   'a-switch': { template: '<button />' }, 'a-spin': { template: '<div><slot /></div>' }, 'a-tag': { template: '<span><slot /></span>' }, 'a-empty': { template: '<div><slot /></div>' },
-  'a-tooltip': { template: '<div><slot /></div>' }, 'a-popconfirm': { template: '<div><slot /></div>' }, 'a-form': { template: '<form><slot /></form>' }, 'a-form-item': { template: '<div><slot /></div>' },
+  'a-tooltip': { template: '<div class="tooltip-wrapper"><slot /></div>' }, 'a-popconfirm': { emits: ['confirm'], template: '<div class="popconfirm-wrapper"><slot /><button class="confirm-delete" @click="$emit(\'confirm\')">确认删除</button></div>' }, 'a-form': { template: '<form><slot /></form>' }, 'a-form-item': { template: '<div><slot /></div>' },
   'a-tabs': { template: '<div><slot /></div>' }, 'a-tab-pane': { template: '<section><slot /></section>' }, 'a-radio-group': { template: '<div><slot /></div>' }, 'a-radio': { template: '<label><slot /></label>' }, 'a-checkbox': { template: '<input type="checkbox" />' },
   'a-modal': { props: ['open'], emits: ['ok'], template: '<div v-if="open" class="modal"><slot /><button class="modal-ok" @click="$emit(\'ok\')">保存</button></div>' },
 };
@@ -34,6 +34,18 @@ beforeEach(() => { Object.values(mocks).forEach((mock) => mock.mockReset()); moc
 afterEach(() => wrappers.splice(0).forEach((wrapper) => wrapper.unmount()));
 
 describe('AgentManageView tool interactions', () => {
+  it('opens a reliable confirmation modal before deleting an agent', async () => {
+    const deletableAgent = { ...structuredClone(agent), id: 'deletable-agent', name: '可删除智能体', is_builtin: false, is_default: false };
+    mocks.agentsList.mockResolvedValue([deletableAgent]);
+    mocks.remove.mockResolvedValue({ success: true, agent_id: deletableAgent.id });
+    const wrapper = render(); await flushPromises();
+
+    await wrapper.get('[aria-label="删除智能体"]').trigger('click');
+    expect(wrapper.find('.modal').exists()).toBe(true);
+    await wrapper.get('.modal-ok').trigger('click'); await flushPromises();
+    expect(mocks.remove).toHaveBeenCalledWith(deletableAgent.id);
+  });
+
   it('shows a disabled binding, blocks save and copy, then removes it from update payload', async () => {
     mocks.agentsList.mockResolvedValueOnce([structuredClone(agent)]).mockResolvedValue([{ ...structuredClone(agent), tool_ids: [] }]);
     const wrapper = render(); await flushPromises();
