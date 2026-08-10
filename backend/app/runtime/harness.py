@@ -207,11 +207,17 @@ class PlatformAgentHarness:
             for message in self.repository.get_run_messages(run_id)
             if message.role in {"user", "assistant", "system"}
         ][-MAX_CONVERSATION_MESSAGES:]
-        return [
+        messages = [
             *([{"role": "system", "content": agent.system_prompt}] if agent.system_prompt.strip() else []),
             *([{"role": "system", "content": agent.context_prompt}] if agent.context_prompt.strip() else []),
             *conversation_messages,
         ]
+        if not agent.tool_ids and self.tool_service is not None:
+            messages.append({
+                "role": "system",
+                "content": "当前智能体未授权任何工具，不可调用任何工具；不得声称已经调用工具或编造工具返回结果。",
+            })
+        return messages
 
     def _resolve_tool_definitions(self, tool_ids: list[str]) -> list[ToolDefinition]:
         if not tool_ids:

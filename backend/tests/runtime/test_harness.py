@@ -142,6 +142,23 @@ def test_completes_run_and_persists_assistant_message():
     session.close()
 
 
+def test_build_messages_explicitly_disallows_unavailable_tool_claims():
+    session, run_id = build_queued_run()
+    repository = ConversationRepository(session)
+    harness = PlatformAgentHarness(repository, SuccessfulGateway(), FakeAgentService(tool_ids=[]), tool_service=object())
+
+    messages = harness._build_messages(run_id, FakeAgentService(tool_ids=[]).agent)
+
+    assert any(
+        message["role"] == "system"
+        and "不可调用任何工具" in message["content"]
+        and "不得声称已经调用工具" in message["content"]
+        for message in messages
+    )
+    assert messages[-1]["content"].startswith("当前智能体未授权任何工具")
+    session.close()
+
+
 def test_records_agent_status_and_safe_llm_iteration_events_idempotently():
     session, run_id = build_queued_run()
     repository = ConversationRepository(session)
