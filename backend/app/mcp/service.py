@@ -13,6 +13,8 @@ from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.core.request_context import RequestContext
 from app.tools.store import ToolStore
 from .protocol import McpProtocolClient, McpProtocolError
+from .credential_resolver import McpCredentialResolver, CredentialNotFoundError, CredentialScopeError
+from .discovery_service import McpDiscoveryService
 from .schemas import McpClientConfig, McpClientCreate, McpClientInfo, McpToolInfo
 from .store import McpConcurrentUpdateError, McpStore
 from .tool_registry import McpToolRegistrySynchronizer
@@ -53,6 +55,7 @@ class McpService:
         *,
         audit_recorder: AuditRecorder | None = None,
         tool_store: ToolStore | None = None,
+        credential_resolver: McpCredentialResolver | None = None,
     ):
         self.store = store or McpStore()
         self.http_client = http_client or httpx.Client(timeout=15, follow_redirects=False)
@@ -60,6 +63,8 @@ class McpService:
         self.audit_recorder = audit_recorder or AuditRecorder()
         self.tool_store = tool_store or ToolStore(self.store.session_factory)
         self.tool_registry = McpToolRegistrySynchronizer(self.tool_store)
+        self.discovery_service = McpDiscoveryService(self.store.session_factory, self.tool_registry)
+        self.credential_resolver = credential_resolver
 
     @staticmethod
     def _cas(operation):
@@ -216,7 +221,15 @@ class McpService:
             raise McpValidationError("stdio MCP must be synchronized by a sandbox worker")
         try:
             self.protocol_client.http_client = self.http_client
-            raw_tools = self.protocol_client.list_tools(record["url"], record["transport"], record["headers"])
+            headers = record["headers"]
+            if record.get("credential_id"):
+                if self.credential_resolver is None or context is None:
+                    raise McpValidationError("credential is not available")
+                try:
+                    headers = self.credential_resolver.resolve(record["credential_id"], unit_id=context.unit_id)
+                except (CredentialNotFoundError, CredentialScopeError) as error:
+                    raise McpValidationError(str(error)) from error
+            raw_tools = self.protocol_client.list_tools(record["url"], record["transport"], headers)
             tools = [
                 {
                     "name": tool["name"],
@@ -233,7 +246,12 @@ class McpService:
             self._cas(lambda: self.store.update_tools(key, tools, synced_at, record["version"]))
         else:
             updated = self._cas(lambda: self.store.update_in_session(session, key, expected_version=record["version"], tool_records=tools, last_synced_at=synced_at))
-            self.tool_registry.sync(session, key, tools)
+            self.discovery_service.sync(
+                session,
+                client_id=record.get("client_id") or key,
+                client_key=key,
+                tools=tools,
+            )
             self.tool_registry.apply_client_state(session, updated)
             self._commit_management(context, session, request_id, action="resource.updated", key=key, name=record["name"], metadata={"tool_count": len(tools)})
         return self.list_tools(key)

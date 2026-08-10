@@ -13,6 +13,7 @@ class McpClientConfig(BaseModel):
     transport: McpTransport = "streamable_http"
     url: str = ""
     headers: dict[str, str] = Field(default_factory=dict)
+    credential_id: str | None = Field(default=None, max_length=128)
     command: str = ""
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)

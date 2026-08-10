@@ -21,9 +21,12 @@ class McpStore:
     def _decode(row: McpClientRecord | None) -> dict[str, Any] | None:
         if row is None:
             return None
+        config = dict(row.config)
+        config.setdefault("credential_id", row.credential_id)
         return {
             "key": row.client_key,
-            **row.config,
+            "client_id": row.client_id,
+            **config,
             "tool_records": row.tool_records,
             "tools": row.whitelist,
             "last_synced_at": row.last_synced_at,
@@ -46,7 +49,7 @@ class McpStore:
             return self.create_in_session(session, key, config)
 
     def create_in_session(self, session: Session, key: str, config: dict[str, Any]) -> dict[str, Any]:
-        row = McpClientRecord(client_key=key, config=config, tool_records=[])
+        row = McpClientRecord(client_key=key, client_id=key, credential_id=config.get("credential_id"), config=config, tool_records=[])
         session.add(row)
         session.flush()
         session.refresh(row)
@@ -98,6 +101,8 @@ class McpStore:
                 if row is None:
                     return None
                 expected_version = row.version
+            if "config" in values:
+                values["credential_id"] = values["config"].get("credential_id")
             return self.update_in_session(
                 session,
                 key,
