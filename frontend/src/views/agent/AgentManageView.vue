@@ -83,10 +83,10 @@
                   <span class="skill-check"><CheckOutlined v-if="form.tool_ids.includes(tool.tool_id)" /></span>
                   <span class="tool-picker-copy"><strong>{{ tool.name }}</strong><code>{{ tool.tool_id }}</code></span>
                   <a-tag>{{ toolRiskLabel(tool) }}</a-tag><em>{{ toolSourceLabel(tool) }}</em>
-                  <small v-if="!isToolSelectable(tool)">{{ tool.missing ? '注册表缺失，仅保留历史绑定' : '已停用或未发布，仅保留现有绑定' }} <a-button class="tool-remove" size="small" danger @click.stop="removeToolBinding(tool.tool_id)">移除绑定</a-button></small>
+                  <small v-if="!isToolSelectable(tool)">{{ unavailableToolMessage(tool) }} <a-button class="tool-remove" size="small" danger @click.stop="removeToolBinding(tool.tool_id)">移除绑定</a-button></small>
                 </div>
               </div>
-              <p class="skill-picker-help">只有已发布且启用的工具可以新增授权。</p>
+              <p class="skill-picker-help">只有已发布、启用且来源可用的工具可以新增授权。</p>
             </section>
           </a-form>
         </a-tab-pane>
@@ -126,15 +126,20 @@ const enabledCount = computed(() => agents.value.filter((item) => item.enabled).
 const filteredAgents = computed(() => { const term = query.value.trim().toLowerCase(); return agents.value.filter((item) => (!term || `${item.name} ${item.id} ${item.description}`.toLowerCase().includes(term)) && (runtimeFilter.value === 'all' || item.runtime_form === runtimeFilter.value)); });
 const providerOptions = computed(() => providers.value.filter((item) => item.enabled && item.configured).map((item) => ({ label: item.name, value: item.id }))); const activeProvider = computed(() => providers.value.find((item) => item.id === form.provider_id)); const modelOptions = computed(() => (activeProvider.value?.models || []).filter((item) => item.enabled).map((item) => ({ label: item.name, value: item.id }))); const enabledSkills = computed(() => skills.value.filter((item) => item.enabled)); const skillTagOptions = computed(() => [{ label: '全部标签', value: 'all' }, ...Array.from(new Set(enabledSkills.value.flatMap((item) => item.tags))).sort((a, b) => a.localeCompare(b, 'zh-CN')).map((tag) => ({ label: tag, value: tag }))]); const visibleSkills = computed(() => { const term = skillQuery.value.trim().toLowerCase(); return enabledSkills.value.filter((item) => (!term || `${item.name} ${item.description}`.toLowerCase().includes(term)) && (skillTag.value === 'all' || item.tags.includes(skillTag.value))); });
 type ToolOption = ToolInfo & { missing?: boolean };
-function missingTool(toolId: string): ToolOption { return { tool_id: toolId, version: '', name: toolId, description: '', source: 'builtin', risk_level: 'low', input_schema: {}, output_schema: {}, requires_approval: false, published: false, enabled: false, is_builtin: false, created_at: '', updated_at: '', missing: true }; }
+function missingTool(toolId: string): ToolOption { return { tool_id: toolId, version: '', name: toolId, description: '', source: 'builtin', risk_level: 'low', input_schema: {}, output_schema: {}, source_resource_id: null, source_capability_id: null, source_available: false, requires_approval: false, published: false, enabled: false, is_builtin: false, created_at: '', updated_at: '', missing: true }; }
 const visibleTools = computed<ToolOption[]>(() => {
-  const registryTools = tools.value.filter((tool) => (tool.published && tool.enabled) || form.tool_ids.includes(tool.tool_id));
+  const registryTools = tools.value.filter((tool) => isToolSelectable(tool) || form.tool_ids.includes(tool.tool_id));
   const registryIds = new Set(registryTools.map((tool) => tool.tool_id));
   return [...registryTools, ...form.tool_ids.filter((toolId) => !registryIds.has(toolId)).map(missingTool)];
 });
 function toolRiskLabel(tool: ToolOption) { return tool.missing ? '未知' : tool.risk_level; }
 function toolSourceLabel(tool: ToolOption) { return tool.missing ? '历史绑定' : tool.source; }
-function isToolSelectable(tool: ToolInfo) { return tool.published && tool.enabled; }
+function isToolSelectable(tool: ToolInfo) { return tool.published && tool.enabled && tool.source_available; }
+function unavailableToolMessage(tool: ToolOption) {
+  if (tool.missing) return '注册表缺失，仅保留历史绑定';
+  if (tool.source === 'mcp' && !tool.source_available) return 'MCP 来源不可用，仅保留现有绑定';
+  return '已停用或未发布，仅保留现有绑定';
+}
 const unavailableBindingMessage = '存在不可用的工具绑定，请先编辑并移除后再复制';
 function unavailableToolIds(toolIds: string[]) { if (toolLoadError.value) return toolIds; const available = new Set(tools.value.filter(isToolSelectable).map((tool) => tool.tool_id)); return toolIds.filter((toolId) => !available.has(toolId)); }
 function hasUnavailableToolBindings(agent: AgentInfo) { return unavailableToolIds(agent.tool_ids).length > 0; }

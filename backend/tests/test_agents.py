@@ -232,6 +232,70 @@ def test_rejects_disabled_or_unpublished_tool_bindings(client, published, enable
     assert tool_id in response.json()["detail"]
 
 
+def test_accepts_available_published_mcp_tool_binding(client):
+    service = client.app.state.agent_service
+    tool_id = "mcp.water.query_level_abcd1234"
+    with service.tool_service.store.session_factory.begin() as session:
+        session.add(
+            RegisteredToolRecord(
+                tool_id=tool_id,
+                version="1.0.0",
+                name="查询水位",
+                description="读取水位",
+                source="mcp",
+                risk_level="medium",
+                input_schema={"type": "object"},
+                output_schema={"type": "object"},
+                source_resource_id="water",
+                source_capability_id="query_level",
+                source_available=True,
+                requires_approval=False,
+                published=True,
+                enabled=True,
+            )
+        )
+
+    response = client.post(
+        "/api/agents",
+        json=agent_payload(tool_ids=[tool_id]),
+    )
+
+    assert response.status_code == 201
+    assert response.json()["tool_ids"] == [tool_id]
+
+
+def test_rejects_source_unavailable_mcp_tool_binding(client):
+    service = client.app.state.agent_service
+    tool_id = "mcp.water.query_level_abcd1234"
+    with service.tool_service.store.session_factory.begin() as session:
+        session.add(
+            RegisteredToolRecord(
+                tool_id=tool_id,
+                version="1.0.0",
+                name="查询水位",
+                description="读取水位",
+                source="mcp",
+                risk_level="medium",
+                input_schema={"type": "object"},
+                output_schema={"type": "object"},
+                source_resource_id="water",
+                source_capability_id="query_level",
+                source_available=False,
+                requires_approval=False,
+                published=True,
+                enabled=True,
+            )
+        )
+
+    response = client.post(
+        "/api/agents",
+        json=agent_payload(tool_ids=[tool_id]),
+    )
+
+    assert response.status_code == 422
+    assert tool_id in response.json()["detail"]
+
+
 def test_updates_and_copies_agent_tool_bindings(client):
     assert client.post("/api/agents", json=agent_payload()).status_code == 201
     updated_payload = agent_payload(

@@ -10,19 +10,20 @@ import source from './ToolManageView.vue?raw';
 const mocks = vi.hoisted(() => ({
   list: vi.fn(),
   toggle: vi.fn(),
+  publish: vi.fn(),
   showError: vi.fn(),
   showSuccess: vi.fn(),
 }));
 
 vi.mock('@/api/tools', () => ({
-  toolsApi: { list: mocks.list, toggle: mocks.toggle },
+  toolsApi: { list: mocks.list, toggle: mocks.toggle, setPublished: mocks.publish },
 }));
 
 vi.mock('ant-design-vue', () => ({
   message: { error: mocks.showError, success: mocks.showSuccess },
 }));
 
-const { list, toggle, showError, showSuccess } = mocks;
+const { list, toggle, publish, showError, showSuccess } = mocks;
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -41,6 +42,9 @@ function tool(tool_id: string, enabled = true) {
     name: tool_id,
     description: '测试工具',
     source: 'builtin',
+    source_resource_id: null,
+    source_capability_id: null,
+    source_available: true,
     risk_level: 'low',
     input_schema: { properties: {} },
     output_schema: { properties: {} },
@@ -50,6 +54,20 @@ function tool(tool_id: string, enabled = true) {
     is_builtin: true,
     created_at: '2026-08-02T00:00:00Z',
     updated_at: '2026-08-02T00:00:00Z',
+  };
+}
+
+function mcpTool(tool_id: string, source_available: boolean, published = false) {
+  return {
+    ...tool(tool_id),
+    name: 'query_level',
+    description: '读取水位',
+    source: 'mcp',
+    source_resource_id: 'water-data',
+    source_capability_id: 'query_level',
+    source_available,
+    published,
+    is_builtin: false,
   };
 }
 
@@ -82,6 +100,7 @@ function render() {
 beforeEach(() => {
   list.mockReset();
   toggle.mockReset();
+  publish.mockReset();
   showError.mockReset();
   showSuccess.mockReset();
 });
@@ -162,6 +181,32 @@ describe('ToolManageView interactions', () => {
     first.resolve(tool('tool-one', false));
     second.resolve(tool('tool-two', false));
     await flushPromises();
+  });
+
+  it('renders unavailable MCP source and disables publication', async () => {
+    list.mockResolvedValue([mcpTool('mcp.water.query_level_abcd1234', false)]);
+
+    const wrapper = render();
+    await flushPromises();
+
+    expect(wrapper.text()).toContain('water-data');
+    expect(wrapper.text()).toContain('query_level');
+    expect(wrapper.text()).toContain('来源不可用');
+    expect(wrapper.get('[aria-label="发布工具"]').attributes('disabled')).toBeDefined();
+  });
+
+  it('publishes an available MCP tool', async () => {
+    const candidate = mcpTool('mcp.water.query_level_abcd1234', true);
+    list.mockResolvedValue([candidate]);
+    publish.mockResolvedValue({ ...candidate, published: true });
+
+    const wrapper = render();
+    await flushPromises();
+    await wrapper.get('[aria-label="发布工具"]').trigger('click');
+    await flushPromises();
+
+    expect(publish).toHaveBeenCalledWith(candidate.tool_id, true);
+    expect(wrapper.text()).toContain('已发布');
   });
 });
 

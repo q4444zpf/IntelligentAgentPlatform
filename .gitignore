@@ -26,6 +26,7 @@ frontend/*.log
 output/
 .pydeps/
 .tmp/
+/.local-backups/
 
 # Backend runtime data may contain model credentials.
 backend/data/

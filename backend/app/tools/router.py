@@ -9,7 +9,7 @@ from app.core.request_context import (
     require_request_context,
 )
 
-from .schemas import ToolInfo
+from .schemas import ToolInfo, ToolPublicationRequest
 from .service import ToolNotFoundError, ToolService, ToolValidationError
 
 
@@ -30,16 +30,16 @@ def create_router(service: ToolService | None = None) -> APIRouter:
             raise HTTPException(status_code=404, detail=f"Tool '{error}' was not found") from error
         except ToolValidationError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
-    def call_management(operation, session, context: RequestContext, request_id: str | None, tool_id: str):
+    def call_management(operation, session, context: RequestContext, request_id: str | None, tool_id: str, action: str = "resource.updated"):
         try:
             return operation()
         except ToolNotFoundError as error:
             session.rollback()
-            record_failed_management(manager().store.session_factory, manager().audit_recorder, context, source="tool", action="resource.updated", resource_type="tool", resource_id=tool_id, error_code="TOOL_NOT_FOUND", request_id=request_id, risk_level="medium")
+            record_failed_management(manager().store.session_factory, manager().audit_recorder, context, source="tool", action=action, resource_type="tool", resource_id=tool_id, error_code="TOOL_NOT_FOUND", request_id=request_id, risk_level="medium")
             raise HTTPException(status_code=404, detail=f"Tool '{error}' was not found") from error
         except ToolValidationError as error:
             session.rollback()
-            record_failed_management(manager().store.session_factory, manager().audit_recorder, context, source="tool", action="resource.updated", resource_type="tool", resource_id=tool_id, error_code="TOOL_VALIDATION", request_id=request_id, risk_level="medium")
+            record_failed_management(manager().store.session_factory, manager().audit_recorder, context, source="tool", action=action, resource_type="tool", resource_id=tool_id, error_code="TOOL_VALIDATION", request_id=request_id, risk_level="medium")
             raise HTTPException(status_code=422, detail=str(error)) from error
 
     def require_tool_admin(
@@ -59,6 +59,40 @@ def create_router(service: ToolService | None = None) -> APIRouter:
         raise HTTPException(
             status_code=403,
             detail="Administrator permission is required",
+        )
+
+    def require_tool_publication_admin(
+        request: Request,
+        context: RequestContext = Depends(require_request_context),
+    ) -> RequestContext:
+        if "unit_admin" in context.roles:
+            request.state.management_context = context
+            management_request_id(request)
+            return context
+        service_instance = manager()
+        tool_id = request.path_params.get("tool_id", "unknown")
+        current = service_instance.store.get(tool_id)
+        action = (
+            "resource.unpublished"
+            if current and current["published"]
+            else "resource.published"
+        )
+        request_id = management_request_id(request)
+        record_failed_management(
+            service_instance.store.session_factory,
+            service_instance.audit_recorder,
+            context,
+            source="tool",
+            action=action,
+            resource_type="tool",
+            resource_id=tool_id,
+            error_code="PERMISSION_DENIED",
+            request_id=request_id,
+            risk_level="medium",
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="Unit administrator permission is required",
         )
 
 
@@ -84,6 +118,30 @@ def create_router(service: ToolService | None = None) -> APIRouter:
         service_instance = manager()
         with service_instance.store.session_factory() as session:
             return call_management(lambda: service_instance.toggle(tool_id, context=context, session=session, request_id=request_id), session, context, request_id, tool_id)
+
+    @router.patch("/{tool_id}/publication", response_model=ToolInfo)
+    def set_tool_publication(
+        tool_id: str,
+        request: ToolPublicationRequest,
+        context: RequestContext = Depends(require_tool_publication_admin),
+        request_id: str = Depends(management_request_id),
+    ):
+        service_instance = manager()
+        with service_instance.store.session_factory() as session:
+            return call_management(
+                lambda: service_instance.set_published(
+                    tool_id,
+                    request.published,
+                    context=context,
+                    session=session,
+                    request_id=request_id,
+                ),
+                session,
+                context,
+                request_id,
+                tool_id,
+                "resource.published" if request.published else "resource.unpublished",
+            )
 
     return router
 

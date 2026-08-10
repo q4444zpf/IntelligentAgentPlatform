@@ -10,9 +10,17 @@ from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.core.request_context import RequestContext
 from .builtins import BUILTIN_TOOL_DEFINITIONS
 from .schemas import ToolInfo
-from .store import ToolStore
+from .store import ToolSourceUnavailableError, ToolStore
 
 TOOL_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$")
+
+
+def _management_audit_scope(
+    context: RequestContext,
+) -> tuple[str, str, str | None]:
+    if context.project_id:
+        return "project", "project", context.project_id
+    return "unit", "unit", None
 
 
 class ToolNotFoundError(Exception):
@@ -52,7 +60,7 @@ class ToolService:
         resolved = []
         for tool_id in tool_ids:
             tool = self.get(tool_id)
-            if not tool.published or not tool.enabled:
+            if not tool.published or not tool.enabled or not tool.source_available:
                 raise ToolValidationError(
                     f"Tool '{tool_id}' is not available for binding"
                 )
@@ -92,6 +100,57 @@ class ToolService:
                 occurred_at=datetime.now(UTC),
             ))
             session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        return ToolInfo.model_validate(updated)
+
+    def set_published(
+        self,
+        tool_id: str,
+        published: bool,
+        *,
+        context: RequestContext | None,
+        session: Session,
+        request_id: str | None = None,
+    ) -> ToolInfo:
+        self._validate_tool_id(tool_id)
+        try:
+            updated = self.store.set_published_in_session(
+                session, tool_id, published
+            )
+            if updated is None:
+                raise ToolNotFoundError(tool_id)
+            if context is not None:
+                authorization_scope, event_scope, project_id = (
+                    _management_audit_scope(context)
+                )
+                self.audit_recorder.record(session, AuditRecordRequest(
+                    unit_id=context.unit_id, project_id=project_id,
+                    user_id=context.user_id, actor_roles=context.role_codes,
+                    authorization_scope=authorization_scope, event_scope=event_scope,
+                    trace_id=management_trace_id(request_id), category="management",
+                    source="tool",
+                    action="resource.published" if published else "resource.unpublished",
+                    status="succeeded", risk_level="medium",
+                    resource_type="tool", resource_id=tool_id,
+                    resource_name=updated["name"],
+                    summary=f"Tool {tool_id} publication status changed",
+                    metadata={
+                        "published": published,
+                        "source_resource_id": updated["source_resource_id"],
+                        "source_capability_id": updated["source_capability_id"],
+                    },
+                    allowed_metadata_keys=frozenset({
+                        "published", "source_resource_id", "source_capability_id",
+                    }),
+                    idempotency_key=f"management:{management_event_id(request_id)}:succeeded:tool.publication:{tool_id}",
+                    occurred_at=datetime.now(UTC),
+                ))
+            session.commit()
+        except ToolSourceUnavailableError as error:
+            session.rollback()
+            raise ToolValidationError("Tool source is unavailable") from error
         except Exception:
             session.rollback()
             raise

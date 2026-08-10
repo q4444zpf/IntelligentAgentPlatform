@@ -16,7 +16,7 @@ vi.mock('@/api/tools', () => ({ toolsApi: { list: mocks.toolsList } }));
 vi.mock('ant-design-vue', () => ({ message: { error: mocks.showError, success: mocks.showSuccess } }));
 
 const agent = { id: 'default-agent', name: '默认智能体', description: '', runtime_form: 'common', language: 'zh-CN', provider_id: '', model: '', system_prompt: '', context_prompt: '', approval_policy: 'never', skill_names: [], tool_ids: ['disabled.tool'], enabled: true, is_builtin: true, is_default: true, pinned: false, startup_status: 'ready', workspace_dir: 'agents/default', created_at: '2026-08-02T00:00:00Z', updated_at: '2026-08-02T00:00:00Z' };
-const disabledTool = { tool_id: 'disabled.tool', version: '1.0.0', name: '停用工具', description: '', source: 'builtin', risk_level: 'low', input_schema: {}, output_schema: {}, requires_approval: false, published: true, enabled: false, is_builtin: true, created_at: '', updated_at: '' };
+const disabledTool = { tool_id: 'disabled.tool', version: '1.0.0', name: '停用工具', description: '', source: 'builtin', risk_level: 'low', input_schema: {}, output_schema: {}, source_resource_id: null, source_capability_id: null, source_available: true, requires_approval: false, published: true, enabled: false, is_builtin: true, created_at: '', updated_at: '' };
 const stubs = {
   'a-alert': { props: ['description', 'message'], template: '<div class="alert"><slot />{{ message }}{{ description }}<slot name="action" /></div>' },
   'a-space': { template: '<div><slot /></div>' },
@@ -69,6 +69,45 @@ describe('AgentManageView tool interactions', () => {
     expect(wrapper.text()).toContain('可用工具'); expect(wrapper.text()).toContain('high'); expect(wrapper.text()).toContain('mcp'); expect(wrapper.text()).not.toContain('未发布工具');
     await wrapper.get('.tool-picker-row').trigger('click'); await wrapper.get('.modal-ok').trigger('click'); await flushPromises();
     expect(mocks.update).toHaveBeenCalledWith('default-agent', expect.objectContaining({ tool_ids: ['enabled.tool'] }));
+  });
+
+  it('keeps unavailable MCP bindings visible, blocks selection and save, and allows removal', async () => {
+    const unavailableTool = {
+      ...structuredClone(disabledTool),
+      tool_id: 'mcp.water.query_level_abcd1234',
+      name: '查询水位',
+      source: 'mcp',
+      source_resource_id: 'water-data',
+      source_capability_id: 'query_level',
+      source_available: false,
+      enabled: true,
+      published: true,
+      is_builtin: false,
+    };
+    const boundAgent = { ...structuredClone(agent), tool_ids: [unavailableTool.tool_id], is_default: false, is_builtin: false };
+    mocks.agentsList.mockResolvedValue([boundAgent]);
+    mocks.toolsList.mockResolvedValue([unavailableTool]);
+
+    const wrapper = render();
+    await flushPromises();
+    await wrapper.get('[aria-label="编辑智能体"]').trigger('click');
+    await flushPromises();
+
+    expect(wrapper.text()).toContain('MCP 来源不可用');
+    const row = wrapper.find('.tool-picker-row');
+    expect(row.classes()).toContain('unavailable');
+    expect(row.attributes('tabindex')).toBe('-1');
+    await row.trigger('click');
+    expect(wrapper.text()).toContain('查询水位');
+
+    await wrapper.get('.modal-ok').trigger('click');
+    expect(mocks.update).not.toHaveBeenCalled();
+    expect(mocks.showError).toHaveBeenCalledWith('请先移除不可用的工具绑定再保存');
+
+    await wrapper.get('.tool-remove').trigger('click');
+    await wrapper.get('.modal-ok').trigger('click');
+    await flushPromises();
+    expect(mocks.update).toHaveBeenCalledWith('default-agent', expect.objectContaining({ tool_ids: [] }));
   });
 });
 
