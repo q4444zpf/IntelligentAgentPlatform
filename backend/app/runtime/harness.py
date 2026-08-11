@@ -194,6 +194,13 @@ class PlatformAgentHarness:
             )
         except ToolRuntimeError as error:
             self.repository.session.rollback()
+            if error.code == "approval_required":
+                run = self.repository.get_run_by_id(run_id)
+                if run is not None:
+                    run.status = "waiting_approval"
+                    self.repository.append_event(run_id, "run.status", {"status": "waiting_approval"})
+                    self.repository.session.commit()
+                return
             self._persist_failure_safely(run_id, error.code, error.safe_message, rollback=False)
         except Exception:
             self.repository.session.rollback()
@@ -212,6 +219,26 @@ class PlatformAgentHarness:
             *([{"role": "system", "content": agent.context_prompt}] if agent.context_prompt.strip() else []),
             *conversation_messages,
         ]
+        for invocation in self.repository.list_tool_invocations(run_id):
+            if invocation.status != "completed" or invocation.result_summary is None:
+                continue
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": invocation.tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": invocation.tool_id,
+                        "arguments": json.dumps(invocation.arguments_summary, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    },
+                }],
+            })
+            messages.append({
+                "role": "tool",
+                "tool_call_id": invocation.tool_call_id,
+                "content": json.dumps(invocation.result_summary, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            })
         if not agent.tool_ids and self.tool_service is not None:
             messages.append({
                 "role": "system",

@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.agents.service import AgentNotFoundError
 from app.audit.recorder import AuditRecorder
 from app.audit.models import AuditEvent
-from app.conversations.models import AgentRun, Conversation, Message, RunEvent
+from app.conversations.models import AgentRun, Conversation, Message, RunEvent, ToolInvocation
 from app.conversations.repository import ConversationRepository
 from app.db.base import Base
 from app.runtime.harness import MAX_MODEL_ITERATIONS, MAX_TOOL_CALLS, PlatformAgentHarness
@@ -156,6 +156,20 @@ def test_build_messages_explicitly_disallows_unavailable_tool_claims():
         for message in messages
     )
     assert messages[-1]["content"].startswith("当前智能体未授权任何工具")
+    session.close()
+
+
+def test_build_messages_reconstructs_completed_approved_tool_call_for_resume():
+    session, run_id = build_queued_run()
+    repository = ConversationRepository(session)
+    run = repository.get_run_by_id(run_id)
+    session.add(ToolInvocation(run_id=run_id, tool_call_id="c1", tool_id="system.one", tool_version="1", status="completed", arguments_summary={"amount": 10}, result_summary={"ok": True}))
+    session.commit()
+    harness = PlatformAgentHarness(repository, SuccessfulGateway(), FakeAgentService())
+    messages = harness._build_messages(run_id, FakeAgentService().agent)
+    assert messages[-2]["role"] == "assistant"
+    assert messages[-2]["tool_calls"][0]["id"] == "c1"
+    assert messages[-1] == {"role": "tool", "tool_call_id": "c1", "content": '{"ok":true}'}
     session.close()
 
 
@@ -579,6 +593,17 @@ def test_tool_runtime_error_fails_safely_without_assistant_message():
     assert repo.get_run_by_id(run_id).status == "failed"
     assert repo.list_events(run_id, 0)[-2].payload == {"code": "tool_not_authorized", "message": "该工具当前不可用。"}
     assert not any(message.role == "assistant" for message in repo.get_run_messages(run_id))
+
+
+def test_approval_required_pauses_run_without_recording_failure():
+    session, run_id = build_queued_run()
+    repo = ConversationRepository(session)
+    model = ScriptedToolModel([ModelResult(None, tool_calls=(ToolCall("c1", "system.one", {}),))])
+    error = ToolRuntimeError("approval_required", "该工具需要人工审批后才能执行。")
+    PlatformAgentHarness(repo, model, FakeAgentService(tool_ids=["system.one"]), tool_service=FakeToolService(), tool_gateway=RecordingToolGateway(error)).execute(run_id)
+    assert repo.get_run_by_id(run_id).status == "waiting_approval"
+    assert repo.list_events(run_id, 0)[-1].payload == {"status": "waiting_approval"}
+    assert not any(event.event_type == "run.error" for event in repo.list_events(run_id, 0))
 
 
 def build_integrated_runtime(tmp_path, *, enabled=True, bound=True):

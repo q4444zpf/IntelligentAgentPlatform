@@ -149,7 +149,7 @@ class ConversationRepository:
                     ).label("completed"),
                     func.coalesce(
                         func.sum(
-                            case((runs.c.status.in_(("queued", "running")), 1), else_=0)
+                            case((runs.c.status.in_(("queued", "running", "waiting_approval")), 1), else_=0)
                         ),
                         0,
                     ).label("running"),

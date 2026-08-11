@@ -1,14 +1,19 @@
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.conversations.dispatcher import ThreadRunDispatcher
+from app.approvals.models import Approval
+from app.approvals.service import arguments_digest
 from app.conversations.models import AgentRun, Conversation, Message, RunEvent, ToolInvocation
 from app.db.base import Base
 from app.db.platform_models import RegisteredToolRecord
 from app.runtime.model_gateway import ModelResult, ModelSelection
 from app.tools.schemas import ToolCall
+from app.tools.builtins import BUILTIN_TOOL_DEFINITIONS
+from app.tools.store import ToolStore
 
 
 class RecordingAgentService:
@@ -171,3 +176,45 @@ def test_dispatcher_executes_tool_loop_entirely_in_supplied_database(tmp_path):
     assert len(model.calls) == 2
     assert model.calls[0][1][0].tool_id == "system.get_current_time"
     assert model.calls[1][0][-1]["role"] == "tool"
+
+
+def test_dispatcher_resumes_approved_tool_and_completes_run(tmp_path):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'dispatcher-approval.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+
+    class ResumeModel:
+        def __init__(self): self.calls = []
+        def generate(self, messages, selection=None, tools=None):
+            self.calls.append(list(messages))
+            return ModelResult("审批后的结果")
+
+    model = ResumeModel()
+    with factory.begin() as session:
+        store = ToolStore(factory)
+        for definition in BUILTIN_TOOL_DEFINITIONS:
+            store.upsert_builtin(definition)
+        tool = session.get(RegisteredToolRecord, "system.get_current_time")
+        tool.requires_approval = True
+        tool.risk_level = "high"
+        conversation = Conversation(unit_id="unit-1", project_id="p-tool", owner_id="u-tool", title="审批")
+        session.add(conversation); session.flush()
+        message = Message(conversation_id=conversation.id, role="user", content="查询时间")
+        session.add(message); session.flush()
+        run = AgentRun(conversation_id=conversation.id, trigger_message_id=message.id, actor_type="agent", actor_id="flood", actor_roles_json=["user"], status="waiting_approval")
+        session.add(run); session.flush()
+        invocation = ToolInvocation(run_id=run.id, tool_call_id="approval-call", tool_id="system.get_current_time", tool_version="1.0.0", status="waiting_approval", arguments_summary={})
+        session.add(invocation); session.flush()
+        approval = Approval(run_id=run.id, invocation_id=invocation.id, tool_id=invocation.tool_id, tool_version=invocation.tool_version, unit_id="unit-1", project_id="p-tool", requester_id="u-tool", requester_roles=["user"], assignee_role="project_admin", risk_level="high", arguments_summary={}, arguments_digest=arguments_digest({}), status="approved", expires_at=datetime(2026, 8, 11, tzinfo=timezone.utc))
+        session.add(approval); session.flush()
+        run_id = run.id
+
+    dispatcher = ThreadRunDispatcher(session_factory=factory, gateway_factory=lambda: model, agent_service_factory=ToolBoundAgentService, max_workers=1)
+    dispatcher.resume_approval(approval.id)
+    dispatcher.shutdown()
+
+    with factory() as session:
+        assert session.get(AgentRun, run_id).status == "completed"
+        assert session.query(ToolInvocation).filter_by(run_id=run_id).one().status == "completed"
+        assert session.query(Message).filter_by(conversation_id=conversation.id).order_by(Message.sequence).all()[-1].content == "审批后的结果"
+    assert model.calls[0][-1]["role"] == "tool"

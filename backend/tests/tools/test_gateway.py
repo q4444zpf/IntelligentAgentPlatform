@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.audit.models import AuditEvent
 from app.audit.recorder import AuditRecorder
+from app.approvals.models import Approval
 from app.conversations.models import AgentRun, Conversation, Message, RunEvent, ToolInvocation
 from app.conversations.repository import ConversationRepository
 from app.db.base import Base
@@ -245,6 +246,58 @@ def test_missing_builtin_executor_is_execution_failure(runtime, monkeypatch):
             execute(gateway)
         assert caught.value.code == "tool_execution_failed"
         assert session.query(ToolInvocation).count() == 0
+    finally:
+        session.close()
+
+
+def test_required_approval_pauses_run_without_executing_tool(runtime, monkeypatch):
+    factory, _ = runtime
+    with factory.begin() as db:
+        tool = db.get(RegisteredToolRecord, "system.get_current_time")
+        tool.requires_approval = True
+        tool.risk_level = "high"
+
+    def must_not_run(*_args):
+        raise AssertionError("tool executed before approval")
+
+    monkeypatch.setitem(BUILTIN_EXECUTORS, "system.get_current_time", must_not_run)
+    session, gateway = make_gateway(runtime)
+    try:
+        with pytest.raises(ToolRuntimeError) as caught:
+            execute(gateway)
+        assert caught.value.code == "approval_required"
+        run = session.get(AgentRun, "run-1")
+        invocation = session.scalar(select(ToolInvocation))
+        approval = session.scalar(select(Approval))
+        events = list(session.scalars(select(RunEvent).order_by(RunEvent.sequence)))
+        assert run.status == "waiting_approval"
+        assert invocation.status == "waiting_approval"
+        assert approval.status == "pending"
+        assert approval.invocation_id == invocation.id
+        assert [event.event_type for event in events] == ["approval.requested", "run.status"]
+        assert events[-1].payload == {"status": "waiting_approval"}
+    finally:
+        session.close()
+
+
+def test_approved_tool_invocation_executes_after_digest_check(runtime):
+    factory, _ = runtime
+    with factory.begin() as db:
+        tool = db.get(RegisteredToolRecord, "system.get_current_time")
+        tool.requires_approval = True
+        tool.risk_level = "high"
+    session, gateway = make_gateway(runtime)
+    try:
+        with pytest.raises(ToolRuntimeError) as caught:
+            execute(gateway)
+        assert caught.value.code == "approval_required"
+        approval = session.scalar(select(Approval))
+        from app.approvals.service import ApprovalService
+        ApprovalService(session, clock=lambda: datetime(2026, 8, 2, 4, 30, tzinfo=timezone.utc)).approve(approval.id, __import__("app.core.request_context", fromlist=["RequestContext"]).RequestContext(user_id="reviewer", unit_id="unit-1", project_id="project-1", roles=frozenset({"project_admin"})))
+        result = gateway.execute_approved(approval.id, context())
+        invocation = session.scalar(select(ToolInvocation))
+        assert result.value["date"] == "2026-08-02"
+        assert invocation.status == "completed"
     finally:
         session.close()
 
