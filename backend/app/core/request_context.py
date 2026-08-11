@@ -3,6 +3,9 @@ from typing import Annotated, Literal, TypeAlias
 from fastapi import Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 
+from app.identity.catalogue import ROLE_PERMISSION_CODES
+from app.identity.schemas import AuthorizationContext, PermissionGrant
+
 UserRole: TypeAlias = Literal["user", "project_admin", "unit_auditor"]
 VALID_ROLES = frozenset({"user", "project_admin", "unit_auditor"})
 
@@ -65,3 +68,39 @@ def require_admin_context(
             detail="Administrator permission is required",
         )
     return context
+
+
+def require_dev_authorization_context(
+    request: Request,
+    user_id: Annotated[str | None, Header(alias="X-User-ID")] = None,
+    project_id: Annotated[str | None, Header(alias="X-Project-ID")] = None,
+    unit_id: Annotated[str | None, Header(alias="X-Unit-ID")] = None,
+    roles: Annotated[str | None, Header(alias="X-User-Roles")] = None,
+) -> AuthorizationContext:
+    """Build a test-only authorization snapshot from development headers."""
+    if not getattr(request.app.state, "allow_dev_identity", False):
+        raise HTTPException(status_code=401, detail="Authentication is required")
+    if not user_id or not unit_id:
+        raise HTTPException(status_code=401, detail="Unit and user headers are required")
+    parsed = tuple(sorted({item.strip() for item in (roles or "viewer").split(",") if item.strip()}))
+    allowed = {"user", *ROLE_PERMISSION_CODES}
+    if not parsed or not set(parsed) <= allowed:
+        raise HTTPException(status_code=401, detail="Invalid development identity")
+    grants: list[PermissionGrant] = []
+    for role in parsed:
+        catalogue_role = "viewer" if role == "user" else role
+        if catalogue_role in ROLE_PERMISSION_CODES:
+            scope = "unit" if catalogue_role == "unit_auditor" else "project"
+            project_ids = frozenset({project_id}) if scope == "project" and project_id else frozenset()
+            for code in ROLE_PERMISSION_CODES[catalogue_role]:
+                grants.append(PermissionGrant(code, scope, project_ids, None))
+    return AuthorizationContext(
+        session_id="dev-test",
+        user_id=user_id,
+        unit_id=unit_id,
+        current_project_id=project_id,
+        auth_method="dev_test",
+        authorization_version=1,
+        role_codes=parsed,
+        grants=tuple(grants),
+    )
