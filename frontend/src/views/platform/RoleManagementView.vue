@@ -19,6 +19,7 @@
           <template v-else-if="column.key === 'action'">
             <a-typography-text v-if="record.built_in" type="secondary">内置角色不可删除</a-typography-text>
             <a-space v-else>
+              <a :class="{ 'disabled-action': isRoleOperating(record.id) }" @click="openEdit(record)">编辑</a>
               <a :class="{ 'disabled-action': isRoleOperating(record.id) }" @click="openPermissions(record)">权限管理</a>
               <a :class="{ 'disabled-action': isRoleOperating(record.id) }" @click="toggleStatus(record)">{{ record.status === 'active' ? '停用' : '启用' }}</a>
               <a-popconfirm title="删除角色会同时移除该角色的用户绑定和权限授予，是否继续？" @confirm="deleteRole(record)">
@@ -32,6 +33,7 @@
     </a-card>
   </div>
   <a-modal v-model:open="createOpen" title="新建角色" :confirm-loading="creating" @ok="submitCreate"><a-form layout="vertical"><a-form-item label="角色编码"><a-input v-model:value="form.code" /></a-form-item><a-form-item label="角色名称"><a-input v-model:value="form.name" /></a-form-item><a-form-item label="作用域"><a-select v-model:value="form.scope_type" :options="[{ label: '单位', value: 'unit' }, { label: '项目', value: 'project' }]" /></a-form-item></a-form></a-modal>
+  <a-modal v-model:open="editOpen" title="编辑角色" :confirm-loading="editing" @ok="submitEdit"><a-form layout="vertical"><a-form-item label="角色编码"><a-input :value="editForm.code" disabled /></a-form-item><a-form-item label="作用域"><a-input :value="scopeText(editForm.scope_type)" disabled /></a-form-item><a-form-item label="角色名称"><a-input v-model:value="editForm.name" /></a-form-item></a-form></a-modal>
   <a-modal v-model:open="permissionOpen" title="角色权限" :footer="null" @cancel="closePermissions">
     <a-alert type="info" show-icon message="当前后端仅提供权限目录查询和授权接口；尚未提供单角色已授权权限查询及撤销接口。" style="margin-bottom: 16px" />
     <a-alert v-if="permissionError" type="error" show-icon :message="permissionError" style="margin-bottom: 16px" />
@@ -48,6 +50,7 @@ import { onBeforeUnmount, onMounted, ref } from 'vue';
 import { ApiError } from '@/api/client';
 import {
   createIdentityRole,
+  updateIdentityRole,
   deleteIdentityRole,
   grantIdentityRolePermission,
   listIdentityPermissions,
@@ -63,6 +66,7 @@ const errorMessage = ref('');
 let controller: AbortController | null = null;
 let permissionController: AbortController | null = null;
 const createOpen = ref(false); const creating = ref(false); const form = ref<{ code: string; name: string; scope_type: 'unit' | 'project' }>({ code: '', name: '', scope_type: 'unit' });
+const editOpen = ref(false); const editing = ref(false); const editForm = ref<{ id: string; code: string; name: string; scope_type: string }>({ id: '', code: '', name: '', scope_type: 'unit' });
 const removingRoleId = ref<string | null>(null);
 const updatingRoleId = ref<string | null>(null);
 const permissionOpen = ref(false);
@@ -94,7 +98,9 @@ const permissionScopeOptions = (): Array<{ label: string; value: 'unit' | 'assig
 };
 function isRoleOperating(roleId: string): boolean { return removingRoleId.value === roleId || updatingRoleId.value === roleId; }
 function openCreate(): void { form.value = { code: '', name: '', scope_type: 'unit' }; createOpen.value = true; }
+function openEdit(role: IdentityRole): void { if (role.built_in) return; editForm.value = { id: role.id, code: role.code, name: role.name, scope_type: role.scope_type }; editOpen.value = true; }
 async function submitCreate(): Promise<void> { if (!form.value.code.trim() || !form.value.name.trim()) return; creating.value = true; try { await createIdentityRole(form.value); createOpen.value = false; await loadRoles(); } catch (error) { errorMessage.value = error instanceof ApiError ? error.message : '创建角色失败'; } finally { creating.value = false; } }
+async function submitEdit(): Promise<void> { if (!editForm.value.name.trim() || editing.value) return; editing.value = true; try { await updateIdentityRole(editForm.value.id, { name: editForm.value.name.trim() }); editOpen.value = false; await loadRoles(); } catch (error) { errorMessage.value = error instanceof ApiError ? error.message : '编辑角色失败'; } finally { editing.value = false; } }
 async function toggleStatus(role: IdentityRole): Promise<void> {
   if (role.built_in || isRoleOperating(role.id)) return;
   updatingRoleId.value = role.id;

@@ -355,3 +355,39 @@ def test_builtin_role_permissions_cannot_be_revoked():
         json={'permission_code': permission_code, 'data_scope': 'unit'},
     )
     assert grant_response.status_code == 409
+
+
+def test_admin_can_update_project_name_within_unit():
+    client = build_client()
+    response = client.patch('/api/identity/projects/project-1', headers=headers(), json={'name': 'Updated Project'})
+    assert response.status_code == 200
+    assert response.json()['name'] == 'Updated Project'
+    with app.dependency_overrides[get_session]() as session:
+        assert session.scalar(select(AuditEvent).where(AuditEvent.action == 'identity.project.updated', AuditEvent.resource_id == 'project-1')) is not None
+
+
+def test_admin_cannot_update_project_from_another_unit():
+    client = build_client()
+    response = client.patch('/api/identity/projects/project-2', headers=headers(), json={'name': 'Nope'})
+    assert response.status_code == 404
+
+
+def test_admin_can_update_custom_role_name():
+    client = build_client()
+    with app.dependency_overrides[get_session]() as session:
+        session.add(Role(id='editable-role', code='editable', name='Before', scope_type='unit', unit_id='unit-1', built_in=False, status='active'))
+        session.commit()
+    response = client.patch('/api/identity/roles/editable-role', headers=headers(), json={'name': 'After'})
+    assert response.status_code == 200
+    assert response.json()['name'] == 'After'
+    with app.dependency_overrides[get_session]() as session:
+        assert session.scalar(select(AuditEvent).where(AuditEvent.action == 'identity.role.updated', AuditEvent.resource_id == 'editable-role')) is not None
+
+
+def test_builtin_role_cannot_be_updated():
+    client = build_client()
+    with app.dependency_overrides[get_session]() as session:
+        role = session.scalar(select(Role).where(Role.unit_id == 'unit-1', Role.built_in.is_(True)))
+        role_id = role.id
+    response = client.patch(f'/api/identity/roles/{role_id}', headers=headers(), json={'name': 'Changed'})
+    assert response.status_code == 409

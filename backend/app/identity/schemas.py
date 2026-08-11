@@ -99,6 +99,10 @@ class AdminUnit(BaseModel):
     status: str
 
 
+class UpdateUnitRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+
+
 class AdminProject(BaseModel):
     id: str
     unit_id: str
@@ -200,6 +204,10 @@ class CreateRoleRequest(BaseModel):
 
 class RoleStatusRequest(BaseModel):
     status: Literal["active", "inactive"]
+
+
+class UpdateRoleRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
 
 
 class GrantPermissionRequest(BaseModel):

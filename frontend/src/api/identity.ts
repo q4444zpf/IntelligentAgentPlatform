@@ -101,10 +101,15 @@ export function replaceIdentityUserRoles(userId: string, body: { role_ids: strin
 }
 
 export interface IdentityProject { id: string; unit_id: string; code: string; name: string; status: string }
+export interface IdentityUnit { id: string; code: string; name: string; status: string }
+export function listIdentityUnits(signal?: AbortSignal): Promise<IdentityUnit[]> { return request<IdentityUnit[]>('/identity/units', { signal }); }
+export function updateIdentityUnit(unitId: string, body: { name: string }): Promise<IdentityUnit> { return request<IdentityUnit>(`/identity/units/${encodeURIComponent(unitId)}`, { method: 'PATCH', body: JSON.stringify(body) }); }
 export function listIdentityProjects(signal?: AbortSignal): Promise<IdentityProject[]> { return request<IdentityProject[]>('/identity/projects', { signal }); }
 export function createIdentityProject(body: { code: string; name: string }): Promise<IdentityProject> { return request<IdentityProject>('/identity/projects', { method: 'POST', body: JSON.stringify(body) }); }
+export function updateIdentityProject(projectId: string, body: { name: string }): Promise<IdentityProject> { return request<IdentityProject>(`/identity/projects/${encodeURIComponent(projectId)}`, { method: 'PATCH', body: JSON.stringify(body) }); }
 export function setIdentityProjectStatus(projectId: string, status: 'active' | 'inactive'): Promise<IdentityProject> { return request<IdentityProject>(`/identity/projects/${encodeURIComponent(projectId)}/status`, { method: 'POST', body: JSON.stringify({ status }) }); }
 export function createIdentityRole(body: { code: string; name: string; scope_type: 'unit' | 'project' }): Promise<IdentityRole> { return request<IdentityRole>('/identity/roles', { method: 'POST', body: JSON.stringify(body) }); }
+export function updateIdentityRole(roleId: string, body: { name: string }): Promise<IdentityRole> { return request<IdentityRole>(`/identity/roles/${encodeURIComponent(roleId)}`, { method: 'PATCH', body: JSON.stringify(body) }); }
 export function setIdentityRoleStatus(roleId: string, status: 'active' | 'inactive'): Promise<IdentityRole> { return request<IdentityRole>(`/identity/roles/${encodeURIComponent(roleId)}/status`, { method: 'POST', body: JSON.stringify({ status }) }); }
 export function deleteIdentityRole(roleId: string): Promise<{ role_id: string; deleted: boolean }> { return request<{ role_id: string; deleted: boolean }>(`/identity/roles/${encodeURIComponent(roleId)}`, { method: 'DELETE' }); }
 export function grantIdentityRolePermission(

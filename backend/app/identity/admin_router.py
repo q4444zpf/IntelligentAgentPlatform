@@ -39,7 +39,8 @@ from .schemas import (
     IdentityStatusRequest, PasswordResetRequest, UpdateIdentityUserRequest,
     ReplaceIdentityRolesRequest,
     CreateProjectRequest, UpdateProjectRequest, ProjectStatusRequest,
-    CreateRoleRequest, RoleStatusRequest, GrantPermissionRequest,
+    CreateRoleRequest, UpdateRoleRequest, RoleStatusRequest, GrantPermissionRequest,
+    UpdateUnitRequest,
 )
 from .passwords import hash_password
 from .session_lifecycle import revoke_user_sessions
@@ -509,6 +510,27 @@ def list_units(
     return [] if unit is None else [AdminUnit.model_validate(unit, from_attributes=True)]
 
 
+@router.patch("/units/{unit_id}", response_model=AdminUnit)
+def update_unit(unit_id: str, body: UpdateUnitRequest, context: RequestContext = Depends(identity_admin_context), session: Session = Depends(get_session)) -> AdminUnit:
+    unit = session.scalar(select(Unit).where(Unit.id == unit_id, Unit.id == context.unit_id))
+    if unit is None:
+        raise HTTPException(status_code=404, detail="单位不存在或不属于当前单位")
+    previous_name = unit.name
+    unit.name = body.name
+    now = datetime.now(timezone.utc)
+    AuditRecorder().record(session, AuditRecordRequest(
+        unit_id=context.unit_id, user_id=context.user_id, actor_roles=context.role_codes,
+        authorization_scope="unit", event_scope="unit", category="management", source="system",
+        action="identity.unit.updated", status="succeeded", risk_level="medium",
+        resource_type="unit", resource_id=unit.id, resource_name=unit.name,
+        summary="Updated an identity unit", metadata={"previous_name": previous_name, "name": unit.name},
+        allowed_metadata_keys=frozenset({"previous_name", "name"}),
+        idempotency_key=f"identity-unit-updated:{unit.id}:{now.isoformat()}", occurred_at=now,
+    ))
+    session.commit()
+    return AdminUnit.model_validate(unit, from_attributes=True)
+
+
 @router.get("/projects", response_model=list[AdminProject])
 def list_projects(
     context: RequestContext = Depends(identity_admin_context),
@@ -534,7 +556,19 @@ def update_project(project_id: str, body: UpdateProjectRequest, context: Request
     project = _ensure_project(session, project_id, context.unit_id)
     if project is None:
         raise HTTPException(status_code=404, detail="项目不存在或不属于当前单位")
-    project.name = body.name; session.commit()
+    previous_name = project.name
+    project.name = body.name
+    now = datetime.now(timezone.utc)
+    AuditRecorder().record(session, AuditRecordRequest(
+        unit_id=context.unit_id, user_id=context.user_id, actor_roles=context.role_codes,
+        authorization_scope="unit", event_scope="unit", category="management", source="system",
+        action="identity.project.updated", status="succeeded", risk_level="medium",
+        resource_type="project", resource_id=project.id, resource_name=project.name,
+        summary="Updated an identity project", metadata={"previous_name": previous_name, "name": project.name},
+        allowed_metadata_keys=frozenset({"previous_name", "name"}),
+        idempotency_key=f"identity-project-updated:{project.id}:{now.isoformat()}", occurred_at=now,
+    ))
+    session.commit()
     return AdminProject.model_validate(project, from_attributes=True)
 
 
@@ -577,6 +611,30 @@ def set_role_status(role_id: str, body: RoleStatusRequest, context: RequestConte
     if role.built_in:
         raise HTTPException(status_code=409, detail="内置角色不可停用")
     role.status = body.status; session.commit()
+    return AdminRole.model_validate(role, from_attributes=True)
+
+
+@router.patch("/roles/{role_id}", response_model=AdminRole)
+def update_role(role_id: str, body: UpdateRoleRequest, context: RequestContext = Depends(identity_admin_context), session: Session = Depends(get_session)) -> AdminRole:
+    role = session.scalar(select(Role).where(Role.id == role_id, Role.unit_id == context.unit_id))
+    if role is None:
+        raise HTTPException(status_code=404, detail="角色不存在或不属于当前单位")
+    if role.built_in:
+        raise HTTPException(status_code=409, detail="内置角色不可修改")
+    previous_name = role.name
+    role.name = body.name
+    _invalidate_role_users(session, role.id, context.unit_id, "role_updated")
+    now = datetime.now(timezone.utc)
+    AuditRecorder().record(session, AuditRecordRequest(
+        unit_id=context.unit_id, user_id=context.user_id, actor_roles=context.role_codes,
+        authorization_scope="unit", event_scope="unit", category="management", source="system",
+        action="identity.role.updated", status="succeeded", risk_level="high",
+        resource_type="role", resource_id=role.id, resource_name=role.name,
+        summary="Updated a custom identity role", metadata={"previous_name": previous_name, "name": role.name},
+        allowed_metadata_keys=frozenset({"previous_name", "name"}),
+        idempotency_key=f"identity-role-updated:{role.id}:{now.isoformat()}", occurred_at=now,
+    ))
+    session.commit()
     return AdminRole.model_validate(role, from_attributes=True)
 
 
