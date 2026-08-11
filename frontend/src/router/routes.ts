@@ -88,6 +88,7 @@ export const appMenus: AppMenuItem[] = [
     children: [
       { key: 'users', title: '用户与权限', path: '/system/users', permission: 'system:users' },
       { key: 'tenant-projects', title: '租户与项目', path: '/system/tenant-projects', permission: 'system:users' },
+      { key: 'units', title: '单位管理', path: '/system/units', permission: 'system:users' },
       { key: 'roles', title: '角色管理', path: '/system/roles', permission: 'system:users' },
       { key: 'sessions', title: '登录会话', path: '/system/sessions', permission: 'chat:view' },
       { key: 'integration', title: '系统集成', path: '/integration', permission: 'integration:view' },
@@ -142,6 +143,7 @@ export const routes: RouteRecordRaw[] = [
       { path: 'policies', name: 'Policies', component: genericView, meta: { title: '风险策略', module: 'settings', permission: 'system:settings' } },
       { path: 'credentials', name: 'Credentials', component: genericView, meta: { title: '凭据管理', module: 'settings', permission: 'system:settings' } },
       { path: 'system/tenant-projects', name: 'TenantProjects', component: () => import('@/views/platform/ProjectManagementView.vue'), meta: { title: '单位与项目', permission: 'system:users' } },
+      { path: 'system/units', name: 'Units', component: () => import('@/views/platform/UnitManagementView.vue'), meta: { title: '单位管理', permission: 'system:users' } },
       { path: 'system/roles', name: 'Roles', component: () => import('@/views/platform/RoleManagementView.vue'), meta: { title: '角色管理', permission: 'system:users' } },
       { path: 'system/users', name: 'Users', component: () => import('@/views/platform/UserManagementView.vue'), meta: { title: '用户与权限', permission: 'system:users' } },
       { path: 'system/sessions', name: 'Sessions', component: () => import('@/views/security/SessionManagementView.vue'), meta: { title: '登录会话' } },
