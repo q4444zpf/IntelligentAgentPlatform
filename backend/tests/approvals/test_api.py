@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -27,7 +27,7 @@ def build_client():
     message = Message(id="message-1", conversation_id=conversation.id, sequence=1, role="user", content="run")
     run = AgentRun(id="run-1", conversation_id=conversation.id, trigger_message_id=message.id, actor_type="agent", actor_id="agent-1", actor_roles_json=["user"], status="waiting_approval")
     invocation = ToolInvocation(id="invocation-1", run_id=run.id, tool_call_id="call-1", tool_id="water.release", tool_version="1", status="waiting_approval", arguments_summary={"amount": 10})
-    approval = Approval(id="approval-1", run_id=run.id, invocation_id=invocation.id, tool_id=invocation.tool_id, tool_version="1", unit_id="unit-1", project_id="project-1", requester_id="requester", requester_roles=["user"], assignee_role="project_admin", risk_level="high", arguments_summary={"amount": 10}, arguments_digest=arguments_digest({"amount": 10}), status="pending", expires_at=datetime(2026, 8, 11, tzinfo=timezone.utc))
+    approval = Approval(id="approval-1", run_id=run.id, invocation_id=invocation.id, tool_id=invocation.tool_id, tool_version="1", unit_id="unit-1", project_id="project-1", requester_id="requester", requester_roles=["user"], assignee_role="project_admin", risk_level="high", arguments_summary={"amount": 10}, arguments_digest=arguments_digest({"amount": 10}), status="pending", expires_at=datetime.now(timezone.utc) + timedelta(days=1))
     session.add_all([conversation, message, run, invocation, approval])
     session.commit()
     app = FastAPI()
