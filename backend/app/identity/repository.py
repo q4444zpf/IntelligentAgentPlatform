@@ -60,12 +60,18 @@ class AuthorizationRepository:
                 (ProjectMembership.user_id == ProjectMembershipRole.user_id)
                 & (ProjectMembership.unit_id == ProjectMembershipRole.unit_id)
                 & (ProjectMembership.project_id == ProjectMembershipRole.project_id),
+            ).join(
+                Project,
+                (Project.id == ProjectMembership.project_id)
+                & (Project.unit_id == ProjectMembership.unit_id),
             ).where(
                 ProjectMembershipRole.user_id == auth.user_id,
                 ProjectMembershipRole.unit_id == auth.unit_id,
                 Role.unit_id == auth.unit_id,
                 ProjectMembership.status == "active",
+                Project.status == "active",
                 Role.status == "active",
+                Permission.status == "active",
             )
         ).all()
         # The explicit rows are assembled below to keep the scope boundary visible.
@@ -115,9 +121,7 @@ class AuthorizationRepository:
         ))
 
     def _valid_current_project(self, auth: AuthSession) -> str | None:
-        if auth.current_project_id is None:
-            return None
-        return self.session.scalar(select(Project.id).join(
+        current = self.session.scalar(select(Project.id).join(
             ProjectMembership,
             (ProjectMembership.project_id == Project.id)
             & (ProjectMembership.unit_id == Project.unit_id),
@@ -128,3 +132,16 @@ class AuthorizationRepository:
             ProjectMembership.user_id == auth.user_id,
             ProjectMembership.status == "active",
         ))
+        if current is not None:
+            return current
+        candidates = list(self.session.scalars(select(Project.id).join(
+            ProjectMembership,
+            (ProjectMembership.project_id == Project.id)
+            & (ProjectMembership.unit_id == Project.unit_id),
+        ).where(
+            Project.unit_id == auth.unit_id,
+            Project.status == "active",
+            ProjectMembership.user_id == auth.user_id,
+            ProjectMembership.status == "active",
+        )))
+        return candidates[0] if len(candidates) == 1 else None

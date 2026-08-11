@@ -3,6 +3,7 @@ from fastapi.testclient import TestClient
 
 from app.core.request_context import (
     RequestContext,
+    require_dev_authorization_context,
     require_admin_context,
     require_request_context,
 )
@@ -97,3 +98,32 @@ def test_admin_dependency_rejects_unit_auditor_and_accepts_project_admin():
     base = {"X-Unit-ID": "unit-1", "X-User-ID": "user-1", "X-Project-ID": "project-1"}
     assert client.post("/admin", headers={**base, "X-User-Roles": "unit_auditor"}).status_code == 403
     assert client.post("/admin", headers={**base, "X-User-Roles": "project_admin"}).status_code == 200
+
+
+def test_dev_authorization_adapter_returns_scoped_context_without_legacy_fields():
+    app = FastAPI()
+
+    @app.get("/context")
+    def context(value=Depends(require_dev_authorization_context)):
+        return {
+            "project": value.current_project_id,
+            "can_run": any(grant.permission_code == "agent.run" for grant in value.grants),
+            "has_legacy_project": hasattr(value, "project_id"),
+        }
+
+    app.state.allow_dev_identity = True
+    response = TestClient(app).get(
+        "/context",
+        headers={
+            "X-Unit-ID": "unit-1",
+            "X-User-ID": "user-1",
+            "X-Project-ID": "project-1",
+            "X-User-Roles": "user",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "project": "project-1",
+        "can_run": False,
+        "has_legacy_project": False,
+    }
