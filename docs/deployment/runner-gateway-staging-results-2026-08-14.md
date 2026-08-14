@@ -7,17 +7,16 @@
 The complete backend suite and all three deployment images passed locally.
 Ephemeral signing and Launcher secrets were injected into container process
 environments without writing them to a file or Git. A live sandbox Run
-completed and wrote an Artifact to MinIO. Live Launcher outage handling was
-also verified; live OOM injection did not produce an `OOMKilled=true` signal
-and remains pending. Deployment-owner approval remains pending. The repository default for
+completed and wrote an Artifact to MinIO. Live Launcher outage and OOM handling
+were also verified. Deployment-owner approval remains pending. The repository default for
 `IAP_WORKFLOW_RUNNER_SANDBOX_ENABLED` remains `false`.
 
 ## Automated evidence
 
 - Full backend suite:
   `python -m pytest --import-mode=importlib -q`
-  from a clean worktree under `backend/` -> **825 passed, 38 skipped**
-  in 372.51 seconds.
+  under `backend/` -> **843 passed, 38 skipped**
+  in 440.56 seconds.
 - Task 12 Runner Gateway integration suite -> **17 passed**.
 - Runtime-limit and snapshot compatibility suite -> **29 passed**.
 - `docker compose --profile sandbox config --quiet` -> exit code 0.
@@ -47,9 +46,10 @@ test database. They are not counted as live staging evidence.
 
 | Image | Immutable local digest |
 | --- | --- |
-| `intelligent-agent-platform-api:latest` | `sha256:96d7441d4277946e2dd1ef128643ca1ce719c57b45242fa44309628309fc9585` |
-| `intelligent-agent-platform-workflow-runner:latest` | `sha256:d031db728ef0fba42cefb1ad5f9522ddc2d3e45c6978875216c7066a349733a4` |
-| `intelligent-agent-platform-sandbox-launcher:latest` | `sha256:6d4c02eca6e587b3b818ad4ecdb430dd909c40ed77d7594836c8719e92c8712e` |
+| `intelligent-agent-platform-api:latest` | `sha256:4cf687c039e2c99628b8018294f53b257d776893f9609a904911818a55438047` |
+| `intelligent-agent-platform-workflow-runner:latest` | `sha256:f421439fe81b19e947c619b9110ae88307bf118f3caf58db8b8d0664e66fc4af` |
+| `intelligent-agent-platform-sandbox-launcher:latest` | `sha256:0ff72d68c7cdfc88409f6efceffb503e51e64015bc142085fc5991d7027c03a9` |
+| `iap/workflow-runner:latest` (per-Run image) | `sha256:b1790f6b68214f18c29f73c6de5c0c40ca37fda984d398f7ce969121d1e49e49` |
 
 ## Boundary inspection
 
@@ -95,7 +95,7 @@ object-storage credentials are not placed in the Run container contract. Task
 | Cancellation, deadline, OOM and Launcher outage final states | PASS (automated) | Task 12 and lifecycle tests |
 | Runtime iteration, tool, subagent and output limits | PASS | Runtime-limit tests and schema v3 snapshot |
 | Live staging Launcher outage fault injection | PASS | Run `c72fff58-3c68-4174-91c6-4185f65397c0` -> `failed/launcher_unavailable`; restart and cleanup retry recorded `cleaned` |
-| Live staging OOM fault injection | PENDING | Dynamic cgroup limit injection did not produce `OOMKilled=true`; no pass claimed |
+| Live staging OOM fault injection | PASS | Run `93e3aefd-5d3e-4cdc-8b04-0f39787337ce` -> `failed/sandbox_oom`; token revoked, no Artifact created and cleanup recorded `cleaned` |
 | Live success Run, MinIO Artifact and cleanup | PASS | Run `8aa87e3f-12f5-4d12-9ff4-46f62c946455` |
 | Live Run policy acceptance | PASS | Launcher accepted the Run only after actual Docker metadata passed image, user, rootfs, capability, environment, mount, resource and network inspection |
 
@@ -129,10 +129,9 @@ Rollback remains:
 
 ## Residual risks and required approval
 
-- Execute live staging success, unauthorized tool, approval, cancellation,
-  timeout and OOM scenarios with deployment-owned secrets. Launcher outage is
-  verified locally; OOM still requires a controlled staging workload that
-  deterministically exits with `OOMKilled=true`.
+- Execute the remaining live staging unauthorized-tool, approval,
+  cancellation and timeout scenarios with deployment-owned secrets. Success,
+  Launcher outage and OOM are verified locally.
 - Inspect an active Run container's user, read-only root, capabilities, mounts,
   network and environment key names.
 - Run PostgreSQL-only integration tests against the staging-compatible database.
