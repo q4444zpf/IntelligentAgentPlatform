@@ -13,7 +13,10 @@ import app.approvals.models  # noqa: E402,F401
 import app.conversations.models  # noqa: E402,F401
 import app.db.platform_models  # noqa: E402,F401
 import app.identity.models  # noqa: E402,F401
+import app.artifacts.models  # noqa: E402,F401
+import app.runtime.checkpoint_store  # noqa: E402,F401
 import app.runtime.execution_snapshot  # noqa: E402,F401
+import app.runtime.run_tokens  # noqa: E402,F401
 
 
 def _identity_before_flush(session, flush_context, instances):

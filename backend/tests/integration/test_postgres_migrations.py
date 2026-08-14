@@ -28,7 +28,7 @@ def test_upgrade_head_creates_conversation_tables():
     engine = create_engine(env["DATABASE_URL"])
     inspector = inspect(engine)
     with engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260814_18"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260814_19"
     tables = set(inspector.get_table_names())
     assert {
         "conversations",
@@ -44,6 +44,7 @@ def test_upgrade_head_creates_conversation_tables():
         "tool_invocations",
         "audit_events",
         "runtime_execution_snapshots",
+        "runtime_run_token_revocations",
     } <= tables
     conversation_columns = {
         column["name"]: column
@@ -185,6 +186,32 @@ def test_execution_snapshot_migration_creates_unique_run_index_and_cycles():
         assert "runtime_execution_snapshots" in inspect(
             create_engine(database_url)
         ).get_table_names()
+    finally:
+        subprocess.run(ALEMBIC_UPGRADE_COMMAND, check=True, env=env)
+
+
+@pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="requires PostgreSQL")
+def test_run_token_revocation_migration_cycles():
+    database_url = os.environ["TEST_DATABASE_URL"]
+    env = os.environ | {"DATABASE_URL": database_url}
+    upgrade = (*ALEMBIC_UPGRADE_COMMAND[:-1], "20260814_19")
+    downgrade = (*ALEMBIC_UPGRADE_COMMAND[:-2], "downgrade", "20260814_18")
+    try:
+        subprocess.run(upgrade, check=True, env=env)
+        inspector = inspect(create_engine(database_url))
+        assert "runtime_run_token_revocations" in inspector.get_table_names()
+        indexes = {
+            index["name"]: index
+            for index in inspector.get_indexes("runtime_run_token_revocations")
+        }
+        assert indexes["ix_runtime_run_token_revocations_run_id"]["column_names"] == ["run_id"]
+
+        subprocess.run(downgrade, check=True, env=env)
+        assert "runtime_run_token_revocations" not in inspect(
+            create_engine(database_url)
+        ).get_table_names()
+
+        subprocess.run(upgrade, check=True, env=env)
     finally:
         subprocess.run(ALEMBIC_UPGRADE_COMMAND, check=True, env=env)
 
