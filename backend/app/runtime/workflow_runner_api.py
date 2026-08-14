@@ -92,7 +92,7 @@ app = create_runner_app(
         image_trusted=os.getenv("IAP_SANDBOX_IMAGE_TRUSTED", "false").lower() in {"1", "true", "yes"},
         non_root=os.getenv("IAP_SANDBOX_NON_ROOT", "false").lower() in {"1", "true", "yes"},
         read_only_root=os.getenv("IAP_SANDBOX_READ_ONLY_ROOT", "false").lower() in {"1", "true", "yes"},
-        network_disabled=os.getenv("IAP_SANDBOX_NETWORK_DISABLED", "false").lower() in {"1", "true", "yes"},
+        runner_gateway_network=os.getenv("IAP_SANDBOX_RUNNER_GATEWAY_NETWORK", "false").lower() in {"1", "true", "yes"},
         resource_limits=os.getenv("IAP_SANDBOX_RESOURCE_LIMITS", "false").lower() in {"1", "true", "yes"},
         cleanup_guaranteed=os.getenv("IAP_SANDBOX_CLEANUP_GUARANTEED", "false").lower() in {"1", "true", "yes"},
     ),

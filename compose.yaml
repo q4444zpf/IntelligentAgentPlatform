@@ -17,6 +17,23 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
 
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "${IAP_OBJECT_STORAGE_ACCESS_KEY:-iap-access}"
+      MINIO_ROOT_PASSWORD: "${IAP_OBJECT_STORAGE_SECRET_KEY:-change-me-minio-secret}"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
   api:
     build:
       context: .
@@ -28,13 +45,27 @@ services:
       IAP_SESSION_COOKIE_SECURE: "${IAP_SESSION_COOKIE_SECURE:-true}"
       LEGACY_SQLITE_DATA_DIR: /data
       AGENT_WORKSPACE_ROOT: /data/agent-workspaces
+      IAP_OBJECT_STORAGE_ENDPOINT: "${IAP_OBJECT_STORAGE_ENDPOINT:-http://minio:9000}"
+      IAP_OBJECT_STORAGE_PUBLIC_ENDPOINT: "${IAP_OBJECT_STORAGE_PUBLIC_ENDPOINT:-http://127.0.0.1:9000}"
+      IAP_OBJECT_STORAGE_ACCESS_KEY: "${IAP_OBJECT_STORAGE_ACCESS_KEY:-iap-access}"
+      IAP_OBJECT_STORAGE_SECRET_KEY: "${IAP_OBJECT_STORAGE_SECRET_KEY:-change-me-minio-secret}"
+      IAP_ARTIFACT_BUCKET: "${IAP_ARTIFACT_BUCKET:-iap-artifacts}"
+      IAP_WORKFLOW_RUNNER_URL: "${IAP_WORKFLOW_RUNNER_URL:-http://workflow-runner:8090}"
+      IAP_WORKFLOW_RUNNER_SANDBOX_ENABLED: "${IAP_WORKFLOW_RUNNER_SANDBOX_ENABLED:-false}"
+      IAP_RUNNER_GATEWAY_URL: "${IAP_RUNNER_GATEWAY_URL:-http://api:8000/internal/runner}"
+      IAP_RUNNER_TOKEN_SIGNING_KEY: "${IAP_RUNNER_TOKEN_SIGNING_KEY:-}"
     depends_on:
       postgres:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     volumes:
       - model-provider-data:/data
     ports:
       - "8000:8000"
+    networks:
+      - default
+      - runner-gateway
     restart: unless-stopped
     healthcheck:
       test:
@@ -46,6 +77,67 @@ services:
       timeout: 3s
       retries: 6
       start_period: 10s
+
+  workflow-runner:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile.runner
+    command: ["python", "-m", "uvicorn", "app.runtime.workflow_runner_api:app", "--host", "0.0.0.0", "--port", "8090"]
+    environment:
+      IAP_WORKFLOW_RUNNER_SANDBOX_ENABLED: "${IAP_WORKFLOW_RUNNER_SANDBOX_ENABLED:-false}"
+      IAP_SANDBOX_IMAGE_TRUSTED: "${IAP_SANDBOX_IMAGE_TRUSTED:-false}"
+      IAP_SANDBOX_NON_ROOT: "${IAP_SANDBOX_NON_ROOT:-false}"
+      IAP_SANDBOX_READ_ONLY_ROOT: "${IAP_SANDBOX_READ_ONLY_ROOT:-false}"
+      IAP_SANDBOX_RUNNER_GATEWAY_NETWORK: "${IAP_SANDBOX_RUNNER_GATEWAY_NETWORK:-false}"
+      IAP_SANDBOX_RESOURCE_LIMITS: "${IAP_SANDBOX_RESOURCE_LIMITS:-false}"
+      IAP_SANDBOX_CLEANUP_GUARANTEED: "${IAP_SANDBOX_CLEANUP_GUARANTEED:-false}"
+      IAP_SANDBOX_LAUNCHER_URL: "${IAP_SANDBOX_LAUNCHER_URL:-http://sandbox-launcher:8091}"
+      IAP_RUNNER_LAUNCHER_TOKEN: "${IAP_RUNNER_LAUNCHER_TOKEN:-}"
+    expose:
+      - "8090"
+    networks:
+      - runner-gateway
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health')
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+  sandbox-launcher:
+    profiles: ["sandbox"]
+    build:
+      context: .
+      dockerfile: backend/Dockerfile.launcher
+    command: ["python", "-m", "uvicorn", "app.runtime.launcher_service:app", "--host", "0.0.0.0", "--port", "8091"]
+    environment:
+      IAP_LAUNCHER_SERVICE_ENABLED: "true"
+      IAP_RUNNER_LAUNCHER_TOKEN: "${IAP_RUNNER_LAUNCHER_TOKEN:-}"
+      IAP_SANDBOX_RUNNER_IMAGE: "${IAP_SANDBOX_RUNNER_IMAGE:-iap/workflow-runner:latest}"
+      IAP_RUNNER_GATEWAY_NETWORK: "intelligent-agent-platform_runner-gateway"
+      IAP_RUNNER_GATEWAY_URL: "http://api:8000/internal/runner"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    expose:
+      - "8091"
+    networks:
+      - runner-gateway
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
 
   web:
     build:
@@ -64,6 +156,12 @@ services:
       - "80:80"
     restart: unless-stopped
 
+networks:
+  runner-gateway:
+    name: intelligent-agent-platform_runner-gateway
+    internal: true
+
 volumes:
   model-provider-data:
   postgres-data:
+  minio-data:

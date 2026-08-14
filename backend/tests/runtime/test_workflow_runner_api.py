@@ -15,7 +15,7 @@ def test_runner_health_reports_sandbox_capability():
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
     assert response.json()["sandbox"] is False
-    assert "network_disabled" in response.json()["missing"]
+    assert "runner_gateway_network" in response.json()["missing"]
 
 
 def test_runner_rejects_execution_until_sandbox_is_enabled():
@@ -43,8 +43,29 @@ def test_runner_can_derive_sandbox_from_inspected_container():
     client = TestClient(create_runner_app(
         sandbox_enabled=True,
         container_info={
-            "Config": {"Image": "iap/workflow-runner:v1", "User": "65534", "ReadonlyRootfs": True},
-            "HostConfig": {"NetworkMode": "none", "Privileged": False, "CapDrop": ["ALL"], "Memory": 1, "PidsLimit": 1, "NanoCpus": 1},
+            "Config": {
+                "Image": "iap/workflow-runner:v1",
+                "User": "65534",
+                "ReadonlyRootfs": True,
+                "Env": [
+                    "IAP_RUN_EXECUTION_REQUEST={}",
+                    "IAP_RUNNER_GATEWAY_URL=http://api:8000/internal/runner",
+                ],
+            },
+            "HostConfig": {
+                "NetworkMode": "intelligent-agent-platform_runner-gateway",
+                "Privileged": False,
+                "CapDrop": ["ALL"],
+                "Memory": 1,
+                "PidsLimit": 1,
+                "NanoCpus": 1,
+            },
+            "NetworkSettings": {
+                "Networks": {"intelligent-agent-platform_runner-gateway": {}},
+            },
+            "Mounts": [
+                {"Source": "/workspace/run-1", "Destination": "/workspace"},
+            ],
             "Labels": {"iap.cleanup_guaranteed": "true"},
         },
     ))

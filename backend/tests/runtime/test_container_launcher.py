@@ -25,8 +25,29 @@ class FakeClient:
     def __init__(self):
         self.kwargs = None
         self.container = FakeContainer({
-            "Config": {"Image": "iap/workflow-runner:latest", "User": "65534", "ReadonlyRootfs": True},
-            "HostConfig": {"NetworkMode": "none", "Privileged": False, "CapDrop": ["ALL"], "Memory": 1, "PidsLimit": 1, "NanoCpus": 1},
+            "Config": {
+                "Image": "iap/workflow-runner:latest",
+                "User": "65534",
+                "ReadonlyRootfs": True,
+                "Env": [
+                    "IAP_RUN_EXECUTION_REQUEST={}",
+                    "IAP_RUNNER_GATEWAY_URL=http://api:8000/internal/runner",
+                ],
+            },
+            "HostConfig": {
+                "NetworkMode": "intelligent-agent-platform_runner-gateway",
+                "Privileged": False,
+                "CapDrop": ["ALL"],
+                "Memory": 1,
+                "PidsLimit": 1,
+                "NanoCpus": 1,
+            },
+            "NetworkSettings": {
+                "Networks": {"intelligent-agent-platform_runner-gateway": {}},
+            },
+            "Mounts": [
+                {"Source": "/workspace/run-1", "Destination": "/workspace"},
+            ],
             "Labels": {"iap.cleanup_guaranteed": "true"},
         })
     def containers_run(self, **kwargs): self.kwargs = kwargs; return self.container
@@ -52,7 +73,7 @@ def test_launcher_runs_with_policy_and_always_removes_container(tmp_path):
     result = launcher.run("run-1", "/workspace/run-1")
 
     assert result == {"StatusCode": 0}
-    assert client.kwargs["network_disabled"] is True
+    assert client.kwargs["network"] == "intelligent-agent-platform_runner-gateway"
     assert client.kwargs["remove"] is False
     assert client.container.removed is True
 

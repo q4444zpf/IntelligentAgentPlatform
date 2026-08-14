@@ -9,18 +9,32 @@ class InvalidContainerPolicyError(ValueError):
     pass
 
 
+RUNNER_GATEWAY_NETWORK = "intelligent-agent-platform_runner-gateway"
+RUNNER_GATEWAY_URL = "http://api:8000/internal/runner"
+RUNNER_ENVIRONMENT_KEYS = {
+    "IAP_RUN_EXECUTION_REQUEST",
+    "IAP_RUNNER_GATEWAY_URL",
+}
+
+
 @dataclass(frozen=True)
 class ContainerPolicy:
     image: str
     mem_limit: str = "512m"
     pids_limit: int = 128
     cpus: float = 1.0
+    network: str = RUNNER_GATEWAY_NETWORK
+    gateway_url: str = RUNNER_GATEWAY_URL
 
     def __post_init__(self):
         if not self.image.startswith("iap/") or ":" not in self.image:
             raise InvalidContainerPolicyError("untrusted runner image")
         if self.pids_limit <= 0 or self.cpus <= 0:
             raise InvalidContainerPolicyError("invalid resource limits")
+        if self.network != RUNNER_GATEWAY_NETWORK:
+            raise InvalidContainerPolicyError("invalid runner gateway network")
+        if self.gateway_url != RUNNER_GATEWAY_URL:
+            raise InvalidContainerPolicyError("invalid runner gateway URL")
 
     def build(self, run_id: str, workspace_path: str, *, execution_request: str | None = None) -> dict:
         if not run_id or "/" in run_id or "\\" in run_id or ".." in PurePosixPath(run_id).parts:
@@ -38,7 +52,10 @@ class ContainerPolicy:
                 raise InvalidContainerPolicyError("execution request must be JSON") from exc
             if not isinstance(parsed, dict):
                 raise InvalidContainerPolicyError("execution request must be an object")
-            environment = {"IAP_RUN_EXECUTION_REQUEST": execution_request}
+            environment = {
+                "IAP_RUN_EXECUTION_REQUEST": execution_request,
+                "IAP_RUNNER_GATEWAY_URL": self.gateway_url,
+            }
         return {
             "image": self.image,
             "name": f"iap-run-{run_id}",
@@ -47,8 +64,7 @@ class ContainerPolicy:
                 "-m",
                 "app.runtime.run_worker",
             ],
-            "network_disabled": True,
-            "network_mode": "none",
+            "network": self.network,
             "read_only": True,
             "privileged": False,
             "cap_drop": ["ALL"],
