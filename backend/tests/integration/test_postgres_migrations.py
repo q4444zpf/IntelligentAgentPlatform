@@ -28,7 +28,7 @@ def test_upgrade_head_creates_conversation_tables():
     engine = create_engine(env["DATABASE_URL"])
     inspector = inspect(engine)
     with engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260809_13"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260814_18"
     tables = set(inspector.get_table_names())
     assert {
         "conversations",
@@ -43,6 +43,7 @@ def test_upgrade_head_creates_conversation_tables():
         "registered_tools",
         "tool_invocations",
         "audit_events",
+        "runtime_execution_snapshots",
     } <= tables
     conversation_columns = {
         column["name"]: column
@@ -134,6 +135,36 @@ def test_upgrade_head_creates_conversation_tables():
         name: audit_indexes[name] for name in expected_audit_indexes
     } == expected_audit_indexes
     engine.dispose()
+
+
+@pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="requires PostgreSQL")
+def test_execution_snapshot_migration_creates_unique_run_index_and_cycles():
+    database_url = os.environ["TEST_DATABASE_URL"]
+    env = os.environ | {"DATABASE_URL": database_url}
+    upgrade = (*ALEMBIC_UPGRADE_COMMAND[:-1], "20260814_18")
+    downgrade = (*ALEMBIC_UPGRADE_COMMAND[:-2], "downgrade", "20260812_17")
+    try:
+        subprocess.run(upgrade, check=True, env=env)
+        inspector = inspect(create_engine(database_url))
+        assert "runtime_execution_snapshots" in inspector.get_table_names()
+        indexes = {
+            index["name"]: index
+            for index in inspector.get_indexes("runtime_execution_snapshots")
+        }
+        assert indexes["ix_runtime_execution_snapshots_run_id"]["column_names"] == ["run_id"]
+        assert indexes["ix_runtime_execution_snapshots_run_id"]["unique"] is True
+
+        subprocess.run(downgrade, check=True, env=env)
+        assert "runtime_execution_snapshots" not in inspect(
+            create_engine(database_url)
+        ).get_table_names()
+
+        subprocess.run(upgrade, check=True, env=env)
+        assert "runtime_execution_snapshots" in inspect(
+            create_engine(database_url)
+        ).get_table_names()
+    finally:
+        subprocess.run(ALEMBIC_UPGRADE_COMMAND, check=True, env=env)
 
 
 @pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="requires PostgreSQL")
