@@ -135,3 +135,21 @@ def test_snapshot_digest_mismatch_is_409():
 
     assert response.status_code == 409
     assert response.json()["code"] == "snapshot_invalid"
+
+
+def test_model_endpoint_requires_model_invoke_action():
+    response = make_client().post(
+        "/internal/runner/runs/run-1/model-invocations",
+        headers={
+            **bearer("model-only"),
+            "Idempotency-Key": "model-1",
+        },
+        json={
+            "messages": [{"role": "user", "content": "test"}],
+            "tools": [],
+            "invocation_sequence": 0,
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "runner_action_forbidden"

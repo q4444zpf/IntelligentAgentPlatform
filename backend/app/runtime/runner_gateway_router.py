@@ -4,11 +4,13 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Header
 from sqlalchemy.orm import Session
 
+from app.audit.recorder import AuditRecorder
 from app.conversations.repository import ConversationRepository
 from app.core.database import get_session
 
 from .checkpoint_store import CheckpointStore
 from .execution_snapshot import ExecutionSnapshotService
+from .model_gateway import ModelGateway, OpenAICompatibleModelGateway
 from .run_tokens import RunTokenClaims, RunTokenService
 from .runner_gateway_auth import default_token_service, require_runner_action
 from .runner_gateway_schemas import (
@@ -16,6 +18,8 @@ from .runner_gateway_schemas import (
     CheckpointWriteRequest,
     EventAppendRequest,
     EventAppendResponse,
+    ModelInvocationRequest,
+    ModelInvocationResponse,
     SnapshotResponse,
 )
 from .runner_gateway_service import RunnerGatewayService
@@ -39,12 +43,22 @@ def default_conversation_repository(
     return ConversationRepository(session)
 
 
+def default_model_gateway() -> ModelGateway:
+    return OpenAICompatibleModelGateway()
+
+
+def default_audit_recorder() -> AuditRecorder:
+    return AuditRecorder()
+
+
 def create_router(
     *,
     token_service_dependency: Callable[..., RunTokenService] = default_token_service,
     snapshot_service_dependency: Callable[..., ExecutionSnapshotService] = default_snapshot_service,
     checkpoint_store_dependency: Callable[..., CheckpointStore] = default_checkpoint_store,
     conversation_repository_dependency: Callable[..., ConversationRepository] = default_conversation_repository,
+    model_gateway_dependency: Callable[..., ModelGateway] = default_model_gateway,
+    audit_recorder_dependency: Callable[..., AuditRecorder] = default_audit_recorder,
     event_payload_max_bytes: int | None = None,
 ) -> APIRouter:
     router = APIRouter()
@@ -59,6 +73,9 @@ def create_router(
     )
     event_append_claims = require_runner_action(
         "event.append", token_service_dependency
+    )
+    model_invoke_claims = require_runner_action(
+        "model.invoke", token_service_dependency
     )
 
     @router.get(
@@ -170,6 +187,46 @@ def create_router(
             repository,
             event_payload_max_bytes=event_payload_max_bytes,
         ).append_event(run_id, request, claims, idempotency_key)
+
+    @router.post(
+        "/runs/{run_id}/model-invocations",
+        response_model=ModelInvocationResponse,
+    )
+    def invoke_model(
+        run_id: str,
+        request: ModelInvocationRequest,
+        idempotency_key: Annotated[
+            str,
+            Header(
+                alias="Idempotency-Key",
+                min_length=1,
+                max_length=200,
+            ),
+        ],
+        claims: Annotated[RunTokenClaims, Depends(model_invoke_claims)],
+        snapshot_service: Annotated[
+            ExecutionSnapshotService,
+            Depends(snapshot_service_dependency),
+        ],
+        repository: Annotated[
+            ConversationRepository,
+            Depends(conversation_repository_dependency),
+        ],
+        model_gateway: Annotated[
+            ModelGateway,
+            Depends(model_gateway_dependency),
+        ],
+        audit_recorder: Annotated[
+            AuditRecorder,
+            Depends(audit_recorder_dependency),
+        ],
+    ) -> ModelInvocationResponse:
+        return RunnerGatewayService(
+            snapshot_service,
+            conversation_repository=repository,
+            model_gateway=model_gateway,
+            audit_recorder=audit_recorder,
+        ).invoke_model(run_id, request, claims, idempotency_key)
 
     return router
 

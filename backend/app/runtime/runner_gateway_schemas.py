@@ -44,3 +44,48 @@ class EventAppendResponse(BaseModel):
     sequence: int
     runner_sequence: int
     event_type: str
+
+
+class ModelMessage(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    role: str = Field(min_length=1, max_length=20)
+    content: str | None = None
+
+
+class ModelToolDefinition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tool_id: str = Field(min_length=1, max_length=128)
+    description: str = ""
+    input_schema: dict[str, Any]
+
+
+class ModelInvocationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider_id: str | None = None
+    model: str | None = None
+    messages: list[ModelMessage] = Field(min_length=1)
+    tools: list[ModelToolDefinition] = Field(default_factory=list)
+    temperature: float | None = Field(default=None, allow_inf_nan=False)
+    max_output_tokens: int | None = Field(default=None, gt=0)
+    invocation_sequence: int = Field(ge=0)
+
+
+class ModelToolCall(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+class ModelInvocationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    content: str | None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    tool_calls: list[ModelToolCall] = Field(default_factory=list)
