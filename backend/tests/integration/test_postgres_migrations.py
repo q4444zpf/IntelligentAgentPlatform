@@ -28,7 +28,7 @@ def test_upgrade_head_creates_conversation_tables():
     engine = create_engine(env["DATABASE_URL"])
     inspector = inspect(engine)
     with engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260814_19"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260814_20"
     tables = set(inspector.get_table_names())
     assert {
         "conversations",
@@ -45,6 +45,7 @@ def test_upgrade_head_creates_conversation_tables():
         "audit_events",
         "runtime_execution_snapshots",
         "runtime_run_token_revocations",
+        "runtime_runner_requests",
     } <= tables
     conversation_columns = {
         column["name"]: column
@@ -210,6 +211,48 @@ def test_run_token_revocation_migration_cycles():
         assert "runtime_run_token_revocations" not in inspect(
             create_engine(database_url)
         ).get_table_names()
+
+        subprocess.run(upgrade, check=True, env=env)
+    finally:
+        subprocess.run(ALEMBIC_UPGRADE_COMMAND, check=True, env=env)
+
+
+@pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="requires PostgreSQL")
+def test_runner_idempotency_migration_cycles():
+    database_url = os.environ["TEST_DATABASE_URL"]
+    env = os.environ | {"DATABASE_URL": database_url}
+    upgrade = (*ALEMBIC_UPGRADE_COMMAND[:-1], "20260814_20")
+    downgrade = (*ALEMBIC_UPGRADE_COMMAND[:-2], "downgrade", "20260814_19")
+    try:
+        subprocess.run(upgrade, check=True, env=env)
+        inspector = inspect(create_engine(database_url))
+        checkpoint_columns = {
+            column["name"]
+            for column in inspector.get_columns("runtime_checkpoints")
+        }
+        assert {"snapshot_digest", "idempotency_key"} <= checkpoint_columns
+        assert "runtime_runner_requests" in inspector.get_table_names()
+        constraints = {
+            constraint["name"]: constraint["column_names"]
+            for constraint in inspector.get_unique_constraints(
+                "runtime_runner_requests"
+            )
+        }
+        assert constraints["uq_runtime_runner_request_run_action_key"] == [
+            "run_id",
+            "action",
+            "idempotency_key",
+        ]
+
+        subprocess.run(downgrade, check=True, env=env)
+        downgraded = inspect(create_engine(database_url))
+        assert "runtime_runner_requests" not in downgraded.get_table_names()
+        checkpoint_columns = {
+            column["name"]
+            for column in downgraded.get_columns("runtime_checkpoints")
+        }
+        assert "snapshot_digest" not in checkpoint_columns
+        assert "idempotency_key" not in checkpoint_columns
 
         subprocess.run(upgrade, check=True, env=env)
     finally:
