@@ -15,6 +15,10 @@ from sqlalchemy.orm import Mapped, Session, mapped_column
 from app.db.base import Base
 
 
+class SnapshotIntegrityError(ValueError):
+    pass
+
+
 class PublishedAgentSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -146,7 +150,7 @@ class ExecutionSnapshotService:
 
     @staticmethod
     def _stored(row: RuntimeExecutionSnapshot) -> StoredExecutionSnapshot:
-        return StoredExecutionSnapshot(
+        stored = StoredExecutionSnapshot(
             snapshot_id=row.snapshot_id,
             run_id=row.run_id,
             digest=row.digest,
@@ -154,6 +158,9 @@ class ExecutionSnapshotService:
             created_at=row.created_at,
             expires_at=row.expires_at,
         )
+        if not verify_snapshot_digest(stored.payload, stored.digest):
+            raise SnapshotIntegrityError("execution snapshot digest mismatch")
+        return stored
 
     def get(self, snapshot_id: str) -> StoredExecutionSnapshot | None:
         row = self.session.get(RuntimeExecutionSnapshot, snapshot_id)

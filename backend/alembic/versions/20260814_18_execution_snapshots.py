@@ -37,9 +37,28 @@ def upgrade() -> None:
         ["run_id"],
         unique=True,
     )
+    op.execute("""
+        CREATE FUNCTION reject_runtime_execution_snapshot_update()
+        RETURNS trigger AS $$
+        BEGIN
+            RAISE EXCEPTION 'runtime execution snapshots are immutable';
+        END;
+        $$ LANGUAGE plpgsql
+    """)
+    op.execute("""
+        CREATE TRIGGER runtime_execution_snapshots_immutable
+        BEFORE UPDATE ON runtime_execution_snapshots
+        FOR EACH ROW
+        EXECUTE FUNCTION reject_runtime_execution_snapshot_update()
+    """)
 
 
 def downgrade() -> None:
+    op.execute("""
+        DROP TRIGGER IF EXISTS runtime_execution_snapshots_immutable
+        ON runtime_execution_snapshots
+    """)
+    op.execute("DROP FUNCTION IF EXISTS reject_runtime_execution_snapshot_update()")
     op.drop_index(
         "ix_runtime_execution_snapshots_run_id",
         table_name="runtime_execution_snapshots",

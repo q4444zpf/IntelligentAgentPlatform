@@ -10,6 +10,8 @@ from app.agents.schemas import AgentInfo
 from app.db.base import Base
 from app.runtime.execution_snapshot import (
     ExecutionSnapshotService,
+    RuntimeExecutionSnapshot,
+    SnapshotIntegrityError,
     canonical_snapshot_bytes,
     verify_snapshot_digest,
 )
@@ -132,3 +134,13 @@ def test_snapshot_rejects_payloads_larger_than_configured_limit(snapshot_service
 
     with pytest.raises(ValueError, match="execution snapshot exceeds 1 bytes"):
         snapshot_service.create("run-1")
+
+
+def test_snapshot_get_rejects_payload_tampered_after_persistence(snapshot_service):
+    stored = snapshot_service.create("run-1")
+    row = snapshot_service.session.get(RuntimeExecutionSnapshot, stored.snapshot_id)
+    row.payload = {**row.payload, "user_id": "attacker"}
+    snapshot_service.session.commit()
+
+    with pytest.raises(SnapshotIntegrityError, match="digest mismatch"):
+        snapshot_service.get(stored.snapshot_id)

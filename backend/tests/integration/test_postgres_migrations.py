@@ -4,7 +4,7 @@ import sys
 
 import pytest
 from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 ALEMBIC_UPGRADE_COMMAND = (
     sys.executable,
@@ -153,6 +153,28 @@ def test_execution_snapshot_migration_creates_unique_run_index_and_cycles():
         }
         assert indexes["ix_runtime_execution_snapshots_run_id"]["column_names"] == ["run_id"]
         assert indexes["ix_runtime_execution_snapshots_run_id"]["unique"] is True
+        engine = create_engine(database_url)
+        with engine.begin() as connection:
+            connection.execute(text("""
+                INSERT INTO runtime_execution_snapshots (
+                    snapshot_id, run_id, digest, payload, created_at
+                ) VALUES (
+                    'immutable-snapshot', 'immutable-run', :digest,
+                    CAST(:payload AS json), now()
+                )
+            """), {"digest": "a" * 64, "payload": '{"schema_version":"1"}'})
+        with pytest.raises(DBAPIError):
+            with engine.begin() as connection:
+                connection.execute(text("""
+                    UPDATE runtime_execution_snapshots
+                    SET digest = :digest
+                    WHERE snapshot_id = 'immutable-snapshot'
+                """), {"digest": "b" * 64})
+        with engine.begin() as connection:
+            connection.execute(text("""
+                DELETE FROM runtime_execution_snapshots
+                WHERE snapshot_id = 'immutable-snapshot'
+            """))
 
         subprocess.run(downgrade, check=True, env=env)
         assert "runtime_execution_snapshots" not in inspect(
