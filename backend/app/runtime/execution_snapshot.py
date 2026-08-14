@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import JSON, DateTime, Index, String, select
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
@@ -77,13 +77,17 @@ class SnapshotTool(BaseModel):
 class SnapshotRuntimeLimits(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    snapshot_max_bytes: int
+    snapshot_max_bytes: int = Field(gt=0)
+    max_iterations: int = Field(default=4, gt=0)
+    max_tool_calls: int = Field(default=8, ge=0)
+    max_subagents: int = Field(default=4, ge=0)
+    max_output_bytes: int = Field(default=4 * 1024 * 1024, gt=0)
 
 
 class ExecutionSnapshotPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["1", "2"] = "1"
+    schema_version: Literal["1", "2", "3"] = "1"
     snapshot_id: str
     run_id: str
     unit_id: str
@@ -134,6 +138,10 @@ def canonical_snapshot_bytes(payload: ExecutionSnapshotPayload) -> bytes:
     serialized = payload.model_dump(mode="json")
     if payload.schema_version == "1":
         serialized.pop("tools", None)
+    if payload.schema_version in {"1", "2"}:
+        serialized["limits"] = {
+            "snapshot_max_bytes": payload.limits.snapshot_max_bytes,
+        }
     return json.dumps(
         serialized,
         ensure_ascii=False,
@@ -155,6 +163,10 @@ class ExecutionSnapshotService:
         conversation_repository,
         *,
         max_bytes: int | None = None,
+        max_iterations: int | None = None,
+        max_tool_calls: int | None = None,
+        max_subagents: int | None = None,
+        max_output_bytes: int | None = None,
         clock=None,
     ):
         self.session = session
@@ -162,6 +174,22 @@ class ExecutionSnapshotService:
         self.conversation_repository = conversation_repository
         self.max_bytes = max_bytes or int(
             os.getenv("IAP_RUNNER_SNAPSHOT_MAX_BYTES", "1048576")
+        )
+        self.max_iterations = max_iterations or int(
+            os.getenv("IAP_RUNNER_MAX_ITERATIONS", "4")
+        )
+        self.max_tool_calls = (
+            max_tool_calls
+            if max_tool_calls is not None
+            else int(os.getenv("IAP_RUNNER_MAX_TOOL_CALLS", "8"))
+        )
+        self.max_subagents = (
+            max_subagents
+            if max_subagents is not None
+            else int(os.getenv("IAP_RUNNER_MAX_SUBAGENTS", "4"))
+        )
+        self.max_output_bytes = max_output_bytes or int(
+            os.getenv("IAP_RUNNER_MAX_OUTPUT_BYTES", str(4 * 1024 * 1024))
         )
         self.clock = clock or (lambda: datetime.now(UTC))
 
@@ -203,7 +231,7 @@ class ExecutionSnapshotService:
         created_at = self.clock()
         tools = self.agent_service.tool_service.resolve_bindable(agent.tool_ids)
         payload = ExecutionSnapshotPayload(
-            schema_version="2",
+            schema_version="3",
             snapshot_id=str(uuid4()),
             run_id=run_id,
             unit_id=str(context["unit_id"]),
@@ -250,7 +278,13 @@ class ExecutionSnapshotService:
                 )
                 for tool in tools
             ),
-            limits=SnapshotRuntimeLimits(snapshot_max_bytes=self.max_bytes),
+            limits=SnapshotRuntimeLimits(
+                snapshot_max_bytes=self.max_bytes,
+                max_iterations=self.max_iterations,
+                max_tool_calls=self.max_tool_calls,
+                max_subagents=self.max_subagents,
+                max_output_bytes=self.max_output_bytes,
+            ),
             created_at=created_at,
         )
         serialized = canonical_snapshot_bytes(payload)

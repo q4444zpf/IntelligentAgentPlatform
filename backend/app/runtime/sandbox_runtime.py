@@ -14,7 +14,7 @@ from .deepagents_factory import (
 )
 from .execution_contract import RunExecutionRequest, RunExecutionResult
 from .execution_snapshot import verify_snapshot_digest
-from .gateway_model import GatewayChatModel
+from .gateway_model import GatewayChatModel, RunnerGatewayModelError
 from .gateway_tools import RunnerApprovalInterruption, build_gateway_tools
 from .langgraph_runtime import LangGraphRuntimeAdapter, RuntimeState
 from .runner_gateway_client import (
@@ -80,7 +80,14 @@ class SandboxRuntime:
             checkpoint_store = _GatewayCheckpointStore(
                 self.gateway, request.snapshot_digest
             )
-            model = GatewayChatModel(self.gateway)
+            limits = snapshot.payload.limits
+            model = GatewayChatModel(
+                self.gateway,
+                max_iterations=limits.max_iterations,
+                max_tool_calls=limits.max_tool_calls,
+                max_subagents=limits.max_subagents,
+                max_output_bytes=limits.max_output_bytes,
+            )
             tools = build_gateway_tools(snapshot.payload, self.gateway)
             backend = ArtifactBackend(self.gateway)
             actor = snapshot.payload.actor
@@ -161,6 +168,8 @@ class SandboxRuntime:
                 error_code="approval_required",
                 checkpoint_key=checkpoint_key,
             )
+        except RunnerGatewayModelError as error:
+            return self._fail(error.code)
         except RunnerGatewayClientError as error:
             return self._fail(error.code)
         except Exception:  # noqa: BLE001

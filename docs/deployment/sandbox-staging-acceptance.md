@@ -13,6 +13,17 @@ IAP_RUNNER_GATEWAY_URL=http://api:8000/internal/runner
 IAP_RUNNER_GATEWAY_NETWORK=intelligent-agent-platform_runner-gateway
 ```
 
+Optionally override the immutable per-Run limits. The defaults are shown here;
+keep the values in deployment configuration rather than changing application
+code:
+
+```text
+IAP_RUNNER_MAX_ITERATIONS=4
+IAP_RUNNER_MAX_TOOL_CALLS=8
+IAP_RUNNER_MAX_SUBAGENTS=4
+IAP_RUNNER_MAX_OUTPUT_BYTES=4194304
+```
+
 Do not store real secret values in `.env`, CI logs or Git.
 
 ## 2. Start the controlled launcher
@@ -70,3 +81,11 @@ docker network rm intelligent-agent-platform_runner-gateway
 ```
 
 Keep `IAP_WORKFLOW_RUNNER_SANDBOX_ENABLED=false` unless every acceptance check passes and the staging owner approves the change.
+
+## 5. Record the enablement decision
+
+Attach the dated Runner Gateway staging report to the deployment change. The
+report must distinguish automated evidence from staging-only evidence and list
+the deployment owner who approved the service identity, secret injection,
+network policy and rollback procedure. An automated test pass is not sufficient
+to enable the sandbox without the staging fault-injection checks above.

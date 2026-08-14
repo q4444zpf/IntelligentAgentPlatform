@@ -9,9 +9,13 @@ from sqlalchemy.pool import StaticPool
 from app.agents.schemas import AgentInfo
 from app.db.base import Base
 from app.runtime.execution_snapshot import (
+    ExecutionSnapshotPayload,
     ExecutionSnapshotService,
+    PublishedAgentSnapshot,
     RuntimeExecutionSnapshot,
     SnapshotIntegrityError,
+    SnapshotModelSelection,
+    SnapshotRuntimeLimits,
     canonical_snapshot_bytes,
     verify_snapshot_digest,
 )
@@ -135,12 +139,16 @@ def test_snapshot_digest_is_deterministic_and_covers_complete_payload(snapshot_s
     assert first.payload.actor.id == "agent-1"
     assert first.payload.messages[0].content == "水位是多少？"
     assert first.payload.skills[0].name == "forecast"
-    assert first.payload.schema_version == "2"
+    assert first.payload.schema_version == "3"
     assert first.payload.tools[0].tool_id == "mcp.water.level"
     assert first.payload.tools[0].version == "3"
     assert first.payload.tools[0].input_schema["properties"]["station"] == {
         "type": "string"
     }
+    assert first.payload.limits.max_iterations == 4
+    assert first.payload.limits.max_tool_calls == 8
+    assert first.payload.limits.max_subagents == 4
+    assert first.payload.limits.max_output_bytes == 4 * 1024 * 1024
 
 
 def test_snapshot_contains_no_provider_or_mcp_secrets(snapshot_service):
@@ -175,3 +183,46 @@ def test_snapshot_get_rejects_payload_tampered_after_persistence(snapshot_servic
 
     with pytest.raises(SnapshotIntegrityError, match="digest mismatch"):
         snapshot_service.get(stored.snapshot_id)
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "expected_digest"),
+    [
+        ("1", "ff79e119bc3c1ace31ea2ba6283546413f5b1e6dd7e9cf169900bf9deaa7d93f"),
+        ("2", "c4cadfabbfbe2ef5dbd8026c792263232d7986a6395cd071b65e011553f6c8fc"),
+    ],
+)
+def test_legacy_snapshot_digest_vectors_ignore_v3_runtime_limits(
+    schema_version,
+    expected_digest,
+):
+    payload = ExecutionSnapshotPayload(
+        schema_version=schema_version,
+        snapshot_id="legacy-snapshot",
+        run_id="legacy-run",
+        unit_id="unit-1",
+        project_id="project-1",
+        user_id="user-1",
+        actor=PublishedAgentSnapshot(
+            id="agent-1",
+            name="Agent",
+            description="",
+            runtime_form="common",
+            language="zh-CN",
+            system_prompt="",
+            context_prompt="",
+            approval_policy="never",
+        ),
+        model=SnapshotModelSelection(provider_id="provider-1", model="model-1"),
+        messages=(),
+        limits=SnapshotRuntimeLimits(
+            snapshot_max_bytes=1048576,
+            max_iterations=99,
+            max_tool_calls=77,
+            max_subagents=55,
+            max_output_bytes=33,
+        ),
+        created_at=datetime(2026, 8, 14, 10, 0, tzinfo=UTC),
+    )
+
+    assert hashlib.sha256(canonical_snapshot_bytes(payload)).hexdigest() == expected_digest

@@ -15,6 +15,7 @@ from app.runtime.execution_snapshot import (
     SnapshotTool,
     canonical_snapshot_bytes,
 )
+from app.runtime.gateway_model import RunnerGatewayModelError
 from app.runtime.gateway_tools import RunnerApprovalInterruption
 from app.runtime.runner_gateway_schemas import SnapshotResponse
 from app.runtime.sandbox_runtime import SandboxRuntime
@@ -230,6 +231,40 @@ def test_raw_runtime_error_is_sanitized():
         "status": "failed",
         "error_code": "sandbox_failed",
     }
+
+
+def test_runtime_preserves_safe_model_limit_error_code():
+    class LimitedGraph:
+        def invoke(self, state, *, config=None):
+            raise RunnerGatewayModelError("runtime_output_limit")
+
+    snapshot = _snapshot()
+    gateway = FakeGateway(snapshot)
+    runtime = SandboxRuntime(gateway, agent_factory=FakeFactory(LimitedGraph()))
+
+    result = runtime.execute(_request(snapshot))
+
+    assert result.status == "failed"
+    assert result.error_code == "runtime_output_limit"
+    assert gateway.completions[-1][0] == {
+        "status": "failed",
+        "error_code": "runtime_output_limit",
+    }
+
+
+def test_runtime_passes_snapshot_limits_to_gateway_model():
+    snapshot = _snapshot()
+    gateway = FakeGateway(snapshot)
+    factory = FakeFactory(CompletingGraph())
+    runtime = SandboxRuntime(gateway, agent_factory=factory)
+
+    runtime.execute(_request(snapshot))
+
+    model = factory.calls[0][1]["model"]
+    assert model.max_iterations == snapshot.payload.limits.max_iterations
+    assert model.max_tool_calls == snapshot.payload.limits.max_tool_calls
+    assert model.max_subagents == snapshot.payload.limits.max_subagents
+    assert model.max_output_bytes == snapshot.payload.limits.max_output_bytes
 
 
 @pytest.mark.parametrize(

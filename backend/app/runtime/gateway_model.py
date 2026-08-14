@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -21,6 +22,10 @@ _SAFE_MESSAGES = {
     "idempotency_conflict": "模型调用幂等键冲突",
     "gateway_unavailable": "Runner Gateway 不可用",
     "gateway_response_invalid": "Runner Gateway 返回无效响应",
+    "runtime_iteration_limit": "智能体迭代次数超过运行限制",
+    "runtime_tool_call_limit": "工具调用次数超过运行限制",
+    "runtime_subagent_limit": "子智能体调用次数超过运行限制",
+    "runtime_output_limit": "智能体输出超过运行限制",
 }
 
 
@@ -87,7 +92,13 @@ class GatewayChatModel(BaseChatModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     transport: Any = Field(exclude=True, repr=False)
+    max_iterations: int = Field(default=4, gt=0)
+    max_tool_calls: int = Field(default=8, ge=0)
+    max_subagents: int = Field(default=4, ge=0)
+    max_output_bytes: int = Field(default=4 * 1024 * 1024, gt=0)
     _next_invocation_sequence: int = PrivateAttr(default=0)
+    _tool_call_count: int = PrivateAttr(default=0)
+    _subagent_call_count: int = PrivateAttr(default=0)
 
     def __init__(self, transport: ModelInvocationTransport, **data: Any) -> None:
         super().__init__(transport=transport, **data)
@@ -108,6 +119,8 @@ class GatewayChatModel(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         del stop, run_manager
+        if self._next_invocation_sequence >= self.max_iterations:
+            raise RunnerGatewayModelError("runtime_iteration_limit")
         sequence = self._next_invocation_sequence
         self._next_invocation_sequence += 1
         tools = [_normalize_tool(tool) for tool in kwargs.get("tools", [])]
@@ -130,6 +143,30 @@ class GatewayChatModel(BaseChatModel):
             raise RunnerGatewayModelError(error.code) from error
         except Exception as error:
             raise RunnerGatewayModelError("gateway_response_invalid") from error
+
+        response_tool_calls = len(response.tool_calls)
+        if self._tool_call_count + response_tool_calls > self.max_tool_calls:
+            raise RunnerGatewayModelError("runtime_tool_call_limit")
+        response_subagent_calls = sum(
+            call.name == "task" for call in response.tool_calls
+        )
+        if self._subagent_call_count + response_subagent_calls > self.max_subagents:
+            raise RunnerGatewayModelError("runtime_subagent_limit")
+        output_bytes = json.dumps(
+            {
+                "content": response.content or "",
+                "tool_calls": [
+                    call.model_dump(mode="json") for call in response.tool_calls
+                ],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(output_bytes) > self.max_output_bytes:
+            raise RunnerGatewayModelError("runtime_output_limit")
+        self._tool_call_count += response_tool_calls
+        self._subagent_call_count += response_subagent_calls
 
         usage_metadata = None
         if any(
@@ -206,8 +243,6 @@ def _normalize_message(message: BaseMessage) -> dict[str, Any]:
 
 
 def _json_arguments(arguments: dict[str, Any]) -> str:
-    import json
-
     return json.dumps(
         arguments,
         ensure_ascii=False,

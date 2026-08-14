@@ -396,3 +396,122 @@ def test_gateway_chat_model_maps_transport_errors_without_leaking_details():
 
     assert captured.value.code == "model_request_failed"
     assert "runner-secret" not in str(captured.value)
+
+
+def test_gateway_chat_model_enforces_snapshot_iteration_limit():
+    transport = FakeModelTransport(
+        response={
+            "content": "完成",
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+            "tool_calls": [],
+        }
+    )
+    model = GatewayChatModel(
+        transport,
+        max_iterations=1,
+        max_tool_calls=8,
+        max_subagents=4,
+        max_output_bytes=1024,
+    )
+
+    model.invoke([HumanMessage(content="第一次")])
+    with pytest.raises(RunnerGatewayModelError) as captured:
+        model.invoke([HumanMessage(content="第二次")])
+
+    assert captured.value.code == "runtime_iteration_limit"
+    assert len(transport.requests) == 1
+
+
+def test_gateway_chat_model_enforces_tool_and_subagent_call_limits():
+    transport = FakeModelTransport(
+        response={
+            "content": None,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+            "tool_calls": [
+                {"id": "call-1", "name": "water.query", "arguments": {}},
+                {"id": "call-2", "name": "task", "arguments": {}},
+            ],
+        }
+    )
+    model = GatewayChatModel(
+        transport,
+        max_iterations=4,
+        max_tool_calls=1,
+        max_subagents=0,
+        max_output_bytes=1024,
+    )
+
+    with pytest.raises(RunnerGatewayModelError) as captured:
+        model.invoke([HumanMessage(content="执行")])
+
+    assert captured.value.code == "runtime_tool_call_limit"
+
+    model = GatewayChatModel(
+        FakeModelTransport(response=transport.response),
+        max_iterations=4,
+        max_tool_calls=8,
+        max_subagents=0,
+        max_output_bytes=1024,
+    )
+    with pytest.raises(RunnerGatewayModelError) as captured:
+        model.invoke([HumanMessage(content="委派")])
+
+    assert captured.value.code == "runtime_subagent_limit"
+
+
+def test_gateway_chat_model_rejects_oversized_assistant_output():
+    transport = FakeModelTransport(
+        response={
+            "content": "水位结果",
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+            "tool_calls": [],
+        }
+    )
+    model = GatewayChatModel(
+        transport,
+        max_iterations=4,
+        max_tool_calls=8,
+        max_subagents=4,
+        max_output_bytes=4,
+    )
+
+    with pytest.raises(RunnerGatewayModelError) as captured:
+        model.invoke([HumanMessage(content="查询")])
+
+    assert captured.value.code == "runtime_output_limit"
+
+
+def test_gateway_chat_model_counts_tool_arguments_toward_output_limit():
+    transport = FakeModelTransport(
+        response={
+            "content": None,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "name": "water.query",
+                    "arguments": {"query": "x" * 128},
+                }
+            ],
+        }
+    )
+    model = GatewayChatModel(
+        transport,
+        max_iterations=4,
+        max_tool_calls=8,
+        max_subagents=4,
+        max_output_bytes=64,
+    )
+
+    with pytest.raises(RunnerGatewayModelError) as captured:
+        model.invoke([HumanMessage(content="查询")])
+
+    assert captured.value.code == "runtime_output_limit"
