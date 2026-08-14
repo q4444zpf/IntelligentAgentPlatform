@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from threading import Lock
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -62,6 +63,7 @@ class SandboxRunCoordinator:
         self.token_service_factory = token_service_factory
         self.gateway_url = gateway_url.rstrip("/")
         self.clock = clock or (lambda: datetime.now(UTC))
+        self._cleanup_locks: dict[str, Lock] = {}
 
     def execute(self, run_id: str) -> None:
         if not self._start(run_id):
@@ -281,16 +283,31 @@ class SandboxRunCoordinator:
             session.commit()
 
     def _cleanup(self, run_id: str) -> None:
-        payload = {"status": "cleaned"}
-        try:
-            self.runner.cleanup(run_id)
-        except RunnerUnavailableError:
-            payload = {"status": "failed", "code": "launcher_unavailable"}
-        with self.session_factory() as session:
-            repository = ConversationRepository(session)
-            if repository.get_run_by_id(run_id) is not None:
-                repository.append_event(run_id, "sandbox.cleanup", payload)
-                session.commit()
+        lock = self._cleanup_locks.setdefault(run_id, Lock())
+        with lock:
+            with self.session_factory() as session:
+                latest = session.scalar(
+                    select(RunEvent)
+                    .where(
+                        RunEvent.run_id == run_id,
+                        RunEvent.event_type == "sandbox.cleanup",
+                    )
+                    .order_by(RunEvent.sequence.desc())
+                    .limit(1)
+                )
+                if latest is not None and latest.payload.get("status") == "cleaned":
+                    return
+
+            payload = {"status": "cleaned"}
+            try:
+                self.runner.cleanup(run_id)
+            except RunnerUnavailableError:
+                payload = {"status": "failed", "code": "launcher_unavailable"}
+            with self.session_factory() as session:
+                repository = ConversationRepository(session)
+                if repository.get_run_by_id(run_id) is not None:
+                    repository.append_event(run_id, "sandbox.cleanup", payload)
+                    session.commit()
 
     def _terminate_safely(self, run_id: str) -> None:
         try:

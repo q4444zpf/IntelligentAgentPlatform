@@ -7,8 +7,9 @@
 The complete backend suite and all three deployment images passed locally.
 Ephemeral signing and Launcher secrets were injected into container process
 environments without writing them to a file or Git. A live sandbox Run
-completed and wrote an Artifact to MinIO. Destructive fault injection and
-deployment-owner approval remain pending. The repository default for
+completed and wrote an Artifact to MinIO. Live Launcher outage handling was
+also verified; live OOM injection did not produce an `OOMKilled=true` signal
+and remains pending. Deployment-owner approval remains pending. The repository default for
 `IAP_WORKFLOW_RUNNER_SANDBOX_ENABLED` remains `false`.
 
 ## Automated evidence
@@ -22,6 +23,7 @@ deployment-owner approval remain pending. The repository default for
 - `docker compose --profile sandbox config --quiet` -> exit code 0.
 - `docker compose build api workflow-runner sandbox-launcher` -> all three
   images built successfully.
+- Runtime regression after cleanup-idempotency fix: **284 passed**.
 
 The 38 skipped tests require external services such as a configured PostgreSQL
 test database. They are not counted as live staging evidence.
@@ -92,7 +94,8 @@ object-storage credentials are not placed in the Run container contract. Task
 | Artifact digest rejection and post-upload object compensation | PASS | `test_runner_gateway_artifacts.py` |
 | Cancellation, deadline, OOM and Launcher outage final states | PASS (automated) | Task 12 and lifecycle tests |
 | Runtime iteration, tool, subagent and output limits | PASS | Runtime-limit tests and schema v3 snapshot |
-| Live staging OOM and Launcher outage fault injection | PENDING | Deployment credentials not available |
+| Live staging Launcher outage fault injection | PASS | Run `c72fff58-3c68-4174-91c6-4185f65397c0` -> `failed/launcher_unavailable`; restart and cleanup retry recorded `cleaned` |
+| Live staging OOM fault injection | PENDING | Dynamic cgroup limit injection did not produce `OOMKilled=true`; no pass claimed |
 | Live success Run, MinIO Artifact and cleanup | PASS | Run `8aa87e3f-12f5-4d12-9ff4-46f62c946455` |
 | Live Run policy acceptance | PASS | Launcher accepted the Run only after actual Docker metadata passed image, user, rootfs, capability, environment, mount, resource and network inspection |
 
@@ -112,8 +115,9 @@ are digest-protected in schema v3.
 
 Automated failure tests verify Artifact digest rejection, database rollback and
 object deletion when event persistence fails after upload, plus idempotent
-terminal persistence. The local Docker inventory had no `iap-run-*` containers
-after the suite.
+terminal persistence. Cleanup retries are serialized per Run so concurrent
+startup/manual retries cannot append a stale failure after a successful delete.
+The local Docker inventory had no `iap-run-*` containers after the suite.
 
 Rollback remains:
 
@@ -126,7 +130,9 @@ Rollback remains:
 ## Residual risks and required approval
 
 - Execute live staging success, unauthorized tool, approval, cancellation,
-  timeout, OOM and Launcher outage scenarios with deployment-owned secrets.
+  timeout and OOM scenarios with deployment-owned secrets. Launcher outage is
+  verified locally; OOM still requires a controlled staging workload that
+  deterministically exits with `OOMKilled=true`.
 - Inspect an active Run container's user, read-only root, capabilities, mounts,
   network and environment key names.
 - Run PostgreSQL-only integration tests against the staging-compatible database.

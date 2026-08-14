@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import ANY
 
 import pytest
@@ -309,6 +310,37 @@ def test_coordinator_retries_failed_cleanup_for_terminal_run(run_factory):
     assert state.run.status == "failed"
     assert state.events[-1].event_type == "sandbox.cleanup"
     assert state.events[-1].payload == {"status": "cleaned"}
+
+
+def test_coordinator_deduplicates_concurrent_cleanup_retries(run_factory):
+    factory, run_id = run_factory
+    with factory.begin() as session:
+        session.get(AgentRun, run_id).status = "failed"
+        session.add(RunEvent(
+            run_id=run_id,
+            sequence=2,
+            event_type="sandbox.cleanup",
+            payload={"status": "failed", "code": "launcher_unavailable"},
+        ))
+
+    class CleanupRaceRunner(SequenceRunner):
+        def cleanup(self, current_run_id):
+            self.calls.append(("cleanup", current_run_id))
+            if len([call for call in self.calls if call[0] == "cleanup"]) > 1:
+                raise RunnerUnavailableError("container is not registered for run")
+            return {"run_id": current_run_id, "status": "cleaned"}
+
+    runner = CleanupRaceRunner([])
+    coordinator = make_coordinator(factory, runner)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(coordinator.retry_cleanup, run_id) for _ in range(2)]
+        for future in futures:
+            future.result()
+
+    state = snapshot(factory, run_id)
+    cleanup_events = [event for event in state.events if event.event_type == "sandbox.cleanup"]
+    assert cleanup_events[-1].payload == {"status": "cleaned"}
+    assert len([call for call in runner.calls if call[0] == "cleanup"]) == 1
 
 
 def test_coordinator_issues_snapshot_and_token_before_submit(run_factory):
