@@ -20,9 +20,17 @@ from .skills.router import router as skills_router
 from .tools.router import router as tools_router
 from .identity.admin_router import router as identity_admin_router
 from .identity.auth_router import router as identity_auth_router
+from .artifacts.router import router as artifacts_router
+from .runtime.runner_gateway_auth import (
+    RunnerGatewayError,
+    runner_gateway_error_handler,
+    validate_runner_gateway_startup,
+)
+from .runtime.runner_gateway_router import router as runner_gateway_router
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    validate_runner_gateway_startup()
     default_mcp_health_scheduler.start()
     try:
         yield
@@ -38,6 +46,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.state.allow_dev_identity = settings.allow_dev_identity
+app.add_exception_handler(RunnerGatewayError, runner_gateway_error_handler)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -78,6 +87,12 @@ app.include_router(audit_router, prefix="/api/audit", tags=["audit"])
 app.include_router(approvals_router, prefix="/api/approvals", tags=["approvals"])
 app.include_router(identity_admin_router, prefix="/api/identity", tags=["identity"])
 app.include_router(identity_auth_router, prefix="/api/auth", tags=["auth"])
+app.include_router(artifacts_router, prefix="/api", tags=["artifacts"])
+app.include_router(
+    runner_gateway_router,
+    prefix="/internal/runner",
+    include_in_schema=False,
+)
 
 
 @app.get("/api/health")
