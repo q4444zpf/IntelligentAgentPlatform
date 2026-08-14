@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
+import logging
 import os
 from datetime import UTC, datetime
 from time import perf_counter
@@ -9,6 +12,14 @@ from time import perf_counter
 from sqlalchemy import func, select
 
 from app.approvals.models import Approval
+from app.artifacts.service import (
+    ArtifactAlreadyExistsError,
+    ArtifactContentTypeError,
+    ArtifactIntegrityError,
+    ArtifactNotFoundError,
+    ArtifactService,
+    ArtifactSizeError,
+)
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.conversations.models import AgentRun, RunEvent
 from app.conversations.repository import ConversationRepository
@@ -31,6 +42,9 @@ from .model_gateway import ModelGateway, ModelRuntimeError, ModelSelection
 from .run_tokens import RunTokenClaims
 from .runner_gateway_auth import RunnerGatewayError
 from .runner_gateway_schemas import (
+    ArtifactContentResponse,
+    ArtifactCreateRequest,
+    ArtifactFileResponse,
     CheckpointResponse,
     CheckpointWriteRequest,
     EventAppendRequest,
@@ -42,6 +56,8 @@ from .runner_gateway_schemas import (
     ToolInvocationRequest,
     ToolInvocationResponse,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _canonical_digest(value: dict[str, object]) -> str:
@@ -76,6 +92,7 @@ class RunnerGatewayService:
         model_gateway: ModelGateway | None = None,
         audit_recorder: AuditRecorder | None = None,
         tool_gateway: ToolGateway | None = None,
+        artifact_service: ArtifactService | None = None,
         *,
         event_payload_max_bytes: int | None = None,
     ) -> None:
@@ -85,6 +102,7 @@ class RunnerGatewayService:
         self.model_gateway = model_gateway
         self.audit_recorder = audit_recorder or AuditRecorder()
         self.tool_gateway = tool_gateway
+        self.artifact_service = artifact_service
         self.event_payload_max_bytes = (
             _event_payload_limit()
             if event_payload_max_bytes is None
@@ -538,6 +556,152 @@ class RunnerGatewayService:
         repository.session.commit()
         return response
 
+    def create_artifact(
+        self,
+        run_id: str,
+        request: ArtifactCreateRequest,
+        claims: RunTokenClaims,
+        idempotency_key: str,
+    ) -> ArtifactFileResponse:
+        repository = self._require_conversation_repository()
+        artifacts = self._require_artifact_service()
+        self._verified_snapshot(run_id, claims)
+        self._lock_run(repository, run_id)
+        requests = RunnerRequestStore(repository.session)
+        action = "artifact.create"
+        request_digest = _canonical_digest(
+            {
+                "snapshot_digest": claims.snapshot_digest,
+                "request": request.model_dump(mode="json"),
+            }
+        )
+        replay = self._replay_or_conflict(
+            requests, run_id, action, idempotency_key, request_digest
+        )
+        if replay is not None:
+            return ArtifactFileResponse.model_validate(replay)
+        try:
+            data = base64.b64decode(request.data_base64, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise RunnerGatewayError(
+                400, "artifact_invalid", "成果文件内容无效"
+            ) from error
+        if len(data) != request.size_bytes:
+            raise RunnerGatewayError(400, "artifact_invalid", "成果文件大小无效")
+        relative_path = self._relative_artifact_path(request.path)
+        created = None
+        try:
+            created = artifacts.create_for_run(
+                run_id=run_id,
+                path=relative_path,
+                content_type=request.content_type,
+                data=data,
+                sha256=request.sha256,
+                commit=False,
+            )
+            response = self._artifact_response(created)
+            repository.append_event(
+                run_id,
+                "artifact.ready",
+                {
+                    "artifact_id": created.id,
+                    "path": response.path,
+                    "size_bytes": created.size_bytes,
+                    "sha256": created.sha256,
+                    "content_type": created.content_type,
+                },
+            )
+            requests.add(
+                run_id=run_id,
+                action=action,
+                idempotency_key=idempotency_key,
+                request_digest=request_digest,
+                response_json=response.model_dump(mode="json"),
+            )
+            repository.session.commit()
+            return response
+        except ArtifactAlreadyExistsError as error:
+            raise RunnerGatewayError(
+                409, "artifact_already_exists", "成果文件已存在"
+            ) from error
+        except (ArtifactIntegrityError, ArtifactContentTypeError) as error:
+            raise RunnerGatewayError(
+                400, "artifact_invalid", "成果文件无效"
+            ) from error
+        except ArtifactSizeError as error:
+            raise RunnerGatewayError(
+                413, "artifact_too_large", "成果文件超过大小限制"
+            ) from error
+        except Exception as error:
+            created_object_key = created.object_key if created is not None else None
+            repository.session.rollback()
+            if created_object_key is not None:
+                try:
+                    artifacts.storage.delete_object(created_object_key)
+                except Exception:  # noqa: BLE001
+                    logger.warning("runner artifact cleanup failed")
+            raise RunnerGatewayError(
+                502, "artifact_upload_failed", "成果文件保存失败"
+            ) from error
+
+    def list_artifacts(
+        self, run_id: str, claims: RunTokenClaims
+    ) -> list[ArtifactFileResponse]:
+        self._verified_snapshot(run_id, claims)
+        artifacts = self._require_artifact_service()
+        return [
+            self._artifact_response(artifact)
+            for artifact in artifacts.list_for_run(run_id)
+        ]
+
+    def read_artifact(
+        self,
+        run_id: str,
+        artifact_id: str,
+        claims: RunTokenClaims,
+    ) -> ArtifactContentResponse:
+        self._verified_snapshot(run_id, claims)
+        artifacts = self._require_artifact_service()
+        try:
+            artifact = artifacts.get_for_run(run_id, artifact_id)
+        except ArtifactNotFoundError as error:
+            raise RunnerGatewayError(
+                404, "artifact_not_found", "成果文件不存在"
+            ) from error
+        try:
+            data = artifacts.storage.get_bytes(artifact.object_key)
+        except Exception as error:
+            raise RunnerGatewayError(
+                502, "artifact_read_failed", "成果文件读取失败"
+            ) from error
+        if hashlib.sha256(data).hexdigest() != artifact.sha256:
+            raise RunnerGatewayError(
+                409, "artifact_invalid", "成果文件校验失败"
+            )
+        return ArtifactContentResponse(
+            **self._artifact_response(artifact).model_dump(),
+            data_base64=base64.b64encode(data).decode("ascii"),
+        )
+
+    @staticmethod
+    def _relative_artifact_path(path: str) -> str:
+        prefix = "/artifacts/"
+        if not path.startswith(prefix):
+            raise RunnerGatewayError(
+                400, "artifact_invalid", "成果文件路径无效"
+            )
+        return path[len(prefix) :]
+
+    @staticmethod
+    def _artifact_response(artifact) -> ArtifactFileResponse:
+        return ArtifactFileResponse(
+            path=f"/artifacts/{artifact.filename}",
+            artifact_id=artifact.id,
+            size_bytes=artifact.size_bytes,
+            sha256=artifact.sha256,
+            content_type=artifact.content_type,
+        )
+
     @staticmethod
     def _map_tool_error(error: ToolRuntimeError) -> tuple[int, str, str]:
         if error.code == "tool_not_authorized":
@@ -569,6 +733,11 @@ class RunnerGatewayService:
         if self.tool_gateway is None:
             raise RuntimeError("tool gateway is required")
         return self.tool_gateway
+
+    def _require_artifact_service(self) -> ArtifactService:
+        if self.artifact_service is None:
+            raise RuntimeError("artifact service is required")
+        return self.artifact_service
 
     @staticmethod
     def _lock_run(repository: ConversationRepository, run_id: str) -> AgentRun:

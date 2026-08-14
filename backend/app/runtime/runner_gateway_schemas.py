@@ -106,3 +106,27 @@ class ToolInvocationResponse(BaseModel):
 
     invocation_id: str
     value: dict[str, Any]
+
+
+class ArtifactCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=266)
+    content_type: str = Field(min_length=1, max_length=160)
+    size_bytes: int = Field(ge=0)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    data_base64: str
+
+
+class ArtifactFileResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    artifact_id: str
+    size_bytes: int
+    sha256: str
+    content_type: str
+
+
+class ArtifactContentResponse(ArtifactFileResponse):
+    data_base64: str

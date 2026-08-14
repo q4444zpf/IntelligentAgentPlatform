@@ -4,6 +4,8 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Header
 from sqlalchemy.orm import Session
 
+from app.artifacts.service import ArtifactService
+from app.artifacts.storage import S3ObjectStorage
 from app.audit.recorder import AuditRecorder
 from app.conversations.repository import ConversationRepository
 from app.core.database import get_session
@@ -18,6 +20,9 @@ from .model_gateway import ModelGateway, OpenAICompatibleModelGateway
 from .run_tokens import RunTokenClaims, RunTokenService
 from .runner_gateway_auth import default_token_service, require_runner_action
 from .runner_gateway_schemas import (
+    ArtifactContentResponse,
+    ArtifactCreateRequest,
+    ArtifactFileResponse,
     CheckpointResponse,
     CheckpointWriteRequest,
     EventAppendRequest,
@@ -57,6 +62,12 @@ def default_audit_recorder() -> AuditRecorder:
     return AuditRecorder()
 
 
+def default_artifact_service(
+    session: Annotated[Session, Depends(get_session)],
+) -> ArtifactService:
+    return ArtifactService(session, S3ObjectStorage())
+
+
 def default_tool_gateway(
     repository: Annotated[
         ConversationRepository,
@@ -80,6 +91,7 @@ def create_router(
     model_gateway_dependency: Callable[..., ModelGateway] = default_model_gateway,
     audit_recorder_dependency: Callable[..., AuditRecorder] = default_audit_recorder,
     tool_gateway_dependency: Callable[..., ToolGateway] = default_tool_gateway,
+    artifact_service_dependency: Callable[..., ArtifactService] = default_artifact_service,
     event_payload_max_bytes: int | None = None,
 ) -> APIRouter:
     router = APIRouter()
@@ -100,6 +112,9 @@ def create_router(
     )
     tool_invoke_claims = require_runner_action(
         "tool.invoke", token_service_dependency
+    )
+    artifact_claims = require_runner_action(
+        "artifact.create", token_service_dependency
     )
 
     @router.get(
@@ -286,6 +301,81 @@ def create_router(
             conversation_repository=repository,
             tool_gateway=tool_gateway,
         ).invoke_tool(run_id, request, claims, idempotency_key)
+
+    @router.post(
+        "/runs/{run_id}/artifacts",
+        response_model=ArtifactFileResponse,
+        status_code=201,
+    )
+    def create_artifact(
+        run_id: str,
+        request: ArtifactCreateRequest,
+        idempotency_key: Annotated[
+            str,
+            Header(alias="Idempotency-Key", min_length=1, max_length=200),
+        ],
+        claims: Annotated[RunTokenClaims, Depends(artifact_claims)],
+        snapshot_service: Annotated[
+            ExecutionSnapshotService,
+            Depends(snapshot_service_dependency),
+        ],
+        repository: Annotated[
+            ConversationRepository,
+            Depends(conversation_repository_dependency),
+        ],
+        artifacts: Annotated[
+            ArtifactService,
+            Depends(artifact_service_dependency),
+        ],
+    ) -> ArtifactFileResponse:
+        return RunnerGatewayService(
+            snapshot_service,
+            conversation_repository=repository,
+            artifact_service=artifacts,
+        ).create_artifact(run_id, request, claims, idempotency_key)
+
+    @router.get(
+        "/runs/{run_id}/artifacts",
+        response_model=list[ArtifactFileResponse],
+    )
+    def list_artifacts(
+        run_id: str,
+        claims: Annotated[RunTokenClaims, Depends(artifact_claims)],
+        snapshot_service: Annotated[
+            ExecutionSnapshotService,
+            Depends(snapshot_service_dependency),
+        ],
+        artifacts: Annotated[
+            ArtifactService,
+            Depends(artifact_service_dependency),
+        ],
+    ) -> list[ArtifactFileResponse]:
+        return RunnerGatewayService(
+            snapshot_service,
+            artifact_service=artifacts,
+        ).list_artifacts(run_id, claims)
+
+    @router.get(
+        "/runs/{run_id}/artifacts/{artifact_id}",
+        response_model=ArtifactContentResponse,
+    )
+    def read_artifact(
+        run_id: str,
+        artifact_id: str,
+        claims: Annotated[RunTokenClaims, Depends(artifact_claims)],
+        snapshot_service: Annotated[
+            ExecutionSnapshotService,
+            Depends(snapshot_service_dependency),
+        ],
+        artifacts: Annotated[
+            ArtifactService,
+            Depends(artifact_service_dependency),
+        ],
+    ) -> ArtifactContentResponse:
+        return RunnerGatewayService(
+            snapshot_service,
+            artifact_service=artifacts,
+        ).read_artifact(run_id, artifact_id, claims)
 
     return router
 
