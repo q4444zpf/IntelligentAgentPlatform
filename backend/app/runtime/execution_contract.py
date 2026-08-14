@@ -51,7 +51,7 @@ class RunExecutionRequest(BaseModel):
 class RunExecutionResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    status: Literal["completed", "failed", "cancelled"]
+    status: Literal["completed", "failed", "cancelled", "interrupted"]
     error_code: str | None = Field(default=None, pattern=_ERROR_CODE_PATTERN)
     artifact_refs: tuple[str, ...] = ()
     checkpoint_key: str | None = Field(default=None, max_length=128, pattern=_REFERENCE_PATTERN)

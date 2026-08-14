@@ -77,7 +77,7 @@ def test_execution_request_rejects_untrusted_runtime_fields():
         )
 
 
-@pytest.mark.parametrize("status", ["completed", "failed", "cancelled"])
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled", "interrupted"])
 def test_execution_result_uses_bounded_terminal_statuses(status):
     result = RunExecutionResult(
         status=status,
