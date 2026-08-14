@@ -4,7 +4,7 @@ import base64
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
 from cryptography.exceptions import InvalidSignature
@@ -16,7 +16,8 @@ from sqlalchemy.orm import Mapped, Session, mapped_column
 from app.core.config import RunnerTokenSettings
 from app.db.base import Base
 
-from .execution_snapshot import StoredExecutionSnapshot
+if TYPE_CHECKING:
+    from .execution_snapshot import StoredExecutionSnapshot
 
 
 RunnerAction = Literal[
