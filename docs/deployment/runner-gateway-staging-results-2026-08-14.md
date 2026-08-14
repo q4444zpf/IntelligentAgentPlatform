@@ -14,7 +14,8 @@ default.
 
 - Full backend suite:
   `python -m pytest tests -q --import-mode=importlib -p no:cacheprovider`
-  from `backend/` -> **837 passed, 38 skipped** in 661.91 seconds.
+  from a clean committed worktree under `backend/` -> **820 passed, 38 skipped**
+  in 576.17 seconds.
 - Task 12 Runner Gateway integration suite -> **17 passed**.
 - Runtime-limit and snapshot compatibility suite -> **29 passed**.
 - `docker compose --profile sandbox config --quiet` -> exit code 0.
