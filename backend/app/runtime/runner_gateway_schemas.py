@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -130,3 +130,26 @@ class ArtifactFileResponse(BaseModel):
 
 class ArtifactContentResponse(ArtifactFileResponse):
     data_base64: str
+
+
+class CompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["completed", "failed", "cancelled", "interrupted"]
+    final_assistant_content: str | None = Field(default=None, max_length=262144)
+    error_code: str | None = Field(
+        default=None,
+        pattern=r"^[a-z][a-z0-9_]{0,119}$",
+    )
+    approval_id: str | None = Field(default=None, min_length=1, max_length=128)
+    checkpoint_key: str | None = Field(default=None, min_length=1, max_length=128)
+    artifact_refs: list[str] = Field(default_factory=list, max_length=100)
+
+
+class CompletionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    status: Literal["completed", "failed", "cancelled", "interrupted"]
+    checkpoint_key: str | None = None
+    artifact_refs: list[str] = Field(default_factory=list)

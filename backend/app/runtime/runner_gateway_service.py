@@ -47,6 +47,8 @@ from .runner_gateway_schemas import (
     ArtifactFileResponse,
     CheckpointResponse,
     CheckpointWriteRequest,
+    CompletionRequest,
+    CompletionResponse,
     EventAppendRequest,
     EventAppendResponse,
     ModelInvocationRequest,
@@ -643,6 +645,103 @@ class RunnerGatewayService:
             raise RunnerGatewayError(
                 502, "artifact_upload_failed", "成果文件保存失败"
             ) from error
+
+    def complete(
+        self,
+        run_id: str,
+        request: CompletionRequest,
+        claims: RunTokenClaims,
+        idempotency_key: str,
+    ) -> CompletionResponse:
+        repository = self._require_conversation_repository()
+        self._verified_snapshot(run_id, claims)
+        run = self._lock_run(repository, run_id)
+        requests = RunnerRequestStore(repository.session)
+        action = "result.complete"
+        request_digest = _canonical_digest(
+            {
+                "snapshot_digest": claims.snapshot_digest,
+                "request": request.model_dump(mode="json"),
+            }
+        )
+        replay = self._replay_or_conflict(
+            requests, run_id, action, idempotency_key, request_digest
+        )
+        if replay is not None:
+            return CompletionResponse.model_validate(replay)
+
+        target_status = {
+            "completed": "completed",
+            "failed": "failed",
+            "cancelled": "cancelled",
+            "interrupted": "waiting_approval",
+        }[request.status]
+        if run.status in {"completed", "failed", "cancelled"}:
+            raise RunnerGatewayError(
+                409,
+                "completion_already_committed",
+                "Run 结果已提交",
+            )
+
+        artifacts = self._require_artifact_service()
+        try:
+            for artifact_id in request.artifact_refs:
+                artifacts.get_for_run(run_id, artifact_id)
+        except ArtifactNotFoundError as error:
+            raise RunnerGatewayError(
+                404, "artifact_not_found", "成果文件不存在"
+            ) from error
+
+        if request.final_assistant_content:
+            repository.add_assistant_message(
+                run_id,
+                request.final_assistant_content,
+            )
+        repository.append_event(
+            run_id,
+            "runner.completion",
+            {
+                "status": request.status,
+                **(
+                    {"error_code": request.error_code}
+                    if request.error_code
+                    else {}
+                ),
+                **(
+                    {"approval_id": request.approval_id}
+                    if request.approval_id
+                    else {}
+                ),
+                **(
+                    {"checkpoint_key": request.checkpoint_key}
+                    if request.checkpoint_key
+                    else {}
+                ),
+                "artifact_refs": request.artifact_refs,
+            },
+        )
+        if run.status != target_status:
+            run.status = target_status
+            repository.append_event(
+                run_id,
+                "run.status",
+                {"status": target_status},
+            )
+        response = CompletionResponse(
+            run_id=run_id,
+            status=request.status,
+            checkpoint_key=request.checkpoint_key,
+            artifact_refs=request.artifact_refs,
+        )
+        requests.add(
+            run_id=run_id,
+            action=action,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+            response_json=response.model_dump(mode="json"),
+        )
+        repository.session.commit()
+        return response
 
     def list_artifacts(
         self, run_id: str, claims: RunTokenClaims

@@ -25,6 +25,8 @@ from .runner_gateway_schemas import (
     ArtifactFileResponse,
     CheckpointResponse,
     CheckpointWriteRequest,
+    CompletionRequest,
+    CompletionResponse,
     EventAppendRequest,
     EventAppendResponse,
     ModelInvocationRequest,
@@ -115,6 +117,9 @@ def create_router(
     )
     artifact_claims = require_runner_action(
         "artifact.create", token_service_dependency
+    )
+    completion_claims = require_runner_action(
+        "result.complete", token_service_dependency
     )
 
     @router.get(
@@ -376,6 +381,37 @@ def create_router(
             snapshot_service,
             artifact_service=artifacts,
         ).read_artifact(run_id, artifact_id, claims)
+
+    @router.post(
+        "/runs/{run_id}/completion",
+        response_model=CompletionResponse,
+    )
+    def complete(
+        run_id: str,
+        request: CompletionRequest,
+        idempotency_key: Annotated[
+            str,
+            Header(alias="Idempotency-Key", min_length=1, max_length=200),
+        ],
+        claims: Annotated[RunTokenClaims, Depends(completion_claims)],
+        snapshot_service: Annotated[
+            ExecutionSnapshotService,
+            Depends(snapshot_service_dependency),
+        ],
+        repository: Annotated[
+            ConversationRepository,
+            Depends(conversation_repository_dependency),
+        ],
+        artifacts: Annotated[
+            ArtifactService,
+            Depends(artifact_service_dependency),
+        ],
+    ) -> CompletionResponse:
+        return RunnerGatewayService(
+            snapshot_service,
+            conversation_repository=repository,
+            artifact_service=artifacts,
+        ).complete(run_id, request, claims, idempotency_key)
 
     return router
 

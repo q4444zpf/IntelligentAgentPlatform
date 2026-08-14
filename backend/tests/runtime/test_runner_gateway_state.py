@@ -2,10 +2,11 @@ from datetime import UTC, datetime
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
+from app.artifacts.service import ArtifactNotFoundError
 from app.conversations.models import AgentRun, Conversation, Message
 from app.conversations.repository import ConversationRepository
 from app.db.base import Base
@@ -90,7 +91,18 @@ class FakeSnapshotService:
         return self.snapshot if snapshot_id == self.snapshot.snapshot_id else None
 
 
-def build_client(snapshot=None, *, event_payload_max_bytes=65536):
+class FakeArtifactService:
+    def __init__(self, artifacts=None):
+        self.artifacts = artifacts or {}
+
+    def get_for_run(self, run_id, artifact_id):
+        artifact = self.artifacts.get(artifact_id)
+        if artifact is None or artifact.run_id != run_id:
+            raise ArtifactNotFoundError(artifact_id)
+        return artifact
+
+
+def build_client(snapshot=None, *, event_payload_max_bytes=65536, artifacts=None):
     snapshot = snapshot or build_snapshot()
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
@@ -135,6 +147,7 @@ def build_client(snapshot=None, *, event_payload_max_bytes=65536):
             snapshot_service_dependency=lambda: FakeSnapshotService(snapshot),
             checkpoint_store_dependency=lambda: checkpoint_store,
             conversation_repository_dependency=lambda: repository,
+            artifact_service_dependency=lambda: FakeArtifactService(artifacts),
             event_payload_max_bytes=event_payload_max_bytes,
         ),
         prefix="/internal/runner",
@@ -316,3 +329,92 @@ def test_event_payload_over_limit_is_rejected():
     assert response.status_code == 413
     assert response.json()["code"] == "event_payload_too_large"
     assert repository.list_events("run-1", 0) == []
+
+
+def test_completion_commits_final_message_status_and_artifact_references_once():
+    from types import SimpleNamespace
+
+    artifact = SimpleNamespace(id="artifact-1", run_id="run-1")
+    client, repository, _store, _token_service = build_client(
+        artifacts={artifact.id: artifact}
+    )
+    request = {
+        "status": "completed",
+        "final_assistant_content": "任务已完成",
+        "checkpoint_key": "langgraph",
+        "artifact_refs": [artifact.id],
+    }
+
+    first = client.post(
+        "/internal/runner/runs/run-1/completion",
+        headers=idempotent("completion:final"),
+        json=request,
+    )
+    second = client.post(
+        "/internal/runner/runs/run-1/completion",
+        headers=idempotent("completion:final"),
+        json=request,
+    )
+
+    assert first.status_code == 200
+    assert second.json() == first.json()
+    assert first.json() == {
+        "run_id": "run-1",
+        "status": "completed",
+        "checkpoint_key": "langgraph",
+        "artifact_refs": ["artifact-1"],
+    }
+    assert repository.get_run_by_id("run-1").status == "completed"
+    messages = list(
+        repository.session.scalars(
+            select(Message)
+            .where(Message.conversation_id == "conversation-1")
+            .order_by(Message.sequence)
+        )
+    )
+    assert [(message.role, message.content) for message in messages] == [
+        ("user", "test"),
+        ("assistant", "任务已完成"),
+    ]
+    assert [event.event_type for event in repository.list_events("run-1", 0)] == [
+        "runner.completion",
+        "run.status",
+    ]
+
+
+def test_completion_rejects_artifact_from_another_run():
+    from types import SimpleNamespace
+
+    artifact = SimpleNamespace(id="artifact-2", run_id="run-2")
+    client, repository, _store, _token_service = build_client(
+        artifacts={artifact.id: artifact}
+    )
+
+    response = client.post(
+        "/internal/runner/runs/run-1/completion",
+        headers=idempotent("completion:wrong-artifact"),
+        json={"status": "completed", "artifact_refs": [artifact.id]},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "artifact_not_found"
+    assert repository.get_run_by_id("run-1").status == "running"
+
+
+def test_interrupted_completion_preserves_waiting_approval_state():
+    client, repository, _store, _token_service = build_client()
+
+    response = client.post(
+        "/internal/runner/runs/run-1/completion",
+        headers=idempotent("completion:approval"),
+        json={
+            "status": "interrupted",
+            "error_code": "approval_required",
+            "approval_id": "approval-1",
+            "checkpoint_key": "approval-approval-1",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "interrupted"
+    assert repository.get_run_by_id("run-1").status == "waiting_approval"
