@@ -61,6 +61,19 @@ class SnapshotKnowledgeSource(BaseModel):
     tool_id: str
 
 
+class SnapshotTool(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tool_id: str
+    version: str
+    name: str
+    description: str
+    input_schema: dict[str, object]
+    published: bool
+    enabled: bool
+    source_available: bool
+
+
 class SnapshotRuntimeLimits(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -70,7 +83,7 @@ class SnapshotRuntimeLimits(BaseModel):
 class ExecutionSnapshotPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["1"] = "1"
+    schema_version: Literal["1", "2"] = "1"
     snapshot_id: str
     run_id: str
     unit_id: str
@@ -81,6 +94,7 @@ class ExecutionSnapshotPayload(BaseModel):
     messages: tuple[SnapshotMessage, ...]
     skills: tuple[SnapshotSkill, ...] = ()
     knowledge_sources: tuple[SnapshotKnowledgeSource, ...] = ()
+    tools: tuple[SnapshotTool, ...] = ()
     limits: SnapshotRuntimeLimits
     created_at: datetime
 
@@ -117,8 +131,11 @@ class RuntimeExecutionSnapshot(Base):
 
 
 def canonical_snapshot_bytes(payload: ExecutionSnapshotPayload) -> bytes:
+    serialized = payload.model_dump(mode="json")
+    if payload.schema_version == "1":
+        serialized.pop("tools", None)
     return json.dumps(
-        payload.model_dump(mode="json"),
+        serialized,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -184,7 +201,9 @@ class ExecutionSnapshotService:
             raise ValueError(f"Agent '{agent.id}' is disabled")
 
         created_at = self.clock()
+        tools = self.agent_service.tool_service.resolve_bindable(agent.tool_ids)
         payload = ExecutionSnapshotPayload(
+            schema_version="2",
             snapshot_id=str(uuid4()),
             run_id=run_id,
             unit_id=str(context["unit_id"]),
@@ -217,6 +236,19 @@ class ExecutionSnapshotService:
             skills=tuple(SnapshotSkill(name=name) for name in agent.skill_names),
             knowledge_sources=tuple(
                 SnapshotKnowledgeSource(tool_id=tool_id) for tool_id in agent.tool_ids
+            ),
+            tools=tuple(
+                SnapshotTool(
+                    tool_id=tool.tool_id,
+                    version=tool.version,
+                    name=tool.name,
+                    description=tool.description,
+                    input_schema=tool.input_schema,
+                    published=tool.published,
+                    enabled=tool.enabled,
+                    source_available=tool.source_available,
+                )
+                for tool in tools
             ),
             limits=SnapshotRuntimeLimits(snapshot_max_bytes=self.max_bytes),
             created_at=created_at,

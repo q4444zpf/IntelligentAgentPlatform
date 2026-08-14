@@ -1,6 +1,6 @@
+import hashlib
 from datetime import UTC, datetime
 
-import hashlib
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -18,12 +18,37 @@ from app.runtime.execution_snapshot import (
 
 
 class StaticAgentService:
-    def __init__(self, agent: AgentInfo):
+    def __init__(self, agent: AgentInfo, tools):
         self.agent = agent
+        self.tool_service = StaticToolService(tools)
 
     def get(self, agent_id: str) -> AgentInfo:
         assert agent_id == self.agent.id
         return self.agent
+
+
+class StaticToolService:
+    def __init__(self, tools):
+        self.tools = tools
+
+    def resolve_bindable(self, tool_ids):
+        assert tool_ids == [tool.tool_id for tool in self.tools]
+        return self.tools
+
+
+class Tool:
+    def __init__(self):
+        self.tool_id = "mcp.water.level"
+        self.version = "3"
+        self.name = "查询水位"
+        self.description = "查询测站水位"
+        self.input_schema = {
+            "type": "object",
+            "properties": {"station": {"type": "string"}},
+        }
+        self.published = True
+        self.enabled = True
+        self.source_available = True
 
 
 class Run:
@@ -93,7 +118,7 @@ def snapshot_service():
     )
     yield ExecutionSnapshotService(
         Session(engine),
-        StaticAgentService(agent),
+        StaticAgentService(agent, [Tool()]),
         StaticConversationRepository(),
         clock=lambda: datetime(2026, 8, 14, 10, 1, tzinfo=UTC),
     )
@@ -110,6 +135,12 @@ def test_snapshot_digest_is_deterministic_and_covers_complete_payload(snapshot_s
     assert first.payload.actor.id == "agent-1"
     assert first.payload.messages[0].content == "水位是多少？"
     assert first.payload.skills[0].name == "forecast"
+    assert first.payload.schema_version == "2"
+    assert first.payload.tools[0].tool_id == "mcp.water.level"
+    assert first.payload.tools[0].version == "3"
+    assert first.payload.tools[0].input_schema["properties"]["station"] == {
+        "type": "string"
+    }
 
 
 def test_snapshot_contains_no_provider_or_mcp_secrets(snapshot_service):

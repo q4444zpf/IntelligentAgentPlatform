@@ -11,27 +11,38 @@ from app.core.config import RunnerTokenSettings
 from app.core.database import get_session
 
 from .run_tokens import (
+    RunnerAction,
     RunTokenClaims,
     RunTokenForbidden,
     RunTokenInvalid,
     RunTokenNotFound,
     RunTokenService,
-    RunnerAction,
 )
 
 
 class RunnerGatewayError(Exception):
-    def __init__(self, status_code: int, code: str, message: str) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        details: dict[str, str] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
+        self.details = details or {}
 
 
 async def runner_gateway_error_handler(_request, error: RunnerGatewayError):
     return JSONResponse(
         status_code=error.status_code,
-        content={"code": error.code, "message": error.message},
+        content={
+            **error.details,
+            "code": error.code,
+            "message": error.message,
+        },
     )
 
 

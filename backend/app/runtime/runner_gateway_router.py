@@ -7,6 +7,10 @@ from sqlalchemy.orm import Session
 from app.audit.recorder import AuditRecorder
 from app.conversations.repository import ConversationRepository
 from app.core.database import get_session
+from app.mcp.protocol import McpProtocolClient
+from app.mcp.store import McpStore
+from app.tools.gateway import ToolGateway
+from app.tools.store import ToolStore
 
 from .checkpoint_store import CheckpointStore
 from .execution_snapshot import ExecutionSnapshotService
@@ -21,6 +25,8 @@ from .runner_gateway_schemas import (
     ModelInvocationRequest,
     ModelInvocationResponse,
     SnapshotResponse,
+    ToolInvocationRequest,
+    ToolInvocationResponse,
 )
 from .runner_gateway_service import RunnerGatewayService
 
@@ -51,6 +57,20 @@ def default_audit_recorder() -> AuditRecorder:
     return AuditRecorder()
 
 
+def default_tool_gateway(
+    repository: Annotated[
+        ConversationRepository,
+        Depends(default_conversation_repository),
+    ],
+) -> ToolGateway:
+    return ToolGateway(
+        tool_store=ToolStore(),
+        repository=repository,
+        mcp_store=McpStore(),
+        mcp_protocol_client=McpProtocolClient(),
+    )
+
+
 def create_router(
     *,
     token_service_dependency: Callable[..., RunTokenService] = default_token_service,
@@ -59,6 +79,7 @@ def create_router(
     conversation_repository_dependency: Callable[..., ConversationRepository] = default_conversation_repository,
     model_gateway_dependency: Callable[..., ModelGateway] = default_model_gateway,
     audit_recorder_dependency: Callable[..., AuditRecorder] = default_audit_recorder,
+    tool_gateway_dependency: Callable[..., ToolGateway] = default_tool_gateway,
     event_payload_max_bytes: int | None = None,
 ) -> APIRouter:
     router = APIRouter()
@@ -76,6 +97,9 @@ def create_router(
     )
     model_invoke_claims = require_runner_action(
         "model.invoke", token_service_dependency
+    )
+    tool_invoke_claims = require_runner_action(
+        "tool.invoke", token_service_dependency
     )
 
     @router.get(
@@ -227,6 +251,41 @@ def create_router(
             model_gateway=model_gateway,
             audit_recorder=audit_recorder,
         ).invoke_model(run_id, request, claims, idempotency_key)
+
+    @router.post(
+        "/runs/{run_id}/tool-invocations",
+        response_model=ToolInvocationResponse,
+    )
+    def invoke_tool(
+        run_id: str,
+        request: ToolInvocationRequest,
+        idempotency_key: Annotated[
+            str,
+            Header(
+                alias="Idempotency-Key",
+                min_length=1,
+                max_length=200,
+            ),
+        ],
+        claims: Annotated[RunTokenClaims, Depends(tool_invoke_claims)],
+        snapshot_service: Annotated[
+            ExecutionSnapshotService,
+            Depends(snapshot_service_dependency),
+        ],
+        repository: Annotated[
+            ConversationRepository,
+            Depends(conversation_repository_dependency),
+        ],
+        tool_gateway: Annotated[
+            ToolGateway,
+            Depends(tool_gateway_dependency),
+        ],
+    ) -> ToolInvocationResponse:
+        return RunnerGatewayService(
+            snapshot_service,
+            conversation_repository=repository,
+            tool_gateway=tool_gateway,
+        ).invoke_tool(run_id, request, claims, idempotency_key)
 
     return router
 

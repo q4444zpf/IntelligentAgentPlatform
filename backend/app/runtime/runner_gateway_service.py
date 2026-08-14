@@ -8,10 +8,17 @@ from time import perf_counter
 
 from sqlalchemy import func, select
 
+from app.approvals.models import Approval
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.conversations.models import AgentRun, RunEvent
 from app.conversations.repository import ConversationRepository
-from app.tools.schemas import ToolDefinition
+from app.tools.gateway import ToolGateway
+from app.tools.schemas import (
+    ToolCall,
+    ToolDefinition,
+    ToolExecutionContext,
+    ToolRuntimeError,
+)
 
 from .checkpoint_store import CheckpointStore, RunnerRequestStore
 from .execution_snapshot import (
@@ -32,6 +39,8 @@ from .runner_gateway_schemas import (
     ModelInvocationResponse,
     ModelToolCall,
     SnapshotResponse,
+    ToolInvocationRequest,
+    ToolInvocationResponse,
 )
 
 
@@ -66,6 +75,7 @@ class RunnerGatewayService:
         conversation_repository: ConversationRepository | None = None,
         model_gateway: ModelGateway | None = None,
         audit_recorder: AuditRecorder | None = None,
+        tool_gateway: ToolGateway | None = None,
         *,
         event_payload_max_bytes: int | None = None,
     ) -> None:
@@ -74,6 +84,7 @@ class RunnerGatewayService:
         self.conversation_repository = conversation_repository
         self.model_gateway = model_gateway
         self.audit_recorder = audit_recorder or AuditRecorder()
+        self.tool_gateway = tool_gateway
         self.event_payload_max_bytes = (
             _event_payload_limit()
             if event_payload_max_bytes is None
@@ -426,6 +437,119 @@ class RunnerGatewayService:
             ),
         )
 
+    def invoke_tool(
+        self,
+        run_id: str,
+        request: ToolInvocationRequest,
+        claims: RunTokenClaims,
+        idempotency_key: str,
+    ) -> ToolInvocationResponse:
+        repository = self._require_conversation_repository()
+        tool_gateway = self._require_tool_gateway()
+        snapshot = self._verified_snapshot(run_id, claims)
+        snapshot_tools = {
+            tool.tool_id: tool
+            for tool in snapshot.payload.tools
+            if tool.published and tool.enabled and tool.source_available
+        }
+        snapshotted = snapshot_tools.get(request.tool_id)
+        if snapshotted is None or request.version != snapshotted.version:
+            raise RunnerGatewayError(
+                403, "tool_not_authorized", "该工具当前不可用"
+            )
+        current = tool_gateway.tool_store.get_executable(request.tool_id)
+        if current is None or current.get("version") != snapshotted.version:
+            raise RunnerGatewayError(
+                403, "tool_not_authorized", "该工具当前不可用"
+            )
+
+        self._lock_run(repository, run_id)
+        requests = RunnerRequestStore(repository.session)
+        action = "tool.invoke"
+        request_digest = _canonical_digest(
+            {
+                "snapshot_digest": claims.snapshot_digest,
+                "request": request.model_dump(mode="json"),
+            }
+        )
+        replay = self._replay_or_conflict(
+            requests, run_id, action, idempotency_key, request_digest
+        )
+        if replay is not None:
+            return ToolInvocationResponse.model_validate(replay)
+
+        context_data = repository.get_run_execution_context(run_id)
+        if context_data is None:
+            raise RunnerGatewayError(404, "run_not_found", "Run 不存在")
+        context = ToolExecutionContext(
+            unit_id=str(context_data["unit_id"]),
+            run_id=run_id,
+            conversation_id=str(context_data["conversation_id"]),
+            project_id=str(context_data["project_id"]),
+            user_id=str(context_data["user_id"]),
+            actor_roles=tuple(context_data["actor_roles"]),
+        )
+        call = ToolCall(
+            id=request.tool_call_id,
+            name=request.tool_id,
+            arguments=request.arguments,
+        )
+        try:
+            result = tool_gateway.execute(call, context, set(snapshot_tools))
+        except ToolRuntimeError as error:
+            if error.code == "approval_required":
+                approval_id = getattr(error, "approval_id", None)
+                if approval_id is None:
+                    invocation = repository.get_tool_invocation(
+                        run_id, request.tool_call_id
+                    )
+                    if invocation is not None:
+                        approval_id = repository.session.scalar(
+                            select(Approval.id).where(
+                                Approval.invocation_id == invocation.id
+                            )
+                        )
+                if approval_id is None:
+                    raise RunnerGatewayError(
+                        500,
+                        "tool_execution_failed",
+                        "工具执行失败",
+                    ) from error
+                raise RunnerGatewayError(
+                    409,
+                    "tool_approval_required",
+                    "该工具需要人工审批后才能执行",
+                    {"approval_id": str(approval_id)},
+                ) from error
+            status_code, code, message = self._map_tool_error(error)
+            raise RunnerGatewayError(status_code, code, message) from error
+
+        response = ToolInvocationResponse(
+            invocation_id=result.invocation_id,
+            value=result.value,
+        )
+        requests.add(
+            run_id=run_id,
+            action=action,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+            response_json=response.model_dump(mode="json"),
+        )
+        repository.session.commit()
+        return response
+
+    @staticmethod
+    def _map_tool_error(error: ToolRuntimeError) -> tuple[int, str, str]:
+        if error.code == "tool_not_authorized":
+            return 403, "tool_not_authorized", "该工具当前不可用"
+        if error.code == "tool_invalid_arguments":
+            return 400, "tool_invalid_arguments", "工具参数无效"
+        if error.code == "tool_duplicate_call":
+            return 409, "tool_duplicate_call", "工具调用标识重复"
+        if error.code == "audit_persistence_failed":
+            return 500, "audit_persistence_failed", "工具审计记录失败"
+        return 502, "tool_execution_failed", "工具执行失败"
+
     def _require_checkpoint_store(self) -> CheckpointStore:
         if self.checkpoint_store is None:
             raise RuntimeError("checkpoint store is required")
@@ -440,6 +564,11 @@ class RunnerGatewayService:
         if self.model_gateway is None:
             raise RuntimeError("model gateway is required")
         return self.model_gateway
+
+    def _require_tool_gateway(self) -> ToolGateway:
+        if self.tool_gateway is None:
+            raise RuntimeError("tool gateway is required")
+        return self.tool_gateway
 
     @staticmethod
     def _lock_run(repository: ConversationRepository, run_id: str) -> AgentRun:

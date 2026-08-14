@@ -153,3 +153,23 @@ def test_model_endpoint_requires_model_invoke_action():
 
     assert response.status_code == 403
     assert response.json()["code"] == "runner_action_forbidden"
+
+
+def test_tool_endpoint_requires_tool_invoke_action():
+    response = make_client().post(
+        "/internal/runner/runs/run-1/tool-invocations",
+        headers={
+            **bearer("model-only"),
+            "Idempotency-Key": "tool-1",
+        },
+        json={
+            "tool_call_id": "call-1",
+            "tool_id": "water.query_level",
+            "version": "1",
+            "arguments": {},
+            "invocation_sequence": 0,
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "runner_action_forbidden"

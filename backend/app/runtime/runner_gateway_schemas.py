@@ -89,3 +89,20 @@ class ModelInvocationResponse(BaseModel):
     completion_tokens: int | None = None
     total_tokens: int | None = None
     tool_calls: list[ModelToolCall] = Field(default_factory=list)
+
+
+class ToolInvocationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tool_call_id: str = Field(min_length=1, max_length=128)
+    tool_id: str = Field(min_length=1, max_length=128)
+    version: str = Field(min_length=1, max_length=32)
+    arguments: dict[str, Any]
+    invocation_sequence: int = Field(ge=0)
+
+
+class ToolInvocationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    invocation_id: str
+    value: dict[str, Any]
