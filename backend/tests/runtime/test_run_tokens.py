@@ -127,6 +127,22 @@ def test_expired_tokens_are_rejected(session, snapshot):
         service.verify(issued.value, snapshot.run_id, "snapshot.read")
 
 
+def test_token_with_another_audience_is_rejected(session, token_service, snapshot):
+    issued = token_service.issue(
+        snapshot, {"snapshot.read"}, NOW + timedelta(minutes=5)
+    )
+    other_audience = RunTokenService(
+        session,
+        signing_key=SIGNING_KEY,
+        issuer="iap-api",
+        audience="another-service",
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(RunTokenInvalid, match="audience"):
+        other_audience.verify(issued.value, snapshot.run_id, "snapshot.read")
+
+
 def test_token_errors_never_include_raw_token(token_service, snapshot):
     raw = token_service.issue(
         snapshot, {"snapshot.read"}, NOW + timedelta(minutes=5)
