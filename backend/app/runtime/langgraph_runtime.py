@@ -43,6 +43,25 @@ class LangGraphRuntimeAdapter:
         self.graph = graph
         self.checkpoint_store = checkpoint_store
 
+    @staticmethod
+    def _message_dict(message: Any) -> dict[str, Any] | None:
+        if isinstance(message, dict):
+            return dict(message)
+        role = {
+            "ai": "assistant",
+            "human": "user",
+            "system": "system",
+            "tool": "tool",
+        }.get(str(getattr(message, "type", "")))
+        if role is None:
+            return None
+        normalized = {"role": role, "content": getattr(message, "content", "")}
+        for field_name in ("name", "tool_call_id", "tool_calls"):
+            value = getattr(message, field_name, None)
+            if value is not None and value != [] and value != "":
+                normalized[field_name] = value
+        return normalized
+
     def invoke(self, state: RuntimeState, *, metadata: dict[str, Any] | None = None) -> RuntimeResult:
         initial_state = state.as_dict()
         if self.checkpoint_store is not None:
@@ -57,19 +76,24 @@ class LangGraphRuntimeAdapter:
         messages = output.get("messages") if isinstance(output, dict) else None
         if not isinstance(messages, list):
             raise RuntimeError("Graph did not produce an assistant result")
+        normalized_messages = [
+            normalized
+            for message in messages
+            if (normalized := self._message_dict(message)) is not None
+        ]
         assistant_messages = [
-            message for message in messages
-            if isinstance(message, dict)
-            and message.get("role") == "assistant"
+            message for message in normalized_messages
+            if message.get("role") == "assistant"
             and isinstance(message.get("content"), str)
             and message["content"].strip()
         ]
         if not assistant_messages:
             raise RuntimeError("Graph did not produce an assistant result")
+        normalized_output = {**output, "messages": normalized_messages}
         if self.checkpoint_store is not None:
-            self.checkpoint_store.save(state.run_id, "langgraph", output)
+            self.checkpoint_store.save(state.run_id, "langgraph", normalized_output)
         return RuntimeResult(
             status=str(output.get("status", "completed")),
             content=assistant_messages[-1]["content"],
-            state=output,
+            state=normalized_output,
         )

@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from .container_policy import RUNNER_ENVIRONMENT_KEYS, RUNNER_GATEWAY_NETWORK
+from .container_policy import (
+    RUNNER_BASE_ENVIRONMENT_KEYS,
+    RUNNER_ENVIRONMENT_KEYS,
+    RUNNER_GATEWAY_NETWORK,
+)
 from .sandbox_readiness import SandboxReadiness
 
 
@@ -19,16 +23,16 @@ class SandboxInspector:
         }
 
     @staticmethod
-    def _mounts(info: dict[str, Any], host: dict[str, Any]) -> list[tuple[str, str]]:
-        mounts = [
+    def _mounts(info: dict[str, Any], host: dict[str, Any]) -> set[tuple[str, str]]:
+        mounts = {
             (str(item.get("Source", "")), str(item.get("Destination", "")))
             for item in (info.get("Mounts") or [])
             if isinstance(item, dict)
-        ]
+        }
         for bind in host.get("Binds") or []:
             source, separator, remainder = str(bind).partition(":")
             destination = remainder.partition(":")[0] if separator else ""
-            mounts.append((source, destination))
+            mounts.add((source, destination))
         return mounts
 
     def inspect(self, info: dict[str, Any]) -> SandboxReadiness:
@@ -51,9 +55,10 @@ class SandboxInspector:
         )
         mounts_allowlisted = (
             len(mounts) == 1
-            and mounts[0][0].startswith("/workspace/")
-            and mounts[0][1] == "/workspace"
+            and next(iter(mounts))[0].startswith("/workspace/")
+            and next(iter(mounts))[1] == "/workspace"
         )
+        environment_names = self._environment_names(config)
         return SandboxReadiness(
             image_trusted=image.startswith("iap/"),
             non_root=user not in {"", "0", "root"},
@@ -68,7 +73,9 @@ class SandboxInspector:
             capabilities_dropped="ALL" in cap_drop,
             docker_socket_absent=docker_socket_absent,
             environment_allowlisted=(
-                self._environment_names(config) == RUNNER_ENVIRONMENT_KEYS
+                RUNNER_ENVIRONMENT_KEYS <= environment_names
+                and environment_names
+                <= RUNNER_ENVIRONMENT_KEYS | RUNNER_BASE_ENVIRONMENT_KEYS
             ),
             mounts_allowlisted=mounts_allowlisted,
         )

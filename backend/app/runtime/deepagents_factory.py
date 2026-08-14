@@ -65,7 +65,7 @@ class DeepAgentFactory:
             "model": model,
             "system_prompt": prompt,
             "tools": resolved_tools,
-            "metadata": {"agent_id": snapshot.agent_id},
+            "name": snapshot.agent_id,
         }
         if backend is not None:
             arguments["backend"] = backend

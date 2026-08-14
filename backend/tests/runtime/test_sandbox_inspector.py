@@ -70,6 +70,72 @@ def test_inspector_reads_real_docker_attrs_layout():
     assert readiness.is_ready() is True
 
 
+def test_inspector_allows_trusted_runner_image_base_environment():
+    readiness = SandboxInspector().inspect({
+        "Config": {
+            "Image": "iap/workflow-runner:v1",
+            "User": "nobody",
+            "Labels": {"iap.cleanup_guaranteed": "true"},
+            "Env": [
+                "PATH=/usr/local/bin:/usr/bin:/bin",
+                "LANG=C.UTF-8",
+                "GPG_KEY=python-release-key",
+                "PYTHON_VERSION=3.12.13",
+                "PYTHON_SHA256=python-release-digest",
+                "PYTHONDONTWRITEBYTECODE=1",
+                "PYTHONUNBUFFERED=1",
+                "IAP_RUN_EXECUTION_REQUEST={}",
+                "IAP_RUNNER_GATEWAY_URL=http://api:8000/internal/runner",
+            ],
+        },
+        "HostConfig": {
+            "ReadonlyRootfs": True,
+            "NetworkMode": "intelligent-agent-platform_runner-gateway",
+            "Privileged": False,
+            "CapDrop": ["ALL"],
+            "Memory": 1,
+            "PidsLimit": 1,
+            "NanoCpus": 1,
+        },
+        "NetworkSettings": {
+            "Networks": {"intelligent-agent-platform_runner-gateway": {}},
+        },
+        "Mounts": [{"Source": "/workspace/run-1", "Destination": "/workspace"}],
+    })
+
+    assert readiness.is_ready() is True
+
+
+def test_inspector_deduplicates_same_workspace_mount_from_docker_attrs():
+    readiness = SandboxInspector().inspect({
+        "Config": {
+            "Image": "iap/workflow-runner:v1",
+            "User": "nobody",
+            "Labels": {"iap.cleanup_guaranteed": "true"},
+            "Env": [
+                "IAP_RUN_EXECUTION_REQUEST={}",
+                "IAP_RUNNER_GATEWAY_URL=http://api:8000/internal/runner",
+            ],
+        },
+        "HostConfig": {
+            "ReadonlyRootfs": True,
+            "NetworkMode": "intelligent-agent-platform_runner-gateway",
+            "Privileged": False,
+            "CapDrop": ["ALL"],
+            "Memory": 1,
+            "PidsLimit": 1,
+            "NanoCpus": 1,
+            "Binds": ["/workspace/run-1:/workspace:rw"],
+        },
+        "NetworkSettings": {
+            "Networks": {"intelligent-agent-platform_runner-gateway": {}},
+        },
+        "Mounts": [{"Source": "/workspace/run-1", "Destination": "/workspace"}],
+    })
+
+    assert readiness.is_ready() is True
+
+
 def test_inspector_rejects_extra_network_secret_environment_and_docker_socket():
     readiness = SandboxInspector().inspect({
         "Config": {

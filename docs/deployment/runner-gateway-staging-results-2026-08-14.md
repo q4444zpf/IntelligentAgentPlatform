@@ -2,20 +2,21 @@
 
 ## Decision
 
-**Automated acceptance: PASS. Production enablement: NOT APPROVED.**
+**Local staging success path: PASS. Production enablement: NOT APPROVED.**
 
-The complete backend suite and all three deployment images passed locally. A
-deployment-owned staging signing key and Launcher token were not injected in
-this workspace, so live staging fault injection and deployment-owner approval
-remain pending. `IAP_WORKFLOW_RUNNER_SANDBOX_ENABLED` remains `false` by
-default.
+The complete backend suite and all three deployment images passed locally.
+Ephemeral signing and Launcher secrets were injected into container process
+environments without writing them to a file or Git. A live sandbox Run
+completed and wrote an Artifact to MinIO. Destructive fault injection and
+deployment-owner approval remain pending. The repository default for
+`IAP_WORKFLOW_RUNNER_SANDBOX_ENABLED` remains `false`.
 
 ## Automated evidence
 
 - Full backend suite:
-  `python -m pytest tests -q --import-mode=importlib -p no:cacheprovider`
-  from a clean committed worktree under `backend/` -> **820 passed, 38 skipped**
-  in 576.17 seconds.
+  `python -m pytest --import-mode=importlib -q`
+  from a clean worktree under `backend/` -> **825 passed, 38 skipped**
+  in 372.51 seconds.
 - Task 12 Runner Gateway integration suite -> **17 passed**.
 - Runtime-limit and snapshot compatibility suite -> **29 passed**.
 - `docker compose --profile sandbox config --quiet` -> exit code 0.
@@ -24,6 +25,21 @@ default.
 
 The 38 skipped tests require external services such as a configured PostgreSQL
 test database. They are not counted as live staging evidence.
+
+## Live local staging evidence
+
+- PostgreSQL, MinIO, API and Workflow Runner reported healthy; authenticated
+  Launcher health returned `200` and unauthenticated health returned `401`.
+- Workflow Runner health returned `sandbox=true` with an empty `missing` list.
+- The internal Runner network reported `Internal=true`; Workflow Runner had no
+  Docker Socket mount and only Launcher mounted `/var/run/docker.sock`.
+- Run `8aa87e3f-12f5-4d12-9ff4-46f62c946455` completed through the isolated
+  Launcher and emitted `runner.started`, `artifact.ready`, `runner.completed`,
+  `runner.completion`, and `sandbox.cleanup` events.
+- Artifact `acceptance.txt` was stored as `text/plain`, read back from MinIO,
+  and matched `sandbox acceptance passed`.
+- The Run token was revoked after completion, cleanup recorded `cleaned`, and
+  Docker reported no residual `iap-run-*` containers.
 
 ## Image identities
 
@@ -77,7 +93,8 @@ object-storage credentials are not placed in the Run container contract. Task
 | Cancellation, deadline, OOM and Launcher outage final states | PASS (automated) | Task 12 and lifecycle tests |
 | Runtime iteration, tool, subagent and output limits | PASS | Runtime-limit tests and schema v3 snapshot |
 | Live staging OOM and Launcher outage fault injection | PENDING | Deployment credentials not available |
-| Live Run container non-root/read-only/capability inspection | PENDING | No staging Run container launched |
+| Live success Run, MinIO Artifact and cleanup | PASS | Run `8aa87e3f-12f5-4d12-9ff4-46f62c946455` |
+| Live Run policy acceptance | PASS | Launcher accepted the Run only after actual Docker metadata passed image, user, rootfs, capability, environment, mount, resource and network inspection |
 
 ## Runtime limits
 

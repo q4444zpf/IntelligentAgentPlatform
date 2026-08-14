@@ -9,9 +9,7 @@ from app.conversations.models import AgentRun, Conversation, Message, RunEvent
 from app.conversations.repository import ConversationRepository
 from app.db.base import Base
 from app.runtime.artifact_backend import (
-    ArtifactAlreadyExistsError,
     ArtifactBackend,
-    ArtifactPathError,
 )
 from app.runtime.execution_snapshot import (
     ExecutionSnapshotPayload,
@@ -66,30 +64,39 @@ class FakeArtifactClient:
 def test_artifact_backend_rejects_unsafe_paths(path):
     backend = ArtifactBackend(FakeArtifactClient())
 
-    with pytest.raises(ArtifactPathError):
-        backend.write(path, b"data", "text/plain")
+    result = backend.write(path, "data")
+
+    assert result.error == "Artifact path is invalid"
 
 
 def test_artifact_backend_writes_reads_and_lists_virtual_files():
     client = FakeArtifactClient()
     backend = ArtifactBackend(client)
 
-    created = backend.write(
-        "/artifacts/reports/result.txt", b"result", "text/plain"
-    )
+    created = backend.write("/artifacts/reports/result.txt", "result")
 
     assert created.path == "/artifacts/reports/result.txt"
-    assert created.sha256 == hashlib.sha256(b"result").hexdigest()
-    assert backend.read(created.path) == b"result"
-    assert backend.list("/artifacts/reports") == [created]
+    assert created.error is None
+    read = backend.read(created.path)
+    assert read.error is None
+    assert read.file_data["content"] == "result"
+    assert client.files[created.path]["content_type"] == "text/plain"
+    listed = backend.ls("/artifacts/reports")
+    assert [entry["path"] for entry in listed.entries] == [created.path]
+    assert [item.path for item in backend.list("/artifacts/reports")] == [created.path]
 
 
 def test_artifact_backend_is_create_only():
     backend = ArtifactBackend(FakeArtifactClient())
-    backend.write("/artifacts/result.txt", b"first", "text/plain")
+    backend.write("/artifacts/result.txt", "first")
 
-    with pytest.raises(ArtifactAlreadyExistsError):
-        backend.write("/artifacts/result.txt", b"second", "text/plain")
+    duplicate = backend.write("/artifacts/result.txt", "second")
+    edited = backend.edit("/artifacts/result.txt", "first", "second")
+    deleted = backend.delete("/artifacts/result.txt")
+
+    assert duplicate.error == "Artifact already exists"
+    assert edited.error == "Artifacts are immutable"
+    assert deleted.error == "Artifact deletion requires platform authorization"
 
 
 class GatewayStorage:
