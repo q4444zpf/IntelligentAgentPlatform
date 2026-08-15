@@ -20,6 +20,7 @@ from app.tools.gateway import ToolGateway
 from app.tools.schemas import ToolCall, ToolDefinition, ToolExecutionResult, ToolRuntimeError
 from app.tools.service import ToolService
 from app.tools.store import ToolStore
+from app.artifacts.models import ArtifactRecord
 
 
 class FakeAgentService:
@@ -139,6 +140,111 @@ def test_completes_run_and_persists_assistant_message():
         "completion_tokens": 7,
         "total_tokens": 18,
     }
+    session.close()
+
+
+def test_completed_run_persists_result_artifact_when_storage_is_configured():
+    class FakeStorage:
+        def __init__(self):
+            self.objects = {}
+
+        def put_bytes(self, object_key, data, content_type):
+            self.objects[object_key] = (data, content_type)
+
+        def presigned_get_url(self, object_key, expires_seconds=900):
+            return object_key
+
+    session, run_id = build_queued_run()
+    storage = FakeStorage()
+    PlatformAgentHarness(
+        ConversationRepository(session), SuccessfulGateway(), FakeAgentService(),
+        artifact_storage=storage,
+    ).execute(run_id)
+
+    artifact = session.query(ArtifactRecord).filter_by(run_id=run_id).one()
+    assert artifact.filename == "run-result.txt"
+    assert artifact.content_type == "text/plain; charset=utf-8"
+    assert storage.objects[artifact.object_key][0] == "研判完成".encode("utf-8")
+    session.close()
+
+
+def test_artifact_storage_outage_does_not_lose_completed_model_result():
+    class FailingStorage:
+        def put_bytes(self, object_key, data, content_type):
+            raise RuntimeError("minio password=/internal/path")
+
+        def delete_object(self, object_key):
+            raise AssertionError("no completed upload should be deleted")
+
+    session, run_id = build_queued_run()
+    repository = ConversationRepository(session)
+
+    PlatformAgentHarness(
+        repository,
+        SuccessfulGateway(),
+        FakeAgentService(),
+        artifact_storage=FailingStorage(),
+    ).execute(run_id)
+
+    assert repository.get_run_by_id(run_id).status == "completed"
+    assert repository.list_messages(
+        "unit-1", "p1", "u1", repository.get_run_by_id(run_id).conversation_id
+    )[-1].content == "研判完成"
+    failure = next(
+        event
+        for event in repository.list_events(run_id, 0)
+        if event.event_type == "artifact.persistence_failed"
+    )
+    assert failure.payload == {
+        "code": "artifact_persistence_failed",
+        "message": "成果文件保存失败",
+    }
+    session.close()
+
+
+def test_artifact_upload_is_deleted_when_database_commit_fails():
+    from sqlalchemy import event
+
+    class FakeStorage:
+        def __init__(self):
+            self.objects = {}
+            self.deleted = []
+
+        def put_bytes(self, object_key, data, content_type):
+            self.objects[object_key] = data
+
+        def delete_object(self, object_key):
+            self.deleted.append(object_key)
+            self.objects.pop(object_key, None)
+
+    session, run_id = build_queued_run()
+    repository = ConversationRepository(session)
+    storage = FakeStorage()
+    failed = False
+
+    def fail_artifact_commit(current_session):
+        nonlocal failed
+        if not failed and any(isinstance(row, ArtifactRecord) for row in current_session.new):
+            failed = True
+            raise RuntimeError("database unavailable")
+
+    event.listen(session, "before_commit", fail_artifact_commit)
+    PlatformAgentHarness(
+        repository,
+        SuccessfulGateway(),
+        FakeAgentService(),
+        artifact_storage=storage,
+    ).execute(run_id)
+    event.remove(session, "before_commit", fail_artifact_commit)
+
+    assert repository.get_run_by_id(run_id).status == "completed"
+    assert storage.objects == {}
+    assert len(storage.deleted) == 1
+    assert session.query(ArtifactRecord).filter_by(run_id=run_id).count() == 0
+    assert any(
+        event_row.event_type == "artifact.persistence_failed"
+        for event_row in repository.list_events(run_id, 0)
+    )
     session.close()
 
 
@@ -604,6 +710,42 @@ def test_approval_required_pauses_run_without_recording_failure():
     assert repo.get_run_by_id(run_id).status == "waiting_approval"
     assert repo.list_events(run_id, 0)[-1].payload == {"status": "waiting_approval"}
     assert not any(event.event_type == "run.error" for event in repo.list_events(run_id, 0))
+
+
+def test_approval_required_persists_checkpoint_state():
+    class Checkpoints:
+        def __init__(self): self.saved = []
+        def save(self, run_id, checkpoint_key, state, *, commit=True):
+            self.saved.append((run_id, checkpoint_key, state))
+
+    session, run_id = build_queued_run()
+    repo = ConversationRepository(session)
+    model = ScriptedToolModel([ModelResult(None, tool_calls=(ToolCall("c1", "system.one", {}),))])
+    checkpoint = Checkpoints()
+    error = ToolRuntimeError("approval_required", "该工具需要人工审批后才能执行。")
+    PlatformAgentHarness(repo, model, FakeAgentService(tool_ids=["system.one"]), tool_service=FakeToolService(), tool_gateway=RecordingToolGateway(error), checkpoint_store=checkpoint).execute(run_id)
+
+    assert checkpoint.saved[0][0:2] == (run_id, "approval")
+    assert checkpoint.saved[0][2]["status"] == "waiting_approval"
+    assert checkpoint.saved[0][2]["messages"][-1]["role"] == "assistant"
+
+
+def test_completed_run_persists_terminal_checkpoint_state():
+    class Checkpoints:
+        def __init__(self): self.saved = []
+        def save(self, run_id, checkpoint_key, state, *, commit=True):
+            self.saved.append((run_id, checkpoint_key, state))
+
+    session, run_id = build_queued_run()
+    checkpoint = Checkpoints()
+    PlatformAgentHarness(
+        ConversationRepository(session), SuccessfulGateway(), FakeAgentService(),
+        checkpoint_store=checkpoint,
+    ).execute(run_id)
+
+    assert checkpoint.saved[-1][0:2] == (run_id, "runtime")
+    assert checkpoint.saved[-1][2]["status"] == "completed"
+    assert checkpoint.saved[-1][2]["messages"][-1] == {"role": "assistant", "content": "研判完成"}
 
 
 def build_integrated_runtime(tmp_path, *, enabled=True, bound=True):

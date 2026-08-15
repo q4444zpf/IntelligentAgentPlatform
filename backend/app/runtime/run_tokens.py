@@ -11,6 +11,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, hmac
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import DateTime, Integer, String, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from app.core.config import RunnerTokenSettings
@@ -66,9 +67,9 @@ class RunTokenClaims(BaseModel):
     snapshot_id: str
     snapshot_digest: str
     actions: tuple[str, ...]
-    iat: int
-    nbf: int
-    exp: int
+    iat: float
+    nbf: float
+    exp: float
 
 
 @dataclass(frozen=True)
@@ -163,9 +164,9 @@ class RunTokenService:
             snapshot_id=snapshot.snapshot_id,
             snapshot_digest=snapshot.digest,
             actions=normalized_actions,
-            iat=int(now.timestamp()),
-            nbf=int(now.timestamp()),
-            exp=int(expires_at.timestamp()),
+            iat=now.timestamp(),
+            nbf=now.timestamp(),
+            exp=expires_at.timestamp(),
         )
         header = _encode_segment({"alg": "HS256", "typ": "JWT"})
         payload = _encode_segment(claims.model_dump())
@@ -196,7 +197,7 @@ class RunTokenService:
         except (InvalidSignature, ValueError, TypeError, json.JSONDecodeError) as error:
             raise RunTokenInvalid("Runner token is invalid") from error
 
-        now = int(self.clock().astimezone(UTC).timestamp())
+        now = self.clock().astimezone(UTC).timestamp()
         if claims.iss != self.issuer or claims.aud != self.audience:
             raise RunTokenInvalid("Runner token issuer or audience is invalid")
         if now < claims.nbf:
@@ -207,35 +208,62 @@ class RunTokenService:
             raise RunTokenNotFound(run_id)
         if required_action not in claims.actions:
             raise RunTokenForbidden("Runner token action is forbidden")
-        revoked = self.session.scalar(
-            select(RuntimeRunTokenRevocation.id).where(
+        revocations = self.session.scalars(
+            select(RuntimeRunTokenRevocation).where(
                 or_(
                     RuntimeRunTokenRevocation.jti == claims.jti,
                     RuntimeRunTokenRevocation.run_id == claims.run_id,
                 )
             )
-        )
-        if revoked is not None:
-            raise RunTokenInvalid("Runner token is revoked")
+        ).all()
+        for revocation in revocations:
+            revoked_at_value = revocation.revoked_at
+            if revoked_at_value.tzinfo is None:
+                revoked_at_value = revoked_at_value.replace(tzinfo=UTC)
+            revoked_at = revoked_at_value.astimezone(UTC).timestamp()
+            if revocation.jti == claims.jti or claims.iat <= revoked_at:
+                raise RunTokenInvalid("Runner token is revoked")
         return claims
 
     def revoke(self, run_id: str, reason: str) -> None:
         existing = self.session.scalar(
             select(RuntimeRunTokenRevocation).where(
                 RuntimeRunTokenRevocation.run_id == run_id
-            )
+            ).with_for_update()
         )
+        revoked_at = self.clock().astimezone(UTC)
         if existing is not None:
-            return
-        self.session.add(
-            RuntimeRunTokenRevocation(
-                jti=f"run:{run_id}",
-                run_id=run_id,
-                revoked_at=self.clock().astimezone(UTC),
-                reason=reason[:120],
+            current = existing.revoked_at
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=UTC)
+            existing.revoked_at = max(current.astimezone(UTC), revoked_at)
+            existing.reason = reason[:120]
+        else:
+            self.session.add(
+                RuntimeRunTokenRevocation(
+                    jti=f"run:{run_id}",
+                    run_id=run_id,
+                    revoked_at=revoked_at,
+                    reason=reason[:120],
+                )
             )
-        )
-        self.session.commit()
+        try:
+            self.session.commit()
+        except IntegrityError:
+            self.session.rollback()
+            existing = self.session.scalar(
+                select(RuntimeRunTokenRevocation)
+                .where(RuntimeRunTokenRevocation.run_id == run_id)
+                .with_for_update()
+            )
+            if existing is None:
+                raise
+            current = existing.revoked_at
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=UTC)
+            existing.revoked_at = max(current.astimezone(UTC), revoked_at)
+            existing.reason = reason[:120]
+            self.session.commit()
 
 
 __all__ = [

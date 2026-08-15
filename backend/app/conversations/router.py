@@ -11,7 +11,7 @@ from app.agents.service import AgentService
 from app.core.database import get_session
 from app.core.request_context import RequestContext, require_request_context
 
-from .dispatcher import ThreadRunDispatcher
+from .dispatcher import build_default_run_dispatcher
 from .repository import ConversationRepository
 from .schemas import (
     AgentRunInfo,
@@ -33,7 +33,7 @@ from .service import (
 
 ServiceFactory = Callable[[Session], ConversationService]
 
-default_run_dispatcher = ThreadRunDispatcher()
+default_run_dispatcher = build_default_run_dispatcher()
 
 
 def default_service_factory(session: Session) -> ConversationService:
@@ -139,7 +139,7 @@ def create_router(
     def list_runs(
         page: Annotated[int, Query(ge=1)] = 1,
         page_size: Annotated[int, Query(ge=1, le=100)] = 20,
-        status: Literal["queued", "running", "waiting_approval", "completed", "failed"] | None = None,
+        status: Literal["queued", "running", "waiting_approval", "completed", "failed", "cancelled"] | None = None,
         actor_id: Annotated[
             str | None,
             Query(
@@ -172,6 +172,14 @@ def create_router(
         manager: ConversationService = Depends(service),
     ):
         return not_found(lambda: manager.get_run(context, run_id))
+
+    @router.post("/agent-runs/{run_id}/cancel", response_model=AgentRunInfo)
+    def cancel_run(
+        run_id: str,
+        context: RequestContext = Depends(require_request_context),
+        manager: ConversationService = Depends(service),
+    ):
+        return not_found(lambda: manager.cancel_run(context, run_id))
 
     @router.get(
         "/agent-runs/{run_id}/tool-invocations",

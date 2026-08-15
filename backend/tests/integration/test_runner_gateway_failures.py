@@ -187,6 +187,16 @@ def test_approval_interruption_can_resume_authorized_execution(runner_gateway_en
     assert result.value["run_id"] == "run-1"
     assert env.repository.list_tool_invocations("run-1")[0].status == "completed"
 
+    resumed = env.client.post(
+        "/internal/runner/runs/run-1/tool-invocations",
+        headers=env.headers(token, "tool:approval:resumed"),
+        json=_tool_request("system.get_runtime_context"),
+    )
+
+    assert resumed.status_code == 200
+    assert resumed.json()["value"]["run_id"] == "run-1"
+    assert len(env.repository.list_tool_invocations("run-1")) == 1
+
 
 def test_model_checkpoint_and_artifact_failures_do_not_leak_details(
     runner_gateway_env,

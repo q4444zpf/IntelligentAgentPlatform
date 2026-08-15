@@ -12,6 +12,7 @@ from time import perf_counter
 from sqlalchemy import func, select
 
 from app.approvals.models import Approval
+from app.approvals.service import arguments_digest
 from app.artifacts.service import (
     ArtifactAlreadyExistsError,
     ArtifactContentTypeError,
@@ -498,6 +499,38 @@ class RunnerGatewayService:
         if replay is not None:
             return ToolInvocationResponse.model_validate(replay)
 
+        existing_invocation = repository.get_tool_invocation(
+            run_id, request.tool_call_id
+        )
+        if (
+            existing_invocation is not None
+            and existing_invocation.status == "completed"
+            and existing_invocation.tool_id == request.tool_id
+            and existing_invocation.tool_version == request.version
+            and isinstance(existing_invocation.result_summary, dict)
+        ):
+            approved = repository.session.scalar(
+                select(Approval).where(
+                    Approval.invocation_id == existing_invocation.id,
+                    Approval.status == "approved",
+                    Approval.arguments_digest == arguments_digest(request.arguments),
+                )
+            )
+            if approved is not None:
+                response = ToolInvocationResponse(
+                    invocation_id=existing_invocation.id,
+                    value=existing_invocation.result_summary,
+                )
+                requests.add(
+                    run_id=run_id,
+                    action=action,
+                    idempotency_key=idempotency_key,
+                    request_digest=request_digest,
+                    response_json=response.model_dump(mode="json"),
+                )
+                repository.session.commit()
+                return response
+
         context_data = repository.get_run_execution_context(run_id)
         if context_data is None:
             raise RunnerGatewayError(404, "run_not_found", "Run 不存在")
@@ -681,6 +714,12 @@ class RunnerGatewayService:
                 409,
                 "completion_already_committed",
                 "Run 结果已提交",
+            )
+        if run.status == "waiting_approval" and request.status != "interrupted":
+            raise RunnerGatewayError(
+                409,
+                "completion_conflicts_with_approval",
+                "Run 正在等待审批",
             )
 
         artifacts = self._require_artifact_service()

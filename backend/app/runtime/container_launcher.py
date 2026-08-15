@@ -99,6 +99,7 @@ class ControlledContainerLauncher:
             raise
         except Exception as exc:
             raise LauncherUnavailableError("container creation failed") from exc
+        self._cleaned_run_ids.discard(run_id)
         self._containers[run_id] = container
         return {"run_id": run_id, "container_id": getattr(container, "id", config["name"]), "status": "created"}
 

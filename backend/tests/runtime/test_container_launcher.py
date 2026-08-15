@@ -166,6 +166,23 @@ def test_controlled_launcher_cleanup_is_idempotent_after_success():
     assert launcher.cleanup("run-1") == {"run_id": "run-1", "status": "cleaned"}
 
 
+def test_controlled_launcher_cleans_recreated_container_for_same_run():
+    client = FakeClient()
+    launcher = ControlledContainerLauncher(
+        client,
+        ContainerPolicy("iap/workflow-runner:latest"),
+    )
+    launcher.create("run-1", execution_payload())
+    launcher.cleanup("run-1")
+    second_container = FakeContainer(client.container.attrs)
+    client.container = second_container
+
+    launcher.create("run-1", execution_payload())
+    launcher.cleanup("run-1")
+
+    assert second_container.removed is True
+
+
 def test_controlled_launcher_terminate_is_idempotent_for_existing_container():
     client = FakeClient()
     launcher = ControlledContainerLauncher(client, ContainerPolicy("iap/workflow-runner:latest"))

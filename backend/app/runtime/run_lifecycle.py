@@ -6,7 +6,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
@@ -16,7 +16,8 @@ from app.conversations.repository import ConversationRepository
 from .workflow_runner import RunnerUnavailableError, WorkflowRunnerClient
 
 _TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
-_GATEWAY_FINAL_STATUSES = _TERMINAL_STATUSES | {"waiting_approval"}
+_NON_STARTABLE_STATUSES = _TERMINAL_STATUSES | {"waiting_approval"}
+_TOKEN_REVOCATION_STATUSES = _TERMINAL_STATUSES | {"waiting_approval"}
 _SAFE_ERRORS = {
     "sandbox_failed": "沙箱任务执行失败",
     "sandbox_oom": "沙箱任务超过内存限制",
@@ -84,8 +85,9 @@ class SandboxRunCoordinator:
             )
             while True:
                 if self.monotonic() - started_at >= self.timeout_seconds:
-                    self._terminate_safely(run_id)
                     self._finish(run_id, "failed", "sandbox_timeout")
+                    self._revoke_for_terminal_run(run_id)
+                    self._terminate_safely(run_id)
                     return
                 status = self.runner.status(run_id)
                 container_status = status.get("status")
@@ -104,16 +106,34 @@ class SandboxRunCoordinator:
     def cancel(self, run_id: str) -> None:
         if self._is_terminal(run_id):
             return
-        self._terminate_safely(run_id)
-        self._finish(run_id, "cancelled", "sandbox_cancelled")
+        self._finish(
+            run_id,
+            "cancelled",
+            "sandbox_cancelled",
+            allow_waiting_approval=True,
+        )
         self._revoke_for_terminal_run(run_id)
+        self._terminate_safely(run_id)
         self._cleanup(run_id)
 
     def recover(self, run_id: str) -> None:
         if self._is_terminal(run_id):
             return
+        started_at = self.monotonic()
         try:
-            self._apply_container_status(run_id, self.runner.status(run_id))
+            while True:
+                if self.monotonic() - started_at >= self.timeout_seconds:
+                    self._finish(run_id, "failed", "sandbox_timeout")
+                    self._revoke_for_terminal_run(run_id)
+                    self._terminate_safely(run_id)
+                    return
+                status = self.runner.status(run_id)
+                if status.get("status") in {"running", "created", "accepted"}:
+                    if self.poll_interval:
+                        self.sleeper(self.poll_interval)
+                    continue
+                self._apply_container_status(run_id, status)
+                return
         except RunnerUnavailableError:
             self._finish(run_id, "failed", "launcher_unavailable")
         finally:
@@ -142,7 +162,7 @@ class SandboxRunCoordinator:
             return
         with self.session_factory() as session:
             run = session.get(AgentRun, run_id)
-            if run is None or run.status not in _GATEWAY_FINAL_STATUSES:
+            if run is None or run.status not in _TOKEN_REVOCATION_STATUSES:
                 return
             latest_error = session.scalar(
                 select(RunEvent)
@@ -188,7 +208,7 @@ class SandboxRunCoordinator:
             )
             retry_ids = []
             for run_id in candidates:
-                latest = session.scalar(
+                latest_cleanup = session.scalar(
                     select(RunEvent)
                     .where(
                         RunEvent.run_id == run_id,
@@ -197,7 +217,24 @@ class SandboxRunCoordinator:
                     .order_by(RunEvent.sequence.desc())
                     .limit(1)
                 )
-                if latest is not None and latest.payload.get("status") == "failed":
+                latest_started = session.scalar(
+                    select(RunEvent)
+                    .where(
+                        RunEvent.run_id == run_id,
+                        RunEvent.event_type == "sandbox.started",
+                    )
+                    .order_by(RunEvent.sequence.desc())
+                    .limit(1)
+                )
+                if (
+                    latest_cleanup is not None
+                    and latest_cleanup.payload.get("status") == "failed"
+                ):
+                    retry_ids.append(run_id)
+                elif latest_started is not None and (
+                    latest_cleanup is None
+                    or latest_cleanup.sequence < latest_started.sequence
+                ):
                     retry_ids.append(run_id)
             return retry_ids
 
@@ -210,7 +247,7 @@ class SandboxRunCoordinator:
             run = repository.get_run_by_id(run_id)
             if run is None:
                 raise KeyError(run_id)
-            if run.status in _GATEWAY_FINAL_STATUSES:
+            if run.status in _NON_STARTABLE_STATUSES:
                 return False
             if run.status == "running":
                 return False
@@ -246,14 +283,32 @@ class SandboxRunCoordinator:
                 raise KeyError(run_id)
             return run.actor_id
 
-    def _finish(self, run_id: str, status: str, error_code: str | None = None) -> None:
+    def _finish(
+        self,
+        run_id: str,
+        status: str,
+        error_code: str | None = None,
+        *,
+        allow_waiting_approval: bool = False,
+    ) -> None:
         with self.session_factory() as session:
             repository = ConversationRepository(session)
-            run = repository.get_run_by_id(run_id)
+            eligibility = [
+                AgentRun.id == run_id,
+                AgentRun.status.not_in(_TERMINAL_STATUSES),
+            ]
+            if not allow_waiting_approval:
+                eligibility.append(AgentRun.status != "waiting_approval")
+            transition = session.execute(
+                update(AgentRun).where(*eligibility).values(status=status)
+            )
+            if transition.rowcount == 0:
+                if session.get(AgentRun, run_id) is None:
+                    raise KeyError(run_id)
+                return
+            run = session.get(AgentRun, run_id)
             if run is None:
                 raise KeyError(run_id)
-            if run.status in _GATEWAY_FINAL_STATUSES:
-                return
             repository.append_event(
                 run_id,
                 "sandbox.finished",
@@ -265,7 +320,6 @@ class SandboxRunCoordinator:
                     "run.error",
                     {"code": error_code, "message": _SAFE_ERRORS[error_code]},
                 )
-            run.status = status
             repository.append_event(run_id, "run.status", {"status": status})
             audit_status = {
                 "completed": "succeeded",
@@ -286,7 +340,7 @@ class SandboxRunCoordinator:
         lock = self._cleanup_locks.setdefault(run_id, Lock())
         with lock:
             with self.session_factory() as session:
-                latest = session.scalar(
+                latest_cleanup = session.scalar(
                     select(RunEvent)
                     .where(
                         RunEvent.run_id == run_id,
@@ -295,7 +349,23 @@ class SandboxRunCoordinator:
                     .order_by(RunEvent.sequence.desc())
                     .limit(1)
                 )
-                if latest is not None and latest.payload.get("status") == "cleaned":
+                latest_started = session.scalar(
+                    select(RunEvent)
+                    .where(
+                        RunEvent.run_id == run_id,
+                        RunEvent.event_type == "sandbox.started",
+                    )
+                    .order_by(RunEvent.sequence.desc())
+                    .limit(1)
+                )
+                if (
+                    latest_cleanup is not None
+                    and latest_cleanup.payload.get("status") == "cleaned"
+                    and (
+                        latest_started is None
+                        or latest_cleanup.sequence > latest_started.sequence
+                    )
+                ):
                     return
 
             payload = {"status": "cleaned"}

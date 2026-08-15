@@ -35,7 +35,7 @@ class StubAgentService:
             raise AgentNotFoundError(agent_id) from error
 
 
-def build_client():
+def build_client(dispatcher=None):
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -45,7 +45,7 @@ def build_client():
     session = Session(engine)
     service = ConversationService(
         ConversationRepository(session),
-        UnavailableRunDispatcher(),
+        dispatcher or UnavailableRunDispatcher(),
         agent_service=StubAgentService(),
     )
     app = FastAPI()
@@ -182,6 +182,31 @@ def test_conversations_and_runs_are_scoped_to_unit():
     assert run.status_code == 404
 
 
+def test_cancel_run_is_scoped_and_delegates_to_dispatcher():
+    class RecordingDispatcher(UnavailableRunDispatcher):
+        def __init__(self): self.cancelled = []
+        def cancel(self, run_id): self.cancelled.append(run_id)
+
+    dispatcher = RecordingDispatcher()
+    client = build_client(dispatcher)
+    accepted = create_run(client)
+
+    response = client.post(f"/api/agent-runs/{accepted['run']['id']}/cancel", headers=HEADERS)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "queued"
+    assert dispatcher.cancelled == [accepted["run"]["id"]]
+
+
+def test_cancel_run_hides_other_users_run():
+    client = build_client()
+    hidden = create_run(client, headers={"X-Unit-ID": "unit-1", "X-User-ID": "u2", "X-Project-ID": "p1"})
+
+    response = client.post(f"/api/agent-runs/{hidden['run']['id']}/cancel", headers=HEADERS)
+
+    assert response.status_code == 404
+
+
 def test_agent_run_list_rejects_invalid_query_parameters():
     client = build_client()
 
@@ -220,6 +245,16 @@ def test_agent_run_list_rejects_unknown_status():
     )
 
     assert response.status_code == 422
+
+
+def test_agent_run_list_accepts_cancelled_status():
+    client = build_client()
+
+    response = client.get(
+        "/api/agent-runs", params={"status": "cancelled"}, headers=HEADERS
+    )
+
+    assert response.status_code == 200
 
 
 def test_agent_run_list_treats_backslash_as_a_literal_without_match():

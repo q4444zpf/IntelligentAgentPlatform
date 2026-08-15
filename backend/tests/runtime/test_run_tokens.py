@@ -1,4 +1,6 @@
 from datetime import UTC, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, local
 
 import pytest
 from sqlalchemy import create_engine
@@ -14,6 +16,7 @@ from app.runtime.execution_snapshot import (
     StoredExecutionSnapshot,
 )
 from app.runtime.run_tokens import (
+    RuntimeRunTokenRevocation,
     RunTokenForbidden,
     RunTokenInvalid,
     RunTokenNotFound,
@@ -109,6 +112,108 @@ def test_revoked_tokens_are_rejected(token_service, snapshot):
 
     with pytest.raises(RunTokenInvalid, match="revoked"):
         token_service.verify(issued.value, snapshot.run_id, "snapshot.read")
+
+
+def test_token_issued_after_run_revocation_is_valid(token_service, snapshot):
+    old_token = token_service.issue(
+        snapshot, {"snapshot.read"}, NOW + timedelta(minutes=5)
+    )
+    token_service.clock = lambda: NOW + timedelta(seconds=1)
+    token_service.revoke(snapshot.run_id, "approval_required")
+
+    with pytest.raises(RunTokenInvalid, match="revoked"):
+        token_service.verify(old_token.value, snapshot.run_id, "snapshot.read")
+
+    token_service.clock = lambda: NOW + timedelta(seconds=2)
+    resumed_token = token_service.issue(
+        snapshot, {"snapshot.read"}, NOW + timedelta(minutes=5)
+    )
+
+    claims = token_service.verify(
+        resumed_token.value,
+        snapshot.run_id,
+        "snapshot.read",
+    )
+    assert claims.jti == resumed_token.claims.jti
+
+
+def test_token_issued_later_in_same_second_after_revocation_is_valid(session, snapshot):
+    service = RunTokenService(
+        session,
+        signing_key=SIGNING_KEY,
+        issuer="iap-api",
+        audience="iap-runner-gateway",
+        grace_seconds=30,
+        clock=lambda: NOW + timedelta(milliseconds=100),
+    )
+    service.revoke(snapshot.run_id, "approval_required")
+    service.clock = lambda: NOW + timedelta(milliseconds=200)
+    resumed_token = service.issue(
+        snapshot, {"snapshot.read"}, NOW + timedelta(minutes=5)
+    )
+
+    claims = service.verify(
+        resumed_token.value,
+        snapshot.run_id,
+        "snapshot.read",
+    )
+
+    assert claims.jti == resumed_token.claims.jti
+
+
+def test_later_revocation_invalidates_resumed_token(token_service, snapshot):
+    token_service.clock = lambda: NOW + timedelta(seconds=1)
+    token_service.revoke(snapshot.run_id, "approval_required")
+    token_service.clock = lambda: NOW + timedelta(seconds=2)
+    resumed_token = token_service.issue(
+        snapshot, {"snapshot.read"}, NOW + timedelta(minutes=5)
+    )
+    token_service.clock = lambda: NOW + timedelta(seconds=3)
+    token_service.revoke(snapshot.run_id, "completed")
+
+    with pytest.raises(RunTokenInvalid, match="revoked"):
+        token_service.verify(
+            resumed_token.value,
+            snapshot.run_id,
+            "snapshot.read",
+        )
+
+
+def test_concurrent_first_revocations_are_idempotent(tmp_path, monkeypatch, snapshot):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'token-revocation.db'}")
+    Base.metadata.create_all(engine)
+    barrier = Barrier(2)
+    thread_state = local()
+    original_scalar = Session.scalar
+
+    def synchronized_scalar(current_session, statement, *args, **kwargs):
+        value = original_scalar(current_session, statement, *args, **kwargs)
+        if not getattr(thread_state, "synchronized", False):
+            thread_state.synchronized = True
+            barrier.wait(timeout=5)
+        return value
+
+    monkeypatch.setattr(Session, "scalar", synchronized_scalar)
+
+    def revoke(reason):
+        with Session(engine) as current_session:
+            RunTokenService(
+                current_session,
+                signing_key=SIGNING_KEY,
+                issuer="iap-api",
+                audience="iap-runner-gateway",
+                clock=lambda: NOW,
+            ).revoke(snapshot.run_id, reason)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(revoke, "cancelled")
+        second = executor.submit(revoke, "completed")
+        first.result()
+        second.result()
+
+    with Session(engine) as verification_session:
+        assert verification_session.query(RuntimeRunTokenRevocation).count() == 1
+    engine.dispose()
 
 
 def test_expired_tokens_are_rejected(session, snapshot):

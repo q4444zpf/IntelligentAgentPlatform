@@ -1,4 +1,6 @@
 import json
+import hashlib
+import uuid
 from datetime import UTC, datetime
 from time import perf_counter
 
@@ -8,6 +10,7 @@ from app.conversations.repository import ConversationRepository
 from app.tools.gateway import ToolGateway
 from app.tools.schemas import ToolDefinition, ToolExecutionContext, ToolRuntimeError
 from app.tools.service import ToolService
+from app.artifacts.models import ArtifactRecord
 
 from .model_gateway import ModelGateway, ModelRuntimeError, ModelSelection
 
@@ -25,6 +28,8 @@ class PlatformAgentHarness:
         *,
         tool_service: ToolService | None = None,
         tool_gateway: ToolGateway | None = None,
+        artifact_storage=None,
+        checkpoint_store=None,
         audit_recorder: AuditRecorder | None = None,
     ):
         self.repository = repository
@@ -32,6 +37,8 @@ class PlatformAgentHarness:
         self.agent_service = agent_service
         self.tool_service = tool_service
         self.tool_gateway = tool_gateway
+        self.artifact_storage = artifact_storage
+        self.checkpoint_store = checkpoint_store
         self.audit_recorder = audit_recorder or AuditRecorder()
 
     def execute(self, run_id: str) -> None:
@@ -117,7 +124,7 @@ class PlatformAgentHarness:
                         usage_seen[key] = True
 
                 if not calls:
-                    self._complete(run_id, result.content, usage, usage_seen)
+                    self._complete(run_id, result.content, usage, usage_seen, messages)
                     return
 
                 if iteration == MAX_MODEL_ITERATIONS - 1:
@@ -199,6 +206,13 @@ class PlatformAgentHarness:
                 if run is not None:
                     run.status = "waiting_approval"
                     self.repository.append_event(run_id, "run.status", {"status": "waiting_approval"})
+                    if self.checkpoint_store is not None:
+                        self.checkpoint_store.save(run_id, "approval", {
+                            "run_id": run_id,
+                            "status": "waiting_approval",
+                            "messages": messages,
+                            "iteration": llm_iteration,
+                        })
                     self.repository.session.commit()
                 return
             self._persist_failure_safely(run_id, error.code, error.safe_message, rollback=False)
@@ -266,18 +280,77 @@ class PlatformAgentHarness:
         value = self.repository.get_run_execution_context(run_id)
         return ToolExecutionContext(**value) if value is not None else None
 
-    def _complete(self, run_id, content, usage, usage_seen):
+    def _complete(self, run_id, content, usage, usage_seen, messages=None):
         try:
             assistant_message = self.repository.add_assistant_message(run_id, content)
             self.repository.append_event(run_id, "message.completed", {"message_id": assistant_message.id, "role": "assistant"})
             if any(usage_seen.values()):
                 self.repository.append_event(run_id, "run.usage", {key: usage[key] if usage_seen[key] else None for key in usage})
             self._record_agent_status(run_id, "completed", commit=False)
+            if self.checkpoint_store is not None and messages is not None:
+                self.checkpoint_store.save(run_id, "runtime", {
+                    "run_id": run_id,
+                    "status": "completed",
+                    "messages": [*messages, {"role": "assistant", "content": content}],
+                }, commit=False)
             self.repository.session.commit()
         except Exception:
             self._persist_failure_safely(
                 run_id, "audit_persistence_failed", "智能体运行失败，请稍后重试"
             )
+            return
+        if self.artifact_storage is not None and content:
+            self._persist_result_artifact_safely(run_id, content)
+
+    def _persist_result_artifact_safely(self, run_id: str, content: str) -> None:
+        object_key = None
+        try:
+            object_key = self._persist_result_artifact(run_id, content)
+            self.repository.session.commit()
+            return
+        except Exception:  # noqa: BLE001
+            self.repository.session.rollback()
+            if object_key is not None:
+                try:
+                    self.artifact_storage.delete_object(object_key)
+                except Exception:  # noqa: BLE001, S110
+                    pass
+        self.repository.append_event(
+            run_id,
+            "artifact.persistence_failed",
+            {
+                "code": "artifact_persistence_failed",
+                "message": "成果文件保存失败",
+            },
+        )
+        self.repository.session.commit()
+
+    def _persist_result_artifact(self, run_id: str, content: str) -> str:
+        context = self.repository.get_run_execution_context(run_id)
+        if context is None:
+            raise KeyError(run_id)
+        artifact_id = str(uuid.uuid4())
+        object_key = (
+            f"units/{context['unit_id']}/projects/{context['project_id']}"
+            f"/{artifact_id}/run-result.txt"
+        )
+        data = content.encode("utf-8")
+        self.artifact_storage.put_bytes(object_key, data, "text/plain; charset=utf-8")
+        self.repository.session.add(ArtifactRecord(
+            id=artifact_id,
+            unit_id=context["unit_id"],
+            project_id=context["project_id"],
+            owner_id=context["user_id"],
+            scope="project",
+            run_id=run_id,
+            object_key=object_key,
+            filename="run-result.txt",
+            content_type="text/plain; charset=utf-8",
+            size_bytes=len(data),
+            sha256=hashlib.sha256(data).hexdigest(),
+            status="active",
+        ))
+        return object_key
 
     def _record_agent_status(
         self, run_id: str, status: str, *, code: str | None = None,

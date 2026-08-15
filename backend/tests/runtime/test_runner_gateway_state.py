@@ -418,3 +418,34 @@ def test_interrupted_completion_preserves_waiting_approval_state():
     assert response.status_code == 200
     assert response.json()["status"] == "interrupted"
     assert repository.get_run_by_id("run-1").status == "waiting_approval"
+
+
+def test_completed_completion_cannot_overwrite_waiting_approval_state():
+    client, repository, _store, _token_service = build_client()
+    run = repository.get_run_by_id("run-1")
+    run.status = "waiting_approval"
+    repository.session.commit()
+
+    response = client.post(
+        "/internal/runner/runs/run-1/completion",
+        headers=idempotent("completion:late-after-approval"),
+        json={
+            "status": "completed",
+            "final_assistant_content": "This completion arrived too late.",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "completion_conflicts_with_approval"
+    assert repository.get_run_by_id("run-1").status == "waiting_approval"
+    assert repository.list_events("run-1", 0) == []
+    messages = list(
+        repository.session.scalars(
+            select(Message)
+            .where(Message.conversation_id == "conversation-1")
+            .order_by(Message.sequence)
+        )
+    )
+    assert [(message.role, message.content) for message in messages] == [
+        ("user", "test"),
+    ]

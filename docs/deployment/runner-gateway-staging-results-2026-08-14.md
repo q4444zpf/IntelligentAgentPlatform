@@ -15,8 +15,8 @@ were also verified. Deployment-owner approval remains pending. The repository de
 
 - Full backend suite:
   `python -m pytest --import-mode=importlib -q`
-  under `backend/` -> **843 passed, 38 skipped**
-  in 440.56 seconds.
+  under `backend/` -> **862 passed, 38 skipped**
+  in 510.09 seconds.
 - Task 12 Runner Gateway integration suite -> **17 passed**.
 - Runtime-limit and snapshot compatibility suite -> **29 passed**.
 - `docker compose --profile sandbox config --quiet` -> exit code 0.
@@ -98,6 +98,11 @@ object-storage credentials are not placed in the Run container contract. Task
 | Live staging OOM fault injection | PASS | Run `93e3aefd-5d3e-4cdc-8b04-0f39787337ce` -> `failed/sandbox_oom`; token revoked, no Artifact created and cleanup recorded `cleaned` |
 | Live success Run, MinIO Artifact and cleanup | PASS | Run `8aa87e3f-12f5-4d12-9ff4-46f62c946455` |
 | Live Run policy acceptance | PASS | Launcher accepted the Run only after actual Docker metadata passed image, user, rootfs, capability, environment, mount, resource and network inspection |
+| Live authorized tool call | PASS | Run `52606877-1c04-4f05-abaf-ab0b8c34c79e` completed `system.get_current_time` with `tool.started` and `tool.completed` |
+| Live unauthorized tool request | PASS | Run `183ed19f-c0a1-4936-814c-1c11c1c24a76` created no ToolInvocation and returned a refusal; direct Gateway `403` remains covered by integration tests |
+| Live approval interruption and resume | PASS | Run `1074c9d7-53f2-4d65-8e68-b3bf4c8843a5`; approvals `95966b0c-7bbe-4af7-bd39-5e0fac1b5b1b` and `6749e8dc-8192-4b56-9adc-d668b35b6d49` approved, both invocations completed, resumed Run completed and cleanup recorded `cleaned` |
+| Live active cancellation | PASS | Run `619f2124-a1d5-47e1-98d1-e7e6785c71c6` -> `cancelled/sandbox_cancelled`; token revoked and cleanup recorded `cleaned` |
+| Live deadline timeout | PASS | Run `c31519d2-d8ff-4145-b6bf-928b88fed560` -> `failed/sandbox_timeout`; token revoked and cleanup recorded `cleaned` |
 
 ## Runtime limits
 
@@ -119,6 +124,31 @@ terminal persistence. Cleanup retries are serialized per Run so concurrent
 startup/manual retries cannot append a stale failure after a successful delete.
 The local Docker inventory had no `iap-run-*` containers after the suite.
 
+The 2026-08-15 live approval/cancellation follow-up exposed and fixed these
+cross-process races before acceptance was recorded:
+
+- a late normal completion can no longer overwrite `waiting_approval`;
+- sandbox approval resume executes the approved invocation and redispatches the Run;
+- Run-level token revocation rejects tokens issued at or before the revocation
+  boundary while allowing a newly issued post-approval token;
+- approved tool-call replay returns the persisted approved result instead of
+  failing with `tool_duplicate_call`;
+- resumed executions reset Launcher cleanup idempotency, and lifecycle cleanup
+  distinguishes a prior execution's `cleaned` event from the current execution;
+- cancellation commits `cancelled` before terminating the container so an exit
+  observation cannot win the terminal-state race;
+- startup recovery now monitors an already-running container to its real
+  terminal state instead of treating `running` as `sandbox_failed`;
+- repeated and sub-second Run-token revocations advance the cutoff, while
+  concurrent first revocations converge on one record without aborting cleanup;
+- terminal Run transitions use an atomic compare-and-set so cancellation,
+  timeout and container completion cannot overwrite each other;
+- duplicate approval-resume workers no longer replay a completed invocation or
+  strand a Run in `running`;
+- non-sandbox result Artifact persistence is explicitly enabled, preserves the
+  completed model result during storage outages, and compensates uploaded
+  objects when the metadata commit fails.
+
 Rollback remains:
 
 1. Keep or restore `IAP_WORKFLOW_RUNNER_SANDBOX_ENABLED=false`.
@@ -129,9 +159,6 @@ Rollback remains:
 
 ## Residual risks and required approval
 
-- Execute the remaining live staging unauthorized-tool, approval,
-  cancellation and timeout scenarios with deployment-owned secrets. Success,
-  Launcher outage and OOM are verified locally.
 - Inspect an active Run container's user, read-only root, capabilities, mounts,
   network and environment key names.
 - Run PostgreSQL-only integration tests against the staging-compatible database.

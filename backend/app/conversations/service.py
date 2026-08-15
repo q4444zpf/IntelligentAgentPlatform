@@ -226,6 +226,19 @@ class ConversationService:
             raise RunNotFound(run_id)
         return AgentRunInfo.model_validate(value)
 
+    def cancel_run(self, context: RequestContext, run_id: str) -> AgentRunInfo:
+        value = self.repository.get_run(
+            context.unit_id, context.project_id, context.user_id, run_id
+        )
+        if value is None:
+            raise RunNotFound(run_id)
+        self.dispatcher.cancel(run_id)
+        self.repository.session.expire_all()
+        current = self.repository.get_run(
+            context.unit_id, context.project_id, context.user_id, run_id
+        )
+        return AgentRunInfo.model_validate(current or value)
+
     def list_tool_invocations(
         self, context: RequestContext, run_id: str
     ) -> list[ToolInvocationInfo]:

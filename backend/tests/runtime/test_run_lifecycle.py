@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, local
 from unittest.mock import ANY
 
 import pytest
@@ -187,6 +188,35 @@ def test_coordinator_times_out_terminates_and_cleans_up(run_factory):
     assert runner.calls[-1] == ("cleanup", run_id)
 
 
+def test_timeout_state_is_persisted_before_container_termination(run_factory):
+    factory, run_id = run_factory
+
+    class RacingRunner(SequenceRunner):
+        def terminate(self, current_run_id):
+            with factory.begin() as session:
+                run = session.get(AgentRun, current_run_id)
+                if run.status == "running":
+                    run.status = "completed"
+            return super().terminate(current_run_id)
+
+    runner = RacingRunner([{"status": "running"}] * 3)
+    ticks = iter([0.0, 0.5, 1.1])
+
+    make_coordinator(
+        factory,
+        runner,
+        poll_interval=0,
+        timeout_seconds=1,
+        monotonic=lambda: next(ticks),
+    ).execute(run_id)
+
+    state = snapshot(factory, run_id)
+    assert state.run.status == "failed"
+    assert next(
+        event for event in state.events if event.event_type == "run.error"
+    ).payload["code"] == "sandbox_timeout"
+
+
 @pytest.mark.parametrize("failure_point", ["submit", "status"])
 def test_coordinator_records_launcher_outage_without_leaking_exception(run_factory, failure_point):
     factory, run_id = run_factory
@@ -254,6 +284,39 @@ def test_coordinator_cancels_running_run_and_cleans_up(run_factory):
     assert next(event for event in state.events if event.event_type == "run.error").payload["code"] == "sandbox_cancelled"
 
 
+def test_cancellation_wins_when_container_exit_is_observed_during_terminate(
+    run_factory,
+):
+    factory, run_id = run_factory
+    with factory.begin() as session:
+        session.get(AgentRun, run_id).status = "running"
+
+    class RacingRunner(SequenceRunner):
+        coordinator = None
+
+        def terminate(self, current_run_id):
+            self.calls.append(("terminate", current_run_id))
+            self.coordinator._apply_container_status(
+                current_run_id,
+                {"status": "exited", "exit_code": 1, "oom_killed": False},
+            )
+            return {"run_id": current_run_id, "status": "terminated"}
+
+    runner = RacingRunner([])
+    coordinator = make_coordinator(factory, runner, poll_interval=0)
+    runner.coordinator = coordinator
+
+    coordinator.cancel(run_id)
+
+    state = snapshot(factory, run_id)
+    assert state.run.status == "cancelled"
+    assert [
+        event.payload.get("code")
+        for event in state.events
+        if event.event_type == "run.error"
+    ] == ["sandbox_cancelled"]
+
+
 def test_coordinator_recovers_running_run_without_resubmitting(run_factory):
     factory, run_id = run_factory
     with factory.begin() as session:
@@ -266,6 +329,29 @@ def test_coordinator_recovers_running_run_without_resubmitting(run_factory):
     assert state.run.status == "failed"
     assert next(event for event in state.events if event.event_type == "run.error").payload["code"] == "sandbox_oom"
     assert not [call for call in runner.calls if call[0] == "submit"]
+    assert runner.calls[-1] == ("cleanup", run_id)
+
+
+def test_coordinator_waits_for_recovered_running_container_to_exit(run_factory):
+    factory, run_id = run_factory
+    with factory.begin() as session:
+        session.get(AgentRun, run_id).status = "running"
+    runner = SequenceRunner(
+        [
+            {"status": "running"},
+            {"status": "exited", "exit_code": 0, "oom_killed": False},
+        ]
+    )
+
+    make_coordinator(factory, runner, poll_interval=0).recover(run_id)
+
+    state = snapshot(factory, run_id)
+    assert state.run.status == "completed"
+    assert not [call for call in runner.calls if call[0] == "submit"]
+    assert [call for call in runner.calls if call[0] == "status"] == [
+        ("status", run_id),
+        ("status", run_id),
+    ]
     assert runner.calls[-1] == ("cleanup", run_id)
 
 
@@ -310,6 +396,41 @@ def test_coordinator_retries_failed_cleanup_for_terminal_run(run_factory):
     assert state.run.status == "failed"
     assert state.events[-1].event_type == "sandbox.cleanup"
     assert state.events[-1].payload == {"status": "cleaned"}
+
+
+def test_cleanup_runs_again_after_a_new_sandbox_execution_started(run_factory):
+    factory, run_id = run_factory
+    with factory.begin() as session:
+        session.get(AgentRun, run_id).status = "failed"
+        session.add_all(
+            [
+                RunEvent(
+                    run_id=run_id,
+                    sequence=2,
+                    event_type="sandbox.cleanup",
+                    payload={"status": "cleaned"},
+                ),
+                RunEvent(
+                    run_id=run_id,
+                    sequence=3,
+                    event_type="sandbox.started",
+                    payload={"status": "started"},
+                ),
+            ]
+        )
+    runner = SequenceRunner([])
+    coordinator = make_coordinator(factory, runner)
+
+    assert coordinator.list_cleanup_retry_run_ids() == [run_id]
+    coordinator.retry_cleanup(run_id)
+
+    state = snapshot(factory, run_id)
+    cleanup_events = [
+        event for event in state.events if event.event_type == "sandbox.cleanup"
+    ]
+    assert len(cleanup_events) == 2
+    assert cleanup_events[-1].payload == {"status": "cleaned"}
+    assert runner.calls == [("cleanup", run_id)]
 
 
 def test_coordinator_deduplicates_concurrent_cleanup_retries(run_factory):
@@ -467,3 +588,58 @@ def test_interrupted_gateway_completion_survives_container_exit_and_revokes_toke
     assert state.run.status == "waiting_approval"
     assert "sandbox.finished" not in [event.event_type for event in state.events]
     assert tokens.revoked == [(run_id, "approval_required")]
+
+
+def test_waiting_approval_run_can_be_cancelled(run_factory):
+    factory, run_id = run_factory
+    with factory.begin() as session:
+        session.get(AgentRun, run_id).status = "waiting_approval"
+    runner = SequenceRunner([])
+
+    make_coordinator(factory, runner, poll_interval=0).cancel(run_id)
+
+    state = snapshot(factory, run_id)
+    assert state.run.status == "cancelled"
+    assert next(
+        event for event in state.events if event.event_type == "run.error"
+    ).payload["code"] == "sandbox_cancelled"
+
+
+def test_concurrent_terminal_transitions_persist_only_one_result(
+    run_factory, monkeypatch
+):
+    factory, run_id = run_factory
+    with factory.begin() as session:
+        session.get(AgentRun, run_id).status = "running"
+    coordinator = make_coordinator(factory, SequenceRunner([]), poll_interval=0)
+    barrier = Barrier(2)
+    thread_state = local()
+    original_get = ConversationRepository.get_run_by_id
+
+    def synchronized_get(repository, current_run_id):
+        run = original_get(repository, current_run_id)
+        if (
+            run is not None
+            and run.status == "running"
+            and not getattr(thread_state, "synchronized", False)
+        ):
+            thread_state.synchronized = True
+            barrier.wait(timeout=5)
+        return run
+
+    monkeypatch.setattr(ConversationRepository, "get_run_by_id", synchronized_get)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        completed = executor.submit(coordinator._finish, run_id, "completed")
+        cancelled = executor.submit(
+            coordinator._finish, run_id, "cancelled", "sandbox_cancelled"
+        )
+        completed.result()
+        cancelled.result()
+
+    state = snapshot(factory, run_id)
+    finished = [
+        event for event in state.events if event.event_type == "sandbox.finished"
+    ]
+    assert len(finished) == 1
+    assert finished[0].payload["status"] == state.run.status
