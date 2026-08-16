@@ -13,7 +13,19 @@ export interface PlatformOverview {
   active_model: string;
 }
 
+export interface ServiceStatus {
+  name: string;
+  status: 'healthy' | 'unhealthy' | 'disabled';
+  detail: string;
+}
+
+export interface PlatformServices {
+  checked_at: string;
+  services: ServiceStatus[];
+}
+
 export const platformApi = {
   overview: (signal?: AbortSignal) => request<PlatformOverview>('/platform/overview', { signal }),
+  services: (signal?: AbortSignal) => request<PlatformServices>('/platform/services', { signal }),
   health: (signal?: AbortSignal) => request<{ status: string; service: string; version: string }>('/health', { signal }),
 };

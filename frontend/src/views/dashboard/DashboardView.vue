@@ -7,10 +7,6 @@
         <a-typography-title :level="3">平台运行总览</a-typography-title>
         <a-typography-text type="secondary">集中查看资源、模型和安全执行状态</a-typography-text>
       </div>
-      <a-space>
-        <a-badge :status="overview ? 'success' : 'processing'" :text="overview ? `API 正常 · v${overview.version}` : '正在检查 API'" />
-        <a-button :loading="loading" @click="loadOverview">刷新状态</a-button>
-      </a-space>
     </div>
 
     <a-spin :spinning="loading && !overview">
@@ -22,6 +18,28 @@
       </a-card>
     </div>
     </a-spin>
+
+    <a-card class="section-card">
+      <template #title>基础服务状态</template>
+      <template #extra>
+        <a-button size="small" :loading="servicesLoading" @click="refreshServices">
+          <template #icon><ReloadOutlined /></template>
+          刷新服务状态
+        </a-button>
+      </template>
+      <a-alert v-if="serviceError" type="warning" show-icon :message="serviceError" />
+      <a-list :data-source="services?.services ?? []" size="small" :loading="servicesLoading && !services">
+        <template #renderItem="{ item }">
+          <a-list-item>
+            <a-list-item-meta :title="item.name" :description="item.detail" />
+            <a-tag :color="serviceState(item.status).color">{{ serviceState(item.status).label }}</a-tag>
+          </a-list-item>
+        </template>
+        <template #footer>
+          <a-typography-text type="secondary">最后检查：{{ checkedAt }}</a-typography-text>
+        </template>
+      </a-list>
+    </a-card>
 
     <a-row :gutter="16">
       <a-col :xs="24" :lg="14">
@@ -68,14 +86,24 @@
 </template>
 
 <script setup lang="ts">
+import { ReloadOutlined } from '@ant-design/icons-vue';
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 
-import { platformApi, type PlatformOverview } from '@/api/platform';
+import { platformApi, type PlatformOverview, type PlatformServices, type ServiceStatus } from '@/api/platform';
 
 const overview = ref<PlatformOverview | null>(null);
 const loading = ref(false);
 const errorMessage = ref('');
 let controller: AbortController | undefined;
+const services = ref<PlatformServices | null>(null);
+const servicesLoading = ref(false);
+const serviceError = ref('');
+let servicesController: AbortController | undefined;
+let servicesTimer: number | undefined;
+
+const checkedAt = computed(() => (
+  services.value ? new Date(services.value.checked_at).toLocaleString() : '尚未检查'
+));
 
 const metrics = computed(() => [
   { label: '智能体', value: 18, hint: '个人 / 公用 / 系统', color: 'blue' },
@@ -139,6 +167,35 @@ async function loadOverview() {
   }
 }
 
-onMounted(loadOverview);
-onUnmounted(() => controller?.abort());
+function serviceState(status: ServiceStatus['status']) {
+  if (status === 'healthy') return { label: '正常', color: 'green' };
+  if (status === 'disabled') return { label: '未启用', color: 'default' };
+  return { label: '异常', color: 'red' };
+}
+
+async function refreshServices() {
+  servicesController?.abort();
+  servicesController = new AbortController();
+  servicesLoading.value = true;
+  serviceError.value = '';
+  try {
+    services.value = await platformApi.services(servicesController.signal);
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') return;
+    serviceError.value = error instanceof Error ? error.message : '基础服务状态读取失败';
+  } finally {
+    servicesLoading.value = false;
+  }
+}
+
+onMounted(() => {
+  loadOverview();
+  refreshServices();
+  servicesTimer = window.setInterval(refreshServices, 300000);
+});
+onUnmounted(() => {
+  controller?.abort();
+  servicesController?.abort();
+  if (servicesTimer !== undefined) window.clearInterval(servicesTimer);
+});
 </script>
