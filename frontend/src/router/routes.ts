@@ -138,7 +138,7 @@ export const routes: RouteRecordRaw[] = [
       { path: 'tenant/resources', name: 'TenantResources', component: resourceView, meta: { title: '租户资源', permission: 'resources:public' } },
       { path: 'runs', name: 'AgentRuns', component: () => import('@/views/runs/AgentRunListView.vue'), meta: { title: 'Agent Runs', permission: 'platform:view' } },
       { path: 'async-tasks', name: 'AsyncTasks', component: genericView, meta: { title: '异步任务', module: 'collaboration', permission: 'platform:view' } },
-      { path: 'artifacts', name: 'Artifacts', component: genericView, meta: { title: '成果文件', module: 'integration', permission: 'platform:view' } },
+      { path: 'artifacts', name: 'Artifacts', component: () => import('@/views/artifacts/ArtifactListView.vue'), meta: { title: '成果文件', permission: 'platform:view' } },
       { path: 'approvals', name: 'Approvals', component: () => import('@/views/security/ApprovalListView.vue'), meta: { title: '待办审批', permission: 'publish:review' } },
       { path: 'policies', name: 'Policies', component: genericView, meta: { title: '风险策略', module: 'settings', permission: 'system:settings' } },
       { path: 'credentials', name: 'Credentials', component: genericView, meta: { title: '凭据管理', module: 'settings', permission: 'system:settings' } },

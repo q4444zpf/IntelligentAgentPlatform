@@ -76,6 +76,32 @@ def test_storage_rewrites_presigned_url_to_public_endpoint():
     assert storage.presigned_get_url("result.txt") == "http://127.0.0.1:9000/artifacts/signed"
 
 
+def test_storage_can_override_text_response_content_type_for_browser_preview():
+    client = FakeS3()
+    storage = S3ObjectStorage(client=client, bucket="artifacts")
+
+    storage.presigned_get_url(
+        "result.txt",
+        response_content_type="text/plain; charset=utf-8",
+    )
+
+    assert client.url_calls[-1]["Params"]["ResponseContentType"] == "text/plain; charset=utf-8"
+
+
+def test_storage_can_force_download_with_response_content_disposition():
+    client = FakeS3()
+    storage = S3ObjectStorage(client=client, bucket="artifacts")
+
+    storage.presigned_get_url(
+        "result.txt",
+        response_content_disposition="attachment; filename*=UTF-8''result.txt",
+    )
+
+    assert client.url_calls[-1]["Params"]["ResponseContentDisposition"] == (
+        "attachment; filename*=UTF-8''result.txt"
+    )
+
+
 def test_storage_creates_missing_bucket_before_upload():
     client = MissingBucketS3()
     storage = S3ObjectStorage(client=client, bucket="artifacts")

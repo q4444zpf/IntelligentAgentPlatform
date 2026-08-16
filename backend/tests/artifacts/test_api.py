@@ -16,7 +16,9 @@ class FakeStorage:
     def put_bytes(self, object_key, data, content_type):
         self.objects[object_key] = (data, content_type)
 
-    def presigned_get_url(self, object_key, expires_seconds=900):
+    def presigned_get_url(self, object_key, expires_seconds=900, **kwargs):
+        self.download_content_type = kwargs.get("response_content_type")
+        self.download_content_disposition = kwargs.get("response_content_disposition")
         return f"https://storage.test/{object_key}?expires={expires_seconds}"
 
     def delete_object(self, object_key):
@@ -81,7 +83,7 @@ def test_artifact_visibility_is_scoped_to_project_and_owner():
 
 
 def test_download_returns_short_lived_signed_url():
-    client, _, _ = build_client()
+    client, _, storage = build_client()
     artifact = upload(client).json()
 
     response = client.get(f"/api/artifacts/{artifact['id']}/download?expires_in=3600", headers=HEADERS)
@@ -89,6 +91,8 @@ def test_download_returns_short_lived_signed_url():
     assert response.status_code == 200
     assert response.json()["expires_in"] == 900
     assert "expires=900" in response.json()["url"]
+    assert storage.download_content_type == "text/plain; charset=utf-8"
+    assert storage.download_content_disposition == "attachment; filename*=UTF-8''report.txt"
 
 
 def test_delete_artifact_removes_object_and_marks_record_deleted():

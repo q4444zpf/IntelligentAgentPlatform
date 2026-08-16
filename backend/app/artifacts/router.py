@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from urllib.parse import quote
 
 from fastapi import (
     APIRouter,
@@ -65,7 +66,23 @@ def create_router(session_factory: Callable[[Session], Session] | None = None, *
         except ArtifactNotFoundError as error:
             not_found(error)
         effective_expiry = min(expires_in, 900)
-        return {"artifact": artifact, "url": manager.storage.presigned_get_url(artifact.object_key, effective_expiry), "expires_in": effective_expiry}
+        response_content_type = (
+            "text/plain; charset=utf-8"
+            if artifact.content_type == "text/plain"
+            else artifact.content_type
+        )
+        return {
+            "artifact": artifact,
+            "url": manager.storage.presigned_get_url(
+                artifact.object_key,
+                effective_expiry,
+                response_content_type=response_content_type,
+                response_content_disposition=(
+                    "attachment; filename*=UTF-8''" + quote(artifact.filename)
+                ),
+            ),
+            "expires_in": effective_expiry,
+        }
 
     @router.delete("/artifacts/{artifact_id}", response_model=ArtifactInfo)
     def delete_artifact(artifact_id: str, context: RequestContext = Depends(require_request_context), manager: ArtifactService = Depends(service)):

@@ -63,11 +63,23 @@ class S3ObjectStorage:
     def delete_object(self, object_key: str) -> None:
         self.client.delete_object(Bucket=self.bucket, Key=object_key)
 
-    def presigned_get_url(self, object_key: str, expires_seconds: int = 900) -> str:
+    def presigned_get_url(
+        self,
+        object_key: str,
+        expires_seconds: int = 900,
+        *,
+        response_content_type: str | None = None,
+        response_content_disposition: str | None = None,
+    ) -> str:
         expires = min(max(60, int(expires_seconds)), self.max_url_expiry)
+        params = {"Bucket": self.bucket, "Key": object_key}
+        if response_content_type:
+            params["ResponseContentType"] = response_content_type
+        if response_content_disposition:
+            params["ResponseContentDisposition"] = response_content_disposition
         url = self.client.generate_presigned_url(
             "get_object",
-            Params={"Bucket": self.bucket, "Key": object_key},
+            Params=params,
             ExpiresIn=expires,
         )
         if not self.public_endpoint:
