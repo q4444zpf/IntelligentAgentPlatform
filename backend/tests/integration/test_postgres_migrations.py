@@ -28,7 +28,7 @@ def test_upgrade_head_creates_conversation_tables():
     engine = create_engine(env["DATABASE_URL"])
     inspector = inspect(engine)
     with engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260814_20"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260816_21"
     tables = set(inspector.get_table_names())
     assert {
         "conversations",
@@ -46,6 +46,9 @@ def test_upgrade_head_creates_conversation_tables():
         "runtime_execution_snapshots",
         "runtime_run_token_revocations",
         "runtime_runner_requests",
+        "collaboration_teams",
+        "collaboration_team_versions",
+        "collaboration_team_version_members",
     } <= tables
     conversation_columns = {
         column["name"]: column
@@ -137,6 +140,55 @@ def test_upgrade_head_creates_conversation_tables():
         name: audit_indexes[name] for name in expected_audit_indexes
     } == expected_audit_indexes
     engine.dispose()
+
+
+@pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="requires PostgreSQL")
+def test_published_team_migration_creates_and_removes_persistence_tables():
+    database_url = os.environ["TEST_DATABASE_URL"]
+    env = os.environ | {"DATABASE_URL": database_url}
+    upgrade = (*ALEMBIC_UPGRADE_COMMAND[:-1], "20260816_21")
+    downgrade = (*ALEMBIC_UPGRADE_COMMAND[:-2], "downgrade", "20260814_20")
+    team_tables = {
+        "collaboration_teams",
+        "collaboration_team_versions",
+        "collaboration_team_version_members",
+    }
+    try:
+        subprocess.run(upgrade, check=True, env=env)
+        inspector = inspect(create_engine(database_url))
+        assert team_tables <= set(inspector.get_table_names())
+        team_constraints = {
+            constraint["name"]: constraint["column_names"]
+            for constraint in inspector.get_unique_constraints("collaboration_teams")
+        }
+        version_constraints = {
+            constraint["name"]: constraint["column_names"]
+            for constraint in inspector.get_unique_constraints("collaboration_team_versions")
+        }
+        member_constraints = {
+            constraint["name"]: constraint["column_names"]
+            for constraint in inspector.get_unique_constraints("collaboration_team_version_members")
+        }
+        assert team_constraints["uq_collaboration_teams_project_name"] == ["project_id", "name"]
+        assert version_constraints["uq_collaboration_team_versions_team_version"] == ["team_id", "version"]
+        assert member_constraints["uq_collaboration_team_members_version_position"] == [
+            "team_version_id",
+            "position",
+        ]
+        assert {
+            "ix_collaboration_teams_unit_project",
+            "ix_collaboration_team_versions_team_status",
+            "ix_collaboration_team_members_version",
+        } <= {
+            index["name"]
+            for table in team_tables
+            for index in inspector.get_indexes(table)
+        }
+
+        subprocess.run(downgrade, check=True, env=env)
+        assert not (team_tables & set(inspect(create_engine(database_url)).get_table_names()))
+    finally:
+        subprocess.run(ALEMBIC_UPGRADE_COMMAND, check=True, env=env)
 
 
 @pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="requires PostgreSQL")
