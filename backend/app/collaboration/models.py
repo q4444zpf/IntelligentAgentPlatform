@@ -44,7 +44,15 @@ class Team(Base):
     description: Mapped[str] = mapped_column(String(500), nullable=False, default="")
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     draft_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    published_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    published_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey(
+            "collaboration_team_versions.id",
+            name="fk_collaboration_teams_published_version",
+            ondelete="SET NULL",
+            use_alter=True,
+        ),
+        nullable=True,
+    )
     created_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     updated_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -54,7 +62,9 @@ class Team(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
     versions: Mapped[list["TeamVersion"]] = relationship(
-        back_populates="team", cascade="all, delete-orphan"
+        back_populates="team",
+        cascade="all, delete-orphan",
+        foreign_keys="TeamVersion.team_id",
     )
 
 
@@ -103,7 +113,7 @@ class TeamVersion(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
-    team: Mapped[Team] = relationship(back_populates="versions")
+    team: Mapped[Team] = relationship(back_populates="versions", foreign_keys=[team_id])
     members: Mapped[list["TeamVersionMember"]] = relationship(
         back_populates="team_version",
         cascade="all, delete-orphan",

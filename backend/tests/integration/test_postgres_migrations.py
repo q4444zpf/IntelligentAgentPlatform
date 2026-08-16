@@ -155,7 +155,8 @@ def test_published_team_migration_creates_and_removes_persistence_tables():
     }
     try:
         subprocess.run(upgrade, check=True, env=env)
-        inspector = inspect(create_engine(database_url))
+        engine = create_engine(database_url)
+        inspector = inspect(engine)
         assert team_tables <= set(inspector.get_table_names())
         team_constraints = {
             constraint["name"]: constraint["column_names"]
@@ -184,6 +185,60 @@ def test_published_team_migration_creates_and_removes_persistence_tables():
             for table in team_tables
             for index in inspector.get_indexes(table)
         }
+
+        with engine.begin() as connection:
+            connection.execute(text("""
+                INSERT INTO collaboration_teams (
+                    id, unit_id, project_id, name, published_version_id
+                ) VALUES ('team-1', 'unit-1', 'project-1', '联合研判', NULL)
+            """))
+            connection.execute(text("""
+                INSERT INTO collaboration_team_versions (
+                    id, team_id, version, status, definition, tool_ids,
+                    skill_names, knowledge_source_ids, max_steps,
+                    max_parallel_members, timeout_seconds, failure_strategy,
+                    definition_digest
+                ) VALUES (
+                    'version-1', 'team-1', 1, 'published', '{}'::json,
+                    '[]'::json, '[]'::json, '[]'::json, 4, 1, 60,
+                    'fail_fast', :digest
+                )
+            """), {"digest": "a" * 64})
+            connection.execute(text("""
+                INSERT INTO collaboration_team_version_members (
+                    id, team_version_id, agent_id, role, responsibility,
+                    position, tool_ids, skill_names, knowledge_source_ids
+                ) VALUES (
+                    'member-1', 'version-1', 'supervisor-agent', 'supervisor',
+                    'coordinate', 0, '[]'::json, '[]'::json, '[]'::json
+                )
+            """))
+            connection.execute(text("""
+                UPDATE collaboration_teams
+                SET published_version_id='version-1'
+                WHERE id='team-1'
+            """))
+
+        with pytest.raises(DBAPIError):
+            with engine.begin() as connection:
+                connection.execute(text("""
+                    UPDATE collaboration_team_version_members
+                    SET responsibility='changed'
+                    WHERE id='member-1'
+                """))
+
+        published_version_foreign_keys = {
+            tuple(foreign_key["constrained_columns"]): (
+                foreign_key["referred_table"],
+                tuple(foreign_key["referred_columns"]),
+            )
+            for foreign_key in inspector.get_foreign_keys("collaboration_teams")
+        }
+        assert published_version_foreign_keys[("published_version_id",)] == (
+            "collaboration_team_versions",
+            ("id",),
+        )
+        engine.dispose()
 
         subprocess.run(downgrade, check=True, env=env)
         assert not (team_tables & set(inspect(create_engine(database_url)).get_table_names()))

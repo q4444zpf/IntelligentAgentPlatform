@@ -71,6 +71,14 @@ def upgrade() -> None:
         "collaboration_team_versions",
         ["team_id", "status"],
     )
+    op.create_foreign_key(
+        "fk_collaboration_teams_published_version",
+        "collaboration_teams",
+        "collaboration_team_versions",
+        ["published_version_id"],
+        ["id"],
+        ondelete="SET NULL",
+    )
     op.create_table(
         "collaboration_team_version_members",
         sa.Column("id", sa.String(36), primary_key=True),
@@ -98,12 +106,20 @@ def upgrade() -> None:
         CREATE FUNCTION reject_published_team_version_mutation()
         RETURNS trigger AS $$
         BEGIN
-            IF TG_TABLE_NAME = 'collaboration_team_versions' AND OLD.status = 'published' THEN
+            IF OLD.status = 'published' THEN
                 RAISE EXCEPTION 'published team versions are immutable';
             END IF;
-            IF TG_TABLE_NAME = 'collaboration_team_version_members' AND EXISTS (
+            RETURN COALESCE(NEW, OLD);
+        END;
+        $$ LANGUAGE plpgsql
+    """)
+    op.execute("""
+        CREATE FUNCTION reject_published_team_member_mutation()
+        RETURNS trigger AS $$
+        BEGIN
+            IF EXISTS (
                 SELECT 1 FROM collaboration_team_versions
-                WHERE id = COALESCE(OLD.team_version_id, NEW.team_version_id)
+                WHERE id = OLD.team_version_id
                 AND status = 'published'
             ) THEN
                 RAISE EXCEPTION 'published team versions are immutable';
@@ -119,18 +135,24 @@ def upgrade() -> None:
     """)
     op.execute("""
         CREATE TRIGGER collaboration_team_version_members_immutable
-        BEFORE INSERT OR UPDATE OR DELETE ON collaboration_team_version_members
-        FOR EACH ROW EXECUTE FUNCTION reject_published_team_version_mutation()
+        BEFORE UPDATE OR DELETE ON collaboration_team_version_members
+        FOR EACH ROW EXECUTE FUNCTION reject_published_team_member_mutation()
     """)
 
 
 def downgrade() -> None:
     op.execute("DROP TRIGGER IF EXISTS collaboration_team_version_members_immutable ON collaboration_team_version_members")
     op.execute("DROP TRIGGER IF EXISTS collaboration_team_versions_immutable ON collaboration_team_versions")
+    op.execute("DROP FUNCTION IF EXISTS reject_published_team_member_mutation()")
     op.execute("DROP FUNCTION IF EXISTS reject_published_team_version_mutation()")
     op.drop_index("ix_collaboration_team_members_version", table_name="collaboration_team_version_members")
     op.drop_table("collaboration_team_version_members")
     op.drop_index("ix_collaboration_team_versions_team_status", table_name="collaboration_team_versions")
+    op.drop_constraint(
+        "fk_collaboration_teams_published_version",
+        "collaboration_teams",
+        type_="foreignkey",
+    )
     op.drop_table("collaboration_team_versions")
     op.drop_index("ix_collaboration_teams_unit_project", table_name="collaboration_teams")
     op.drop_table("collaboration_teams")
