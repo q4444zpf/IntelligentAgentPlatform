@@ -1,7 +1,7 @@
 import pytest
 
 from app.runtime.execution_snapshot import PublishedTeamSnapshot, SnapshotTeamMember
-from app.runtime.team_graph import TeamPlan, TeamPlanError, TeamTask, validate_team_plan
+from app.runtime.team_graph import TeamPlan, TeamPlanError, TeamTask, schedule_ready_tasks, validate_team_plan
 
 
 @pytest.fixture
@@ -27,3 +27,15 @@ def test_team_plan_rejects_dependency_cycle(snapshot):
             TeamTask(id="a", member_id="member", objective="a", depends_on=("b",), position=0),
             TeamTask(id="b", member_id="member", objective="b", depends_on=("a",), position=1),
         )), snapshot)
+
+
+def test_schedule_ready_tasks_is_deterministic_and_bounded(snapshot):
+    plan = TeamPlan(tasks=(
+        TeamTask(id="b", member_id="member", objective="b", position=1),
+        TeamTask(id="a", member_id="supervisor", objective="a", position=0),
+        TeamTask(id="c", member_id="member", objective="c", depends_on=("a",), position=2),
+    ))
+    validate_team_plan(plan, snapshot)
+    batch = schedule_ready_tasks(plan, set(), max_parallel_members=2)
+    assert [task.id for task in batch] == ["a", "b"]
+    assert [task.id for task in schedule_ready_tasks(plan, {"a", "b"}, max_parallel_members=2)] == ["c"]

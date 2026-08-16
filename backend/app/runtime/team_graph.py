@@ -62,3 +62,27 @@ def validate_team_plan(plan: TeamPlan, snapshot: PublishedTeamSnapshot) -> None:
 
 def parallel_width(plan: TeamPlan) -> int:
     return max((sum(not task.depends_on for task in plan.tasks), 0))
+
+
+def schedule_ready_tasks(
+    plan: TeamPlan, completed: set[str], *, max_parallel_members: int
+) -> tuple[TeamTask, ...]:
+    """Return the next deterministic batch whose dependencies are complete."""
+    validate_ids = {task.id for task in plan.tasks}
+    if not completed <= validate_ids:
+        raise TeamPlanError("team_plan_invalid: unknown completed task")
+    ready = [
+        task for task in plan.tasks
+        if task.id not in completed and set(task.depends_on) <= completed
+    ]
+    ready.sort(key=lambda task: (task.position, task.id))
+    selected: list[TeamTask] = []
+    members: set[str] = set()
+    for task in ready:
+        if task.member_id in members:
+            continue
+        selected.append(task)
+        members.add(task.member_id)
+        if len(selected) >= max_parallel_members:
+            break
+    return tuple(selected)
