@@ -57,6 +57,13 @@ class PublishedTeamSnapshot(BaseModel):
     max_parallel_members: int
     timeout_seconds: int
     failure_strategy: str
+    name: str
+    description: str
+    runtime_form: str
+    language: str
+    system_prompt: str
+    context_prompt: str
+    approval_policy: str
 
 
 class SnapshotModelSelection(BaseModel):
@@ -290,6 +297,13 @@ class ExecutionSnapshotService:
                 max_parallel_members=team_version.max_parallel_members,
                 timeout_seconds=team_version.timeout_seconds,
                 failure_strategy=team_version.failure_strategy,
+                name=agent.name,
+                description=agent.description,
+                runtime_form=agent.runtime_form,
+                language=agent.language,
+                system_prompt=agent.system_prompt,
+                context_prompt=agent.context_prompt,
+                approval_policy=agent.approval_policy,
             )
             schema_version = "4"
         else:
