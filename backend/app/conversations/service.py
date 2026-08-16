@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 from app.agents.service import AgentNotFoundError, AgentService
 from app.core.request_context import RequestContext
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
+from app.collaboration.service import TeamService, TeamUnavailableError
 
 from .dispatcher import RunDispatcher
 from .models import AgentRun, Conversation, Message, RunEvent
@@ -40,17 +41,24 @@ class ConversationService:
         dispatcher: RunDispatcher,
         *,
         agent_service: AgentService | None = None,
+        team_service: TeamService | None = None,
         audit_recorder: AuditRecorder | None = None,
     ):
         self.repository = repository
         self.dispatcher = dispatcher
         self.agent_service = agent_service or AgentService()
+        self.team_service = team_service
         self.audit_recorder = audit_recorder or AuditRecorder()
 
     def _resolve_actor(self, request: MessageCreate) -> str:
         if request.actor_type == "team":
             if request.actor_id is None:
                 raise AgentSelectionError("Team actor_id is required")
+            if self.team_service is not None:
+                try:
+                    self.team_service.resolve_for_run(context, request.actor_id)
+                except TeamUnavailableError as error:
+                    raise AgentSelectionError("team_unavailable") from error
             return request.actor_id
 
         try:
