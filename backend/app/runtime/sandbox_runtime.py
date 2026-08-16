@@ -14,6 +14,8 @@ from .deepagents_factory import (
 )
 from .execution_contract import RunExecutionRequest, RunExecutionResult
 from .execution_snapshot import verify_snapshot_digest
+from .execution_snapshot import PublishedTeamSnapshot
+from .team_graph import TeamPlan, TeamTask, validate_team_plan
 from .gateway_model import GatewayChatModel, RunnerGatewayModelError
 from .gateway_tools import RunnerApprovalInterruption, build_gateway_tools
 from .langgraph_runtime import LangGraphRuntimeAdapter, RuntimeState
@@ -98,6 +100,21 @@ class SandboxRuntime:
                     f"{context_prompt}\n\nSkills: {skill_context}"
                     if context_prompt
                     else f"Skills: {skill_context}"
+                )
+            if isinstance(actor, PublishedTeamSnapshot):
+                self._append_event("team.plan.created", {
+                    "team_id": actor.id,
+                    "version_id": actor.version_id,
+                    "member_ids": [member.agent_id for member in actor.members],
+                })
+                validate_team_plan(
+                    TeamPlan(tasks=(TeamTask(
+                        id="supervisor-synthesis",
+                        member_id=actor.supervisor.agent_id,
+                        objective="Synthesize the requested result",
+                        position=0,
+                    ),)),
+                    actor,
                 )
             graph = self.agent_factory.build(
                 FactoryAgentSnapshot(

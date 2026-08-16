@@ -1,0 +1,29 @@
+import pytest
+
+from app.runtime.execution_snapshot import PublishedTeamSnapshot, SnapshotTeamMember
+from app.runtime.team_graph import TeamPlan, TeamPlanError, TeamTask, validate_team_plan
+
+
+@pytest.fixture
+def snapshot():
+    return PublishedTeamSnapshot(
+        id="team-1", version_id="version-1", version=1, definition_digest="a" * 64,
+        supervisor=SnapshotTeamMember(agent_id="supervisor", role="supervisor", responsibility="coordinate"),
+        members=(SnapshotTeamMember(agent_id="member", role="member", responsibility="review"),),
+        max_steps=4, max_parallel_members=2, timeout_seconds=60,
+        failure_strategy="fail_fast", name="Team", description="", runtime_form="common",
+        language="en-US", system_prompt="", context_prompt="", approval_policy="never",
+    )
+
+
+def test_team_plan_rejects_unknown_member(snapshot):
+    with pytest.raises(TeamPlanError, match="unknown member"):
+        validate_team_plan(TeamPlan(tasks=(TeamTask(id="task", member_id="other", objective="x", position=0),)), snapshot)
+
+
+def test_team_plan_rejects_dependency_cycle(snapshot):
+    with pytest.raises(TeamPlanError, match="dependency cycle"):
+        validate_team_plan(TeamPlan(tasks=(
+            TeamTask(id="a", member_id="member", objective="a", depends_on=("b",), position=0),
+            TeamTask(id="b", member_id="member", objective="b", depends_on=("a",), position=1),
+        )), snapshot)
