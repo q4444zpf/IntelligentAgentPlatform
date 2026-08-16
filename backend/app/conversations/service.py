@@ -132,6 +132,14 @@ class ConversationService:
         if conversation is None:
             raise ConversationNotFound(conversation_id)
         actor_id = self._resolve_actor(request)
+        actor_version_id = None
+        if request.actor_type == "team" and self.team_service is not None:
+            try:
+                actor_version_id = self.team_service.resolve_for_run(
+                    context, actor_id
+                ).version_id
+            except TeamUnavailableError as error:
+                raise AgentSelectionError("team_unavailable") from error
         conversation.updated_at = datetime.now(UTC)
         message = self.repository.add(
             Message(
@@ -147,6 +155,7 @@ class ConversationService:
                 trigger_message_id=message.id,
                 actor_type=request.actor_type,
                 actor_id=actor_id,
+                actor_version_id=actor_version_id,
                 actor_roles_json=list(context.role_codes),
                 status="queued",
             )

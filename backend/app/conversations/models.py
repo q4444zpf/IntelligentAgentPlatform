@@ -77,6 +77,7 @@ class AgentRun(Base):
     trigger_message_id: Mapped[str] = mapped_column(ForeignKey("messages.id"))
     actor_type: Mapped[str] = mapped_column(String(20))
     actor_id: Mapped[str] = mapped_column(String(64))
+    actor_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     actor_roles_json: Mapped[list[str]] = mapped_column(
         JSON,
         nullable=False,

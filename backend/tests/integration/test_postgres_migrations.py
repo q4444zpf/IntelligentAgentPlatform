@@ -28,7 +28,7 @@ def test_upgrade_head_creates_conversation_tables():
     engine = create_engine(env["DATABASE_URL"])
     inspector = inspect(engine)
     with engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260816_21"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260817_22"
     tables = set(inspector.get_table_names())
     assert {
         "conversations",

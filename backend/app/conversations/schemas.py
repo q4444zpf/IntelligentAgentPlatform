@@ -46,6 +46,7 @@ class AgentRunInfo(BaseModel):
     trigger_message_id: str
     actor_type: Literal["agent", "team"]
     actor_id: str
+    actor_version_id: str | None = None
     status: str
     created_at: datetime
     updated_at: datetime
