@@ -13,6 +13,7 @@ from sqlalchemy import JSON, DateTime, Index, String, select
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from app.db.base import Base
+from app.collaboration.repository import TeamRepository
 
 
 class SnapshotIntegrityError(ValueError):
@@ -30,6 +31,32 @@ class PublishedAgentSnapshot(BaseModel):
     system_prompt: str
     context_prompt: str
     approval_policy: str
+    kind: Literal["agent"] = "agent"
+
+
+class SnapshotTeamMember(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    agent_id: str
+    role: Literal["supervisor", "member"]
+    responsibility: str
+    agent_definition_digest: str | None = None
+
+
+class PublishedTeamSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["team"] = "team"
+    id: str
+    version_id: str
+    version: int
+    definition_digest: str
+    supervisor: SnapshotTeamMember
+    members: tuple[SnapshotTeamMember, ...]
+    max_steps: int
+    max_parallel_members: int
+    timeout_seconds: int
+    failure_strategy: str
 
 
 class SnapshotModelSelection(BaseModel):
@@ -87,13 +114,13 @@ class SnapshotRuntimeLimits(BaseModel):
 class ExecutionSnapshotPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["1", "2", "3"] = "1"
+    schema_version: Literal["1", "2", "3", "4"] = "1"
     snapshot_id: str
     run_id: str
     unit_id: str
     project_id: str
     user_id: str
-    actor: PublishedAgentSnapshot
+    actor: PublishedAgentSnapshot | PublishedTeamSnapshot
     model: SnapshotModelSelection
     messages: tuple[SnapshotMessage, ...]
     skills: tuple[SnapshotSkill, ...] = ()
@@ -136,6 +163,8 @@ class RuntimeExecutionSnapshot(Base):
 
 def canonical_snapshot_bytes(payload: ExecutionSnapshotPayload) -> bytes:
     serialized = payload.model_dump(mode="json")
+    if payload.schema_version in {"1", "2", "3"}:
+        serialized.get("actor", {}).pop("kind", None)
     if payload.schema_version == "1":
         serialized.pop("tools", None)
     if payload.schema_version in {"1", "2"}:
@@ -224,20 +253,48 @@ class ExecutionSnapshotService:
         run = self.conversation_repository.get_run_by_id(run_id)
         if context is None or run is None:
             raise KeyError(run_id)
-        agent = self.agent_service.get(run.actor_id)
-        if not agent.enabled:
-            raise ValueError(f"Agent '{agent.id}' is disabled")
-
-        created_at = self.clock()
-        tools = self.agent_service.tool_service.resolve_bindable(agent.tool_ids)
-        payload = ExecutionSnapshotPayload(
-            schema_version="3",
-            snapshot_id=str(uuid4()),
-            run_id=run_id,
-            unit_id=str(context["unit_id"]),
-            project_id=str(context["project_id"]),
-            user_id=str(context["user_id"]),
-            actor=PublishedAgentSnapshot(
+        if getattr(run, "actor_type", "agent") == "team":
+            if not getattr(run, "actor_version_id", None):
+                raise ValueError("Team Run has no selected version")
+            team_version = TeamRepository(self.session).get_version_by_id(run.actor_version_id)
+            if team_version is None or team_version.status != "published":
+                raise ValueError("Selected Team version is unavailable")
+            supervisor = next((member for member in team_version.members if member.role == "supervisor"), None)
+            if supervisor is None:
+                raise ValueError("Published Team has no supervisor")
+            agent = self.agent_service.get(supervisor.agent_id)
+            if not agent.enabled:
+                raise ValueError(f"Agent '{agent.id}' is disabled")
+            actor = PublishedTeamSnapshot(
+                id=team_version.team_id,
+                version_id=team_version.id,
+                version=team_version.version,
+                definition_digest=team_version.definition_digest or hashlib.sha256(
+                    json.dumps(team_version.definition, ensure_ascii=False, sort_keys=True,
+                               separators=(",", ":")).encode("utf-8")
+                ).hexdigest(),
+                supervisor=SnapshotTeamMember(
+                    agent_id=supervisor.agent_id, role="supervisor",
+                    responsibility=supervisor.responsibility,
+                    agent_definition_digest=supervisor.agent_definition_digest,
+                ),
+                members=tuple(
+                    SnapshotTeamMember(
+                        agent_id=member.agent_id, role="member",
+                        responsibility=member.responsibility,
+                        agent_definition_digest=member.agent_definition_digest,
+                    )
+                    for member in team_version.members if member.role == "member"
+                ),
+                max_steps=team_version.max_steps,
+                max_parallel_members=team_version.max_parallel_members,
+                timeout_seconds=team_version.timeout_seconds,
+                failure_strategy=team_version.failure_strategy,
+            )
+            schema_version = "4"
+        else:
+            agent = self.agent_service.get(run.actor_id)
+            actor = PublishedAgentSnapshot(
                 id=agent.id,
                 name=agent.name,
                 description=agent.description,
@@ -246,7 +303,21 @@ class ExecutionSnapshotService:
                 system_prompt=agent.system_prompt,
                 context_prompt=agent.context_prompt,
                 approval_policy=agent.approval_policy,
-            ),
+            )
+            schema_version = "3"
+        if not agent.enabled:
+            raise ValueError(f"Agent '{agent.id}' is disabled")
+
+        created_at = self.clock()
+        tools = self.agent_service.tool_service.resolve_bindable(agent.tool_ids)
+        payload = ExecutionSnapshotPayload(
+            schema_version=schema_version,
+            snapshot_id=str(uuid4()),
+            run_id=run_id,
+            unit_id=str(context["unit_id"]),
+            project_id=str(context["project_id"]),
+            user_id=str(context["user_id"]),
+            actor=actor,
             model=SnapshotModelSelection(
                 provider_id=agent.provider_id,
                 model=agent.model,
