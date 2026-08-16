@@ -1,7 +1,7 @@
 import pytest
 
 from app.runtime.execution_snapshot import PublishedTeamSnapshot, SnapshotTeamMember
-from app.runtime.team_graph import TeamPlan, TeamPlanError, TeamTask, schedule_ready_tasks, validate_team_plan
+from app.runtime.team_graph import TeamPlan, TeamPlanError, TeamTask, member_agent_snapshot, schedule_ready_tasks, validate_team_plan
 
 
 @pytest.fixture
@@ -44,3 +44,9 @@ def test_schedule_ready_tasks_is_deterministic_and_bounded(snapshot):
 def test_schedule_ready_tasks_rejects_zero_parallelism(snapshot):
     with pytest.raises(ValueError, match="team_limit_exceeded"):
         schedule_ready_tasks(TeamPlan(tasks=()), set(), max_parallel_members=0)
+
+
+def test_member_agent_snapshot_is_factory_compatible(snapshot):
+    member = member_agent_snapshot(snapshot, "member")
+    assert member.agent_id == "member"
+    assert "review" in member.system_prompt

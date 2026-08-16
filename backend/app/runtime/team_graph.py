@@ -5,6 +5,7 @@ from collections import defaultdict, deque
 from pydantic import BaseModel, Field
 
 from .execution_snapshot import PublishedTeamSnapshot
+from .deepagents_factory import PublishedAgentSnapshot
 
 
 class TeamPlanError(ValueError):
@@ -25,6 +26,21 @@ class TeamTask(BaseModel):
 
 class TeamPlan(BaseModel):
     tasks: tuple[TeamTask, ...]
+
+
+def member_agent_snapshot(snapshot: PublishedTeamSnapshot, member_id: str) -> PublishedAgentSnapshot:
+    """Build the immutable factory input for one Team member."""
+    candidates = [snapshot.supervisor, *snapshot.members]
+    member = next((item for item in candidates if item.agent_id == member_id), None)
+    if member is None:
+        raise TeamPlanError("team_plan_invalid: unknown member")
+    return PublishedAgentSnapshot(
+        agent_id=member.agent_id,
+        name=member.agent_id,
+        system_prompt=f"You are the {member.role} member. Responsibility: {member.responsibility}",
+        context_prompt="",
+        tools=(),
+    )
 
 
 def validate_team_plan(plan: TeamPlan, snapshot: PublishedTeamSnapshot) -> None:
