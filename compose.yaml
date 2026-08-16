@@ -19,6 +19,7 @@ services:
 
   minio:
     image: minio/minio:latest
+    restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: "${IAP_OBJECT_STORAGE_ACCESS_KEY:-iap-access}"
