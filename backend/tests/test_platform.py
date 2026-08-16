@@ -1,3 +1,6 @@
+from fastapi.testclient import TestClient
+
+from app.main import app
 from app.model_providers.schemas import AddModelRequest, CreateProviderRequest, ProviderConfigRequest
 from app.model_providers.service import ProviderService
 from sqlalchemy import create_engine
@@ -61,6 +64,25 @@ def test_platform_services_returns_five_records_in_stable_order(monkeypatch):
         "Sandbox Launcher",
     ]
     assert len(result.services) == 5
+
+
+def test_platform_services_is_available_at_the_public_api_path(monkeypatch):
+    monkeypatch.setattr(
+        platform_router,
+        "check_service_health",
+        lambda _name: {"status": "healthy", "detail": "available"},
+    )
+
+    response = TestClient(app).get("/api/platform/services")
+
+    assert response.status_code == 200
+    assert [service["name"] for service in response.json()["services"]] == [
+        "API",
+        "Workflow Runner",
+        "PostgreSQL",
+        "MinIO",
+        "Sandbox Launcher",
+    ]
 
 
 def test_minio_health_check_maps_success_to_safe_status(monkeypatch):
