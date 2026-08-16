@@ -39,3 +39,8 @@ def test_schedule_ready_tasks_is_deterministic_and_bounded(snapshot):
     batch = schedule_ready_tasks(plan, set(), max_parallel_members=2)
     assert [task.id for task in batch] == ["a", "b"]
     assert [task.id for task in schedule_ready_tasks(plan, {"a", "b"}, max_parallel_members=2)] == ["c"]
+
+
+def test_schedule_ready_tasks_rejects_zero_parallelism(snapshot):
+    with pytest.raises(ValueError, match="team_limit_exceeded"):
+        schedule_ready_tasks(TeamPlan(tasks=()), set(), max_parallel_members=0)

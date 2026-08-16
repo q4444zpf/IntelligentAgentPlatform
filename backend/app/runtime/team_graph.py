@@ -68,6 +68,8 @@ def schedule_ready_tasks(
     plan: TeamPlan, completed: set[str], *, max_parallel_members: int
 ) -> tuple[TeamTask, ...]:
     """Return the next deterministic batch whose dependencies are complete."""
+    if max_parallel_members <= 0:
+        raise TeamLimitError("team_limit_exceeded: max_parallel_members")
     validate_ids = {task.id for task in plan.tasks}
     if not completed <= validate_ids:
         raise TeamPlanError("team_plan_invalid: unknown completed task")
