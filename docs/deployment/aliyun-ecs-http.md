@@ -9,8 +9,9 @@
 - Compose 项目名：`intelligent-agent-platform`
 - PostgreSQL 数据卷：`intelligent-agent-platform_postgres-data`
 - 工作区及旧 SQLite 迁移源卷：`intelligent-agent-platform_model-provider-data`
+- MinIO 对象存储卷：`intelligent-agent-platform_minio-data`
 
-服务器使用 Docker Compose 运行 `web` 和 `api` 两个服务。`web` 通过 TCP 80 提供前端并反向代理 `/api/`；`api` 仅在 Compose 内部网络监听 8000。
+服务器使用 Docker Compose 运行 `web`、`api`、PostgreSQL 和 MinIO。`web` 通过 TCP 80 提供前端并反向代理 `/api/`；`api` 仅在 Compose 内部网络监听 8000，MinIO 仅供 Compose 内部服务使用。
 
 ## 状态与日志
 
@@ -63,6 +64,15 @@ Agent 工作区和旧 SQLite 迁移源单独备份：
 tar -C /var/lib/docker/volumes/intelligent-agent-platform_model-provider-data/_data \
   -czf /opt/intelligent-agent-platform/backups/agent-workspaces-$(date +%Y%m%d-%H%M%S).tar.gz .
 ```
+
+MinIO Artifact 数据需要单独备份。至少保留 `minio-data` 卷快照，并在发布前验证对象可读性：
+
+```bash
+docker run --rm -v intelligent-agent-platform_minio-data:/data -v /opt/intelligent-agent-platform/backups:/backup alpine \
+  tar -C /data -czf /backup/minio-artifacts-$(date +%Y%m%d-%H%M%S).tar.gz .
+```
+
+恢复前停止 `api`，恢复对象卷后再启动服务并检查 Artifact 下载接口。生产环境应将数据库、对象存储和工作区备份复制到 ECS 之外的受控存储。
 
 备份完成后执行健康检查。生产环境应将备份复制到 ECS 之外的受控存储。
 

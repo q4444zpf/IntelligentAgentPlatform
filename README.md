@@ -31,6 +31,7 @@
 - HTTPX
 - SQLAlchemy 2 / Alembic
 - PostgreSQL 16（业务配置、会话和运行）
+- MinIO / S3-compatible object storage（Artifact 原始文件、运行中间产物和成果文件）
 - SQLite（仅作为旧数据一次性迁移源和单元测试适配器）
 - Pytest
 
@@ -80,7 +81,7 @@ python -m pip install -r requirements.txt
 先在项目根目录启动 PostgreSQL：
 
 ```powershell
-docker compose up -d postgres
+docker compose up -d postgres minio
 $env:DATABASE_URL = "postgresql+psycopg://iap:iap@127.0.0.1:5432/iap"
 $env:IAP_ALLOW_DEV_IDENTITY = "true"
 cd backend
@@ -98,6 +99,10 @@ npm run dev
 ```
 
 `IAP_ALLOW_DEV_IDENTITY` 默认关闭。`X-User-ID`、`X-Project-ID` 及对应的 Vite 变量仅用于本地开发，不是生产认证方案；生产环境必须接入服务端认证会话并保持该开关关闭。
+
+Artifact 对象存储配置使用 `IAP_OBJECT_STORAGE_ENDPOINT`、`IAP_OBJECT_STORAGE_ACCESS_KEY`、`IAP_OBJECT_STORAGE_SECRET_KEY` 和 `IAP_ARTIFACT_BUCKET`。整套 Compose 会自动启动 MinIO，并通过 `minio-data` 卷持久化对象。不要执行 `docker compose down -v`，否则会删除对象存储卷。
+
+Artifact API 支持 `POST /api/artifacts`（multipart 文件上传）、`GET /api/artifacts`、`GET /api/artifacts/{id}`、`GET /api/artifacts/{id}/download` 和 `POST /api/runs/{run_id}/artifacts/{artifact_id}`。下载接口只返回最多 900 秒有效的签名 URL；权限按当前用户、项目和单位范围过滤，Run 关联也必须通过当前项目校验。
 
 ## 分别启动
 
