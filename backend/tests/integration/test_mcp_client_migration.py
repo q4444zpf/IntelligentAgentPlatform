@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 
 import pytest
 from sqlalchemy import create_engine, inspect, text
@@ -9,8 +11,20 @@ pytestmark = pytest.mark.skipif(
     reason="requires PostgreSQL",
 )
 
+ALEMBIC_UPGRADE_COMMAND = (
+    sys.executable,
+    "-m",
+    "alembic",
+    "-c",
+    "backend/alembic.ini",
+    "upgrade",
+    "head",
+)
+
 
 def test_mcp_client_module_schema_has_unit_health_and_operation_tables():
+    env = os.environ | {"DATABASE_URL": os.environ["TEST_DATABASE_URL"]}
+    subprocess.run(ALEMBIC_UPGRADE_COMMAND, check=True, env=env)
     engine = create_engine(os.environ["TEST_DATABASE_URL"])
     try:
         inspector = inspect(engine)
