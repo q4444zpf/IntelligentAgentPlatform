@@ -6,6 +6,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.agents.service import AgentService
+from app.agents.store import AgentStore
 from app.conversations.dispatcher import UnavailableRunDispatcher
 from app.conversations.models import ToolInvocation
 from app.conversations.repository import ConversationRepository
@@ -147,10 +149,14 @@ def test_authenticated_regular_user_can_read_tools(client):
 def build_invocation_client(tmp_path):
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'invocations-api.db'}")
     Base.metadata.create_all(engine)
-    session = Session(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    session = session_factory()
+    agent_service = AgentService(AgentStore(session_factory))
 
     service = ConversationService(
-        ConversationRepository(session), UnavailableRunDispatcher()
+        ConversationRepository(session),
+        UnavailableRunDispatcher(),
+        agent_service=agent_service,
     )
     app = FastAPI()
     app.state.allow_dev_identity = True

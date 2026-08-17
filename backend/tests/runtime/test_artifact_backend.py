@@ -3,33 +3,11 @@ import hashlib
 from datetime import UTC, datetime
 
 import pytest
-from app.artifacts.models import ArtifactRecord
-from app.artifacts.service import ArtifactService
-from app.conversations.models import AgentRun, Conversation, Message, RunEvent
-from app.conversations.repository import ConversationRepository
-from app.db.base import Base
 from app.runtime.artifact_backend import (
     ArtifactBackend,
 )
-from app.runtime.execution_snapshot import (
-    ExecutionSnapshotPayload,
-    PublishedAgentSnapshot,
-    SnapshotModelSelection,
-    SnapshotRuntimeLimits,
-    StoredExecutionSnapshot,
-    canonical_snapshot_bytes,
-)
-from app.runtime.run_tokens import RunTokenClaims, RunTokenForbidden
-from app.runtime.runner_gateway_auth import (
-    RunnerGatewayError,
-    runner_gateway_error_handler,
-)
-from app.runtime.runner_gateway_router import create_router
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select
-from sqlalchemy.orm import Session
-from sqlalchemy.pool import StaticPool
 
 
 class FakeArtifactClient:
@@ -86,6 +64,81 @@ def test_artifact_backend_writes_reads_and_lists_virtual_files():
     assert [item.path for item in backend.list("/artifacts/reports")] == [created.path]
 
 
+def test_artifact_backend_maps_deepagents_relative_paths_into_artifacts():
+    client = FakeArtifactClient()
+    backend = ArtifactBackend(client)
+
+    created = backend.write("acceptance-result.txt", "accepted")
+
+    assert created.error is None
+    assert created.path == "/artifacts/acceptance-result.txt"
+    assert list(client.files) == ["/artifacts/acceptance-result.txt"]
+
+
+def test_deepagents_write_file_maps_virtual_root_into_artifacts():
+    from app.runtime.deepagents_factory import (
+        DeepAgentFactory,
+        PublishedAgentSnapshot as FactoryPublishedAgentSnapshot,
+    )
+    from app.runtime.gateway_model import GatewayChatModel
+
+    class ModelTransport:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke_model(self, _request, _idempotency_key):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "content": "Creating the artifact.",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "name": "write_file",
+                            "arguments": {
+                                "file_path": "acceptance-result.txt",
+                                "content": "accepted",
+                            },
+                        }
+                    ],
+                }
+            return {
+                "content": "Artifact created.",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
+                "tool_calls": [],
+            }
+
+    client = FakeArtifactClient()
+    graph = DeepAgentFactory().build(
+        FactoryPublishedAgentSnapshot("agent-1", "Agent", "system", "", ()),
+        model=GatewayChatModel(ModelTransport()),
+        tools=[],
+        backend=ArtifactBackend(client),
+    )
+
+    graph.invoke({"messages": [{"role": "user", "content": "create a file"}]})
+
+    assert list(client.files) == ["/artifacts/acceptance-result.txt"]
+
+
+@pytest.mark.parametrize("root_alias", ["/", "."])
+def test_artifact_backend_maps_deepagents_root_aliases_to_artifacts(root_alias):
+    backend = ArtifactBackend(FakeArtifactClient())
+    backend.write("/artifacts/result.txt", "result")
+
+    listed = backend.ls(root_alias)
+
+    assert listed.error is None
+    assert [entry["path"] for entry in listed.entries] == [
+        "/artifacts/result.txt"
+    ]
+
+
 def test_artifact_backend_is_create_only():
     backend = ArtifactBackend(FakeArtifactClient())
     backend.write("/artifacts/result.txt", "first")
@@ -118,6 +171,8 @@ class GatewayTokenService:
         self.snapshot = snapshot
 
     def verify(self, token, run_id, action):
+        from app.runtime.run_tokens import RunTokenClaims, RunTokenForbidden
+
         if token == "denied":
             raise RunTokenForbidden("forbidden")
         return RunTokenClaims(
@@ -145,6 +200,15 @@ class GatewaySnapshotService:
 
 
 def _gateway_snapshot():
+    from app.runtime.execution_snapshot import (
+        ExecutionSnapshotPayload,
+        PublishedAgentSnapshot,
+        SnapshotModelSelection,
+        SnapshotRuntimeLimits,
+        StoredExecutionSnapshot,
+        canonical_snapshot_bytes,
+    )
+
     payload = ExecutionSnapshotPayload(
         snapshot_id="snapshot-1",
         run_id="run-1",
@@ -177,6 +241,8 @@ def _gateway_snapshot():
 
 
 def _add_run(session, run_id, project_id="project-1"):
+    from app.conversations.models import AgentRun, Conversation, Message, RunEvent
+
     conversation = Conversation(
         unit_id="unit-1",
         project_id=project_id,
@@ -206,7 +272,25 @@ def _add_run(session, run_id, project_id="project-1"):
     session.commit()
 
 
-def _gateway_client(repository_type=ConversationRepository):
+def _gateway_client(repository_type=None):
+    from app.artifacts.models import ArtifactRecord
+    from app.artifacts.service import ArtifactService
+    from app.conversations.models import AgentRun, Conversation, Message, RunEvent
+    from app.conversations.repository import ConversationRepository
+    from app.db.base import Base
+    from app.runtime.run_tokens import RunTokenClaims
+    from app.runtime.runner_gateway_auth import (
+        RunnerGatewayError,
+        runner_gateway_error_handler,
+    )
+    from app.runtime.runner_gateway_router import create_router
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+    from sqlalchemy.pool import StaticPool
+
+    if repository_type is None:
+        repository_type = ConversationRepository
+
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -242,6 +326,10 @@ def _headers(token="valid", key=None):
 
 
 def test_runner_artifact_gateway_is_scoped_idempotent_and_emits_ready_event():
+    from app.artifacts.models import ArtifactRecord
+    from app.conversations.models import RunEvent
+    from sqlalchemy import select
+
     client, session, _, _ = _gateway_client()
     data = b"result"
     request = {
@@ -319,6 +407,9 @@ def test_runner_artifact_routes_require_artifact_action():
 
 
 def test_runner_artifact_upload_removes_object_when_event_persistence_fails():
+    from app.artifacts.models import ArtifactRecord
+    from app.conversations.repository import ConversationRepository
+
     class FailingEventRepository(ConversationRepository):
         def append_event(self, run_id, event_type, payload):
             raise RuntimeError("database unavailable")

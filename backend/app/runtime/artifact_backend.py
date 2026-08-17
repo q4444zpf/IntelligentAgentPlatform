@@ -82,7 +82,7 @@ class ArtifactBackend(BackendProtocol):
 
     def write(self, file_path: str, content: str) -> WriteResult:
         try:
-            self._create(
+            artifact = self._create(
                 file_path,
                 content.encode("utf-8"),
                 "text/plain",
@@ -91,7 +91,7 @@ class ArtifactBackend(BackendProtocol):
             return WriteResult(error="Artifact path is invalid")
         except ArtifactAlreadyExistsError:
             return WriteResult(error="Artifact already exists")
-        return WriteResult(path=file_path)
+        return WriteResult(path=artifact.path)
 
     def read(
         self,
@@ -281,19 +281,25 @@ def _grep_result(matches: list[dict[str, Any]], truncated: bool) -> GrepResult:
 
 
 def _normalize_artifact_path(path: str, *, allow_root: bool) -> str:
-    if (
-        not path
-        or "\x00" in path
-        or "\\" in path
-        or len(path) > 266
-        or not path.startswith("/artifacts")
-    ):
+    if not path or "\x00" in path or "\\" in path or len(path) > 266:
         raise ArtifactPathError("artifact path must be under /artifacts")
-    parsed = PurePosixPath(path)
+    if path in {"/", "."}:
+        if allow_root:
+            return "/artifacts"
+        raise ArtifactPathError("artifact path must name a file")
+    if path == "/artifacts" or path.startswith("/artifacts/"):
+        candidate = path
+    elif path.startswith("/"):
+        candidate = f"/artifacts{path}"
+    else:
+        if ":" in path:
+            raise ArtifactPathError("artifact path must be under /artifacts")
+        candidate = f"/artifacts/{path}"
+    parsed = PurePosixPath(candidate)
     if parsed.parts[:2] != ("/", "artifacts"):
         raise ArtifactPathError("artifact path must be under /artifacts")
     relative_parts = parsed.parts[2:]
-    raw_parts = path.split("/")[2:]
+    raw_parts = candidate.split("/")[2:]
     if any(part in {"", ".", ".."} for part in raw_parts):
         raise ArtifactPathError("artifact path is invalid")
     if not allow_root and not relative_parts:
