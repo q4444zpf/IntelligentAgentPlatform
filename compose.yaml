@@ -43,6 +43,7 @@ services:
       DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://iap:iap@postgres:5432/iap}"
       IAP_ENVIRONMENT: "${IAP_ENVIRONMENT:-development}"
       IAP_ALLOW_DEV_IDENTITY: "${IAP_ALLOW_DEV_IDENTITY:-false}"
+      IAP_DEV_IDENTITY_TRUSTED_CIDRS: "${IAP_DEV_IDENTITY_TRUSTED_CIDRS:-}"
       IAP_SESSION_COOKIE_SECURE: "${IAP_SESSION_COOKIE_SECURE:-true}"
       LEGACY_SQLITE_DATA_DIR: /data
       AGENT_WORKSPACE_ROOT: /data/agent-workspaces

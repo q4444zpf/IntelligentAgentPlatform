@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from ipaddress import ip_address, ip_network
 from typing import Annotated, Literal, TypeAlias
 
 from fastapi import Cookie, Depends, Header, HTTPException, Request
@@ -45,10 +46,11 @@ def require_request_context(
     from .settings import settings
     client_host = (request.client.host if request.client else "").lower()
     loopback_hosts = {"127.0.0.1", "localhost", "::1", "testserver", "testclient"}
+    trusted_dev_client = _is_trusted_dev_client(client_host, settings.dev_identity_trusted_cidrs)
     if (
         not getattr(request.app.state, "allow_dev_identity", False)
         or settings.environment not in {"development", "test"}
-        or client_host not in loopback_hosts
+        or (client_host not in loopback_hosts and not trusted_dev_client)
     ):
         raise HTTPException(status_code=401, detail="Authentication is required")
     if not dev_user_id or not dev_project_id or not dev_unit_id:
@@ -73,6 +75,21 @@ def require_request_context(
         project_id=dev_project_id,
         roles=frozenset(parsed_roles),
     )
+
+
+def _is_trusted_dev_client(client_host: str, cidrs: tuple[str, ...]) -> bool:
+    """Allow explicitly configured Docker/private clients only for dev identity."""
+    try:
+        address = ip_address(client_host)
+    except ValueError:
+        return False
+    for cidr in cidrs:
+        try:
+            if address in ip_network(cidr, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def _cookie_request_context(session: Session, session_cookie: str) -> RequestContext:
