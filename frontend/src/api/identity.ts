@@ -11,6 +11,16 @@ export interface IdentityUser {
   /** Populated when the identity service exposes the user's authentication source. */
   auth_method?: 'local' | 'oidc' | 'dev_test' | string | null;
   external_identity?: boolean;
+  initial_password?: string | null;
+  invitation_status?: 'pending' | 'not_required' | null;
+}
+
+export interface CreateIdentityUserPayload {
+  display_name: string;
+  email?: string | null;
+  project_id?: string | null;
+  initial_password?: string | null;
+  invite?: boolean | null;
 }
 
 export interface IdentityProjectMembership {
@@ -59,7 +69,7 @@ export function listIdentityPermissions(signal?: AbortSignal): Promise<IdentityP
   return request<IdentityPermission[]>('/identity/permissions', { signal });
 }
 
-export function createIdentityUser(body: { display_name: string; email?: string | null; project_id?: string | null }): Promise<IdentityUser> {
+export function createIdentityUser(body: CreateIdentityUserPayload): Promise<IdentityUser> {
   return request<IdentityUser>('/identity/users', { method: 'POST', body: JSON.stringify(body) });
 }
 export function updateIdentityUser(userId: string, body: { display_name: string; email?: string | null }): Promise<IdentityUser> {

@@ -35,11 +35,11 @@
 
         <a-form layout="vertical" :model="form" @finish="handleLogin">
           <a-form-item
-            label="账号"
-            name="username"
-            :rules="[{ required: true, message: '请输入账号' }]"
+            label="邮箱"
+            name="email"
+            :rules="[{ required: true, message: '请输入邮箱' }]"
           >
-            <a-input v-model:value="form.username" size="large" autocomplete="username" placeholder="邮箱地址">
+            <a-input v-model:value="form.email" size="large" autocomplete="username" placeholder="邮箱地址">
               <template #prefix>
                 <UserOutlined />
               </template>
@@ -146,8 +146,8 @@ const passwordForm = reactive({ currentPassword: '', newPassword: '', confirmPas
 const hasDevIdentity = Object.keys(identityHeaders).length > 0;
 
 const form = reactive({
-  username: 'admin',
-  password: '123456',
+  email: '',
+  password: '',
   role: 'admin' as UserRole,
   remember: true,
 });
@@ -178,7 +178,7 @@ const capabilities = [
 async function handleLogin() {
   submitting.value = true;
   try {
-    const result = await permissionStore.loginWithLocalCredentials(form.username, form.password);
+    const result = await permissionStore.loginWithLocalCredentials(form.email, form.password);
     if (result?.must_change_password) {
       passwordForm.currentPassword = form.password;
       passwordForm.newPassword = '';
@@ -201,8 +201,8 @@ async function handlePasswordChange() {
     message.error('请输入当前密码');
     return;
   }
-  if (passwordForm.newPassword.length < 8) {
-    message.error('新密码至少需要 8 位');
+  if (passwordForm.newPassword.length < 12) {
+    message.error('新密码至少需要 12 位');
     return;
   }
   if (passwordForm.newPassword !== passwordForm.confirmPassword) {
@@ -215,7 +215,7 @@ async function handlePasswordChange() {
       current_password: passwordForm.currentPassword,
       new_password: passwordForm.newPassword,
     });
-    await permissionStore.loginWithLocalCredentials(form.username, passwordForm.newPassword);
+    await permissionStore.loginWithLocalCredentials(form.email, passwordForm.newPassword);
     passwordChangeOpen.value = false;
     message.success('密码修改成功');
     const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/dashboard';

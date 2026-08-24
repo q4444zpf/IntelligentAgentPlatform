@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { request } from './client';
 import {
   assignIdentityUserRole,
+  createIdentityUser,
   deleteIdentityRole,
   grantIdentityRolePermission,
   listIdentityUserRoles,
@@ -24,6 +25,25 @@ describe('identity role API', () => {
     const controller = new AbortController();
     await listIdentityUserRoles('user/1', 'project 1', controller.signal);
     expect(request).toHaveBeenCalledWith('/identity/users/user%2F1/roles?project_id=project%201', { signal: controller.signal });
+  });
+
+  it('creates a local user with an initial password', async () => {
+    vi.mocked(request).mockResolvedValue({});
+
+    await createIdentityUser({
+      display_name: 'Alice',
+      email: 'alice@example.test',
+      initial_password: 'InitialPassword123!',
+    });
+
+    expect(request).toHaveBeenCalledWith('/identity/users', {
+      method: 'POST',
+      body: JSON.stringify({
+        display_name: 'Alice',
+        email: 'alice@example.test',
+        initial_password: 'InitialPassword123!',
+      }),
+    });
   });
 
   it('assigns, removes, and replaces role bindings using the role contract', async () => {

@@ -146,6 +146,22 @@ def test_admin_create_local_user_returns_one_time_initial_password_and_stores_on
     assert listed_user["initial_password"] is None
 
 
+def test_admin_requires_email_when_creating_local_password_credentials():
+    client = build_client()
+
+    response = client.post(
+        "/api/identity/users",
+        headers=headers(),
+        json={
+            "display_name": "Local User Without Email",
+            "initial_password": "Initial-password-123",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "本地账号必须提供邮箱"
+
+
 def test_admin_create_local_user_without_password_marks_invitation_pending():
     client = build_client()
 

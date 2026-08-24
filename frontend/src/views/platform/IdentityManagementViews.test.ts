@@ -1,5 +1,6 @@
 // @vitest-environment happy-dom
 import { flushPromises, mount } from '@vue/test-utils';
+import { message } from 'ant-design-vue';
 import { nextTick } from 'vue';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import RoleManagementView from './RoleManagementView.vue';
@@ -9,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   listUsers: vi.fn(),
   listRoles: vi.fn(),
   listProjects: vi.fn(),
+  createUser: vi.fn(),
   updateUser: vi.fn(),
   resetPassword: vi.fn(),
   listUserRoles: vi.fn(),
@@ -22,6 +24,7 @@ vi.mock('@/api/identity', () => ({
   listIdentityUsers: mocks.listUsers,
   listIdentityRoles: mocks.listRoles,
   listIdentityProjects: mocks.listProjects,
+  createIdentityUser: mocks.createUser,
   updateIdentityUser: mocks.updateUser,
   resetIdentityUserPassword: mocks.resetPassword,
   listIdentityUserRoles: mocks.listUserRoles,
@@ -53,7 +56,7 @@ function render(component: typeof UserManagementView | typeof RoleManagementView
   const wrapper = mount(component, { global: { stubs } }); wrappers.push(wrapper); return wrapper;
 }
 
-beforeEach(() => { mocks.listUsers.mockReset(); mocks.listRoles.mockReset(); mocks.listProjects.mockReset(); mocks.updateUser.mockReset(); mocks.resetPassword.mockReset(); mocks.listUserRoles.mockReset(); mocks.replaceUserRoles.mockReset(); mocks.deleteRole.mockReset(); mocks.listPermissions.mockReset(); mocks.grantRolePermission.mockReset(); });
+beforeEach(() => { mocks.listUsers.mockReset(); mocks.listRoles.mockReset(); mocks.listProjects.mockReset(); mocks.createUser.mockReset(); mocks.updateUser.mockReset(); mocks.resetPassword.mockReset(); mocks.listUserRoles.mockReset(); mocks.replaceUserRoles.mockReset(); mocks.deleteRole.mockReset(); mocks.listPermissions.mockReset(); mocks.grantRolePermission.mockReset(); });
 afterEach(() => wrappers.splice(0).forEach((wrapper) => wrapper.unmount()));
 
 describe('identity administration views', () => {
@@ -115,6 +118,30 @@ describe('identity administration views', () => {
     expect(wrapper.text()).toContain('编辑');
   });
 
+  it('creates a local user with an email and initial password', async () => {
+    mocks.listUsers.mockResolvedValue([]);
+    mocks.createUser.mockResolvedValue({ id: 'user-1' });
+    const wrapper = render(UserManagementView);
+    await flushPromises();
+
+    await wrapper.findAll('button').find((button) => button.text() === '新建用户')!.trigger('click');
+    const passwordInput = wrapper.find('input[type="password"]');
+    expect(passwordInput.exists()).toBe(true);
+
+    const inputs = wrapper.findAll('input');
+    await inputs[0].setValue('Alice');
+    await inputs[1].setValue('alice@example.test');
+    await passwordInput.setValue('InitialPassword123!');
+    await wrapper.findAll('button').find((button) => button.text() === '保存')!.trigger('click');
+    await flushPromises();
+
+    expect(mocks.createUser).toHaveBeenCalledWith({
+      display_name: 'Alice',
+      email: 'alice@example.test',
+      initial_password: 'InitialPassword123!',
+    });
+  });
+
   it('shows password reset and role management actions for local users', async () => {
     mocks.listUsers.mockResolvedValue([{ id: 'user-1', display_name: 'Alice', email: 'alice@example.test', status: 'active', membership_status: 'active', project_memberships: [], role_summaries: [] }]);
     const wrapper = render(UserManagementView);
@@ -137,6 +164,25 @@ describe('identity administration views', () => {
     await wrapper.findAll('button').find((button) => button.text() === '保存')?.trigger('click');
     await flushPromises();
     expect(mocks.resetPassword).toHaveBeenCalledWith('user-1', { new_password: 'NewPassword123!' });
+  });
+
+  it('copies a generated password when the async clipboard API is unavailable', async () => {
+    mocks.listUsers.mockResolvedValue([{ id: 'user-1', display_name: 'Alice', email: 'alice@example.test', status: 'active', membership_status: 'active', project_memberships: [], role_summaries: [] }]);
+    const clipboardWrite = vi.spyOn(navigator.clipboard, 'writeText').mockRejectedValue(new DOMException('Clipboard unavailable', 'NotAllowedError'));
+    const execCommand = vi.fn(() => true);
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: execCommand });
+    const successMessage = vi.spyOn(message, 'success').mockImplementation(() => undefined as never);
+    const wrapper = render(UserManagementView);
+    await flushPromises();
+    await wrapper.findAll('a').find((link) => link.text() === '重置密码')!.trigger('click');
+
+    await wrapper.findAll('button').find((button) => button.text() === '复制')!.trigger('click');
+    await flushPromises();
+
+    expect(execCommand).toHaveBeenCalledWith('copy');
+    expect(successMessage).toHaveBeenCalledWith('密码已复制');
+    clipboardWrite.mockRestore();
+    successMessage.mockRestore();
   });
 
   it('loads and replaces the selected user roles', async () => {

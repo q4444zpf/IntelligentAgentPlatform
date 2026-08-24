@@ -188,6 +188,8 @@ def create_user(
         raise HTTPException(status_code=422, detail="初始密码和邀请状态不能同时设置")
     display_name = _ensure_display_name_available(session, body.display_name)
     email = _ensure_email_available(session, body.email)
+    if body.initial_password is not None and email is None:
+        raise HTTPException(status_code=422, detail="本地账号必须提供邮箱")
     project = _ensure_project(session, body.project_id, context.unit_id)
     user = User(id=new_id(), display_name=display_name, email=email, status="active", authorization_version=1)
     session.add(user)
