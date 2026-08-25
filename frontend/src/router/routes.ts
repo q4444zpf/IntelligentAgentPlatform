@@ -108,6 +108,12 @@ export const routes: RouteRecordRaw[] = [
     meta: { title: '登录', public: true },
   },
   {
+    path: '/403',
+    name: 'Forbidden',
+    component: () => import('@/views/errors/ForbiddenView.vue'),
+    meta: { title: '无权访问' },
+  },
+  {
     path: '/',
     component: AppLayout,
     redirect: '/dashboard',

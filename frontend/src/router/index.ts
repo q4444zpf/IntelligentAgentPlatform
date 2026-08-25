@@ -29,5 +29,5 @@ router.beforeEach(async (to) => {
 
   if (permissionStore.hasPermission(permission)) return true;
 
-  return '/dashboard';
+  return '/403';
 });

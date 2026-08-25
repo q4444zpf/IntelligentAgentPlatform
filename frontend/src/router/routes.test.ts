@@ -11,3 +11,13 @@ describe('artifact route', () => {
     expect(String(artifact?.component)).toContain('ArtifactListView');
   });
 });
+
+describe('fixed authorization routes', () => {
+  it('keeps an authenticated forbidden page available without a business permission', () => {
+    const forbidden = routes.find((route) => route.path === '/403');
+
+    expect(forbidden?.meta?.public).not.toBe(true);
+    expect(forbidden?.meta?.permission).toBeUndefined();
+    expect(String(forbidden?.component)).toContain('ForbiddenView');
+  });
+});
