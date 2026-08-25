@@ -21,6 +21,13 @@ export interface CreateIdentityUserPayload {
   project_id?: string | null;
   initial_password?: string | null;
   invite?: boolean | null;
+  role_ids: string[];
+}
+
+export interface UpdateIdentityUserPayload {
+  display_name: string;
+  email?: string | null;
+  role_ids: string[];
 }
 
 export interface IdentityProjectMembership {
@@ -72,7 +79,7 @@ export function listIdentityPermissions(signal?: AbortSignal): Promise<IdentityP
 export function createIdentityUser(body: CreateIdentityUserPayload): Promise<IdentityUser> {
   return request<IdentityUser>('/identity/users', { method: 'POST', body: JSON.stringify(body) });
 }
-export function updateIdentityUser(userId: string, body: { display_name: string; email?: string | null }): Promise<IdentityUser> {
+export function updateIdentityUser(userId: string, body: UpdateIdentityUserPayload): Promise<IdentityUser> {
   return request<IdentityUser>(`/identity/users/${encodeURIComponent(userId)}`, { method: 'PATCH', body: JSON.stringify(body) });
 }
 
