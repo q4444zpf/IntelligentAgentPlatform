@@ -143,6 +143,31 @@ def _active_unit_roles(session: Session, role_ids: list[str], unit_id: str) -> l
     return [by_id[role_id] for role_id in unique_ids]
 
 
+def _users_with_only_unit_role(
+    session: Session,
+    role_id: str,
+    unit_id: str,
+) -> set[str]:
+    role_counts = (
+        select(
+            UnitMembershipRole.user_id.label("user_id"),
+            func.count(UnitMembershipRole.id).label("role_count"),
+        )
+        .where(UnitMembershipRole.unit_id == unit_id)
+        .group_by(UnitMembershipRole.user_id)
+        .subquery()
+    )
+    return set(session.scalars(
+        select(UnitMembershipRole.user_id)
+        .join(role_counts, role_counts.c.user_id == UnitMembershipRole.user_id)
+        .where(
+            UnitMembershipRole.unit_id == unit_id,
+            UnitMembershipRole.role_id == role_id,
+            role_counts.c.role_count == 1,
+        )
+    ))
+
+
 def _replace_unit_role_bindings(
     session: Session,
     user_id: str,
@@ -456,19 +481,20 @@ def assign_role(
     session: Session = Depends(get_session),
 ) -> dict[str, str | None]:
     membership = _unit_member(session, user_id, context.unit_id)
-    role = session.scalar(select(Role).where(Role.id == body.role_id, Role.unit_id == context.unit_id))
     project = _ensure_project(session, body.project_id, context.unit_id)
-    if membership is None or role is None:
+    if membership is None:
         raise HTTPException(status_code=404, detail="用户或角色不存在或无权访问")
     changed = False
     if project is None:
-        if role.scope_type != "unit":
-            raise HTTPException(status_code=422, detail="该角色必须绑定项目")
+        role = _active_unit_roles(session, [body.role_id], context.unit_id)[0]
         exists = session.scalar(select(UnitMembershipRole).where(UnitMembershipRole.user_id == user_id, UnitMembershipRole.unit_id == context.unit_id, UnitMembershipRole.role_id == role.id))
         if exists is None:
             session.add(UnitMembershipRole(id=new_id(), user_id=user_id, unit_id=context.unit_id, role_id=role.id, scope_type="unit"))
             changed = True
     else:
+        role = session.scalar(select(Role).where(Role.id == body.role_id, Role.unit_id == context.unit_id))
+        if role is None:
+            raise HTTPException(status_code=404, detail="用户或角色不存在或无权访问")
         if role.scope_type != "project":
             raise HTTPException(status_code=422, detail="单位角色不能绑定单个项目")
         pm = session.scalar(select(ProjectMembership).where(ProjectMembership.user_id == user_id, ProjectMembership.unit_id == context.unit_id, ProjectMembership.project_id == project.id))
@@ -538,6 +564,15 @@ def remove_role(
         binding = session.scalar(select(ProjectMembershipRole).where(ProjectMembershipRole.user_id == user_id, ProjectMembershipRole.unit_id == context.unit_id, ProjectMembershipRole.project_id == project.id, ProjectMembershipRole.role_id == role.id))
     if binding is None:
         return {"user_id": user_id, "role_id": role.id, "project_id": project.id if project else None, "removed": False}
+    if project is None:
+        remaining_count = session.scalar(
+            select(func.count(UnitMembershipRole.id)).where(
+                UnitMembershipRole.user_id == user_id,
+                UnitMembershipRole.unit_id == context.unit_id,
+            )
+        ) or 0
+        if remaining_count <= 1:
+            raise HTTPException(status_code=422, detail="用户必须至少保留一个单位角色")
     session.delete(binding)
     user = session.get(User, user_id)
     if user is not None:
@@ -559,23 +594,17 @@ def replace_roles(
         raise HTTPException(status_code=404, detail="用户不存在或不属于当前单位")
     project = _ensure_project(session, body.project_id, context.unit_id)
     role_ids = list(dict.fromkeys(body.role_ids))
-    roles = session.scalars(select(Role).where(Role.id.in_(role_ids), Role.unit_id == context.unit_id)).all() if role_ids else []
-    if len(roles) != len(role_ids):
-        raise HTTPException(status_code=404, detail="角色不存在或无权访问")
-    expected_scope = "project" if project is not None else "unit"
-    if any(role.scope_type != expected_scope for role in roles):
-        raise HTTPException(status_code=422, detail="角色范围与目标不匹配")
     if project is None:
-        existing = session.scalars(select(UnitMembershipRole).where(UnitMembershipRole.user_id == user_id, UnitMembershipRole.unit_id == context.unit_id)).all()
-        existing_ids = {item.role_id for item in existing}
-        desired_ids = set(role_ids)
-        for item in existing:
-            if item.role_id not in desired_ids:
-                session.delete(item)
-        for role in roles:
-            if role.id not in existing_ids:
-                session.add(UnitMembershipRole(id=new_id(), user_id=user_id, unit_id=context.unit_id, role_id=role.id, scope_type="unit"))
+        if not role_ids:
+            raise HTTPException(status_code=422, detail="用户必须至少保留一个单位角色")
+        roles = _active_unit_roles(session, role_ids, context.unit_id)
+        changed = _replace_unit_role_bindings(session, user_id, context.unit_id, roles)
     else:
+        roles = session.scalars(select(Role).where(Role.id.in_(role_ids), Role.unit_id == context.unit_id)).all() if role_ids else []
+        if len(roles) != len(role_ids):
+            raise HTTPException(status_code=404, detail="角色不存在或无权访问")
+        if any(role.scope_type != "project" for role in roles):
+            raise HTTPException(status_code=422, detail="角色范围与目标不匹配")
         pm = session.scalar(select(ProjectMembership).where(ProjectMembership.user_id == user_id, ProjectMembership.unit_id == context.unit_id, ProjectMembership.project_id == project.id))
         if pm is None:
             pm = ProjectMembership(id=new_id(), user_id=user_id, unit_id=context.unit_id, project_id=project.id, status="active")
@@ -589,7 +618,7 @@ def replace_roles(
         for role in roles:
             if role.id not in existing_ids:
                 session.add(ProjectMembershipRole(id=new_id(), user_id=user_id, unit_id=context.unit_id, project_id=project.id, role_id=role.id, scope_type="project"))
-    changed = existing_ids != set(role_ids) if 'existing_ids' in locals() else bool(role_ids)
+        changed = existing_ids != set(role_ids)
     user = session.get(User, user_id)
     if changed and user is not None:
         _bump(user)
@@ -744,6 +773,8 @@ def delete_role(
         raise HTTPException(status_code=404, detail="角色不存在或不属于当前单位")
     if role.built_in:
         raise HTTPException(status_code=409, detail="内置角色不可删除")
+    if role.scope_type == "unit" and _users_with_only_unit_role(session, role.id, context.unit_id):
+        raise HTTPException(status_code=409, detail="该角色是用户的最后一个单位角色，不能删除")
     session.execute(delete(UnitMembershipRole).where(UnitMembershipRole.role_id == role.id, UnitMembershipRole.unit_id == context.unit_id))
     session.execute(delete(ProjectMembershipRole).where(ProjectMembershipRole.role_id == role.id, ProjectMembershipRole.unit_id == context.unit_id))
     role_permission_ids = session.scalars(select(RolePermission.id).where(RolePermission.role_id == role.id, RolePermission.unit_id == context.unit_id)).all()

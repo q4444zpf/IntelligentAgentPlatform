@@ -445,6 +445,102 @@ def test_replace_roles_replaces_only_requested_scope():
     assert [item['role_id'] for item in response.json()] == [target_id]
 
 
+def test_remove_role_rejects_the_users_last_unit_role():
+    client = build_client()
+
+    response = client.request(
+        "DELETE", "/api/identity/users/user-1/roles",
+        headers=headers(), json={"role_id": role_id()},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "用户必须至少保留一个单位角色"
+    with app.dependency_overrides[get_session]() as session:
+        assert session.get(UnitMembershipRole, "umr-1") is not None
+
+
+def test_replace_unit_roles_rejects_an_empty_list_but_project_roles_can_be_cleared():
+    client = build_client()
+
+    unit_response = client.put(
+        "/api/identity/users/user-1/roles", headers=headers(), json={"role_ids": []},
+    )
+    project_response = client.put(
+        "/api/identity/users/user-1/roles", headers=headers(),
+        json={"role_ids": [], "project_id": "project-1"},
+    )
+
+    assert unit_response.status_code == 422
+    assert unit_response.json()["detail"] == "用户必须至少保留一个单位角色"
+    assert project_response.status_code == 200
+
+
+def test_assign_role_rejects_an_inactive_unit_role():
+    client = build_client()
+    with app.dependency_overrides[get_session]() as session:
+        session.add(Role(
+            id="inactive-assignment-role", code="inactive_assignment_role", name="Inactive assignment",
+            scope_type="unit", unit_id="unit-1", built_in=False, status="inactive",
+        ))
+        session.commit()
+
+    response = client.post(
+        "/api/identity/users/user-1/roles", headers=headers(),
+        json={"role_id": "inactive-assignment-role"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "请选择当前单位的有效单位角色"
+
+
+def test_replace_roles_rejects_an_inactive_unit_role():
+    client = build_client()
+    with app.dependency_overrides[get_session]() as session:
+        session.add(Role(
+            id="inactive-replacement-role", code="inactive_replacement_role", name="Inactive replacement",
+            scope_type="unit", unit_id="unit-1", built_in=False, status="inactive",
+        ))
+        session.commit()
+
+    response = client.put(
+        "/api/identity/users/user-1/roles", headers=headers(),
+        json={"role_ids": ["inactive-replacement-role"]},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "请选择当前单位的有效单位角色"
+
+
+def test_delete_custom_role_rejects_removing_a_users_last_unit_role():
+    client = build_client()
+    with app.dependency_overrides[get_session]() as session:
+        user = User(
+            id="last-role-user", display_name="Last Role User",
+            email="last-role@example.test", status="active", authorization_version=1,
+        )
+        role = Role(
+            id="last-custom-role", code="last_custom_role", name="Last Custom Role",
+            scope_type="unit", unit_id="unit-1", built_in=False, status="active",
+        )
+        session.add_all([user, role])
+        session.add(UnitMembership(
+            id="last-role-membership", user_id=user.id, unit_id="unit-1", status="active",
+        ))
+        session.add(UnitMembershipRole(
+            id="last-role-binding", user_id=user.id, unit_id="unit-1",
+            role_id=role.id, scope_type="unit",
+        ))
+        session.commit()
+
+    response = client.delete("/api/identity/roles/last-custom-role", headers=headers())
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "该角色是用户的最后一个单位角色，不能删除"
+    with app.dependency_overrides[get_session]() as session:
+        assert session.get(Role, "last-custom-role") is not None
+        assert session.get(UnitMembershipRole, "last-role-binding") is not None
+
+
 def test_role_scope_isolated_and_built_in_role_cannot_be_deleted():
     client = build_client()
     with app.dependency_overrides[get_session]() as session:
@@ -452,7 +548,7 @@ def test_role_scope_isolated_and_built_in_role_cannot_be_deleted():
         builtin = session.scalar(select(Role).where(Role.unit_id == 'unit-1', Role.built_in.is_(True)))
         builtin_id = builtin.id
         session.add(platform_or_other); session.commit()
-    assert client.post('/api/identity/users/user-1/roles', headers=headers(), json={'role_id': 'other-role'}).status_code == 404
+    assert client.post('/api/identity/users/user-1/roles', headers=headers(), json={'role_id': 'other-role'}).status_code == 422
     assert client.request('DELETE', f'/api/identity/roles/{builtin_id}', headers=headers()).status_code == 409
 
 
