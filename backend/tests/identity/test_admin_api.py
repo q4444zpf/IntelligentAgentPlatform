@@ -447,10 +447,22 @@ def test_replace_roles_replaces_only_requested_scope():
 
 def test_remove_role_rejects_the_users_last_unit_role():
     client = build_client()
+    active_role_id = role_id()
+    with app.dependency_overrides[get_session]() as session:
+        inactive_role = Role(
+            id="inactive-retained-role", code="inactive_retained_role", name="Inactive retained role",
+            scope_type="unit", unit_id="unit-1", built_in=False, status="inactive",
+        )
+        session.add(inactive_role)
+        session.add(UnitMembershipRole(
+            id="inactive-retained-binding", user_id="user-1", unit_id="unit-1",
+            role_id=inactive_role.id, scope_type="unit",
+        ))
+        session.commit()
 
     response = client.request(
         "DELETE", "/api/identity/users/user-1/roles",
-        headers=headers(), json={"role_id": role_id()},
+        headers=headers(), json={"role_id": active_role_id},
     )
 
     assert response.status_code == 422
@@ -522,13 +534,21 @@ def test_delete_custom_role_rejects_removing_a_users_last_unit_role():
             id="last-custom-role", code="last_custom_role", name="Last Custom Role",
             scope_type="unit", unit_id="unit-1", built_in=False, status="active",
         )
-        session.add_all([user, role])
+        inactive_role = Role(
+            id="inactive-last-custom-role", code="inactive_last_custom_role", name="Inactive last custom role",
+            scope_type="unit", unit_id="unit-1", built_in=False, status="inactive",
+        )
+        session.add_all([user, role, inactive_role])
         session.add(UnitMembership(
             id="last-role-membership", user_id=user.id, unit_id="unit-1", status="active",
         ))
         session.add(UnitMembershipRole(
             id="last-role-binding", user_id=user.id, unit_id="unit-1",
             role_id=role.id, scope_type="unit",
+        ))
+        session.add(UnitMembershipRole(
+            id="inactive-last-role-binding", user_id=user.id, unit_id="unit-1",
+            role_id=inactive_role.id, scope_type="unit",
         ))
         session.commit()
 

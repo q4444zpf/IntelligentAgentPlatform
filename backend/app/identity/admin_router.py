@@ -153,16 +153,21 @@ def _users_with_only_unit_role(
             UnitMembershipRole.user_id.label("user_id"),
             func.count(UnitMembershipRole.id).label("role_count"),
         )
+        .join(Role, Role.id == UnitMembershipRole.role_id)
         .where(UnitMembershipRole.unit_id == unit_id)
+        .where(Role.scope_type == "unit", Role.status == "active")
         .group_by(UnitMembershipRole.user_id)
         .subquery()
     )
     return set(session.scalars(
         select(UnitMembershipRole.user_id)
         .join(role_counts, role_counts.c.user_id == UnitMembershipRole.user_id)
+        .join(Role, Role.id == UnitMembershipRole.role_id)
         .where(
             UnitMembershipRole.unit_id == unit_id,
             UnitMembershipRole.role_id == role_id,
+            Role.scope_type == "unit",
+            Role.status == "active",
             role_counts.c.role_count == 1,
         )
     ))
@@ -566,12 +571,16 @@ def remove_role(
         return {"user_id": user_id, "role_id": role.id, "project_id": project.id if project else None, "removed": False}
     if project is None:
         remaining_count = session.scalar(
-            select(func.count(UnitMembershipRole.id)).where(
+            select(func.count(UnitMembershipRole.id))
+            .join(Role, Role.id == UnitMembershipRole.role_id)
+            .where(
                 UnitMembershipRole.user_id == user_id,
                 UnitMembershipRole.unit_id == context.unit_id,
+                Role.scope_type == "unit",
+                Role.status == "active",
             )
         ) or 0
-        if remaining_count <= 1:
+        if role.status == "active" and remaining_count <= 1:
             raise HTTPException(status_code=422, detail="用户必须至少保留一个单位角色")
     session.delete(binding)
     user = session.get(User, user_id)
