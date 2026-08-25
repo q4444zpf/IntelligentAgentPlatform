@@ -10,6 +10,7 @@ import {
   removeIdentityUserRole,
   replaceIdentityUserRoles,
   resetIdentityUserPassword,
+  updateIdentityUser,
 } from './identity';
 
 vi.mock('./client', async (importOriginal) => {
@@ -34,6 +35,7 @@ describe('identity role API', () => {
       display_name: 'Alice',
       email: 'alice@example.test',
       initial_password: 'InitialPassword123!',
+      role_ids: ['role-1'],
     });
 
     expect(request).toHaveBeenCalledWith('/identity/users', {
@@ -42,6 +44,26 @@ describe('identity role API', () => {
         display_name: 'Alice',
         email: 'alice@example.test',
         initial_password: 'InitialPassword123!',
+        role_ids: ['role-1'],
+      }),
+    });
+  });
+
+  it('updates a user profile and role bindings in one request', async () => {
+    vi.mocked(request).mockResolvedValue({});
+
+    await updateIdentityUser('user-1', {
+      display_name: 'Alice Updated',
+      email: 'alice.updated@example.test',
+      role_ids: ['role-2'],
+    });
+
+    expect(request).toHaveBeenCalledWith('/identity/users/user-1', {
+      method: 'PATCH',
+      body: JSON.stringify({
+        display_name: 'Alice Updated',
+        email: 'alice.updated@example.test',
+        role_ids: ['role-2'],
       }),
     });
   });

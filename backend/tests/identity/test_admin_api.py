@@ -1,5 +1,5 @@
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import sessionmaker
 
@@ -45,6 +45,13 @@ def build_client():
 
 def headers(role='admin', unit='unit-1'):
     return {'X-User-ID': 'user-1', 'X-Project-ID': 'project-1', 'X-Unit-ID': unit, 'X-User-Role': role}
+
+
+def role_id(code: str = "unit_admin", unit_id: str = "unit-1") -> str:
+    with app.dependency_overrides[get_session]() as session:
+        role = session.scalar(select(Role).where(Role.unit_id == unit_id, Role.code == code))
+        assert role is not None
+        return role.id
 
 
 def test_admin_cookie_session_cannot_become_another_user_with_forged_headers():
@@ -93,7 +100,7 @@ def test_admin_cannot_create_case_insensitive_duplicate_email():
     response = client.post(
         "/api/identity/users",
         headers=headers(),
-        json={"display_name": "Duplicate", "email": "ALICE@EXAMPLE.COM"},
+        json={"display_name": "Duplicate", "email": "ALICE@EXAMPLE.COM", "role_ids": [role_id()]},
     )
 
     assert response.status_code == 409
@@ -102,14 +109,86 @@ def test_admin_cannot_create_case_insensitive_duplicate_email():
 
 def test_admin_cannot_create_case_insensitive_duplicate_display_name():
     client = build_client()
-    response = client.post('/api/identity/users', headers=headers(), json={'display_name': 'alice', 'email': 'unique@example.com'})
+    response = client.post('/api/identity/users', headers=headers(), json={'display_name': 'alice', 'email': 'unique@example.com', 'role_ids': [role_id()]})
     assert response.status_code == 409
     assert response.json()['detail'] == '用户名已存在'
 
 
+def test_admin_create_user_requires_at_least_one_unit_role():
+    client = build_client()
+    missing = client.post(
+        "/api/identity/users",
+        headers=headers(),
+        json={"display_name": "Missing Role", "email": "missing-role@example.test"},
+    )
+    empty = client.post(
+        "/api/identity/users",
+        headers=headers(),
+        json={"display_name": "Empty Role", "email": "empty-role@example.test", "role_ids": []},
+    )
+    assert missing.status_code == 422
+    assert empty.status_code == 422
+
+
+def test_admin_create_user_atomically_assigns_selected_unit_roles():
+    client = build_client()
+    selected_role_id = role_id()
+    response = client.post(
+        "/api/identity/users",
+        headers=headers(),
+        json={
+            "display_name": "Role Bound User",
+            "email": "role-bound@example.test",
+            "initial_password": "Initial-password-123",
+            "role_ids": [selected_role_id],
+        },
+    )
+    assert response.status_code == 201
+    user_id = response.json()["id"]
+    with app.dependency_overrides[get_session]() as session:
+        bindings = session.scalars(
+            select(UnitMembershipRole).where(UnitMembershipRole.user_id == user_id)
+        ).all()
+        assert [binding.role_id for binding in bindings] == [selected_role_id]
+        assert session.scalar(select(func.count(AuditEvent.id)).where(
+            AuditEvent.resource_id == user_id,
+            AuditEvent.action == "identity.user.created",
+        )) == 1
+
+
+def test_admin_create_user_rejects_invalid_unit_role_choices_without_partial_data():
+    client = build_client()
+    with app.dependency_overrides[get_session]() as session:
+        project_role = session.scalar(select(Role).where(
+            Role.unit_id == "unit-1", Role.scope_type == "project",
+        ))
+        assert project_role is not None
+        inactive_role = Role(
+            id="inactive-unit-role", code="inactive_unit_role", name="Inactive",
+            scope_type="unit", unit_id="unit-1", built_in=False, status="inactive",
+        )
+        outside_role = Role(
+            id="outside-unit-role", code="outside_unit_role", name="Outside",
+            scope_type="unit", unit_id="unit-2", built_in=False, status="active",
+        )
+        session.add_all([inactive_role, outside_role])
+        session.commit()
+        invalid_role_ids = [project_role.id, inactive_role.id, outside_role.id]
+
+    for index, invalid_role_id in enumerate(invalid_role_ids):
+        email = f"invalid-role-{index}@example.test"
+        response = client.post(
+            "/api/identity/users", headers=headers(),
+            json={"display_name": f"Invalid Role {index}", "email": email, "role_ids": [invalid_role_id]},
+        )
+        assert response.status_code == 422
+        with app.dependency_overrides[get_session]() as session:
+            assert session.scalar(select(User).where(User.email == email)) is None
+
+
 def test_admin_can_delete_another_user():
     client = build_client()
-    created = client.post('/api/identity/users', headers=headers(), json={'display_name': 'Temporary User', 'email': 'temporary@example.com'})
+    created = client.post('/api/identity/users', headers=headers(), json={'display_name': 'Temporary User', 'email': 'temporary@example.com', 'role_ids': [role_id()]})
     assert created.status_code == 201
     deleted = client.delete(f"/api/identity/users/{created.json()['id']}", headers=headers())
     assert deleted.status_code == 200
@@ -127,6 +206,7 @@ def test_admin_create_local_user_returns_one_time_initial_password_and_stores_on
             "display_name": "Local New User",
             "email": "new-local@example.com",
             "initial_password": initial_password,
+            "role_ids": [role_id()],
         },
     )
 
@@ -155,6 +235,7 @@ def test_admin_requires_email_when_creating_local_password_credentials():
         json={
             "display_name": "Local User Without Email",
             "initial_password": "Initial-password-123",
+            "role_ids": [role_id()],
         },
     )
 
@@ -172,6 +253,7 @@ def test_admin_create_local_user_without_password_marks_invitation_pending():
             "display_name": "Invited User",
             "email": "invited@example.com",
             "invite": True,
+            "role_ids": [role_id()],
         },
     )
 
@@ -211,7 +293,7 @@ def test_updating_user_profile_keeps_existing_session_authorization_valid():
     response = client.patch(
         '/api/identity/users/user-1',
         headers={'Origin': 'http://testserver', 'X-CSRF-Token': 'csrf'},
-        json={'display_name': 'Alice Updated', 'email': 'alice.updated@example.com'},
+        json={'display_name': 'Alice Updated', 'email': 'alice.updated@example.com', 'role_ids': [role_id()]},
     )
 
     assert response.status_code == 200
@@ -219,6 +301,82 @@ def test_updating_user_profile_keeps_existing_session_authorization_valid():
         user = session.get(User, 'user-1')
         auth = session.get(AuthSession, 'profile-session')
         assert user.display_name == 'Alice Updated'
+        assert user.authorization_version == 1
+        assert auth.revoked_at is None
+
+
+def test_update_user_replaces_unit_roles_and_revokes_session_when_roles_change():
+    client = build_client()
+    now = datetime.now(timezone.utc)
+    with app.dependency_overrides[get_session]() as session:
+        second_role = Role(
+            id="second-unit-role", code="second_unit_role", name="Second Unit Role",
+            scope_type="unit", unit_id="unit-1", built_in=False, status="active",
+        )
+        session.add(second_role)
+        session.add(AuthSession(
+            id="role-edit-session", session_token_hash=_hash("role-edit-token"),
+            user_id="user-1", unit_id="unit-1", current_project_id="project-1",
+            auth_method="dev_test", csrf_secret_encrypted={"ciphertext": "csrf"},
+            provider_tokens_encrypted=None, provider_sid=None, authorization_version=1,
+            idle_expires_at=now + timedelta(minutes=30),
+            absolute_expires_at=now + timedelta(hours=1), last_seen_at=now,
+        ))
+        session.commit()
+
+    response = client.patch(
+        "/api/identity/users/user-1", headers=headers(),
+        json={
+            "display_name": "Alice Updated", "email": "alice.updated@example.test",
+            "role_ids": ["second-unit-role"],
+        },
+    )
+
+    assert response.status_code == 200
+    with app.dependency_overrides[get_session]() as session:
+        user = session.get(User, "user-1")
+        auth = session.get(AuthSession, "role-edit-session")
+        bindings = session.scalars(select(UnitMembershipRole).where(
+            UnitMembershipRole.user_id == "user-1",
+            UnitMembershipRole.unit_id == "unit-1",
+        )).all()
+        assert {binding.role_id for binding in bindings} == {"second-unit-role"}
+        assert user.authorization_version == 2
+        assert auth.revoked_at is not None
+        assert session.scalar(select(func.count(AuditEvent.id)).where(
+            AuditEvent.resource_id == "user-1",
+            AuditEvent.action == "identity.user.updated",
+        )) == 1
+
+
+def test_update_user_keeps_session_when_profile_changes_but_roles_do_not():
+    client = build_client()
+    now = datetime.now(timezone.utc)
+    current_role_id = role_id()
+    with app.dependency_overrides[get_session]() as session:
+        session.add(AuthSession(
+            id="profile-edit-session", session_token_hash=_hash("profile-edit-token"),
+            user_id="user-1", unit_id="unit-1", current_project_id="project-1",
+            auth_method="dev_test", csrf_secret_encrypted={"ciphertext": "csrf"},
+            provider_tokens_encrypted=None, provider_sid=None, authorization_version=1,
+            idle_expires_at=now + timedelta(minutes=30),
+            absolute_expires_at=now + timedelta(hours=1), last_seen_at=now,
+        ))
+        session.commit()
+
+    response = client.patch(
+        "/api/identity/users/user-1", headers=headers(),
+        json={
+            "display_name": "Alice Profile", "email": "alice.profile@example.test",
+            "role_ids": [current_role_id],
+        },
+    )
+
+    assert response.status_code == 200
+    with app.dependency_overrides[get_session]() as session:
+        user = session.get(User, "user-1")
+        auth = session.get(AuthSession, "profile-edit-session")
+        assert user.display_name == "Alice Profile"
         assert user.authorization_version == 1
         assert auth.revoked_at is None
 
@@ -287,6 +445,122 @@ def test_replace_roles_replaces_only_requested_scope():
     assert [item['role_id'] for item in response.json()] == [target_id]
 
 
+def test_remove_role_rejects_the_users_last_unit_role():
+    client = build_client()
+    active_role_id = role_id()
+    with app.dependency_overrides[get_session]() as session:
+        inactive_role = Role(
+            id="inactive-retained-role", code="inactive_retained_role", name="Inactive retained role",
+            scope_type="unit", unit_id="unit-1", built_in=False, status="inactive",
+        )
+        session.add(inactive_role)
+        session.add(UnitMembershipRole(
+            id="inactive-retained-binding", user_id="user-1", unit_id="unit-1",
+            role_id=inactive_role.id, scope_type="unit",
+        ))
+        session.commit()
+
+    response = client.request(
+        "DELETE", "/api/identity/users/user-1/roles",
+        headers=headers(), json={"role_id": active_role_id},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "用户必须至少保留一个单位角色"
+    with app.dependency_overrides[get_session]() as session:
+        assert session.get(UnitMembershipRole, "umr-1") is not None
+
+
+def test_replace_unit_roles_rejects_an_empty_list_but_project_roles_can_be_cleared():
+    client = build_client()
+
+    unit_response = client.put(
+        "/api/identity/users/user-1/roles", headers=headers(), json={"role_ids": []},
+    )
+    project_response = client.put(
+        "/api/identity/users/user-1/roles", headers=headers(),
+        json={"role_ids": [], "project_id": "project-1"},
+    )
+
+    assert unit_response.status_code == 422
+    assert unit_response.json()["detail"] == "用户必须至少保留一个单位角色"
+    assert project_response.status_code == 200
+
+
+def test_assign_role_rejects_an_inactive_unit_role():
+    client = build_client()
+    with app.dependency_overrides[get_session]() as session:
+        session.add(Role(
+            id="inactive-assignment-role", code="inactive_assignment_role", name="Inactive assignment",
+            scope_type="unit", unit_id="unit-1", built_in=False, status="inactive",
+        ))
+        session.commit()
+
+    response = client.post(
+        "/api/identity/users/user-1/roles", headers=headers(),
+        json={"role_id": "inactive-assignment-role"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "请选择当前单位的有效单位角色"
+
+
+def test_replace_roles_rejects_an_inactive_unit_role():
+    client = build_client()
+    with app.dependency_overrides[get_session]() as session:
+        session.add(Role(
+            id="inactive-replacement-role", code="inactive_replacement_role", name="Inactive replacement",
+            scope_type="unit", unit_id="unit-1", built_in=False, status="inactive",
+        ))
+        session.commit()
+
+    response = client.put(
+        "/api/identity/users/user-1/roles", headers=headers(),
+        json={"role_ids": ["inactive-replacement-role"]},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "请选择当前单位的有效单位角色"
+
+
+def test_delete_custom_role_rejects_removing_a_users_last_unit_role():
+    client = build_client()
+    with app.dependency_overrides[get_session]() as session:
+        user = User(
+            id="last-role-user", display_name="Last Role User",
+            email="last-role@example.test", status="active", authorization_version=1,
+        )
+        role = Role(
+            id="last-custom-role", code="last_custom_role", name="Last Custom Role",
+            scope_type="unit", unit_id="unit-1", built_in=False, status="active",
+        )
+        inactive_role = Role(
+            id="inactive-last-custom-role", code="inactive_last_custom_role", name="Inactive last custom role",
+            scope_type="unit", unit_id="unit-1", built_in=False, status="inactive",
+        )
+        session.add_all([user, role, inactive_role])
+        session.add(UnitMembership(
+            id="last-role-membership", user_id=user.id, unit_id="unit-1", status="active",
+        ))
+        session.add(UnitMembershipRole(
+            id="last-role-binding", user_id=user.id, unit_id="unit-1",
+            role_id=role.id, scope_type="unit",
+        ))
+        session.add(UnitMembershipRole(
+            id="inactive-last-role-binding", user_id=user.id, unit_id="unit-1",
+            role_id=inactive_role.id, scope_type="unit",
+        ))
+        session.commit()
+
+    response = client.delete("/api/identity/roles/last-custom-role", headers=headers())
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "该角色是用户的最后一个单位角色，不能删除"
+    with app.dependency_overrides[get_session]() as session:
+        assert session.get(Role, "last-custom-role") is not None
+        assert session.get(UnitMembershipRole, "last-role-binding") is not None
+
+
 def test_role_scope_isolated_and_built_in_role_cannot_be_deleted():
     client = build_client()
     with app.dependency_overrides[get_session]() as session:
@@ -294,7 +568,7 @@ def test_role_scope_isolated_and_built_in_role_cannot_be_deleted():
         builtin = session.scalar(select(Role).where(Role.unit_id == 'unit-1', Role.built_in.is_(True)))
         builtin_id = builtin.id
         session.add(platform_or_other); session.commit()
-    assert client.post('/api/identity/users/user-1/roles', headers=headers(), json={'role_id': 'other-role'}).status_code == 404
+    assert client.post('/api/identity/users/user-1/roles', headers=headers(), json={'role_id': 'other-role'}).status_code == 422
     assert client.request('DELETE', f'/api/identity/roles/{builtin_id}', headers=headers()).status_code == 409
 
 

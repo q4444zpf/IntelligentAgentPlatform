@@ -143,11 +143,13 @@ class CreateIdentityUserRequest(BaseModel):
     project_id: str | None = None
     initial_password: str | None = Field(default=None, min_length=12, max_length=256)
     invite: bool | None = None
+    role_ids: list[str] = Field(min_length=1, max_length=64)
 
 
 class UpdateIdentityUserRequest(BaseModel):
     display_name: str = Field(min_length=1, max_length=160)
     email: str | None = Field(default=None, max_length=320)
+    role_ids: list[str] = Field(min_length=1, max_length=64)
 
 
 class LocalLoginRequest(BaseModel):
