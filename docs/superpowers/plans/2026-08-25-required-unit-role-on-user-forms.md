@@ -566,15 +566,15 @@ expect(fetchMock).toHaveBeenCalledWith(
 
 The update test must expect `PATCH /api/identity/users/user-1` with `role_ids: ['role-2']` in the same body as the profile fields.
 
-- [ ] **Step 2: Run the API test and verify RED**
+- [ ] **Step 2: Run type checking and verify RED**
 
 ```powershell
 cd frontend
 $nodeRuntime = 'C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe'
-& $nodeRuntime node_modules/vitest/vitest.mjs run src/api/identity.test.ts --pool=threads --maxWorkers=1
+& $nodeRuntime node_modules/vue-tsc/bin/vue-tsc.js --noEmit
 ```
 
-Expected: update typing or body expectation fails because the update contract has no `role_ids`.
+Expected: FAIL with `TS2353` because the update payload type has no `role_ids` property.
 
 - [ ] **Step 3: Add required payload types**
 
@@ -602,6 +602,7 @@ Change `updateIdentityUser` to accept `UpdateIdentityUserPayload` without changi
 ```powershell
 $nodeRuntime = 'C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe'
 & $nodeRuntime node_modules/vitest/vitest.mjs run src/api/identity.test.ts --pool=threads --maxWorkers=1
+& $nodeRuntime node_modules/vue-tsc/bin/vue-tsc.js --noEmit
 git add frontend/src/api/identity.ts frontend/src/api/identity.test.ts
 git commit -m "feat: include unit roles in user payloads"
 ```
@@ -657,11 +658,11 @@ Keep every other existing stub entry unchanged when replacing only the `a-select
 
 - [ ] **Step 2: Write failing create-form tests**
 
-Use one active unit role plus project/inactive roles in `mocks.listRoles`. Open the create modal and assert only the active unit role appears. Fill name, email, and password, then save without a role:
+Use one active unit role plus project/inactive roles in `mocks.listRoles`. Create `const messageError = vi.spyOn(message, 'error').mockImplementation(() => undefined as never)`. Open the create modal and assert only the active unit role appears. Fill name, email, and password, then save without a role:
 
 ```typescript
 expect(mocks.createUser).not.toHaveBeenCalled();
-expect(errorMessage).toHaveBeenCalledWith('请至少选择一个单位角色');
+expect(messageError).toHaveBeenCalledWith('请至少选择一个单位角色');
 ```
 
 Select `role-1`, save again, and expect one atomic request:
