@@ -127,6 +127,80 @@ def _generate_password() -> str:
     return ''.join(chars + [secrets.choice(alphabet) for _ in range(12)])
 
 
+def _active_unit_roles(session: Session, role_ids: list[str], unit_id: str) -> list[Role]:
+    unique_ids = list(dict.fromkeys(role_ids))
+    roles = session.scalars(
+        select(Role).where(
+            Role.id.in_(unique_ids),
+            Role.unit_id == unit_id,
+            Role.scope_type == "unit",
+            Role.status == "active",
+        )
+    ).all()
+    by_id = {role.id: role for role in roles}
+    if len(by_id) != len(unique_ids):
+        raise HTTPException(status_code=422, detail="请选择当前单位的有效单位角色")
+    return [by_id[role_id] for role_id in unique_ids]
+
+
+def _replace_unit_role_bindings(
+    session: Session,
+    user_id: str,
+    unit_id: str,
+    roles: list[Role],
+) -> bool:
+    existing = session.scalars(
+        select(UnitMembershipRole).where(
+            UnitMembershipRole.user_id == user_id,
+            UnitMembershipRole.unit_id == unit_id,
+        )
+    ).all()
+    existing_ids = {binding.role_id for binding in existing}
+    desired_ids = {role.id for role in roles}
+    for binding in existing:
+        if binding.role_id not in desired_ids:
+            session.delete(binding)
+    for role in roles:
+        if role.id not in existing_ids:
+            session.add(UnitMembershipRole(
+                id=new_id(), user_id=user_id, unit_id=unit_id,
+                role_id=role.id, scope_type="unit",
+            ))
+    return existing_ids != desired_ids
+
+
+def _record_user_change(
+    session: Session,
+    context: RequestContext,
+    user: User,
+    action: str,
+    summary: str,
+    now: datetime,
+) -> None:
+    AuditRecorder().record(session, AuditRecordRequest(
+        unit_id=context.unit_id,
+        project_id=None,
+        user_id=context.user_id,
+        actor_roles=context.role_codes,
+        authorization_scope="unit",
+        event_scope="unit",
+        auth_method=None,
+        category="management",
+        source="system",
+        action=action,
+        status="succeeded",
+        risk_level="high",
+        resource_type="user",
+        resource_id=user.id,
+        resource_name=user.display_name,
+        summary=summary,
+        metadata={"target_user_id": user.id},
+        allowed_metadata_keys=frozenset({"target_user_id"}),
+        idempotency_key=f"{action}:{user.id}:{now.isoformat()}",
+        occurred_at=now,
+    ))
+
+
 @router.get("/users", response_model=list[AdminUser])
 def list_users(
     context: RequestContext = Depends(identity_admin_context),
@@ -186,6 +260,7 @@ def create_user(
 ) -> AdminUser:
     if body.initial_password is not None and body.invite is True:
         raise HTTPException(status_code=422, detail="初始密码和邀请状态不能同时设置")
+    roles = _active_unit_roles(session, body.role_ids, context.unit_id)
     display_name = _ensure_display_name_available(session, body.display_name)
     email = _ensure_email_available(session, body.email)
     if body.initial_password is not None and email is None:
@@ -209,10 +284,19 @@ def create_user(
             locked_until=None,
         ))
         invitation_status = "not_required"
+    _replace_unit_role_bindings(session, user.id, context.unit_id, roles)
+    _record_user_change(
+        session, context, user, "identity.user.created",
+        "Created an identity user", datetime.now(timezone.utc),
+    )
     session.commit()
     return AdminUser.from_row(
         user,
         "active",
+        role_summaries=[
+            AdminRoleSummary(role_id=role.id, code=role.code, name=role.name, scope_type="unit")
+            for role in roles
+        ],
         initial_password=body.initial_password,
         invitation_status=invitation_status,
     )
@@ -228,8 +312,17 @@ def update_user(
     user = session.scalar(select(User).where(User.id == user_id))
     if membership is None or user is None:
         raise HTTPException(status_code=404, detail="用户不存在或不属于当前单位")
+    roles = _active_unit_roles(session, body.role_ids, context.unit_id)
     user.display_name = _ensure_display_name_available(session, body.display_name, exclude_user_id=user.id)
     user.email = _ensure_email_available(session, body.email, exclude_user_id=user.id)
+    roles_changed = _replace_unit_role_bindings(session, user.id, context.unit_id, roles)
+    if roles_changed:
+        _bump(user)
+        revoke_user_sessions(session, user.id, "role_changed")
+    _record_user_change(
+        session, context, user, "identity.user.updated",
+        "Updated an identity user", datetime.now(timezone.utc),
+    )
     session.commit()
     return AdminUser.from_row(user, membership.status)
 
