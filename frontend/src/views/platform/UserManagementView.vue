@@ -229,22 +229,28 @@ async function openEdit(user: IdentityUser): Promise<void> {
   editForm.value = { display_name: user.display_name, email: user.email || '', role_ids: [] };
   editOpen.value = true;
   accountRoleController?.abort();
-  accountRoleController = new AbortController();
+  const currentController = new AbortController();
+  accountRoleController = currentController;
   accountRolesLoading.value = true;
   try {
     const [roles, current] = await Promise.all([
-      listIdentityRoles(accountRoleController.signal),
-      listIdentityUserRoles(user.id, null, accountRoleController.signal),
+      listIdentityRoles(currentController.signal),
+      listIdentityUserRoles(user.id, null, currentController.signal),
     ]);
+    if (accountRoleController !== currentController) return;
     availableRoles.value = roles;
+    const activeUnitRoleIds = new Set(roles
+      .filter((role) => role.status === 'active' && role.scope_type === 'unit')
+      .map((role) => role.id));
     editForm.value.role_ids = current
-      .filter((role) => role.scope_type === 'unit')
+      .filter((role) => role.scope_type === 'unit' && activeUnitRoleIds.has(role.role_id))
       .map((role) => role.role_id);
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') return;
+    if (accountRoleController !== currentController) return;
     errorMessage.value = error instanceof ApiError ? error.message : '单位角色加载失败';
   } finally {
-    accountRolesLoading.value = false;
+    if (accountRoleController === currentController) accountRolesLoading.value = false;
   }
 }
 function isOidcUser(user: IdentityUser): boolean { return user.auth_method === 'oidc' || user.external_identity === true; }
