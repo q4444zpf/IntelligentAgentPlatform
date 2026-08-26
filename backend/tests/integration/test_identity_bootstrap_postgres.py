@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 from uuid import uuid4
 
 import pytest
@@ -16,9 +18,26 @@ from app.identity.models import (
 )
 
 
+ALEMBIC_UPGRADE_COMMAND = (
+    sys.executable,
+    "-m",
+    "alembic",
+    "-c",
+    "backend/alembic.ini",
+    "upgrade",
+    "head",
+)
+
+
 @pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="requires PostgreSQL")
 def test_bootstrap_persists_parent_rows_before_foreign_key_dependents():
-    engine = create_engine(os.environ["TEST_DATABASE_URL"])
+    database_url = os.environ["TEST_DATABASE_URL"]
+    subprocess.run(
+        ALEMBIC_UPGRADE_COMMAND,
+        check=True,
+        env=os.environ | {"DATABASE_URL": database_url},
+    )
+    engine = create_engine(database_url)
     suffix = uuid4().hex
     request = BootstrapRequest(
         unit_code=f"postgres-bootstrap-unit-{suffix}",
