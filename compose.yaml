@@ -3,6 +3,7 @@ name: intelligent-agent-platform
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_DB: iap
       POSTGRES_USER: iap
