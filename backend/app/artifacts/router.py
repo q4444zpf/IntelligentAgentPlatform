@@ -8,6 +8,7 @@ from fastapi import (
     Form,
     HTTPException,
     Query,
+    Response,
     UploadFile,
     status,
 )
@@ -17,7 +18,11 @@ from app.core.database import get_session
 from app.core.request_context import RequestContext, require_request_context
 
 from .schemas import ArtifactDownloadInfo, ArtifactInfo
-from .service import ArtifactNotFoundError, ArtifactService
+from .service import (
+    ArtifactNotFoundError,
+    ArtifactNotPreviewableError,
+    ArtifactService,
+)
 from .storage import S3ObjectStorage
 
 
@@ -82,6 +87,45 @@ def create_router(session_factory: Callable[[Session], Session] | None = None, *
                 ),
             ),
             "expires_in": effective_expiry,
+        }
+
+    @router.get("/artifacts/{artifact_id}/preview", response_model=ArtifactDownloadInfo)
+    def preview_artifact(
+        artifact_id: str,
+        response: Response,
+        context: RequestContext = Depends(require_request_context),
+        manager: ArtifactService = Depends(service),
+    ):
+        try:
+            artifact, response_content_type = manager.get_html_preview(
+                artifact_id,
+                context,
+            )
+        except ArtifactNotFoundError as error:
+            not_found(error)
+        except ArtifactNotPreviewableError as error:
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail="Artifact is not previewable as HTML",
+            ) from error
+
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return {
+            "artifact": artifact,
+            "url": manager.storage.presigned_get_url(
+                artifact.object_key,
+                300,
+                response_content_type=response_content_type,
+                response_content_disposition=(
+                    "inline; filename*=UTF-8''"
+                    + quote(artifact.filename, safe="")
+                ),
+                response_cache_control="private, no-store, max-age=0",
+            ),
+            "expires_in": 300,
         }
 
     @router.delete("/artifacts/{artifact_id}", response_model=ArtifactInfo)
