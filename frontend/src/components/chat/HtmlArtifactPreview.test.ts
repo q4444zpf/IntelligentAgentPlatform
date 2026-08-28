@@ -169,6 +169,67 @@ describe('HTML Artifact card and preview', () => {
     wrapper.unmount();
   });
 
+  it('aborts a stale download on artifact switch and ignores its late URL before downloading the new artifact', async () => {
+    const staleDownload = deferred<{ url: string }>();
+    let staleSignal: AbortSignal | undefined;
+    mocks.download
+      .mockResolvedValueOnce({ url: 'https://objects.example/a-preview' })
+      .mockImplementationOnce((_id: string, signal: AbortSignal) => {
+        staleSignal = signal;
+        return staleDownload.promise;
+      })
+      .mockResolvedValueOnce({ url: 'https://objects.example/b-preview' })
+      .mockResolvedValueOnce({ url: 'https://objects.example/b-download' });
+    const clickedAnchors: HTMLAnchorElement[] = [];
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function click(this: HTMLAnchorElement) {
+      clickedAnchors.push(this);
+    });
+    const wrapper = mount(HtmlArtifactPreview, { props: { artifact: firstArtifact } });
+    await flushPromises();
+
+    await wrapper.get('[aria-label="下载 flood-report.html"]').trigger('click');
+    await wrapper.setProps({ artifact: secondArtifact });
+    await flushPromises();
+    expect(staleSignal?.aborted).toBe(true);
+
+    staleDownload.resolve({ url: 'https://objects.example/a-stale-download' });
+    await flushPromises();
+    expect(clickedAnchors).toHaveLength(0);
+    expect(wrapper.text()).not.toContain('HTML 文件下载失败');
+
+    await wrapper.get('[aria-label="下载 dispatch-plan.htm"]').trigger('click');
+    await flushPromises();
+    expect(clickedAnchors).toHaveLength(1);
+    expect(clickedAnchors[0].href).toBe('https://objects.example/b-download');
+    expect(clickedAnchors[0].download).toBe('dispatch-plan.htm');
+    wrapper.unmount();
+  });
+
+  it('ignores a stale download rejection after switching artifacts', async () => {
+    const staleDownload = deferred<{ url: string }>();
+    let staleSignal: AbortSignal | undefined;
+    mocks.download
+      .mockResolvedValueOnce({ url: 'https://objects.example/a-preview' })
+      .mockImplementationOnce((_id: string, signal: AbortSignal) => {
+        staleSignal = signal;
+        return staleDownload.promise;
+      })
+      .mockResolvedValueOnce({ url: 'https://objects.example/b-preview' });
+    const wrapper = mount(HtmlArtifactPreview, { props: { artifact: firstArtifact } });
+    await flushPromises();
+
+    await wrapper.get('[aria-label="下载 flood-report.html"]').trigger('click');
+    await wrapper.setProps({ artifact: secondArtifact });
+    await flushPromises();
+    expect(staleSignal?.aborted).toBe(true);
+
+    staleDownload.reject(new Error('stale A failure'));
+    await flushPromises();
+    expect(wrapper.text()).not.toContain('HTML 文件下载失败');
+    expect(wrapper.get('iframe').attributes('title')).toBe('HTML 预览：dispatch-plan.htm');
+    wrapper.unmount();
+  });
+
   it('opens the current signed URL in a new isolated window', async () => {
     mocks.download.mockResolvedValue({ url: 'https://objects.example/signed' });
     const openSpy = vi.spyOn(window, 'open').mockImplementation(() => null);

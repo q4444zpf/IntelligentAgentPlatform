@@ -1,7 +1,8 @@
 // @vitest-environment happy-dom
 import { flushPromises, mount } from '@vue/test-utils';
 import { nextTick, reactive } from 'vue';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import AssistantMessageContent from '@/components/chat/AssistantMessageContent.vue';
 import AgentConsoleView from './AgentConsoleView.vue';
 import source from './AgentConsoleView.vue?raw';
 
@@ -10,7 +11,7 @@ const mocks = vi.hoisted(() => ({
   downloadArtifact: vi.fn(),
 }));
 
-const store = reactive({ conversations: [], activeConversationId: 'c1', messages: [] as Array<Record<string, unknown>>, activeRun: { id: 'r1', status: 'running' }, error: '', sending: false, toolActivities: [
+const store = reactive({ conversations: [] as Array<Record<string, unknown>>, activeConversationId: 'c1', messages: [] as Array<Record<string, unknown>>, activeRun: { id: 'r1', status: 'running' }, error: '', sending: false, toolActivities: [
   { invocation_id: 'i1', display_name: '获取当前时间', tool_id: 'system.time', status: 'running', duration_ms: null, sequence: 1 },
   { invocation_id: 'i2', display_name: '运行上下文', tool_id: 'system.context', status: 'completed', duration_ms: 12, sequence: 2 },
   { invocation_id: 'i3', display_name: '失败工具', tool_id: 'system.fail', status: 'failed', duration_ms: 7, sequence: 3 },
@@ -43,11 +44,30 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+function useMediumViewport() {
+  vi.stubGlobal('matchMedia', vi.fn((query: string) => ({
+    matches: query === '(min-width: 901px) and (max-width: 1250px)',
+    media: query,
+    onchange: null,
+    addEventListener: vi.fn(),
+    removeEventListener: vi.fn(),
+    dispatchEvent: vi.fn(() => true),
+  })));
+}
+
 beforeEach(() => {
+  store.conversations = [];
+  store.activeConversationId = 'c1';
   store.messages = [];
+  store.selectConversation.mockClear();
+  store.startNewConversation.mockClear();
   mocks.listArtifacts.mockReset();
   mocks.downloadArtifact.mockReset();
   mocks.listArtifacts.mockResolvedValue([]);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
 });
 
 describe('AgentConsoleView runtime interactions', () => {
@@ -70,6 +90,8 @@ describe('AgentConsoleView runtime interactions', () => {
       artifact('html-type', 'report.bin', '  Text/HTML; charset=utf-8  ', 'run-1'),
       artifact('xhtml-type', 'summary.xhtml', 'APPLICATION/XHTML+XML', 'run-1'),
       artifact('html-suffix', 'HYDROGRAPH.HTM', 'application/octet-stream', 'run-1'),
+      artifact('near-html', 'near-html.bin', 'text/htmlfoo', 'run-1'),
+      artifact('near-xhtml', 'near-xhtml.bin', 'application/xhtml+xml-extra', 'run-1'),
       artifact('non-html', 'observations.csv', 'text/csv', 'run-1'),
       artifact('other-run', 'other-run.html', 'text/html', 'run-2'),
       artifact('unlinked', 'unlinked.html', 'text/html', null),
@@ -85,6 +107,8 @@ describe('AgentConsoleView runtime interactions', () => {
     expect(rows[1].text()).toContain('report.bin');
     expect(rows[1].text()).toContain('summary.xhtml');
     expect(rows[1].text()).toContain('HYDROGRAPH.HTM');
+    expect(rows[1].text()).not.toContain('near-html.bin');
+    expect(rows[1].text()).not.toContain('near-xhtml.bin');
     expect(rows[1].text()).not.toContain('observations.csv');
     expect(rows[1].text()).not.toContain('other-run.html');
     expect(rows[2].text()).toContain('other-run.html');
@@ -103,6 +127,104 @@ describe('AgentConsoleView runtime interactions', () => {
     await flushPromises();
     expect(wrapper.get('.conversation-layout').classes()).toContain('preview-open');
     expect(wrapper.get('iframe').attributes('src')).toBe('https://objects.example/signed');
+    wrapper.unmount();
+  });
+
+  it('keeps system and tool messages as literal text without rich rendering or Artifact cards', async () => {
+    store.messages = [
+      { id: 'm-user', conversation_id: 'c1', role: 'user', content: '<img src=x onerror=alert(1)>', run_id: null, created_at: '2026-08-28T01:00:00Z' },
+      { id: 'm-assistant', conversation_id: 'c1', role: 'assistant', content: '**assistant rich**', run_id: 'run-assistant', created_at: '2026-08-28T01:01:00Z' },
+      { id: 'm-system', conversation_id: 'c1', role: 'system', content: '<img src=x onerror=system()>\n```mermaid\nflowchart TD\nA-->B\n```', run_id: 'run-system', created_at: '2026-08-28T01:02:00Z' },
+      { id: 'm-tool', conversation_id: 'c1', role: 'tool', content: '<img src=x onerror=tool()>\n```echarts\n{"series":[]}\n```', run_id: 'run-tool', created_at: '2026-08-28T01:03:00Z' },
+    ];
+    mocks.listArtifacts.mockResolvedValue([
+      artifact('assistant-html', 'assistant.html', 'text/html', 'run-assistant'),
+      artifact('system-html', 'system.html', 'text/html', 'run-system'),
+      artifact('tool-html', 'tool.html', 'text/html', 'run-tool'),
+    ]);
+
+    const wrapper = mount(AgentConsoleView, { global: { stubs } });
+    await vi.waitFor(() => expect(wrapper.text()).toContain('assistant.html'));
+    const rows = wrapper.findAll('.message-row');
+
+    expect(wrapper.findAllComponents(AssistantMessageContent)).toHaveLength(1);
+    expect(rows[0].find('img').exists()).toBe(false);
+    expect(rows[1].text()).toContain('assistant.html');
+    expect(rows[2].text()).toContain('```mermaid');
+    expect(rows[2].find('img').exists()).toBe(false);
+    expect(rows[2].text()).not.toContain('system.html');
+    expect(rows[3].text()).toContain('```echarts');
+    expect(rows[3].find('img').exists()).toBe(false);
+    expect(rows[3].text()).not.toContain('tool.html');
+    wrapper.unmount();
+  });
+
+  it('closes the selected Artifact preview when switching to another conversation and can reopen it', async () => {
+    store.conversations = [
+      { id: 'c1', title: '当前会话', updated_at: '2026-08-28T01:00:00Z' },
+      { id: 'c2', title: '另一会话', updated_at: '2026-08-28T02:00:00Z' },
+    ];
+    store.messages = [
+      { id: 'm-run-1', conversation_id: 'c1', role: 'assistant', content: '结论', run_id: 'run-1', created_at: '2026-08-28T01:01:00Z' },
+    ];
+    mocks.listArtifacts.mockResolvedValue([artifact('html', 'report.html', 'text/html', 'run-1')]);
+    mocks.downloadArtifact.mockResolvedValue({ url: 'https://objects.example/signed' });
+    const wrapper = mount(AgentConsoleView, { global: { stubs } });
+    await vi.waitFor(() => expect(wrapper.text()).toContain('report.html'));
+    await wrapper.get('[aria-label="预览 report.html"]').trigger('click');
+    await flushPromises();
+
+    const otherConversation = wrapper.findAll('.history-list button').find((button) => button.text().includes('另一会话'))!;
+    await otherConversation.trigger('click');
+    expect(wrapper.find('iframe').exists()).toBe(false);
+    expect(wrapper.get('.conversation-layout').classes()).not.toContain('preview-open');
+
+    await wrapper.get('[aria-label="预览 report.html"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('iframe').exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it('closes the selected Artifact preview for a new conversation and can reopen it', async () => {
+    store.messages = [
+      { id: 'm-run-1', conversation_id: 'c1', role: 'assistant', content: '结论', run_id: 'run-1', created_at: '2026-08-28T01:01:00Z' },
+    ];
+    mocks.listArtifacts.mockResolvedValue([artifact('html', 'report.html', 'text/html', 'run-1')]);
+    mocks.downloadArtifact.mockResolvedValue({ url: 'https://objects.example/signed' });
+    const wrapper = mount(AgentConsoleView, { global: { stubs } });
+    await vi.waitFor(() => expect(wrapper.text()).toContain('report.html'));
+    await wrapper.get('[aria-label="预览 report.html"]').trigger('click');
+    await flushPromises();
+
+    await wrapper.get('.new-chat-button').trigger('click');
+    expect(wrapper.find('iframe').exists()).toBe(false);
+    expect(wrapper.get('.conversation-layout').classes()).not.toContain('preview-open');
+
+    await wrapper.get('[aria-label="预览 report.html"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('iframe').exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it('keeps chat and composer visible while removing the context rail for a medium-width preview', async () => {
+    useMediumViewport();
+    store.messages = [
+      { id: 'm-run-1', conversation_id: 'c1', role: 'assistant', content: '结论', run_id: 'run-1', created_at: '2026-08-28T01:01:00Z' },
+    ];
+    mocks.listArtifacts.mockResolvedValue([artifact('html', 'report.html', 'text/html', 'run-1')]);
+    mocks.downloadArtifact.mockResolvedValue({ url: 'https://objects.example/signed' });
+    const wrapper = mount(AgentConsoleView, { global: { stubs } });
+    await vi.waitFor(() => expect(wrapper.text()).toContain('report.html'));
+
+    await wrapper.get('[aria-label="预览 report.html"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('.context-panel').exists()).toBe(false);
+    expect(wrapper.find('.chat-workspace').exists()).toBe(true);
+    expect(wrapper.find('.composer-shell').exists()).toBe(true);
+    expect(wrapper.find('iframe').exists()).toBe(true);
+
+    await wrapper.get('[aria-label="关闭 HTML 预览"]').trigger('click');
+    expect(wrapper.find('.context-panel').exists()).toBe(true);
     wrapper.unmount();
   });
 

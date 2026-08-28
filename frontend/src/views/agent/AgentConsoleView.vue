@@ -28,7 +28,7 @@
       <button :class="{ active: mobilePanel === 'context' }" @click="mobilePanel = 'context'">上下文</button>
     </div>
 
-    <div class="conversation-layout" :class="{ 'preview-open': selectedHtmlArtifact }">
+    <div class="conversation-layout" :class="{ 'preview-open': selectedHtmlArtifact, 'preview-medium': isMediumPreviewLayout }">
       <aside class="history-panel" :class="{ 'mobile-active': mobilePanel === 'history' }">
         <button class="new-chat-button" @click="newConversation"><PlusOutlined /> 新建对话</button>
         <label class="search-box">
@@ -94,10 +94,10 @@
             <div class="message-content">
               <div class="message-meta"><strong>{{ message.author }}</strong><span>{{ message.time }}</span></div>
               <div class="message-bubble">
-                <span v-if="message.role === 'user'">{{ message.content }}</span>
-                <AssistantMessageContent v-else :content="message.content" />
+                <AssistantMessageContent v-if="message.role === 'assistant'" :content="message.content" />
+                <span v-else>{{ message.content }}</span>
                 <AssistantArtifactCards
-                  v-if="message.role === 'agent' && artifactsForRun(message.runId).length"
+                  v-if="message.role === 'assistant' && artifactsForRun(message.runId).length"
                   :artifacts="artifactsForRun(message.runId)"
                   @preview="selectedHtmlArtifact = $event"
                 />
@@ -134,7 +134,7 @@
         </div>
       </section>
 
-      <aside class="context-panel" :class="{ 'mobile-active': mobilePanel === 'context' }">
+      <aside v-if="!isMediumPreviewLayout" class="context-panel" :class="{ 'mobile-active': mobilePanel === 'context' }">
         <section>
           <header><span>运行上下文</span><SlidersOutlined /></header>
           <dl>
@@ -206,7 +206,7 @@ import { isRunActive, runtimeStatusLabel } from '@/features/chat/runtimeStatus';
 import { useConversationStore } from '@/stores/conversations';
 
 type ChatMode = 'single' | 'team';
-interface ChatMessage { id: string; role: 'user' | 'agent'; author: string; avatar: string; time: string; content: string; runId: string | null }
+interface ChatMessage { id: string; role: 'user' | 'assistant' | 'system' | 'tool'; author: string; avatar: string; time: string; content: string; runId: string | null }
 
 const route = useRoute();
 const router = useRouter();
@@ -224,9 +224,11 @@ const historySearch = ref('');
 const input = ref('');
 const artifactsByRun = ref<Map<string, ArtifactInfo[]>>(new Map());
 const selectedHtmlArtifact = ref<ArtifactInfo | null>(null);
+const isMediumViewport = ref(false);
 const messageList = useTemplateRef<HTMLElement>('message-list');
 let artifactListController: AbortController | undefined;
 let artifactListVersion = 0;
+let mediumViewportQuery: MediaQueryList | undefined;
 
 const agentOptions = computed(() => availableAgents.value.map((agent) => ({ value: agent.id, label: agent.name })));
 const teamOptions = [
@@ -257,13 +259,14 @@ const teamMembers = [
 const suggestedPrompts = ['对比三套预泄方案', '生成沿程水位过程线', '研判未来 24 小时洪峰'];
 const messages = computed<ChatMessage[]>(() => conversationStore.messages.map((message) => ({
   id: message.id,
-  role: message.role === 'user' ? 'user' : 'agent',
-  author: message.role === 'user' ? '当前用户' : activeActorName.value,
-  avatar: message.role === 'user' ? '用' : mode.value === 'team' ? '协' : '智',
+  role: message.role,
+  author: message.role === 'user' ? '当前用户' : message.role === 'assistant' ? activeActorName.value : message.role === 'system' ? '系统' : '工具',
+  avatar: message.role === 'user' ? '用' : message.role === 'assistant' ? mode.value === 'team' ? '协' : '智' : message.role === 'system' ? '系' : '工',
   time: formatTime(message.created_at),
   content: message.content,
   runId: message.run_id ?? null,
 })));
+const isMediumPreviewLayout = computed(() => Boolean(selectedHtmlArtifact.value) && isMediumViewport.value);
 const assistantRunSignature = computed(() => [...new Set(conversationStore.messages
   .flatMap((message) => message.role === 'assistant' && message.run_id ? [message.run_id] : []))]
   .sort()
@@ -271,19 +274,30 @@ const assistantRunSignature = computed(() => [...new Set(conversationStore.messa
 
 watch(messages, async () => { await nextTick(); messageList.value?.scrollTo({ top: messageList.value.scrollHeight, behavior: 'smooth' }); }, { deep: true });
 watch(assistantRunSignature, loadArtifactsForRuns, { immediate: true });
+watch(() => conversationStore.activeConversationId, () => { selectedHtmlArtifact.value = null; });
 onMounted(() => {
   void conversationStore.loadConversations();
   void loadAgents();
+  if (typeof window.matchMedia === 'function') {
+    mediumViewportQuery = window.matchMedia('(min-width: 901px) and (max-width: 1250px)');
+    isMediumViewport.value = mediumViewportQuery.matches;
+    mediumViewportQuery.addEventListener('change', updateMediumViewport);
+  }
 });
 onBeforeUnmount(() => {
   artifactListVersion += 1;
   artifactListController?.abort();
+  mediumViewportQuery?.removeEventListener('change', updateMediumViewport);
 });
 
+function updateMediumViewport(event: MediaQueryListEvent) {
+  isMediumViewport.value = event.matches;
+}
+
 function isHtmlArtifact(artifact: ArtifactInfo): boolean {
-  const contentType = artifact.content_type.trim().toLowerCase();
-  return contentType.startsWith('text/html')
-    || contentType.startsWith('application/xhtml+xml')
+  const contentType = artifact.content_type.trim().toLowerCase().split(';', 1)[0].trim();
+  return contentType === 'text/html'
+    || contentType === 'application/xhtml+xml'
     || /\.html?$/i.test(artifact.filename.trim());
 }
 
@@ -335,8 +349,8 @@ function formatTime(value: string) {
   return new Date(value).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
 function setMode(value: ChatMode) { mode.value = value; }
-async function selectSession(id: string) { await conversationStore.selectConversation(id); mobilePanel.value = 'chat'; }
-function newConversation() { conversationStore.startNewConversation(); input.value = ''; mobilePanel.value = 'chat'; }
+async function selectSession(id: string) { selectedHtmlArtifact.value = null; await conversationStore.selectConversation(id); mobilePanel.value = 'chat'; }
+function newConversation() { selectedHtmlArtifact.value = null; conversationStore.startNewConversation(); input.value = ''; mobilePanel.value = 'chat'; }
 async function sendMessage() {
   const content = input.value.trim();
   if (!content || conversationStore.sending) return;
@@ -393,6 +407,7 @@ async function sendMessage() {
 @keyframes pulse { to { opacity: .25; transform: translateY(-2px); } }
 @media (prefers-reduced-motion: reduce) { .thinking i { animation: none; } }
 @media (max-width: 1250px) { .conversation-layout { grid-template-columns: 230px minmax(420px, 1fr) 250px; }.toolbar-selectors { width: 100%; }.selector-field { flex: 1; width: auto; } }
+@media (min-width: 901px) and (max-width: 1250px) { .conversation-layout.preview-open.preview-medium { grid-template-columns: minmax(180px, 20vw) minmax(0, 1fr) minmax(360px, 40vw); } }
 @media (max-width: 900px) { .conversation-page { min-height: calc(100vh - 84px); min-height: calc(100dvh - 84px); }.conversation-topbar { height: 56px; padding: 0 12px; }.runtime-state { display: none; }.mobile-tabs { display: grid; grid-template-columns: repeat(3, 1fr); height: 38px; padding: 3px; background: #edf3f7; }.mobile-tabs button { color: #688090; background: transparent; border: 0; border-radius: 4px; }.mobile-tabs button.active { color: #2059be; background: #fff; font-weight: 700; }.conversation-layout,.conversation-layout.preview-open,.focus-mode .conversation-layout { display: block; height: calc(100vh - 178px); height: calc(100dvh - 178px); min-height: 430px; }.focus-mode .conversation-layout { height: calc(100vh - 94px); height: calc(100dvh - 94px); }.history-panel,.chat-workspace,.context-panel { display: none; height: 100%; box-sizing: border-box; border: 0; }.history-panel.mobile-active,.chat-workspace.mobile-active,.context-panel.mobile-active { display: flex; }.context-panel.mobile-active { display: block; }.history-panel { max-width: none; }.toolbar-selectors { flex: 1; }.conversation-layout .chat-workspace { min-height: 0; }.message-stream { min-height: 120px; } }
 @media (min-width: 761px) and (max-width: 900px) { .conversation-page { min-height: calc(100vh - 95px); min-height: calc(100dvh - 95px); }.conversation-layout { height: calc(100vh - 189px); height: calc(100dvh - 189px); } }
 @media (max-width: 580px) { .tool-activity { max-width: calc(100% - 43px); } .tool-activity-row { grid-template-columns: 8px minmax(0, 1fr) auto; } .tool-activity-row time { grid-column: 2 / -1; } .conversation-brand small,.quiet-button span { display: none; }.conversation-brand strong { font-size: 16px; }.conversation-topbar .quiet-button { width: 34px; padding: 0; font-size: 0; }.conversation-topbar .quiet-button :deep(svg) { width: 14px; height: 14px; }.chat-toolbar { align-items: stretch; flex-direction: column; gap: 7px; }.mode-switch { display: grid; grid-template-columns: 1fr 1fr; }.toolbar-selectors { display: grid; grid-template-columns: 1fr 1fr; }.selector-field { width: 100%; }.resource-field { grid-column: 1 / -1; }.conversation-summary { padding: 9px 12px; }.conversation-summary > span { display: none; }.message-stream { padding: 10px 12px; }.message-content { max-width: calc(100% - 43px); }.run-card footer { flex-direction: column; }.suggestion-row { padding-left: 10px; }.composer-shell { margin: 7px 10px 10px; }.composer-tools span { display: none; } }

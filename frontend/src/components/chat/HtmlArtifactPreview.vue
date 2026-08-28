@@ -28,8 +28,14 @@ const isFullscreen = ref(false);
 let previewController: AbortController | undefined;
 let downloadController: AbortController | undefined;
 let requestVersion = 0;
+let downloadRequestVersion = 0;
 
-watch(() => props.artifact.id, loadPreview, { immediate: true });
+watch(() => props.artifact.id, () => {
+  downloadRequestVersion += 1;
+  downloadController?.abort();
+  commandError.value = '';
+  void loadPreview();
+}, { immediate: true });
 
 function isAbortError(value: unknown): boolean {
   return value instanceof Error && value.name === 'AbortError';
@@ -56,16 +62,19 @@ async function loadPreview() {
 }
 
 async function downloadArtifact() {
+  const version = ++downloadRequestVersion;
   downloadController?.abort();
   const controller = new AbortController();
   downloadController = controller;
+  const artifactId = props.artifact.id;
+  const filename = props.artifact.filename;
   commandError.value = '';
   try {
-    const result = await artifactsApi.download(props.artifact.id, controller.signal);
-    if (controller.signal.aborted) return;
+    const result = await artifactsApi.download(artifactId, controller.signal);
+    if (version !== downloadRequestVersion || controller.signal.aborted) return;
     const link = document.createElement('a');
     link.href = result.url;
-    link.download = props.artifact.filename;
+    link.download = filename;
     link.style.display = 'none';
     document.body.appendChild(link);
     try {
@@ -74,7 +83,7 @@ async function downloadArtifact() {
       link.remove();
     }
   } catch (value) {
-    if (!isAbortError(value)) commandError.value = 'HTML 文件下载失败';
+    if (version === downloadRequestVersion && !isAbortError(value)) commandError.value = 'HTML 文件下载失败';
   }
 }
 
@@ -84,6 +93,7 @@ function openNewWindow() {
 
 onBeforeUnmount(() => {
   requestVersion += 1;
+  downloadRequestVersion += 1;
   previewController?.abort();
   downloadController?.abort();
 });
