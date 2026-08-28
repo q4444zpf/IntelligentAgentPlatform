@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import DOMPurify from 'dompurify';
-import { onBeforeUnmount, onMounted, ref } from 'vue';
+import { onBeforeUnmount, ref, watch } from 'vue';
 import { MAX_MERMAID_BYTES } from '@/features/chat/answerBlocks';
 import SourceFallback from './SourceFallback.vue';
 
@@ -30,14 +30,14 @@ function sanitizeSvg(value: string): string {
   });
 }
 
-async function renderDiagram(): Promise<void> {
+async function renderDiagram(sourceSnapshot: string): Promise<void> {
   const version = ++renderVersion;
   clearActiveTimeout();
   state.value = 'loading';
   error.value = '';
   svg.value = '';
 
-  if (new TextEncoder().encode(source).byteLength > MAX_MERMAID_BYTES) {
+  if (new TextEncoder().encode(sourceSnapshot).byteLength > MAX_MERMAID_BYTES) {
     error.value = '图表源码超过 100 KB 限制';
     state.value = 'error';
     return;
@@ -58,7 +58,7 @@ async function renderDiagram(): Promise<void> {
       timeoutId = window.setTimeout(() => reject(new Error('timeout')), MERMAID_TIMEOUT_MS);
       activeTimeoutId = timeoutId;
     });
-    const result = await Promise.race([mermaid.render(id, source), timeout]);
+    const result = await Promise.race([mermaid.render(id, sourceSnapshot), timeout]);
 
     if (version === renderVersion) {
       svg.value = sanitizeSvg(result.svg);
@@ -77,9 +77,9 @@ async function renderDiagram(): Promise<void> {
   }
 }
 
-onMounted(() => {
-  void renderDiagram();
-});
+watch(() => source, (nextSource) => {
+  void renderDiagram(nextSource);
+}, { immediate: true });
 
 onBeforeUnmount(() => {
   renderVersion += 1;

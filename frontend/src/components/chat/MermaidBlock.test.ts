@@ -140,4 +140,40 @@ describe('MermaidBlock', () => {
     expect(clearTimeout).toHaveBeenCalled();
     expect(wrapper.html()).not.toContain('late');
   });
+
+  it('renders only the replacement source when the initial render completes late', async () => {
+    const initial = deferred<{ svg: string }>();
+    const replacement = deferred<{ svg: string }>();
+    mocks.render
+      .mockReturnValueOnce(initial.promise)
+      .mockReturnValueOnce(replacement.promise);
+    const wrapper = render('graph LR\nA-->B');
+    await vi.waitFor(() => expect(mocks.render).toHaveBeenCalledTimes(1));
+
+    await wrapper.setProps({ source: 'graph LR\nB-->C' });
+    await vi.waitFor(() => expect(mocks.render).toHaveBeenCalledTimes(2));
+    initial.resolve({ svg: '<svg><text>initial</text></svg>' });
+    replacement.resolve({ svg: '<svg><text>replacement</text></svg>' });
+    await flushPromises();
+
+    expect(wrapper.get('[data-state="ready"]').html()).toContain('replacement');
+    expect(wrapper.html()).not.toContain('initial');
+  });
+
+  it('rejects an oversized replacement source without rendering it', async () => {
+    const initial = deferred<{ svg: string }>();
+    mocks.render.mockReturnValue(initial.promise);
+    const wrapper = render('graph LR\nA-->B');
+    await vi.waitFor(() => expect(mocks.render).toHaveBeenCalledTimes(1));
+    const oversized = '水'.repeat(34_134);
+
+    await wrapper.setProps({ source: oversized });
+    await flushPromises();
+    initial.resolve({ svg: '<svg><text>initial</text></svg>' });
+    await flushPromises();
+
+    expect(mocks.render).toHaveBeenCalledTimes(1);
+    expect(wrapper.get('[data-state="error"]').text()).toContain('图表源码超过 100 KB 限制');
+    expect(wrapper.html()).not.toContain('initial');
+  });
 });
