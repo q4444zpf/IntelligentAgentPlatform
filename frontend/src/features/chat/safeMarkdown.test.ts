@@ -28,12 +28,27 @@ describe('renderSafeMarkdown', () => {
     '<img src=x onerror=alert(1)>',
     '<form action="https://evil.test"><input></form>',
     '<svg><a href="javascript:alert(1)"><text>x</text></a></svg>',
+    '<iframe></iframe>',
+    '<object data="https://evil.test/payload"></object>',
+    '<embed src="https://evil.test/payload">',
+    '<p style="position:fixed">覆盖内容</p>',
     '[x](javascript:alert(1))',
+    '[x](vbscript:msgbox(1))',
     '![x](data:text/html;base64,PHNjcmlwdD4=)',
     '[x](//evil.test/path)',
   ])('removes executable content from %s', (source) => {
     const html = renderSafeMarkdown(source).toLowerCase();
 
-    expect(html).not.toMatch(/script|onerror|<form|<input|javascript:|data:|href="\/\/|src="\/\//);
+    expect(html).not.toMatch(/script|onerror|<form|<input|<iframe|<object|<embed|style=|javascript:|vbscript:|data:|href="\/\/|src="\/\//);
+  });
+
+  it.each([
+    ['video', '<video src="//evil.test/x.mp4"></video>', /<video|src="\/\//],
+    ['audio', '<audio src="data:audio/mp3;base64,AAAA"></audio>', /<audio|data:/],
+    ['responsive image', '<img src="https://safe.test/x.png" srcset="//evil.test/x.png 2x">', /srcset|\/\/evil\.test/],
+  ])('does not preserve %s URLs outside the Markdown surface', (_name, source, forbidden) => {
+    const html = renderSafeMarkdown(source).toLowerCase();
+
+    expect(html).not.toMatch(forbidden);
   });
 });

@@ -25,6 +25,38 @@ const FORBIDDEN_TAGS = [
   'math',
 ];
 
+const MARKDOWN_TAGS = [
+  'a',
+  'blockquote',
+  'br',
+  'code',
+  'del',
+  'em',
+  'h1',
+  'h2',
+  'h3',
+  'h4',
+  'h5',
+  'h6',
+  'hr',
+  'img',
+  'li',
+  'ol',
+  'p',
+  'pre',
+  's',
+  'strong',
+  'table',
+  'tbody',
+  'td',
+  'th',
+  'thead',
+  'tr',
+  'ul',
+];
+
+const MARKDOWN_ATTRIBUTES = ['alt', 'class', 'href', 'src', 'title'];
+
 export function isSafeContentUrl(raw: string): boolean {
   const value = raw.trim();
   if (!/^https?:\/\//i.test(value) || value.startsWith('//')) return false;
@@ -61,7 +93,8 @@ function normalizeUrls(fragment: DocumentFragment): void {
 
 export function renderSafeMarkdown(source: string): string {
   const sanitized = DOMPurify.sanitize(markdown.render(source), {
-    USE_PROFILES: { html: true },
+    ALLOWED_TAGS: MARKDOWN_TAGS,
+    ALLOWED_ATTR: MARKDOWN_ATTRIBUTES,
     FORBID_TAGS: FORBIDDEN_TAGS,
     FORBID_ATTR: ['style', 'srcdoc', 'formaction'],
   });
