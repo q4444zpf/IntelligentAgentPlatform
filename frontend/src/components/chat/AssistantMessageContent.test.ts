@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { flushPromises, mount } from '@vue/test-utils';
-import { defineComponent } from 'vue';
+import { defineComponent, h } from 'vue';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
@@ -39,8 +39,6 @@ async function render(content: string, stubs = {}) {
     global: {
       stubs: {
         SafeMarkdownBlock: MarkdownStub,
-        MermaidBlock: MermaidStub,
-        EChartsBlock: EChartsStub,
         ...stubs,
       },
     },
@@ -60,7 +58,10 @@ afterEach(() => {
 
 describe('AssistantMessageContent', () => {
   it('renders parsed block types in their message order', async () => {
-    const wrapper = await render('前言\n\n```mermaid\ngraph LR\nA-->B\n```\n\n结论\n\n```echarts\n{"series":[]}\n```');
+    const wrapper = await render('前言\n\n```mermaid\ngraph LR\nA-->B\n```\n\n结论\n\n```echarts\n{"series":[]}\n```', {
+      MermaidBlock: MermaidStub,
+      EChartsBlock: EChartsStub,
+    });
 
     expect(wrapper.findAll('[data-answer-block]').map((block) => block.attributes('data-answer-block')))
       .toEqual(['markdown', 'mermaid', 'markdown', 'echarts']);
@@ -73,24 +74,35 @@ describe('AssistantMessageContent', () => {
     await flushPromises();
 
     expect(wrapper.get('[data-answer-block="markdown"]').text()).toBe('仅包含 **Markdown** 内容');
+    expect(wrapper.find('.mermaid-block').exists()).toBe(false);
+    expect(wrapper.find('.echarts-block').exists()).toBe(false);
     expect(mocks.mermaidImports).toBe(0);
     expect(mocks.echartsCoreImports).toBe(0);
   });
 
-  it('keeps neighboring Markdown visible when a specialized block throws', async () => {
+  it('retries a failed specialized block when its source changes', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const ThrowingMermaid = defineComponent({
-      setup() {
-        throw new Error('Mermaid setup failed');
+    const RetriableMermaid = defineComponent({
+      props: { source: { required: true, type: String } },
+      setup(props) {
+        if (props.source === 'broken\n') throw new Error('Mermaid setup failed');
+        return () => h('div', { 'data-answer-block': 'mermaid' }, props.source);
       },
     });
-    const wrapper = await render('开始\n\n```mermaid\ngraph LR\nA-->B\n```\n\n结束', {
-      MermaidBlock: ThrowingMermaid,
+    const wrapper = await render('开始\n\n```mermaid\nbroken\n```\n\n结束', {
+      MermaidBlock: RetriableMermaid,
     });
 
     expect(wrapper.findAll('[data-answer-block="markdown"]').map((block) => block.element.textContent))
       .toEqual(['开始\n\n', '\n结束']);
     expect(wrapper.get('.source-fallback').text()).toContain('Mermaid 图表不可用');
+
+    await wrapper.setProps({ content: '开始\n\n```mermaid\nrecovered\n```\n\n结束' });
+
+    expect(wrapper.findAll('[data-answer-block="markdown"]').map((block) => block.element.textContent))
+      .toEqual(['开始\n\n', '\n结束']);
+    expect(wrapper.find('.source-fallback').exists()).toBe(false);
+    expect(wrapper.get('[data-answer-block="mermaid"]').text()).toBe('recovered');
   });
 
   it('uses plain interpolation fallback when parsing throws', async () => {

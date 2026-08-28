@@ -28,11 +28,15 @@ const BlockBoundary = defineComponent({
     return () => (failed.value ? slots.fallback?.() : slots.default?.());
   },
 });
+
+function answerBlockKey(block: AnswerBlock, index: number): string {
+  return JSON.stringify([block.type, index, block.source]);
+}
 </script>
 
 <template>
   <pre v-if="parseResult.failed" class="answer-plain-fallback">{{ props.content }}</pre>
-  <template v-else v-for="(block, index) in parseResult.blocks" :key="`${block.type}-${index}`">
+  <template v-else v-for="(block, index) in parseResult.blocks" :key="answerBlockKey(block, index)">
     <SafeMarkdownBlock v-if="block.type === 'markdown'" :source="block.source" />
     <BlockBoundary v-else-if="block.type === 'mermaid'">
       <MermaidBlock :source="block.source" />
