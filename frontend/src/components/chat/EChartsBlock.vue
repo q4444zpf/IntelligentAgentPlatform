@@ -80,6 +80,7 @@ async function renderChart(sourceSnapshot: string): Promise<void> {
     state.value = 'ready';
   } catch {
     if (version === renderVersion) {
+      disposeChart();
       error.value = 'ECharts 图表渲染失败';
       state.value = 'error';
     }

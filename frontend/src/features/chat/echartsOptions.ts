@@ -12,8 +12,7 @@ export const MAX_ECHARTS_SERIES = 20;
 export const MAX_ECHARTS_DATA_POINTS = 20_000;
 
 const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
-const EXTERNAL_URL = /^(?:https?:)?\/\//i;
-const EXTERNAL_IMAGE_SYMBOL = /^image:\/\/http/i;
+const EXTERNAL_RESOURCE = /^(?:https?:|\/\/|data:|javascript:|vbscript:)/i;
 
 function validationError(message: string): never {
   throw new EChartsValidationError(message);
@@ -23,20 +22,33 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function isExternalResource(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  let normalized = value.trim();
+  if (normalized.toLowerCase().startsWith('image://')) {
+    normalized = normalized.slice('image://'.length).trim();
+  }
+  return EXTERNAL_RESOURCE.test(normalized);
+}
+
+function isGraphicStyleImage(path: string[], key: string): boolean {
+  return key === 'image' && path.at(-1) === 'style' && path.includes('graphic');
+}
+
 function walkOption(
   value: unknown,
   depth: number,
   path: string[],
   dataPoints: { total: number },
 ): void {
-  if (depth > MAX_ECHARTS_DEPTH) validationError('ECharts 配置嵌套深度超过 20 层限制');
+  if (!Array.isArray(value) && !isRecord(value)) return;
+  const nextDepth = depth + 1;
+  if (nextDepth > MAX_ECHARTS_DEPTH) validationError('ECharts 配置嵌套深度超过 20 层限制');
 
   if (Array.isArray(value)) {
-    value.forEach((item) => walkOption(item, depth + 1, path, dataPoints));
+    value.forEach((item) => walkOption(item, nextDepth, path, dataPoints));
     return;
   }
-
-  if (!isRecord(value)) return;
 
   for (const key of Object.keys(value)) {
     if (DANGEROUS_KEYS.has(key)) validationError('ECharts 配置包含危险字段');
@@ -58,13 +70,22 @@ function walkOption(
         validationError('ECharts 数据点不能超过 20,000 个');
       }
     }
-    if (key === 'source' && path.at(-1) === 'dataset' && typeof child === 'string' && EXTERNAL_URL.test(child)) {
-      validationError('ECharts 配置不允许外部数据源');
+    if (key === 'source' && path.length === 1 && path[0] === 'dataset') {
+      if (Array.isArray(child)) {
+        dataPoints.total += child.length;
+        if (dataPoints.total > MAX_ECHARTS_DATA_POINTS) {
+          validationError('ECharts 数据点不能超过 20,000 个');
+        }
+      }
+      if (isExternalResource(child)) validationError('ECharts 配置不允许外部数据源');
     }
-    if (key === 'symbol' && typeof child === 'string' && EXTERNAL_IMAGE_SYMBOL.test(child)) {
+    if (key === 'symbol' && isExternalResource(child)) {
       validationError('ECharts 配置不允许外部 image 符号');
     }
-    walkOption(child, depth + 1, [...path, key], dataPoints);
+    if (isGraphicStyleImage(path, key) && isExternalResource(child)) {
+      validationError('ECharts 配置不允许外部资源');
+    }
+    walkOption(child, nextDepth, [...path, key], dataPoints);
   }
 }
 
