@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EChartsValidationError, parseEChartsOptions } from './echartsOptions';
 
 function nestedObjects(layers: number): unknown {
@@ -9,38 +9,38 @@ function nestedObjects(layers: number): unknown {
   return result;
 }
 
-function nestedArrays(layers: number): unknown {
-  let result: unknown = 0;
-  for (let index = 0; index < layers; index += 1) {
-    result = [result];
-  }
-  return result;
-}
-
-function nestedEmptyObjects(containers: number): unknown {
-  let result: unknown = {};
-  for (let index = 1; index < containers; index += 1) {
-    result = { child: result };
-  }
-  return result;
-}
-
-function nestedEmptyArrays(containers: number): unknown {
-  let result: unknown = [];
-  for (let index = 1; index < containers; index += 1) {
-    result = [result];
-  }
-  return result;
-}
-
 afterEach(() => {
   expect((Object.prototype as Record<string, unknown>).polluted).toBeUndefined();
+  vi.restoreAllMocks();
 });
 
 describe('parseEChartsOptions', () => {
-  it('accepts a bounded JSON object', () => {
-    expect(parseEChartsOptions('{"xAxis":{"data":["08:00"]},"series":[{"type":"line","data":[12.3]}]}'))
-      .toMatchObject({ series: [{ type: 'line', data: [12.3] }] });
+  it('copies the supported chart schema and enforces non-HTML, non-animated rendering', () => {
+    const option = parseEChartsOptions(JSON.stringify({
+      title: { text: '未来 24 小时水位', left: 'center' },
+      legend: { data: ['飞来峡'], top: 32 },
+      tooltip: { trigger: 'axis' },
+      grid: { left: 48, right: 24, containLabel: true },
+      xAxis: { type: 'category', data: ['08:00', '09:00'] },
+      yAxis: { type: 'value', name: '水位（m）' },
+      dataset: { source: [['时刻', '水位'], ['08:00', 12.3]] },
+      series: [
+        { type: 'line', name: '飞来峡', data: [12.3, 12.8], smooth: true },
+        { type: 'bar', data: [3, 4], barWidth: 12 },
+        { type: 'scatter', data: [[1, 2]], symbol: 'circle' },
+      ],
+    }));
+
+    expect(option).toMatchObject({
+      animation: false,
+      tooltip: { trigger: 'axis', renderMode: 'richText' },
+      xAxis: { type: 'category', data: ['08:00', '09:00'] },
+      series: [
+        { type: 'line', data: [12.3, 12.8] },
+        { type: 'bar', data: [3, 4] },
+        { type: 'scatter', data: [[1, 2]], symbol: 'circle' },
+      ],
+    });
   });
 
   it.each([
@@ -54,18 +54,16 @@ describe('parseEChartsOptions', () => {
     expect(() => parseEChartsOptions(source)).toThrow(message);
   });
 
-  it.each([
-    ['objects', nestedObjects(20)],
-    ['arrays', { child: nestedArrays(19) }],
-  ])('accepts exactly twenty nested %s containers', (_, option) => {
-    expect(parseEChartsOptions(JSON.stringify(option))).toBeDefined();
+  it('rejects excessive nesting before invoking JSON.parse', () => {
+    const parse = vi.spyOn(JSON, 'parse');
+
+    expect(() => parseEChartsOptions(JSON.stringify(nestedObjects(21)))).toThrow('深度');
+    expect(parse).not.toHaveBeenCalled();
   });
 
-  it.each([
-    ['objects', nestedEmptyObjects(21)],
-    ['arrays', { child: nestedEmptyArrays(20) }],
-  ])('rejects twenty-one nested %s containers', (_, option) => {
-    expect(() => parseEChartsOptions(JSON.stringify(option))).toThrow('深度');
+  it('does not count structural characters inside JSON strings as nesting', () => {
+    expect(parseEChartsOptions('{"title":{"text":"[{\\\"not a container\\\"}]"},"series":[]}'))
+      .toMatchObject({ title: { text: '[{"not a container"}]' } });
   });
 
   it('rejects a UTF-8 source above the 512 KB boundary before parsing', () => {
@@ -89,6 +87,21 @@ describe('parseEChartsOptions', () => {
     ['{"dataset":{"source":" //example.com/data.csv "}}', '外部'],
   ])('rejects prohibited ECharts content %s', (source, message) => {
     expect(() => parseEChartsOptions(source)).toThrow(message);
+  });
+
+  it.each([
+    ['image-backed background', { backgroundColor: { image: 'https://attacker.example/pixel.png' } }],
+    ['timeline branch', { timeline: { data: ['now'] }, options: [{ series: [] }] }],
+    ['nested base option', { baseOption: { series: Array.from({ length: 21 }, () => ({ data: [] })) } }],
+    ['responsive media option', { media: [{ option: { series: [{ type: 'line', data: [] }] } }] }],
+    ['title navigation', { title: { text: 'report', link: 'https://attacker.example/' } }],
+    ['HTML tooltip mode', { tooltip: { renderMode: 'html' } }],
+    ['dataset transform', { dataset: { source: [[1]], transform: { type: 'filter' } } }],
+    ['unsupported series', { series: [{ type: 'pie', data: [1] }] }],
+    ['custom path symbol', { series: [{ type: 'line', symbol: 'path://M0,0L1,1', data: [1] }] }],
+    ['unknown root field', { darkMode: true }],
+  ])('rejects %s instead of forwarding it to ECharts', (_, option) => {
+    expect(() => parseEChartsOptions(JSON.stringify(option))).toThrow(EChartsValidationError);
   });
 
   it('accepts twenty thousand local dataset rows without counting series references twice', () => {

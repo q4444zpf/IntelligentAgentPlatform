@@ -9,6 +9,7 @@ import source from './AgentConsoleView.vue?raw';
 const mocks = vi.hoisted(() => ({
   listArtifacts: vi.fn(),
   downloadArtifact: vi.fn(),
+  previewArtifact: vi.fn(),
 }));
 
 const store = reactive({ conversations: [] as Array<Record<string, unknown>>, activeConversationId: 'c1', messages: [] as Array<Record<string, unknown>>, activeRun: { id: 'r1', status: 'running' }, error: '', sending: false, toolActivities: [
@@ -22,6 +23,7 @@ vi.mock('@/api/artifacts', () => ({
   artifactsApi: {
     list: mocks.listArtifacts,
     download: mocks.downloadArtifact,
+    preview: mocks.previewArtifact,
   },
 }));
 vi.mock('vue-router', () => ({ useRoute: () => ({ meta: {} }), useRouter: () => ({ push: vi.fn() }) }));
@@ -40,8 +42,12 @@ const artifact = (id: string, filename: string, contentType: string, runId: stri
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise; });
-  return { promise, resolve };
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
 }
 
 function useMediumViewport() {
@@ -63,7 +69,9 @@ beforeEach(() => {
   store.startNewConversation.mockClear();
   mocks.listArtifacts.mockReset();
   mocks.downloadArtifact.mockReset();
+  mocks.previewArtifact.mockReset();
   mocks.listArtifacts.mockResolvedValue([]);
+  mocks.previewArtifact.mockResolvedValue({ url: 'https://objects.example/signed' });
 });
 
 afterEach(() => {
@@ -256,6 +264,32 @@ describe('AgentConsoleView runtime interactions', () => {
 
     wrapper.unmount();
     expect(signals[1].aborted).toBe(true);
+  });
+
+  it('ignores a non-abort rejection from a superseded artifact list', async () => {
+    const staleRequest = deferred<ReturnType<typeof artifact>[]>();
+    const currentRequest = deferred<ReturnType<typeof artifact>[]>();
+    mocks.listArtifacts
+      .mockImplementationOnce(() => staleRequest.promise)
+      .mockImplementationOnce(() => currentRequest.promise);
+    store.messages = [
+      { id: 'm-run-1', conversation_id: 'c1', role: 'assistant', content: '旧运行', run_id: 'run-1', created_at: '2026-08-28T01:01:00Z' },
+    ];
+    const wrapper = mount(AgentConsoleView, { global: { stubs } });
+
+    store.messages = [
+      { id: 'm-run-2', conversation_id: 'c1', role: 'assistant', content: '新运行', run_id: 'run-2', created_at: '2026-08-28T01:02:00Z' },
+    ];
+    await nextTick();
+    currentRequest.resolve([artifact('current', 'current.html', 'text/html', 'run-2')]);
+    await flushPromises();
+    expect(wrapper.text()).toContain('current.html');
+
+    staleRequest.reject(new Error('stale transport failure'));
+    await flushPromises();
+
+    expect(wrapper.text()).toContain('current.html');
+    wrapper.unmount();
   });
 });
 

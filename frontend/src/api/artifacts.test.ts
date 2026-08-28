@@ -22,4 +22,13 @@ describe('artifactsApi', () => {
     expect(requestMock).toHaveBeenCalledWith('/artifacts/artifact-1/download', { signal: undefined });
     expect(result.url).toBe('http://minio.test/signed');
   });
+
+  it('returns a separately authorized inline preview response for an artifact', async () => {
+    requestMock.mockResolvedValueOnce({ url: 'http://minio.test/inline', expires_in: 300 });
+
+    const result = await artifactsApi.preview('artifact/1');
+
+    expect(requestMock).toHaveBeenCalledWith('/artifacts/artifact%2F1/preview', { signal: undefined });
+    expect(result.url).toBe('http://minio.test/inline');
+  });
 });

@@ -11,6 +11,7 @@ import {
 import { onBeforeUnmount, ref, watch } from 'vue';
 
 import { artifactsApi, type ArtifactInfo } from '@/api/artifacts';
+import SandboxedArtifactFrame from './SandboxedArtifactFrame.vue';
 
 const props = defineProps<{
   artifact: ArtifactInfo;
@@ -52,7 +53,7 @@ async function loadPreview() {
   previewUrl.value = '';
 
   try {
-    const result = await artifactsApi.download(props.artifact.id, controller.signal);
+    const result = await artifactsApi.preview(props.artifact.id, controller.signal);
     if (version === requestVersion && !controller.signal.aborted) previewUrl.value = result.url;
   } catch (value) {
     if (version === requestVersion && !isAbortError(value)) error.value = 'HTML 预览加载失败';
@@ -88,7 +89,8 @@ async function downloadArtifact() {
 }
 
 function openNewWindow() {
-  if (previewUrl.value) window.open(previewUrl.value, '_blank', 'noopener,noreferrer');
+  const artifactId = encodeURIComponent(props.artifact.id);
+  window.open(`/artifacts/${artifactId}/preview`, '_blank', 'noopener,noreferrer');
 }
 
 onBeforeUnmount(() => {
@@ -119,7 +121,7 @@ onBeforeUnmount(() => {
           <FullscreenExitOutlined v-if="isFullscreen" />
           <FullscreenOutlined v-else />
         </button>
-        <button type="button" title="在新窗口打开 HTML 预览" aria-label="在新窗口打开 HTML 预览" :disabled="!previewUrl" @click="openNewWindow">
+        <button type="button" title="在新窗口打开 HTML 预览" aria-label="在新窗口打开 HTML 预览" @click="openNewWindow">
           <ExportOutlined />
         </button>
         <button type="button" :title="`下载 ${props.artifact.filename}`" :aria-label="`下载 ${props.artifact.filename}`" @click="downloadArtifact">
@@ -143,12 +145,9 @@ onBeforeUnmount(() => {
           <button type="button" aria-label="关闭 HTML 预览" @click="emit('close')"><CloseOutlined /> 关闭</button>
         </div>
       </div>
-      <iframe
+      <SandboxedArtifactFrame
         v-else-if="previewUrl"
-        :key="previewUrl"
         :src="previewUrl"
-        sandbox=""
-        referrerpolicy="no-referrer"
         :title="`HTML 预览：${props.artifact.filename}`"
       />
     </div>
@@ -238,14 +237,6 @@ onBeforeUnmount(() => {
   min-height: 0;
   overflow: hidden;
   background: #eef3f6;
-}
-
-.preview-body iframe {
-  display: block;
-  width: 100%;
-  height: 100%;
-  background: #fff;
-  border: 0;
 }
 
 .preview-state {

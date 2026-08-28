@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => {
     coreImports: 0,
     dispose,
     init: vi.fn(() => ({ dispose, resize, setOption })),
+    loadECharts: vi.fn(),
     resize,
     setOption,
     use: vi.fn(),
@@ -21,6 +22,10 @@ vi.mock('echarts/core', () => {
   mocks.coreImports += 1;
   return { init: mocks.init, use: mocks.use };
 });
+
+vi.mock('@/features/chat/echartsLoader', () => ({
+  loadECharts: mocks.loadECharts,
+}));
 
 vi.mock('echarts/charts', () => ({
   BarChart: {},
@@ -40,6 +45,29 @@ vi.mock('echarts/renderers', () => ({ CanvasRenderer: {} }));
 
 const validSource = '{"xAxis":{"data":["08:00"]},"series":[{"type":"line","data":[12.3]}]}';
 const wrappers: Array<{ unmount: () => void }> = [];
+
+function echartsModules() {
+  return {
+    charts: { BarChart: {}, LineChart: {}, ScatterChart: {} },
+    components: {
+      DatasetComponent: {},
+      GridComponent: {},
+      LegendComponent: {},
+      TitleComponent: {},
+      TooltipComponent: {},
+    },
+    core: { init: mocks.init, use: mocks.use },
+    renderers: { CanvasRenderer: {} },
+  };
+}
+
+function deferredEChartsModules() {
+  let resolvePromise!: (value: ReturnType<typeof echartsModules>) => void;
+  const promise = new Promise<ReturnType<typeof echartsModules>>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return { promise, resolve: () => resolvePromise(echartsModules()) };
+}
 
 class ResizeObserverMock {
   static instances: ResizeObserverMock[] = [];
@@ -76,6 +104,7 @@ beforeEach(() => {
   mocks.coreImports = 0;
   mocks.dispose.mockReset();
   mocks.init.mockReset();
+  mocks.loadECharts.mockReset();
   mocks.resize.mockReset();
   mocks.setOption.mockReset();
   mocks.use.mockReset();
@@ -84,6 +113,7 @@ beforeEach(() => {
     resize: mocks.resize,
     setOption: mocks.setOption,
   });
+  mocks.loadECharts.mockResolvedValue(echartsModules());
 });
 
 afterEach(() => {
@@ -100,11 +130,12 @@ describe('EChartsBlock', () => {
     await waitForChart();
 
     expect(mocks.setOption).toHaveBeenCalledWith({
+      animation: false,
       xAxis: { data: ['08:00'] },
       series: [{ type: 'line', data: [12.3] }],
     }, { notMerge: true });
     expect(wrapper.attributes('data-state')).toBe('ready');
-    expect(mocks.coreImports).toBe(1);
+    expect(mocks.loadECharts).toHaveBeenCalledTimes(1);
   });
 
   it('resizes its chart when the observed host changes size', async () => {
@@ -148,8 +179,50 @@ describe('EChartsBlock', () => {
     await flushPromises();
 
     expect(wrapper.get('.source-fallback').text()).toContain('ECharts 图表不可用');
-    expect(mocks.coreImports).toBe(0);
+    expect(mocks.loadECharts).not.toHaveBeenCalled();
     expect(mocks.init).not.toHaveBeenCalled();
+  });
+
+  it('falls back before loading ECharts for an image-backed option', async () => {
+    vi.stubGlobal('ResizeObserver', ResizeObserverMock);
+    const wrapper = await render('{"backgroundColor":{"image":"https://attacker.example/pixel.png"}}');
+    await flushPromises();
+
+    expect(wrapper.get('.source-fallback').text()).toContain('ECharts 图表不可用');
+    expect(mocks.loadECharts).not.toHaveBeenCalled();
+    expect(mocks.init).not.toHaveBeenCalled();
+    expect(mocks.setOption).not.toHaveBeenCalled();
+  });
+
+  it('does not initialize after an import completes following unmount', async () => {
+    const pending = deferredEChartsModules();
+    mocks.loadECharts.mockReturnValue(pending.promise);
+    const wrapper = await render();
+    await vi.waitFor(() => expect(mocks.loadECharts).toHaveBeenCalledTimes(1));
+
+    wrapper.unmount();
+    pending.resolve();
+    await flushPromises();
+
+    expect(mocks.init).not.toHaveBeenCalled();
+    expect(mocks.setOption).not.toHaveBeenCalled();
+  });
+
+  it('initializes only the replacement source when a shared import completes late', async () => {
+    vi.stubGlobal('ResizeObserver', ResizeObserverMock);
+    const pending = deferredEChartsModules();
+    mocks.loadECharts.mockReturnValue(pending.promise);
+    const wrapper = await render();
+    await vi.waitFor(() => expect(mocks.loadECharts).toHaveBeenCalledTimes(1));
+
+    await wrapper.setProps({ source: '{"series":[{"type":"bar","data":[4]}]}' });
+    pending.resolve();
+    await vi.waitFor(() => expect(mocks.init).toHaveBeenCalledTimes(1));
+
+    expect(mocks.setOption).toHaveBeenCalledWith({
+      animation: false,
+      series: [{ type: 'bar', data: [4] }],
+    }, { notMerge: true });
   });
 
   it('disposes its chart when setOption throws after initialization', async () => {

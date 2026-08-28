@@ -321,6 +321,7 @@ async function loadArtifactsForRuns(runSignature: string) {
     }
     artifactsByRun.value = grouped;
   } catch (value) {
+    if (version !== artifactListVersion || controller.signal.aborted) return;
     if (!(value instanceof Error && value.name === 'AbortError')) artifactsByRun.value = new Map();
   }
 }

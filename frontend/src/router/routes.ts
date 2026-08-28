@@ -159,5 +159,6 @@ export const routes: RouteRecordRaw[] = [
     ],
   },
   { path: '/chat/focus', name: 'ChatFocus', component: () => import('@/views/agent/AgentConsoleView.vue'), meta: { title: 'AI 对话', permission: 'chat:view', focus: true } },
+  { path: '/artifacts/:artifactId/preview', name: 'ArtifactPreview', component: () => import('@/views/artifacts/ArtifactPreviewView.vue'), meta: { title: 'HTML 成果预览', permission: 'platform:view' } },
   { path: '/:pathMatch(.*)*', redirect: '/dashboard' },
 ];

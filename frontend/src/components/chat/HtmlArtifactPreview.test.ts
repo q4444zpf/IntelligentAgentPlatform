@@ -9,13 +9,14 @@ import HtmlArtifactPreview from './HtmlArtifactPreview.vue';
 
 const mocks = vi.hoisted(() => ({
   download: vi.fn(),
+  preview: vi.fn(),
 }));
 
 vi.mock('@/api/artifacts', async (importOriginal) => {
   const original = await importOriginal<typeof import('@/api/artifacts')>();
   return {
     ...original,
-    artifactsApi: { ...original.artifactsApi, download: mocks.download },
+    artifactsApi: { ...original.artifactsApi, download: mocks.download, preview: mocks.preview },
   };
 });
 
@@ -64,6 +65,8 @@ const PreviewHarness = defineComponent({
 
 beforeEach(() => {
   mocks.download.mockReset();
+  mocks.preview.mockReset();
+  mocks.preview.mockResolvedValue({ url: 'https://objects.example/default-preview', expires_in: 300 });
 });
 
 afterEach(() => {
@@ -73,7 +76,7 @@ afterEach(() => {
 
 describe('HTML Artifact card and preview', () => {
   it('opens a fresh signed URL in a scriptless sandbox when the user clicks the run-linked card', async () => {
-    mocks.download.mockResolvedValue({ url: 'https://objects.example/signed', expires_in: 300 });
+    mocks.preview.mockResolvedValue({ url: 'https://objects.example/signed', expires_in: 300 });
     const fetchSpy = vi.spyOn(globalThis, 'fetch');
     const wrapper = mount(PreviewHarness);
 
@@ -89,12 +92,14 @@ describe('HTML Artifact card and preview', () => {
     expect(iframe.attributes('allow')).toBeUndefined();
     expect(iframe.attributes('srcdoc')).toBeUndefined();
     expect(iframe.attributes('src')).toBe('https://objects.example/signed');
+    expect(mocks.preview).toHaveBeenCalledWith('artifact-1', expect.any(AbortSignal));
+    expect(mocks.download).not.toHaveBeenCalled();
     expect(fetchSpy).not.toHaveBeenCalled();
     wrapper.unmount();
   });
 
   it('refreshes with a new signed URL and toggles the full viewport surface', async () => {
-    mocks.download
+    mocks.preview
       .mockResolvedValueOnce({ url: 'https://objects.example/first' })
       .mockResolvedValueOnce({ url: 'https://objects.example/refreshed' });
     const wrapper = mount(HtmlArtifactPreview, { props: { artifact: firstArtifact } });
@@ -115,7 +120,7 @@ describe('HTML Artifact card and preview', () => {
     const oldRequest = deferred<{ url: string }>();
     const newRequest = deferred<{ url: string }>();
     const signals: AbortSignal[] = [];
-    mocks.download.mockImplementation((_id: string, signal: AbortSignal) => {
+    mocks.preview.mockImplementation((_id: string, signal: AbortSignal) => {
       signals.push(signal);
       return signals.length === 1 ? oldRequest.promise : newRequest.promise;
     });
@@ -134,10 +139,10 @@ describe('HTML Artifact card and preview', () => {
   });
 
   it('does not show an aborted superseded request as a preview failure', async () => {
-    mocks.download.mockImplementationOnce((_id: string, signal: AbortSignal) => new Promise((_resolve, reject) => {
+    mocks.preview.mockImplementationOnce((_id: string, signal: AbortSignal) => new Promise((_resolve, reject) => {
       signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
     }));
-    mocks.download.mockResolvedValueOnce({ url: 'https://objects.example/next' });
+    mocks.preview.mockResolvedValueOnce({ url: 'https://objects.example/next' });
     const wrapper = mount(HtmlArtifactPreview, { props: { artifact: firstArtifact } });
 
     await wrapper.setProps({ artifact: secondArtifact });
@@ -149,9 +154,7 @@ describe('HTML Artifact card and preview', () => {
   });
 
   it('downloads through a temporary anchor and removes it after the click', async () => {
-    mocks.download
-      .mockResolvedValueOnce({ url: 'https://objects.example/preview' })
-      .mockResolvedValueOnce({ url: 'https://objects.example/download' });
+    mocks.download.mockResolvedValueOnce({ url: 'https://objects.example/download' });
     const clickedAnchors: HTMLAnchorElement[] = [];
     const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function click(this: HTMLAnchorElement) {
       clickedAnchors.push(this);
@@ -173,12 +176,10 @@ describe('HTML Artifact card and preview', () => {
     const staleDownload = deferred<{ url: string }>();
     let staleSignal: AbortSignal | undefined;
     mocks.download
-      .mockResolvedValueOnce({ url: 'https://objects.example/a-preview' })
       .mockImplementationOnce((_id: string, signal: AbortSignal) => {
         staleSignal = signal;
         return staleDownload.promise;
       })
-      .mockResolvedValueOnce({ url: 'https://objects.example/b-preview' })
       .mockResolvedValueOnce({ url: 'https://objects.example/b-download' });
     const clickedAnchors: HTMLAnchorElement[] = [];
     vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function click(this: HTMLAnchorElement) {
@@ -209,12 +210,10 @@ describe('HTML Artifact card and preview', () => {
     const staleDownload = deferred<{ url: string }>();
     let staleSignal: AbortSignal | undefined;
     mocks.download
-      .mockResolvedValueOnce({ url: 'https://objects.example/a-preview' })
       .mockImplementationOnce((_id: string, signal: AbortSignal) => {
         staleSignal = signal;
         return staleDownload.promise;
-      })
-      .mockResolvedValueOnce({ url: 'https://objects.example/b-preview' });
+      });
     const wrapper = mount(HtmlArtifactPreview, { props: { artifact: firstArtifact } });
     await flushPromises();
 
@@ -230,20 +229,22 @@ describe('HTML Artifact card and preview', () => {
     wrapper.unmount();
   });
 
-  it('opens the current signed URL in a new isolated window', async () => {
-    mocks.download.mockResolvedValue({ url: 'https://objects.example/signed' });
+  it('opens a controlled same-app viewer containing only the artifact id', async () => {
+    mocks.preview.mockResolvedValue({ url: 'https://objects.example/signed?secret=token' });
     const openSpy = vi.spyOn(window, 'open').mockImplementation(() => null);
     const wrapper = mount(HtmlArtifactPreview, { props: { artifact: firstArtifact } });
     await flushPromises();
 
     await wrapper.get('[aria-label="在新窗口打开 HTML 预览"]').trigger('click');
 
-    expect(openSpy).toHaveBeenCalledWith('https://objects.example/signed', '_blank', 'noopener,noreferrer');
+    expect(openSpy).toHaveBeenCalledWith('/artifacts/artifact-1/preview', '_blank', 'noopener,noreferrer');
+    expect(openSpy.mock.calls[0][0]).not.toContain('objects.example');
+    expect(openSpy.mock.calls[0][0]).not.toContain('secret');
     wrapper.unmount();
   });
 
   it('shows retry and close after failure while the surrounding chat remains mounted', async () => {
-    mocks.download
+    mocks.preview
       .mockRejectedValueOnce(new Error('temporary outage'))
       .mockResolvedValueOnce({ url: 'https://objects.example/retry' });
     const wrapper = mount(PreviewHarness);
@@ -265,7 +266,7 @@ describe('HTML Artifact card and preview', () => {
   it('emits close and aborts its pending request when unmounted', async () => {
     const pending = deferred<{ url: string }>();
     let signal: AbortSignal | undefined;
-    mocks.download.mockImplementation((_id: string, requestSignal: AbortSignal) => {
+    mocks.preview.mockImplementation((_id: string, requestSignal: AbortSignal) => {
       signal = requestSignal;
       return pending.promise;
     });

@@ -43,4 +43,36 @@ describe('SafeMarkdownBlock', () => {
     expect(wrapper.text()).toContain('前置说明');
     expect(wrapper.text()).toContain('后续说明');
   });
+
+  it('removes listeners from replaced code and image elements after a prop update', async () => {
+    const wrapper = render('```ts\nconst stale = true;\n```\n\n![旧图](https://example.com/old.png)');
+    const staleButton = wrapper.get<HTMLButtonElement>('button[aria-label="复制代码"]').element;
+    const staleImage = wrapper.get<HTMLImageElement>('img').element;
+    const replaceWith = vi.spyOn(staleImage, 'replaceWith');
+
+    await wrapper.setProps({
+      source: '```ts\nconst current = true;\n```\n\n![新图](https://example.com/new.png)',
+    });
+    staleButton.click();
+    staleImage.dispatchEvent(new Event('error'));
+
+    expect(mocks.copyText).not.toHaveBeenCalled();
+    expect(replaceWith).not.toHaveBeenCalled();
+    await wrapper.get('button[aria-label="复制代码"]').trigger('click');
+    expect(mocks.copyText).toHaveBeenCalledWith('const current = true;\n');
+  });
+
+  it('removes listeners from owned elements on unmount', () => {
+    const wrapper = render('```ts\nconst stale = true;\n```\n\n![旧图](https://example.com/old.png)');
+    const staleButton = wrapper.get<HTMLButtonElement>('button[aria-label="复制代码"]').element;
+    const staleImage = wrapper.get<HTMLImageElement>('img').element;
+    const replaceWith = vi.spyOn(staleImage, 'replaceWith');
+
+    wrapper.unmount();
+    staleButton.click();
+    staleImage.dispatchEvent(new Event('error'));
+
+    expect(mocks.copyText).not.toHaveBeenCalled();
+    expect(replaceWith).not.toHaveBeenCalled();
+  });
 });

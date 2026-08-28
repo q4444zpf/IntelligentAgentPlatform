@@ -23,4 +23,9 @@ export const artifactsApi = {
       `/artifacts/${encodeURIComponent(artifactId)}/download`,
       { signal },
     ),
+  preview: (artifactId: string, signal?: AbortSignal) =>
+    request<ArtifactDownloadInfo>(
+      `/artifacts/${encodeURIComponent(artifactId)}/preview`,
+      { signal },
+    ),
 };

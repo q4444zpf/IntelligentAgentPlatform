@@ -43,15 +43,13 @@ export function parseAnswerBlocks(content: string): AnswerBlock[] {
     const [startLine, endLine] = token.map!;
     const start = offsets[startLine];
     const end = offsets[Math.min(endLine, offsets.length - 1)];
-    const rawFence = content.slice(start, end);
-    const opening = rawFence.split(/\r?\n/, 1)[0].trimStart();
-    const marker = opening.match(/^(`{3,}|~{3,})/)?.[1];
+    const marker = token.markup;
     const closingLine = content
       .slice(offsets[endLine - 1], offsets[endLine] ?? content.length)
-      .replace(/\r?\n$/, '')
-      .trim();
+      .replace(/\r?\n$/, '');
+    const markerCharacter = marker[0]?.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const closing = marker
-      ? new RegExp(`^${marker[0]}{${marker.length},}\\s*$`).test(closingLine)
+      ? new RegExp(`^ {0,3}${markerCharacter}{${marker.length},}[ \\t]*$`).test(closingLine)
       : false;
     if (!closing || specialized >= MAX_SPECIAL_BLOCKS) continue;
 

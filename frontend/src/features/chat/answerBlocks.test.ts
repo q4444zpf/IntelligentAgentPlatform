@@ -20,6 +20,17 @@ describe('parseAnswerBlocks', () => {
     ]);
   });
 
+  it.each([
+    ['mermaid title', 'graph LR\nA-->B'],
+    ['echarts json', '{"series":[]}'],
+  ])('keeps a fence with the non-exact info string %s as markdown', (info, body) => {
+    const source = `\`\`\`${info}\n${body}\n\`\`\``;
+
+    expect(parseAnswerBlocks(source)).toEqual([
+      { type: 'markdown', source },
+    ]);
+  });
+
   it('does not emit empty markdown segments around a special fence', () => {
     expect(parseAnswerBlocks('```echarts\n{"series":[]}\n```')).toEqual([
       { type: 'echarts', source: '{"series":[]}\n' },
@@ -35,9 +46,17 @@ describe('parseAnswerBlocks', () => {
     expect(blocks.at(-1)?.source).toContain('A6-->B');
   });
 
-  it('specializes fences with an indented closing delimiter', () => {
-    expect(parseAnswerBlocks('```mermaid\ngraph LR\nA-->B\n  ```')).toEqual([
+  it('specializes a fence whose closing delimiter has three leading spaces', () => {
+    expect(parseAnswerBlocks('```mermaid\ngraph LR\nA-->B\n   ```')).toEqual([
       { type: 'mermaid', source: 'graph LR\nA-->B\n' },
+    ]);
+  });
+
+  it('keeps a fence with a four-space-indented closing delimiter as markdown', () => {
+    const source = '```mermaid\ngraph LR\nA-->B\n    ```';
+
+    expect(parseAnswerBlocks(source)).toEqual([
+      { type: 'markdown', source },
     ]);
   });
 

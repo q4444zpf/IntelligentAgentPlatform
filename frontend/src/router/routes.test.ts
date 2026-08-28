@@ -10,6 +10,17 @@ describe('artifact route', () => {
     expect(artifact?.meta?.module).toBeUndefined();
     expect(String(artifact?.component)).toContain('ArtifactListView');
   });
+
+  it('registers the controlled artifact viewer before the catch-all route', () => {
+    const previewIndex = routes.findIndex((route) => route.path === '/artifacts/:artifactId/preview');
+    const catchAllIndex = routes.findIndex((route) => route.path === '/:pathMatch(.*)*');
+    const preview = routes[previewIndex];
+
+    expect(previewIndex).toBeGreaterThanOrEqual(0);
+    expect(previewIndex).toBeLessThan(catchAllIndex);
+    expect(preview?.meta?.permission).toBe('platform:view');
+    expect(String(preview?.component)).toContain('ArtifactPreviewView');
+  });
 });
 
 describe('fixed authorization routes', () => {

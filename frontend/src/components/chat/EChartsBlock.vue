@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { loadECharts } from '@/features/chat/echartsLoader';
 import { EChartsValidationError, parseEChartsOptions } from '@/features/chat/echartsOptions';
 import SourceFallback from './SourceFallback.vue';
 
@@ -45,12 +46,7 @@ async function renderChart(sourceSnapshot: string): Promise<void> {
   error.value = '';
 
   try {
-    const [core, charts, components, renderers] = await Promise.all([
-      import('echarts/core'),
-      import('echarts/charts'),
-      import('echarts/components'),
-      import('echarts/renderers'),
-    ]);
+    const { charts, components, core, renderers } = await loadECharts();
     if (version !== renderVersion || !host.value) return;
 
     core.use([
