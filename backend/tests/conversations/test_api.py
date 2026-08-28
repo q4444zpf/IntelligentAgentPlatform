@@ -69,6 +69,27 @@ def create_run(client, *, headers=HEADERS, title="洪水研判", actor_id="flood
     ).json()
 
 
+def test_message_list_exposes_assistant_run_link_without_assigning_user_message():
+    client = build_client()
+    accepted = create_run(client)
+    session = client.app.state.conversation_session
+    repository = ConversationRepository(session)
+    assistant = repository.add_assistant_message(accepted["run"]["id"], "研判完成")
+    session.commit()
+
+    response = client.get(
+        f"/api/conversations/{accepted['run']['conversation_id']}/messages",
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 200
+    messages = response.json()
+    assert messages[0]["role"] == "user"
+    assert messages[0]["run_id"] is None
+    assert messages[-1]["id"] == assistant.id
+    assert messages[-1]["run_id"] == accepted["run"]["id"]
+
+
 def test_agent_run_list_projects_items_and_summary():
     client = build_client()
     accepted = create_run(client, title="防洪调度")

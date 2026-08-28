@@ -33,6 +33,7 @@ class MessageInfo(BaseModel):
 
     id: str
     conversation_id: str
+    run_id: str | None = None
     role: Literal["user", "assistant", "system", "tool"]
     content: str
     created_at: datetime
