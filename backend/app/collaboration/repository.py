@@ -91,6 +91,16 @@ class TeamRepository:
             .where(TeamVersion.id == version_id)
         )
 
+    def list_published_versions(self, team_id: str) -> list[TeamVersion]:
+        return list(
+            self.session.scalars(
+                select(TeamVersion)
+                .options(selectinload(TeamVersion.members))
+                .where(TeamVersion.team_id == team_id, TeamVersion.status == "published")
+                .order_by(TeamVersion.version.desc())
+            )
+        )
+
     def save_draft(
         self,
         team_id: str,

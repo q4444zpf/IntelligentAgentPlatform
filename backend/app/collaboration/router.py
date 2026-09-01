@@ -50,6 +50,22 @@ def get_team(team_id: str, context: RequestContext = Depends(require_request_con
         raise _error(error) from error
 
 
+@router.get("/teams/{team_id}/versions")
+def list_team_versions(team_id: str, context: RequestContext = Depends(require_request_context), service: TeamService = Depends(_service)):
+    try:
+        return service.list_versions(context, team_id)
+    except Exception as error:
+        raise _error(error) from error
+
+
+@router.get("/teams/{team_id}/versions/{version}")
+def get_team_version(team_id: str, version: int, context: RequestContext = Depends(require_request_context), service: TeamService = Depends(_service)):
+    try:
+        return service.get_version(context, team_id, version)
+    except Exception as error:
+        raise _error(error) from error
+
+
 @router.patch("/teams/{team_id}")
 def update_team(team_id: str, request: TeamMetadataUpdate, context: RequestContext = Depends(require_request_context), service: TeamService = Depends(_service)):
     try:

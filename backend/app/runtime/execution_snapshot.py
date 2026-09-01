@@ -13,7 +13,6 @@ from sqlalchemy import JSON, DateTime, Index, String, select
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from app.db.base import Base
-from app.collaboration.repository import TeamRepository
 
 
 class SnapshotIntegrityError(ValueError):
@@ -263,6 +262,8 @@ class ExecutionSnapshotService:
         if getattr(run, "actor_type", "agent") == "team":
             if not getattr(run, "actor_version_id", None):
                 raise ValueError("Team Run has no selected version")
+            from app.collaboration.repository import TeamRepository
+
             team_version = TeamRepository(self.session).get_version_by_id(run.actor_version_id)
             if team_version is None or team_version.status != "published":
                 raise ValueError("Selected Team version is unavailable")

@@ -3,7 +3,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.collaboration.schemas import TeamCreateRequest, TeamDraft, TeamDraftUpdate, TeamMemberDraft
-from app.collaboration.service import TeamService, TeamUnavailableError
+from app.collaboration.repository import TeamNotFoundError
+from app.collaboration.service import TeamPermissionError, TeamService, TeamUnavailableError
 from app.core.request_context import RequestContext
 from app.db.base import Base
 
@@ -18,6 +19,10 @@ def service():
 
 def admin(project="p1"):
     return RequestContext(user_id="u1", unit_id="unit-1", project_id=project, roles=frozenset({"project_admin"}))
+
+
+def reader(project="p1"):
+    return RequestContext(user_id="u2", unit_id="unit-1", project_id=project, roles=frozenset({"user"}))
 
 
 def draft():
@@ -51,3 +56,38 @@ def test_team_resolution_is_project_scoped(service):
     service.set_enabled(context, team.id, True)
     with pytest.raises(TeamUnavailableError):
         service.resolve_for_run(admin("other-project"), team.id)
+
+
+def test_team_version_history_exposes_only_immutable_published_versions(service):
+    context = admin()
+    team = service.create(context, TeamCreateRequest(name="联合研判"))
+    service.save_draft(context, team.id, TeamDraftUpdate(revision=1, draft=draft()))
+    published = service.publish(context, team.id)
+
+    versions = service.list_versions(reader(), team.id)
+
+    assert [version.id for version in versions] == [published.id]
+    assert versions[0].status == "published"
+
+
+def test_team_draft_definition_is_visible_only_to_managers(service):
+    context = admin()
+    team = service.create(context, TeamCreateRequest(name="联合研判"))
+    service.save_draft(context, team.id, TeamDraftUpdate(revision=1, draft=draft()))
+
+    saved = service.get_version(context, team.id, 0)
+
+    assert saved.status == "draft"
+    assert saved.definition["supervisor"]["agent_id"] == "supervisor"
+    with pytest.raises(TeamPermissionError):
+        service.get_version(reader(), team.id, 0)
+
+
+def test_team_version_lookup_is_project_scoped(service):
+    context = admin()
+    team = service.create(context, TeamCreateRequest(name="联合研判"))
+    service.save_draft(context, team.id, TeamDraftUpdate(revision=1, draft=draft()))
+    service.publish(context, team.id)
+
+    with pytest.raises(TeamNotFoundError):
+        service.list_versions(admin("other-project"), team.id)

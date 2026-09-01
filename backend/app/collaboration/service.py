@@ -83,6 +83,23 @@ class TeamService:
             raise TeamNotFoundError(team_id)
         return self._summary(team)
 
+    def list_versions(self, context: RequestContext, team_id: str) -> list[TeamVersionInfo]:
+        self._require(context, "collaboration.read")
+        team = self.repository.get_scoped(context.unit_id, context.project_id, team_id)
+        if team is None:
+            raise TeamNotFoundError(team_id)
+        return [self._version_info(version) for version in self.repository.list_published_versions(team.id)]
+
+    def get_version(self, context: RequestContext, team_id: str, version: int) -> TeamVersionInfo:
+        self._require(context, "collaboration.manage" if version == 0 else "collaboration.read")
+        team = self.repository.get_scoped(context.unit_id, context.project_id, team_id)
+        if team is None:
+            raise TeamNotFoundError(team_id)
+        stored = self.repository.get_version(team.id, version)
+        if stored is None:
+            raise TeamNotFoundError(f"{team_id}:{version}")
+        return self._version_info(stored)
+
     def create(self, context: RequestContext, request: TeamCreateRequest) -> TeamSummary:
         self._require(context, "collaboration.manage")
         team = self.repository.create(
