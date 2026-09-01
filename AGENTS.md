@@ -1,5 +1,9 @@
 # Repository Guidelines
 
+## Skills (Superpowers)
+
+Superpowers skills are installed in `.claude/skills/`. At the start of every session, read `.claude/skills/using-superpowers/SKILL.md` and follow it. Check for an applicable skill before responding to any request: `brainstorming` before building something new, `systematic-debugging` before fixing a bug, `writing-plans` and `subagent-driven-development` for multi-step implementation, and `test-driven-development` while writing code.
+
 ## Project Scope
 
 This repository is the workspace for a professional water-conservancy intelligent agent platform. The platform should cover water model management, model upload and registration, control models, drag-and-drop orchestration, agent management, skill management, multi-agent collaboration, multi-user access, dedicated conversation management, LLM settings, AI chatbox integration, Web system integration, and desktop/client integration.
