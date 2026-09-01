@@ -167,6 +167,7 @@ class RunnerGatewayClient:
         data: bytes,
         content_type: str,
         sha256: str,
+        provenance: dict[str, str] | None = None,
         idempotency_key: str,
     ) -> dict[str, Any]:
         request = ArtifactCreateRequest(
@@ -175,12 +176,13 @@ class RunnerGatewayClient:
             size_bytes=len(data),
             sha256=sha256,
             data_base64=base64.b64encode(data).decode("ascii"),
+            provenance=provenance,
         )
         return self._request(
             "POST",
             "artifacts",
             ArtifactFileResponse,
-            json=request.model_dump(mode="json"),
+            json=request.model_dump(mode="json", exclude_none=True),
             idempotency_key=idempotency_key,
         ).model_dump(mode="json")
 

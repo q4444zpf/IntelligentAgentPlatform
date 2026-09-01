@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from app.agents.service import AgentNotFoundError, AgentService
 from app.core.request_context import RequestContext
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
-from app.collaboration.service import TeamService, TeamUnavailableError
+from app.collaboration.service import TeamPermissionError, TeamService, TeamUnavailableError
 
 from .dispatcher import RunDispatcher
 from .models import AgentRun, Conversation, Message, RunEvent
@@ -50,16 +50,19 @@ class ConversationService:
         self.team_service = team_service
         self.audit_recorder = audit_recorder or AuditRecorder()
 
-    def _resolve_actor(self, request: MessageCreate) -> str:
+    def _resolve_actor(self, context: RequestContext, request: MessageCreate) -> tuple[str, str | None]:
         if request.actor_type == "team":
             if request.actor_id is None:
                 raise AgentSelectionError("Team actor_id is required")
-            if self.team_service is not None:
-                try:
-                    self.team_service.resolve_for_run(context, request.actor_id)
-                except TeamUnavailableError as error:
-                    raise AgentSelectionError("team_unavailable") from error
-            return request.actor_id
+            if self.team_service is None:
+                raise AgentSelectionError("team_unavailable")
+            try:
+                resolved = self.team_service.resolve_for_run(context, request.actor_id)
+            except TeamUnavailableError as error:
+                raise AgentSelectionError("team_unavailable") from error
+            except TeamPermissionError as error:
+                raise AgentSelectionError(str(error)) from error
+            return request.actor_id, resolved.version_id
 
         try:
             agent = (
@@ -74,7 +77,7 @@ class ConversationService:
             ) from error
         if not agent.enabled:
             raise AgentSelectionError(f"Agent '{agent.id}' is unavailable")
-        return agent.id
+        return agent.id, None
 
     def create_conversation(
         self, context: RequestContext, request: ConversationCreate
@@ -131,15 +134,7 @@ class ConversationService:
         )
         if conversation is None:
             raise ConversationNotFound(conversation_id)
-        actor_id = self._resolve_actor(request)
-        actor_version_id = None
-        if request.actor_type == "team" and self.team_service is not None:
-            try:
-                actor_version_id = self.team_service.resolve_for_run(
-                    context, actor_id
-                ).version_id
-            except TeamUnavailableError as error:
-                raise AgentSelectionError("team_unavailable") from error
+        actor_id, actor_version_id = self._resolve_actor(context, request)
         conversation.updated_at = datetime.now(UTC)
         message = self.repository.add(
             Message(

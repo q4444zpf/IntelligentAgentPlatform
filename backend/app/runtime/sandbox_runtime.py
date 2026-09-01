@@ -15,7 +15,7 @@ from .deepagents_factory import (
 from .execution_contract import RunExecutionRequest, RunExecutionResult
 from .execution_snapshot import verify_snapshot_digest
 from .execution_snapshot import PublishedTeamSnapshot
-from .team_graph import TeamPlan, TeamTask, validate_team_plan
+from .team_graph import TeamLimitError, TeamPlan, TeamTask, member_agent_snapshot, validate_team_plan
 from .gateway_model import GatewayChatModel, RunnerGatewayModelError
 from .gateway_tools import RunnerApprovalInterruption, build_gateway_tools
 from .langgraph_runtime import LangGraphRuntimeAdapter, RuntimeState
@@ -101,49 +101,105 @@ class SandboxRuntime:
                     if context_prompt
                     else f"Skills: {skill_context}"
                 )
+            messages = [
+                {"role": message.role, "content": message.content}
+                for message in snapshot.payload.messages
+            ]
+            metadata = {
+                "snapshot_id": snapshot.snapshot_id,
+                "snapshot_digest": snapshot.digest,
+                "project_id": snapshot.payload.project_id,
+            }
             if isinstance(actor, PublishedTeamSnapshot):
+                if len(actor.members) > limits.max_subagents:
+                    raise TeamLimitError("team_limit_exceeded: max_subagents")
+                plan = TeamPlan(tasks=tuple(
+                    TeamTask(
+                        id=f"member-{position + 1}", member_id=member.agent_id,
+                        objective=member.responsibility, position=position,
+                    )
+                    for position, member in enumerate(actor.members)
+                ))
+                validate_team_plan(plan, actor)
+                team_fields = {"team_id": actor.id, "version_id": actor.version_id}
                 self._append_event("team.plan.created", {
-                    "team_id": actor.id,
-                    "version_id": actor.version_id,
-                    "member_ids": [member.agent_id for member in actor.members],
+                    **team_fields, "member_ids": [member.agent_id for member in actor.members],
+                    "task_ids": [task.id for task in plan.tasks],
                 })
-                validate_team_plan(
-                    TeamPlan(tasks=(TeamTask(
-                        id="supervisor-synthesis",
-                        member_id=actor.supervisor.agent_id,
-                        objective="Synthesize the requested result",
-                        position=0,
-                    ),)),
-                    actor,
+                member_results: list[str] = []
+                failed_members: list[str] = []
+                for task in plan.tasks:
+                    self._append_event("team.task.started", {
+                        **team_fields, "agent_id": task.member_id,
+                        "task_id": task.id, "position": task.position,
+                    })
+                    try:
+                        graph = self.agent_factory.build(
+                            member_agent_snapshot(actor, task.member_id),
+                            model=model, tools=tools,
+                            backend=ArtifactBackend(self.gateway, provenance={
+                                "team_version_id": actor.version_id,
+                                "member_agent_id": task.member_id,
+                                "task_id": task.id,
+                            }),
+                        )
+                        member_result = self.runtime_adapter_type(graph).invoke(
+                            RuntimeState(run_id=request.run_id, messages=messages, status="running"),
+                            metadata=metadata,
+                        )
+                    except RunnerApprovalInterruption:
+                        raise
+                    except Exception:
+                        failed_members.append(task.member_id)
+                        self._append_event("team.task.failed", {
+                            **team_fields, "agent_id": task.member_id,
+                            "task_id": task.id, "position": task.position,
+                        })
+                        if actor.failure_strategy == "fail_fast":
+                            raise
+                    else:
+                        member_results.append(f"{task.member_id}: {member_result.content}")
+                        self._append_event("team.task.completed", {
+                            **team_fields, "agent_id": task.member_id,
+                            "task_id": task.id, "position": task.position,
+                        })
+                self._append_event("team.synthesis.started", {
+                    **team_fields, "completed_members": len(member_results),
+                    "failed_members": len(failed_members),
+                })
+                synthesis_messages = [*messages, {
+                    "role": "user",
+                    "content": "Synthesize these bounded member results:\n" + "\n".join(member_results),
+                }]
+                graph = self.agent_factory.build(
+                    member_agent_snapshot(actor, actor.supervisor.agent_id),
+                    model=model, tools=tools,
+                    backend=ArtifactBackend(self.gateway, provenance={
+                        "team_version_id": actor.version_id,
+                        "member_agent_id": actor.supervisor.agent_id,
+                        "task_id": "synthesis",
+                    }),
                 )
-            graph = self.agent_factory.build(
-                FactoryAgentSnapshot(
-                    agent_id=actor.id,
-                    name=actor.name,
-                    system_prompt=actor.system_prompt,
-                    context_prompt=context_prompt,
-                    tools=(),
-                ),
-                model=model,
-                tools=tools,
-                backend=backend,
-            )
-            adapter = self.runtime_adapter_type(graph, checkpoint_store=checkpoint_store)
-            result = adapter.invoke(
-                RuntimeState(
-                    run_id=request.run_id,
-                    messages=[
-                        {"role": message.role, "content": message.content}
-                        for message in snapshot.payload.messages
-                    ],
-                    status="running",
-                ),
-                metadata={
-                    "snapshot_id": snapshot.snapshot_id,
-                    "snapshot_digest": snapshot.digest,
-                    "project_id": snapshot.payload.project_id,
-                },
-            )
+                result = self.runtime_adapter_type(graph, checkpoint_store=checkpoint_store).invoke(
+                    RuntimeState(run_id=request.run_id, messages=synthesis_messages, status="running"),
+                    metadata=metadata,
+                )
+                self._append_event("team.synthesis.completed", {
+                    **team_fields, "partial": bool(failed_members),
+                })
+            else:
+                graph = self.agent_factory.build(
+                    FactoryAgentSnapshot(
+                        agent_id=actor.id, name=actor.name,
+                        system_prompt=actor.system_prompt, context_prompt=context_prompt,
+                        tools=(),
+                    ),
+                    model=model, tools=tools, backend=backend,
+                )
+                result = self.runtime_adapter_type(graph, checkpoint_store=checkpoint_store).invoke(
+                    RuntimeState(run_id=request.run_id, messages=messages, status="running"),
+                    metadata=metadata,
+                )
             self._append_event("runner.completed", {"status": result.status})
             completion = {
                 "status": "completed",

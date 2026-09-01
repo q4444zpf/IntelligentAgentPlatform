@@ -108,6 +108,14 @@ class ToolInvocationResponse(BaseModel):
     value: dict[str, Any]
 
 
+class ArtifactProvenance(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    team_version_id: str = Field(min_length=1, max_length=128)
+    member_agent_id: str = Field(min_length=1, max_length=128)
+    task_id: str = Field(min_length=1, max_length=128)
+
+
 class ArtifactCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -116,6 +124,7 @@ class ArtifactCreateRequest(BaseModel):
     size_bytes: int = Field(ge=0)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     data_base64: str
+    provenance: ArtifactProvenance | None = None
 
 
 class ArtifactFileResponse(BaseModel):

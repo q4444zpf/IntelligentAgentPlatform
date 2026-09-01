@@ -632,6 +632,7 @@ class RunnerGatewayService:
                 content_type=request.content_type,
                 data=data,
                 sha256=request.sha256,
+                provenance=request.provenance.model_dump() if request.provenance else None,
                 commit=False,
             )
             response = self._artifact_response(created)

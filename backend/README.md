@@ -52,6 +52,21 @@ python -m app.identity.bootstrap --request-file .\bootstrap-request.json
 - `GET /api/artifacts/{artifact_id}/download`
 - `POST /api/runs/{run_id}/artifacts/{artifact_id}`
 
+## 多智能体 Team 接口
+
+- `GET/POST /api/collaboration/teams`
+- `GET/PATCH /api/collaboration/teams/{team_id}`
+- `PUT /api/collaboration/teams/{team_id}/draft`
+- `POST /api/collaboration/teams/{team_id}/publish`
+- `POST /api/collaboration/teams/{team_id}/enable`
+- `POST /api/collaboration/teams/{team_id}/disable`
+- `GET /api/collaboration/teams/{team_id}/versions`
+- `GET /api/collaboration/teams/{team_id}/versions/{version}`
+
+接口按当前单位和项目隔离。读取、管理、运行分别要求 `collaboration.read`、`collaboration.manage`、`collaboration.run`；跨项目资源使用安全的不存在响应。版本 `0` 是仅管理者可读写的草稿，正整数版本是发布后不可变的执行定义。发布要求恰好一个主管、至少一个不同成员及合法运行上限；Team 只有发布后才能启用。
+
+会话消息使用 `actor_type="team"` 和 Team `actor_id` 创建 Team Run。服务在同一接收流程中解析并记录 `actor_version_id`，后续编辑或重新发布不会改变已接受 Run。停用 Team 只阻止新 Run；已在运行的成员调用仍由 Runner Gateway 按用户、Team、Agent、成员白名单和能力当前状态的交集重新授权。
+
 事件接口返回有限 SSE 回放并关闭连接。通过 `Last-Event-ID` 请求头传入已处理的事件序号即可恢复读取；持续事件流将在沙箱执行服务接入后实现。
 
 `GET /api/agent-runs` 仅查询请求身份所属的当前项目和当前用户数据，支持 `page`、`page_size` 分页（`page_size` 最大为 100），以及 `status`、`actor_id`、`query`、`started_after`、`started_before` 筛选。响应包含当前筛选范围的分页记录、总数和状态/工具调用汇总；`query` 匹配会话标题或 Run ID，`started_after` 和 `started_before` 必须使用包含 `Z` 或明确时区偏移的 timezone-aware ISO 8601 时间，且须满足 `started_after <= started_before`。
@@ -136,4 +151,12 @@ python -m app.migrations.sqlite_to_postgres
 ```powershell
 cd backend
 python -m pytest -q
+```
+
+Team 聚焦回归与根级验收：
+
+```powershell
+cd ..
+$env:PYTHONPATH = "backend"
+python -m pytest backend/tests/collaboration backend/tests/runtime/test_team_graph.py tests/e2e/test_published_team_run.py -q
 ```

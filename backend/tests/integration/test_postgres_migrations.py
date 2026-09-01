@@ -28,7 +28,7 @@ def test_migration_graph_has_single_integration_head():
     config = Config(Path(__file__).resolve().parents[3] / "backend" / "alembic.ini")
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["20260901_23"]
+    assert script.get_heads() == ["20260901_24"]
 
 
 @pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="requires PostgreSQL")
@@ -38,7 +38,7 @@ def test_upgrade_head_creates_conversation_tables():
     engine = create_engine(env["DATABASE_URL"])
     inspector = inspect(engine)
     with engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260901_23"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260901_24"
     tables = set(inspector.get_table_names())
     assert {
         "conversations",
@@ -56,10 +56,13 @@ def test_upgrade_head_creates_conversation_tables():
         "runtime_execution_snapshots",
         "runtime_run_token_revocations",
         "runtime_runner_requests",
+        "artifacts",
         "collaboration_teams",
         "collaboration_team_versions",
         "collaboration_team_version_members",
     } <= tables
+    artifact_columns = {column["name"]: column for column in inspector.get_columns("artifacts")}
+    assert artifact_columns["provenance_json"]["nullable"] is False
     conversation_columns = {
         column["name"]: column
         for column in inspector.get_columns("conversations")

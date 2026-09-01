@@ -157,6 +157,7 @@ class ArtifactService:
         content_type: str,
         data: bytes,
         sha256: str,
+        provenance: dict[str, str] | None = None,
         commit: bool = True,
     ) -> ArtifactRecord:
         run_context = self._run_context(run_id)
@@ -196,6 +197,7 @@ class ArtifactService:
             content_type=content_type,
             size_bytes=len(data),
             sha256=actual_sha256,
+            provenance=dict(provenance or {}),
             status="active",
         )
         uploaded = False

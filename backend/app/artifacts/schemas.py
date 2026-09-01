@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -33,6 +33,7 @@ class ArtifactInfo(BaseModel):
     content_type: str
     size_bytes: int
     sha256: str
+    provenance: dict[str, Any] = Field(default_factory=dict)
     status: ArtifactStatus
     created_at: datetime
     deleted_at: datetime | None
