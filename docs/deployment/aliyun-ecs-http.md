@@ -2,8 +2,8 @@
 
 ## 当前部署
 
-- 公网地址：`http://39.108.91.166`
-- 健康检查：`http://39.108.91.166/api/health`
+- 公网地址：`http://<server-host>`
+- 健康检查：`http://<server-host>/api/health`
 - 发布根目录：`/opt/intelligent-agent-platform`
 - 当前版本链接：`/opt/intelligent-agent-platform/current`
 - Compose 项目名：`intelligent-agent-platform`
@@ -38,7 +38,7 @@ docker compose stop
 
 ```bash
 curl -fsS http://127.0.0.1/api/health
-curl -fsS http://39.108.91.166/api/health
+curl -fsS http://<server-host>/api/health
 ```
 
 预期响应：

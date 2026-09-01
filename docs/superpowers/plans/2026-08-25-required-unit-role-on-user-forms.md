@@ -856,16 +856,16 @@ Stage only feature files from the File Map. Do not include existing unrelated ch
 
 - [ ] **Step 4: Deploy API and Web together**
 
-Create a timestamped release under `/home/shuide/intelligent-agent-platform/releases`, copy the current release, overlay the committed feature files, then run:
+Create a timestamped release under `/home/<deploy-user>/intelligent-agent-platform/releases`, copy the current release, overlay the committed feature files, then run:
 
 ```bash
 docker compose -f compose.yaml -f compose.http-staging.yaml build api web
 docker compose -f compose.yaml -f compose.http-staging.yaml up -d api web
 docker compose -f compose.yaml -f compose.http-staging.yaml ps api web postgres
-curl -fsS http://127.0.0.1:39080/api/health
+curl -fsS http://127.0.0.1:<http-port>/api/health
 ```
 
-Only after health succeeds, atomically repoint `/home/shuide/intelligent-agent-platform/current` to the new release. Do not run `docker compose down -v` and do not modify PostgreSQL volumes.
+Only after health succeeds, atomically repoint `/home/<deploy-user>/intelligent-agent-platform/current` to the new release. Do not run `docker compose down -v` and do not modify PostgreSQL volumes.
 
 - [ ] **Step 5: Browser acceptance**
 

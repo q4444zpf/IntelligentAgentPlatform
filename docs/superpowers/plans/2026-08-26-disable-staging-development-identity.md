@@ -11,8 +11,8 @@
 ## Global Constraints
 
 - Follow `docs/superpowers/specs/2026-08-26-disable-staging-development-identity-design.md`.
-- Target host: `27.185.55.121`, SSH port `39022`, user `shuide`.
-- Active deployment root: `/home/shuide/intelligent-agent-platform/current`.
+- Target host: `<staging-host>`, SSH port `<ssh-port>`, user `<deploy-user>`.
+- Active deployment root: `/home/<deploy-user>/intelligent-agent-platform/current`.
 - Keep `IAP_ENVIRONMENT=development` while HTTPS and OIDC remain deferred.
 - Never print, replace, or commit generated secrets, passwords, private keys, identity IDs, or unrelated environment values.
 - Do not remove volumes, reset PostgreSQL, delete releases, or recreate unrelated services.
@@ -23,8 +23,8 @@
 ### Task 1: Close Both Development Identity Entry Points
 
 **Files:**
-- Modify on server: `/home/shuide/intelligent-agent-platform/current/.env`
-- Create on server: `/home/shuide/intelligent-agent-platform/backups/<timestamp>-pre-disable-dev-identity.env`
+- Modify on server: `/home/<deploy-user>/intelligent-agent-platform/current/.env`
+- Create on server: `/home/<deploy-user>/intelligent-agent-platform/backups/<timestamp>-pre-disable-dev-identity.env`
 
 **Interfaces:**
 - Consumes: `compose.yaml`, `compose.http-staging.yaml`, existing generated secrets, existing API and Web images.
@@ -51,13 +51,13 @@ Run over SSH:
 
 ```bash
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
-backup=/home/shuide/intelligent-agent-platform/backups/${stamp}-pre-disable-dev-identity.env
+backup=/home/<deploy-user>/intelligent-agent-platform/backups/${stamp}-pre-disable-dev-identity.env
 cp -- .env "$backup"
 chmod 600 "$backup"
 printf '%s\n' "$backup"
 ```
 
-Expected: one explicit backup path under `/home/shuide/intelligent-agent-platform/backups/` and mode `600`.
+Expected: one explicit backup path under `/home/<deploy-user>/intelligent-agent-platform/backups/` and mode `600`.
 
 - [ ] **Step 3: Replace only the six existing development identity settings**
 
@@ -127,7 +127,7 @@ Expected: API, Web, PostgreSQL, MinIO, Workflow Runner, and Sandbox Launcher are
 
 - [ ] **Step 1: Verify the public login page hides development login**
 
-Open `http://27.185.55.121:39080/login` in the in-app browser and capture a fresh DOM snapshot.
+Open `http://<staging-host>:<http-port>/login` in the in-app browser and capture a fresh DOM snapshot.
 
 Expected: `本地账号登录` and `统一认证登录` are visible; `开发身份登录（仅开发环境）` is absent.
 
@@ -140,7 +140,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
   -H 'X-User-ID: disabled-check' \
   -H 'X-Unit-ID: disabled-check' \
   -H 'X-Project-ID: disabled-check' \
-  http://27.185.55.121:39080/api/auth/dev/login
+  http://<staging-host>:<http-port>/api/auth/dev/login
 ```
 
 Expected: HTTP `401`.

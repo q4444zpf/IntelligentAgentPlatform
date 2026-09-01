@@ -254,7 +254,7 @@ Expected: `{"status":"ok"}`。
 
 - [ ] **Step 3: 验证公网 API 与前端**
 
-Run locally: `curl http://39.108.91.166/api/health` 和请求 `/`。
+Run locally: `curl http://<server-host>/api/health` 和请求 `/`。
 Expected: API HTTP 200；首页 HTTP 200 且内容为构建后的前端 HTML。
 
 - [ ] **Step 4: 验证重启恢复**
