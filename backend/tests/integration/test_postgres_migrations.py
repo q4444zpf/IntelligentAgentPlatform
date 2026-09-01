@@ -28,7 +28,7 @@ def test_upgrade_head_creates_conversation_tables():
     engine = create_engine(env["DATABASE_URL"])
     inspector = inspect(engine)
     with engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260814_20"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260828_21"
     tables = set(inspector.get_table_names())
     assert {
         "conversations",
@@ -91,6 +91,10 @@ def test_upgrade_head_creates_conversation_tables():
     }
     assert run_columns["actor_roles_json"]["nullable"] is False
     assert "actor_role" not in run_columns
+    message_columns = {
+        column["name"]: column for column in inspector.get_columns("messages")
+    }
+    assert message_columns["run_id"]["nullable"] is True
     audit_constraints = inspector.get_unique_constraints("audit_events")
     idempotency_constraint = next(
         constraint for constraint in audit_constraints
@@ -257,6 +261,73 @@ def test_runner_idempotency_migration_cycles():
         subprocess.run(upgrade, check=True, env=env)
     finally:
         subprocess.run(ALEMBIC_UPGRADE_COMMAND, check=True, env=env)
+
+
+@pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="requires PostgreSQL")
+def test_message_run_link_migration_backfills_completed_assistant_message():
+    database_url = os.environ["TEST_DATABASE_URL"]
+    env = os.environ | {"DATABASE_URL": database_url}
+    downgrade = (*ALEMBIC_UPGRADE_COMMAND[:-2], "downgrade", "20260814_20")
+    conversation_id = "message-run-link-conversation"
+    user_message_id = "message-run-link-user"
+    assistant_message_id = "message-run-link-assistant"
+    run_id = "message-run-link-run"
+    event_id = "message-run-link-event"
+    engine = create_engine(database_url)
+    try:
+        subprocess.run(downgrade, check=True, env=env)
+        with engine.begin() as connection:
+            connection.execute(text("""
+                INSERT INTO conversations (id, unit_id, project_id, owner_id, title)
+                VALUES (:conversation_id, 'migration-unit', 'migration-project',
+                        'migration-user', 'message run link')
+            """), {"conversation_id": conversation_id})
+            connection.execute(text("""
+                INSERT INTO messages (id, conversation_id, sequence, role, content)
+                VALUES (:message_id, :conversation_id, 1, 'user', 'trigger')
+            """), {"message_id": user_message_id, "conversation_id": conversation_id})
+            connection.execute(text("""
+                INSERT INTO agent_runs (
+                    id, conversation_id, trigger_message_id, actor_type, actor_id,
+                    actor_roles_json, status
+                ) VALUES (
+                    :run_id, :conversation_id, :message_id, 'agent', 'migration-agent',
+                    '[]'::json, 'completed'
+                )
+            """), {
+                "run_id": run_id,
+                "conversation_id": conversation_id,
+                "message_id": user_message_id,
+            })
+            connection.execute(text("""
+                INSERT INTO messages (id, conversation_id, sequence, role, content)
+                VALUES (:message_id, :conversation_id, 2, 'assistant', 'completed')
+            """), {
+                "message_id": assistant_message_id,
+                "conversation_id": conversation_id,
+            })
+            connection.execute(text("""
+                INSERT INTO run_events (id, run_id, sequence, event_type, payload)
+                VALUES (:event_id, :run_id, 1, 'message.completed', CAST(:payload AS json))
+            """), {
+                "event_id": event_id,
+                "run_id": run_id,
+                "payload": '{"message_id":"message-run-link-assistant"}',
+            })
+
+        subprocess.run(ALEMBIC_UPGRADE_COMMAND, check=True, env=env)
+        with engine.connect() as connection:
+            assert connection.execute(text("""
+                SELECT run_id FROM messages WHERE id=:message_id
+            """), {"message_id": assistant_message_id}).scalar_one() == run_id
+    finally:
+        subprocess.run(ALEMBIC_UPGRADE_COMMAND, check=True, env=env)
+        with engine.begin() as connection:
+            connection.execute(text("DELETE FROM run_events WHERE id=:event_id"), {"event_id": event_id})
+            connection.execute(text("DELETE FROM agent_runs WHERE id=:run_id"), {"run_id": run_id})
+            connection.execute(text("DELETE FROM messages WHERE conversation_id=:conversation_id"), {"conversation_id": conversation_id})
+            connection.execute(text("DELETE FROM conversations WHERE id=:conversation_id"), {"conversation_id": conversation_id})
+        engine.dispose()
 
 
 @pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="requires PostgreSQL")

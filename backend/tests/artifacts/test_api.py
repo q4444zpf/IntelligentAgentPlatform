@@ -4,6 +4,7 @@ from app.conversations.models import AgentRun, Conversation, Message
 from app.db.base import Base
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -12,11 +13,17 @@ from sqlalchemy.pool import StaticPool
 class FakeStorage:
     def __init__(self):
         self.objects = {}
+        self.presign_calls = []
 
     def put_bytes(self, object_key, data, content_type):
         self.objects[object_key] = (data, content_type)
 
     def presigned_get_url(self, object_key, expires_seconds=900, **kwargs):
+        self.presign_calls.append({
+            "object_key": object_key,
+            "expires_seconds": expires_seconds,
+            **kwargs,
+        })
         self.download_content_type = kwargs.get("response_content_type")
         self.download_content_disposition = kwargs.get("response_content_disposition")
         return f"https://storage.test/{object_key}?expires={expires_seconds}"
@@ -46,13 +53,21 @@ def build_client():
 HEADERS = {"X-Unit-ID": "unit-1", "X-User-ID": "u1", "X-Project-ID": "p1"}
 
 
-def upload(client, *, headers=HEADERS, filename="report.txt", scope="project", run_id=None):
+def upload(
+    client,
+    *,
+    headers=HEADERS,
+    filename="report.txt",
+    content_type="text/plain",
+    scope="project",
+    run_id=None,
+):
     data = {"scope": scope}
     if run_id:
         data["run_id"] = run_id
     return client.post(
         "/api/artifacts",
-        files={"file": (filename, b"artifact bytes", "text/plain")},
+        files={"file": (filename, b"artifact bytes", content_type)},
         data=data,
         headers=headers,
     )
@@ -93,6 +108,100 @@ def test_download_returns_short_lived_signed_url():
     assert "expires=900" in response.json()["url"]
     assert storage.download_content_type == "text/plain; charset=utf-8"
     assert storage.download_content_disposition == "attachment; filename*=UTF-8''report.txt"
+
+
+@pytest.mark.parametrize(
+    ("filename", "content_type", "expected_content_type"),
+    [
+        ("report.bin", "Text/HTML; charset=gbk", "text/html; charset=utf-8"),
+        (
+            "report.bin",
+            "APPLICATION/XHTML+XML; charset=utf-16",
+            "application/xhtml+xml; charset=utf-8",
+        ),
+        ("report.HTML", "application/octet-stream", "text/html; charset=utf-8"),
+        ("report.HtM", "text/plain", "text/html; charset=utf-8"),
+    ],
+)
+def test_preview_returns_inline_no_store_signed_url_for_html_artifact(
+    filename,
+    content_type,
+    expected_content_type,
+):
+    client, _, storage = build_client()
+    artifact = upload(
+        client,
+        filename=filename,
+        content_type=content_type,
+    ).json()
+    object_key = next(iter(storage.objects))
+
+    response = client.get(
+        f"/api/artifacts/{artifact['id']}/preview",
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["artifact"]["id"] == artifact["id"]
+    assert response.json()["expires_in"] == 300
+    assert "expires=300" in response.json()["url"]
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["referrer-policy"] == "no-referrer"
+    assert storage.presign_calls[-1] == {
+        "object_key": object_key,
+        "expires_seconds": 300,
+        "response_content_type": expected_content_type,
+        "response_content_disposition": (
+            "inline; filename*=UTF-8''" + filename
+        ),
+        "response_cache_control": "private, no-store, max-age=0",
+    }
+
+
+def test_preview_rejects_non_html_without_signing():
+    client, _, storage = build_client()
+    artifact = upload(
+        client,
+        filename="observations.csv",
+        content_type="text/csv",
+    ).json()
+    storage.presign_calls.clear()
+
+    response = client.get(
+        f"/api/artifacts/{artifact['id']}/preview",
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 415
+    assert storage.presign_calls == []
+
+
+def test_preview_hides_foreign_artifact_without_signing():
+    client, _, storage = build_client()
+    artifact = upload(
+        client,
+        filename="report.html",
+        content_type="text/html",
+    ).json()
+    storage.presign_calls.clear()
+    foreign = {
+        "X-Unit-ID": "unit-1",
+        "X-User-ID": "u2",
+        "X-Project-ID": "p2",
+    }
+
+    response = client.get(
+        f"/api/artifacts/{artifact['id']}/preview",
+        headers=foreign,
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "detail": "Artifact does not exist or is not visible",
+    }
+    assert storage.presign_calls == []
 
 
 def test_delete_artifact_removes_object_and_marks_record_deleted():

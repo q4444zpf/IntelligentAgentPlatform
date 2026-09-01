@@ -15,6 +15,7 @@ export interface MessageInfo {
   conversation_id: string;
   role: 'user' | 'assistant' | 'system' | 'tool';
   content: string;
+  run_id?: string | null;
   created_at: string;
 }
 
