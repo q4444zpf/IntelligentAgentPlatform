@@ -7,11 +7,17 @@ from .repository import TeamDefinitionValidationError, TeamDraftConflictError, T
 from .schemas import TeamCreateRequest, TeamDraftUpdate, TeamMetadataUpdate
 from .service import TeamPermissionError, TeamService, TeamUnavailableError
 
-router = APIRouter(dependencies=[Depends(require_request_context)])
+router = APIRouter()
 
 
 def _service(session=Depends(get_session)) -> TeamService:
     return TeamService(session)
+
+
+def _context(context: RequestContext = Depends(require_request_context)) -> RequestContext:
+    if context.authorization_context is None:
+        raise HTTPException(401, "Authentication is required")
+    return context
 
 
 def _error(error: Exception) -> HTTPException:
@@ -27,7 +33,7 @@ def _error(error: Exception) -> HTTPException:
 
 
 @router.get("/teams")
-def list_teams(context: RequestContext = Depends(require_request_context), service: TeamService = Depends(_service)):
+def list_teams(context: RequestContext = Depends(_context), service: TeamService = Depends(_service)):
     try:
         return service.list(context)
     except Exception as error:
@@ -35,7 +41,7 @@ def list_teams(context: RequestContext = Depends(require_request_context), servi
 
 
 @router.post("/teams", status_code=201)
-def create_team(request: TeamCreateRequest, context: RequestContext = Depends(require_request_context), service: TeamService = Depends(_service)):
+def create_team(request: TeamCreateRequest, context: RequestContext = Depends(_context), service: TeamService = Depends(_service)):
     try:
         return service.create(context, request)
     except Exception as error:
@@ -43,7 +49,7 @@ def create_team(request: TeamCreateRequest, context: RequestContext = Depends(re
 
 
 @router.get("/teams/{team_id}")
-def get_team(team_id: str, context: RequestContext = Depends(require_request_context), service: TeamService = Depends(_service)):
+def get_team(team_id: str, context: RequestContext = Depends(_context), service: TeamService = Depends(_service)):
     try:
         return service.get(context, team_id)
     except Exception as error:
@@ -51,7 +57,7 @@ def get_team(team_id: str, context: RequestContext = Depends(require_request_con
 
 
 @router.get("/teams/{team_id}/versions")
-def list_team_versions(team_id: str, context: RequestContext = Depends(require_request_context), service: TeamService = Depends(_service)):
+def list_team_versions(team_id: str, context: RequestContext = Depends(_context), service: TeamService = Depends(_service)):
     try:
         return service.list_versions(context, team_id)
     except Exception as error:
@@ -59,7 +65,7 @@ def list_team_versions(team_id: str, context: RequestContext = Depends(require_r
 
 
 @router.get("/teams/{team_id}/versions/{version}")
-def get_team_version(team_id: str, version: int, context: RequestContext = Depends(require_request_context), service: TeamService = Depends(_service)):
+def get_team_version(team_id: str, version: int, context: RequestContext = Depends(_context), service: TeamService = Depends(_service)):
     try:
         return service.get_version(context, team_id, version)
     except Exception as error:
@@ -67,7 +73,7 @@ def get_team_version(team_id: str, version: int, context: RequestContext = Depen
 
 
 @router.patch("/teams/{team_id}")
-def update_team(team_id: str, request: TeamMetadataUpdate, context: RequestContext = Depends(require_request_context), service: TeamService = Depends(_service)):
+def update_team(team_id: str, request: TeamMetadataUpdate, context: RequestContext = Depends(_context), service: TeamService = Depends(_service)):
     try:
         return service.update(context, team_id, request)
     except Exception as error:
@@ -75,7 +81,7 @@ def update_team(team_id: str, request: TeamMetadataUpdate, context: RequestConte
 
 
 @router.put("/teams/{team_id}/draft")
-def save_draft(team_id: str, request: TeamDraftUpdate, context: RequestContext = Depends(require_request_context), service: TeamService = Depends(_service)):
+def save_draft(team_id: str, request: TeamDraftUpdate, context: RequestContext = Depends(_context), service: TeamService = Depends(_service)):
     try:
         return service.save_draft(context, team_id, request)
     except Exception as error:
@@ -83,7 +89,7 @@ def save_draft(team_id: str, request: TeamDraftUpdate, context: RequestContext =
 
 
 @router.post("/teams/{team_id}/publish")
-def publish(team_id: str, context: RequestContext = Depends(require_request_context), service: TeamService = Depends(_service)):
+def publish(team_id: str, context: RequestContext = Depends(_context), service: TeamService = Depends(_service)):
     try:
         return service.publish(context, team_id)
     except Exception as error:
@@ -91,7 +97,7 @@ def publish(team_id: str, context: RequestContext = Depends(require_request_cont
 
 
 @router.post("/teams/{team_id}/enable")
-def enable(team_id: str, context: RequestContext = Depends(require_request_context), service: TeamService = Depends(_service)):
+def enable(team_id: str, context: RequestContext = Depends(_context), service: TeamService = Depends(_service)):
     try:
         return service.set_enabled(context, team_id, True)
     except Exception as error:
@@ -99,7 +105,7 @@ def enable(team_id: str, context: RequestContext = Depends(require_request_conte
 
 
 @router.post("/teams/{team_id}/disable")
-def disable(team_id: str, context: RequestContext = Depends(require_request_context), service: TeamService = Depends(_service)):
+def disable(team_id: str, context: RequestContext = Depends(_context), service: TeamService = Depends(_service)):
     try:
         return service.set_enabled(context, team_id, False)
     except Exception as error:

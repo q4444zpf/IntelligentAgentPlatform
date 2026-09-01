@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
 from datetime import UTC, datetime
+from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
 from app.audit.recorder import AuditRecordRequest, AuditRecorder
 from app.core.request_context import RequestContext
+from app.identity.authorization import AuthorizationService
+from app.identity.schemas import ResourceScope
 
 from .models import Team, TeamVersion
 from .repository import (
@@ -48,10 +50,59 @@ class TeamService:
 
     @staticmethod
     def _require(context: RequestContext, permission: str) -> None:
-        if permission == "collaboration.read":
-            return
-        if context.role != "admin":
+        authorization = context.authorization_context
+        if authorization is None or authorization.current_project_id != context.project_id:
             raise TeamPermissionError(f"{permission} is required")
+        allowed = AuthorizationService().allows(
+            authorization,
+            permission,
+            ResourceScope(context.unit_id, context.project_id, context.user_id),
+        )
+        has_project_grant = any(
+            grant.permission_code == permission
+            and grant.data_scope != "unit"
+            and context.project_id in grant.project_ids
+            for grant in authorization.grants
+        )
+        if not allowed or not has_project_grant:
+            raise TeamPermissionError(f"{permission} is required")
+
+    def _commit_mutation(
+        self,
+        context: RequestContext,
+        team: Team,
+        *,
+        action: str,
+        metadata: dict[str, str | bool | int] | None = None,
+    ) -> None:
+        try:
+            self.audit_recorder.record(
+                self.session,
+                AuditRecordRequest(
+                    unit_id=context.unit_id,
+                    project_id=context.project_id,
+                    user_id=context.user_id,
+                    actor_roles=context.role_codes,
+                    authorization_scope="project",
+                    event_scope="project",
+                    category="management",
+                    source="agent",
+                    action=action,
+                    status="succeeded",
+                    risk_level="medium",
+                    resource_type="team",
+                    resource_id=team.id,
+                    resource_name=team.name,
+                    metadata=metadata or {},
+                    allowed_metadata_keys=frozenset((metadata or {}).keys()),
+                    idempotency_key=f"team:{team.id}:{action}:{uuid4()}",
+                    occurred_at=datetime.now(UTC),
+                ),
+            )
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
 
     @staticmethod
     def _summary(team: Team) -> TeamSummary:
@@ -107,7 +158,7 @@ class TeamService:
             name=request.name, description=request.description,
             created_by=context.user_id,
         )
-        self.session.commit()
+        self._commit_mutation(context, team, action="resource.created")
         return self._summary(team)
 
     def update(self, context: RequestContext, team_id: str, request: TeamMetadataUpdate) -> TeamSummary:
@@ -116,7 +167,7 @@ class TeamService:
         if team is None:
             raise TeamNotFoundError(team_id)
         team.name, team.description, team.updated_by = request.name, request.description, context.user_id
-        self.session.commit()
+        self._commit_mutation(context, team, action="resource.updated")
         return self._summary(team)
 
     def save_draft(self, context: RequestContext, team_id: str, request: TeamDraftUpdate) -> TeamSummary:
@@ -126,7 +177,7 @@ class TeamService:
             raise TeamNotFoundError(team_id)
         self.repository.save_draft(team_id, expected_revision=request.revision,
                                    definition=request.draft.model_dump(), updated_by=context.user_id)
-        self.session.commit()
+        self._commit_mutation(context, team, action="resource.updated")
         return self._summary(team)
 
     def publish(self, context: RequestContext, team_id: str) -> TeamVersionInfo:
@@ -139,7 +190,12 @@ class TeamService:
             raise TeamDefinitionValidationError("Team has no draft definition")
         published = self.repository.publish(team.id, expected_revision=team.draft_revision,
                                              definition_digest=_digest(draft.definition), published_by=context.user_id)
-        self.session.commit()
+        self._commit_mutation(
+            context,
+            team,
+            action="resource.published",
+            metadata={"version_id": published.id},
+        )
         return self._version_info(published)
 
     def set_enabled(self, context: RequestContext, team_id: str, enabled: bool) -> TeamSummary:
@@ -150,7 +206,12 @@ class TeamService:
         if enabled and team.published_version_id is None:
             raise TeamUnavailableError("Team must be published before enabling")
         team.enabled, team.updated_by = enabled, context.user_id
-        self.session.commit()
+        self._commit_mutation(
+            context,
+            team,
+            action="resource.enabled" if enabled else "resource.disabled",
+            metadata={"enabled": enabled},
+        )
         return self._summary(team)
 
     def resolve_for_run(self, context: RequestContext, team_id: str) -> ResolvedTeamRunActor:

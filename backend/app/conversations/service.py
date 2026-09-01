@@ -175,14 +175,24 @@ class ConversationService:
                     event_scope="project",
                     category="runtime",
                     source="agent",
-                    action="agent.run.created",
+                    action=f"{request.actor_type}.run.created",
                     status="succeeded",
                     risk_level="low",
                     trace_id=run.id,
                     run_id=run.id,
-                    resource_type="agent",
+                    resource_type=request.actor_type,
                     resource_id=actor_id,
-                    idempotency_key=f"agent:{run.id}:created",
+                    metadata=(
+                        {"actor_version_id": actor_version_id}
+                        if request.actor_type == "team"
+                        else {}
+                    ),
+                    allowed_metadata_keys=(
+                        frozenset({"actor_version_id"})
+                        if request.actor_type == "team"
+                        else frozenset()
+                    ),
+                    idempotency_key=f"{request.actor_type}:{run.id}:created",
                     occurred_at=datetime.now(UTC),
                 ),
             )

@@ -19,6 +19,9 @@ from app.conversations.service import (
 )
 from app.core.request_context import RequestContext
 from app.db.base import Base
+from app.collaboration.schemas import TeamCreateRequest, TeamDraft, TeamDraftUpdate, TeamMemberDraft
+from app.collaboration.service import TeamService
+from app.identity.schemas import AuthorizationContext, PermissionGrant
 
 
 class RecordingDispatcher(RunDispatcher):
@@ -98,6 +101,8 @@ def test_message_creation_records_agent_run_in_same_transaction():
     assert event.actor_roles_json == ["project_admin", "user"]
     assert event.authorization_scope == "project"
     assert event.event_scope == "project"
+    assert event.resource_type == "agent"
+    assert event.metadata_json == {}
 
 
 def test_audit_failure_rolls_back_message_and_run():
@@ -253,3 +258,84 @@ def test_requires_actor_id_for_team_without_persisting():
     assert session.scalar(select(func.count()).select_from(AgentRun)) == 0
     assert dispatcher.run_ids == []
     session.close()
+
+
+def test_team_message_acceptance_records_selected_version_and_run_audit():
+    session, dispatcher, _ = build_service()
+    manager_context = _team_context("collaboration.manage", "collaboration.run")
+    team_service = TeamService(session)
+    team = team_service.create(manager_context, TeamCreateRequest(name="联合研判"))
+    team_service.save_draft(
+        manager_context,
+        team.id,
+        TeamDraftUpdate(revision=1, draft=_team_draft()),
+    )
+    published = team_service.publish(manager_context, team.id)
+    team_service.set_enabled(manager_context, team.id, True)
+    service = ConversationService(
+        ConversationRepository(session),
+        dispatcher,
+        agent_service=StubAgentService(),
+        team_service=team_service,
+    )
+    conversation = service.create_conversation(manager_context, ConversationCreate(title="团队协作"))
+
+    accepted = service.create_message(
+        manager_context,
+        conversation.id,
+        MessageCreate(content="联合研判", actor_type="team", actor_id=team.id),
+    )
+    event = session.scalar(select(AuditEvent).where(AuditEvent.run_id == accepted.run.id))
+
+    assert event is not None
+    assert (event.action, event.resource_type, event.resource_id) == (
+        "team.run.created",
+        "team",
+        team.id,
+    )
+    assert event.run_id == accepted.run.id
+    assert event.project_id == "p1"
+    assert event.actor_roles_json == ["custom_operator"]
+    assert event.metadata_json == {"actor_version_id": published.id}
+
+
+def _team_context(*permissions: str) -> RequestContext:
+    authorization = AuthorizationContext(
+        session_id="test-session",
+        user_id="u1",
+        unit_id="unit-1",
+        current_project_id="p1",
+        auth_method="dev_test",
+        authorization_version=1,
+        role_codes=("custom_operator",),
+        grants=tuple(
+            PermissionGrant(permission, "project", frozenset({"p1"}), None)
+            for permission in permissions
+        ),
+    )
+    return RequestContext(
+        unit_id="unit-1",
+        user_id="u1",
+        project_id="p1",
+        authorization_context=authorization,
+    )
+
+
+def _team_draft() -> TeamDraft:
+    return TeamDraft(
+        supervisor=TeamMemberDraft(
+            agent_id="supervisor",
+            responsibility="coordinate",
+            agent_definition_digest="a" * 64,
+        ),
+        members=[
+            TeamMemberDraft(
+                agent_id="member",
+                responsibility="review",
+                agent_definition_digest="b" * 64,
+            )
+        ],
+        max_steps=4,
+        max_parallel_members=1,
+        timeout_seconds=60,
+    )

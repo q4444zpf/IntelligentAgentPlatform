@@ -3,7 +3,7 @@ from ipaddress import ip_address, ip_network
 from typing import Annotated, Literal, TypeAlias
 
 from fastapi import Cookie, Depends, Header, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -21,6 +21,7 @@ class RequestContext(BaseModel):
     project_id: str
     unit_id: str
     roles: frozenset[UserRole] = frozenset({"user"})
+    authorization_context: AuthorizationContext | None = Field(default=None, exclude=True)
 
     @property
     def role(self) -> Literal["user", "admin"]:
@@ -28,6 +29,8 @@ class RequestContext(BaseModel):
 
     @property
     def role_codes(self) -> tuple[str, ...]:
+        if self.authorization_context is not None:
+            return self.authorization_context.role_codes
         return tuple(sorted(self.roles))
 
 
@@ -58,7 +61,7 @@ def require_request_context(
             status_code=401,
             detail="Unit, user, and project headers are required",
         )
-    if dev_role not in {None, "user", "admin", *VALID_ROLES}:
+    if dev_role not in {None, "user", "admin", *ROLE_PERMISSION_CODES}:
         raise HTTPException(status_code=401, detail="Invalid development identity")
     parsed_roles = {
         value.strip() for value in dev_roles.split(",") if value.strip()
@@ -67,13 +70,20 @@ def require_request_context(
         parsed_roles = {"project_admin" if dev_role == "admin" else dev_role}
     if not parsed_roles:
         parsed_roles = {"user"}
-    if not parsed_roles <= VALID_ROLES:
+    if not parsed_roles <= {"user", *ROLE_PERMISSION_CODES}:
         raise HTTPException(status_code=401, detail="Invalid development identity")
+    authorization = _authorization_context_from_roles(
+        user_id=dev_user_id,
+        unit_id=dev_unit_id,
+        project_id=dev_project_id,
+        roles=parsed_roles,
+    )
     return RequestContext(
         unit_id=dev_unit_id,
         user_id=dev_user_id,
         project_id=dev_project_id,
-        roles=frozenset(parsed_roles),
+        roles=frozenset(role for role in parsed_roles if role in VALID_ROLES) or frozenset({"user"}),
+        authorization_context=authorization,
     )
 
 
@@ -135,6 +145,7 @@ def _cookie_request_context(session: Session, session_cookie: str) -> RequestCon
         project_id=authorization.current_project_id or "",
         unit_id=authorization.unit_id,
         roles=roles,
+        authorization_context=authorization,
     )
 
 
@@ -161,12 +172,28 @@ def require_dev_authorization_context(
         raise HTTPException(status_code=401, detail="Authentication is required")
     if not user_id or not unit_id:
         raise HTTPException(status_code=401, detail="Unit and user headers are required")
-    parsed = tuple(sorted({item.strip() for item in (roles or "viewer").split(",") if item.strip()}))
+    parsed = {item.strip() for item in (roles or "viewer").split(",") if item.strip()}
     allowed = {"user", *ROLE_PERMISSION_CODES}
     if not parsed or not set(parsed) <= allowed:
         raise HTTPException(status_code=401, detail="Invalid development identity")
+    return _authorization_context_from_roles(
+        user_id=user_id,
+        unit_id=unit_id,
+        project_id=project_id,
+        roles=parsed,
+    )
+
+
+def _authorization_context_from_roles(
+    *,
+    user_id: str,
+    unit_id: str,
+    project_id: str | None,
+    roles: set[str],
+) -> AuthorizationContext:
+    """Build the same project-scoped grant snapshot for trusted dev identities."""
     grants: list[PermissionGrant] = []
-    for role in parsed:
+    for role in roles:
         catalogue_role = "viewer" if role == "user" else role
         if catalogue_role in ROLE_PERMISSION_CODES:
             scope = "unit" if catalogue_role == "unit_auditor" else "project"
@@ -180,6 +207,6 @@ def require_dev_authorization_context(
         current_project_id=project_id,
         auth_method="dev_test",
         authorization_version=1,
-        role_codes=parsed,
+        role_codes=tuple(sorted(roles)),
         grants=tuple(grants),
     )
