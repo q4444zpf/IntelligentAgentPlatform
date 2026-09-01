@@ -1,20 +1,22 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class TeamMemberDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     agent_id: str = Field(min_length=1, max_length=64)
     responsibility: str = Field(min_length=1, max_length=500)
-    agent_definition_digest: str | None = Field(default=None, min_length=64, max_length=64)
-    agent_definition: dict[str, Any] | None = None
     tool_ids: list[str] = Field(default_factory=list)
     skill_names: list[str] = Field(default_factory=list)
     knowledge_source_ids: list[str] = Field(default_factory=list)
 
 
 class TeamDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     supervisor: TeamMemberDraft
     members: list[TeamMemberDraft] = Field(min_length=1)
     tool_ids: list[str] = Field(default_factory=list)

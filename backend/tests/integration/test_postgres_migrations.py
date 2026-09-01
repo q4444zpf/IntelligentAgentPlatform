@@ -8,6 +8,9 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.orm import Session
+
+from app.collaboration.repository import TeamRepository
 
 ALEMBIC_UPGRADE_COMMAND = (
     sys.executable,
@@ -213,14 +216,13 @@ def test_published_team_migration_creates_and_removes_persistence_tables():
                 INSERT INTO collaboration_team_versions (
                     id, team_id, version, status, definition, tool_ids,
                     skill_names, knowledge_source_ids, max_steps,
-                    max_parallel_members, timeout_seconds, failure_strategy,
-                    definition_digest
+                    max_parallel_members, timeout_seconds, failure_strategy
                 ) VALUES (
-                    'version-1', 'team-1', 1, 'published', '{}'::json,
+                    'version-1', 'team-1', 0, 'draft', '{}'::json,
                     '[]'::json, '[]'::json, '[]'::json, 4, 1, 60,
-                    'fail_fast', :digest
+                    'fail_fast'
                 )
-            """), {"digest": "a" * 64})
+            """))
             connection.execute(text("""
                 INSERT INTO collaboration_team_version_members (
                     id, team_version_id, agent_id, role, responsibility,
@@ -231,10 +233,64 @@ def test_published_team_migration_creates_and_removes_persistence_tables():
                 )
             """))
             connection.execute(text("""
+                UPDATE collaboration_team_versions
+                SET version=1, status='published', definition_digest=:digest
+                WHERE id='version-1'
+            """), {"digest": "a" * 64})
+            connection.execute(text("""
                 UPDATE collaboration_teams
                 SET published_version_id='version-1'
                 WHERE id='team-1'
             """))
+            connection.execute(text("""
+                INSERT INTO collaboration_team_versions (
+                    id, team_id, version, status, definition, tool_ids,
+                    skill_names, knowledge_source_ids, max_steps,
+                    max_parallel_members, timeout_seconds, failure_strategy
+                ) VALUES (
+                    'draft-2', 'team-1', 0, 'draft', '{}'::json,
+                    '[]'::json, '[]'::json, '[]'::json, 4, 1, 60,
+                    'fail_fast'
+                )
+            """))
+            connection.execute(text("""
+                INSERT INTO collaboration_team_version_members (
+                    id, team_version_id, agent_id, role, responsibility,
+                    position, tool_ids, skill_names, knowledge_source_ids
+                ) VALUES (
+                    'draft-member', 'draft-2', 'draft-agent', 'member',
+                    'draft responsibility', 0, '[]'::json, '[]'::json, '[]'::json
+                )
+            """))
+
+        with engine.begin() as connection:
+            connection.execute(text("""
+                DELETE FROM collaboration_team_version_members
+                WHERE id='draft-member'
+            """))
+            connection.execute(text("""
+                INSERT INTO collaboration_team_version_members (
+                    id, team_version_id, agent_id, role, responsibility,
+                    position, tool_ids, skill_names, knowledge_source_ids
+                ) VALUES (
+                    'draft-member-2', 'draft-2', 'replacement-agent', 'member',
+                    'replacement responsibility', 0,
+                    '[]'::json, '[]'::json, '[]'::json
+                )
+            """))
+
+        with pytest.raises(DBAPIError):
+            with engine.begin() as connection:
+                connection.execute(text("""
+                    INSERT INTO collaboration_team_version_members (
+                        id, team_version_id, agent_id, role, responsibility,
+                        position, tool_ids, skill_names, knowledge_source_ids
+                    ) VALUES (
+                        'member-2', 'version-1', 'second-agent', 'member',
+                        'inserted after publication', 1,
+                        '[]'::json, '[]'::json, '[]'::json
+                    )
+                """))
 
         with pytest.raises(DBAPIError):
             with engine.begin() as connection:
@@ -243,6 +299,83 @@ def test_published_team_migration_creates_and_removes_persistence_tables():
                     SET responsibility='changed'
                     WHERE id='member-1'
                 """))
+
+        with pytest.raises(DBAPIError):
+            with engine.begin() as connection:
+                connection.execute(text("""
+                    UPDATE collaboration_team_version_members
+                    SET team_version_id='draft-2'
+                    WHERE id='member-1'
+                """))
+
+        with pytest.raises(DBAPIError):
+            with engine.begin() as connection:
+                connection.execute(text("""
+                    UPDATE collaboration_team_version_members
+                    SET team_version_id='version-1'
+                    WHERE id='draft-member-2'
+                """))
+
+        with pytest.raises(DBAPIError):
+            with engine.begin() as connection:
+                connection.execute(text("""
+                    DELETE FROM collaboration_team_version_members
+                    WHERE id='member-1'
+                """))
+
+        repository_definition = {
+            "supervisor": {
+                "agent_id": "repository-supervisor",
+                "responsibility": "coordinate",
+                "tool_ids": [],
+                "skill_names": [],
+                "knowledge_source_ids": [],
+            },
+            "members": [
+                {
+                    "agent_id": "repository-member",
+                    "responsibility": "review",
+                    "tool_ids": [],
+                    "skill_names": [],
+                    "knowledge_source_ids": [],
+                }
+            ],
+            "tool_ids": [],
+            "skill_names": [],
+            "knowledge_source_ids": [],
+            "max_steps": 4,
+            "max_parallel_members": 1,
+            "timeout_seconds": 60,
+            "failure_strategy": "fail_fast",
+            "approval_policy_id": None,
+        }
+        with Session(engine) as session:
+            repository = TeamRepository(session)
+            repository_team = repository.create(
+                unit_id="unit-1",
+                project_id="project-1",
+                name="repository publication",
+                created_by="user-1",
+            )
+            repository.save_draft(
+                repository_team.id,
+                expected_revision=1,
+                definition=repository_definition,
+            )
+            repository_version = repository.publish(
+                repository_team.id,
+                expected_revision=2,
+                definition_digest="b" * 64,
+                published_by="user-1",
+            )
+            session.commit()
+
+            assert repository_version.status == "published"
+            assert [member.agent_id for member in repository_version.members] == [
+                "repository-supervisor",
+                "repository-member",
+            ]
+            assert repository.get_version(repository_team.id, 0).status == "draft"
 
         published_version_foreign_keys = {
             tuple(foreign_key["constrained_columns"]): (

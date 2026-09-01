@@ -4,8 +4,8 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import delete, func, select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from .models import Team, TeamVersion, TeamVersionImmutableError, TeamVersionMember
 
@@ -91,6 +91,29 @@ class TeamRepository:
             .where(TeamVersion.id == version_id)
         )
 
+    def get_published_version_scoped(
+        self,
+        unit_id: str,
+        project_id: str,
+        team_id: str,
+        version_id: str,
+    ) -> TeamVersion | None:
+        return self.session.scalar(
+            select(TeamVersion)
+            .join(Team, Team.id == TeamVersion.team_id)
+            .options(
+                selectinload(TeamVersion.members),
+                joinedload(TeamVersion.team),
+            )
+            .where(
+                TeamVersion.id == version_id,
+                TeamVersion.team_id == team_id,
+                TeamVersion.status == "published",
+                Team.unit_id == unit_id,
+                Team.project_id == project_id,
+            )
+        )
+
     def list_published_versions(self, team_id: str) -> list[TeamVersion]:
         return list(
             self.session.scalars(
@@ -125,6 +148,7 @@ class TeamRepository:
         team_id: str,
         *,
         expected_revision: int,
+        definition: dict[str, Any] | None = None,
         definition_digest: str,
         published_by: str,
     ) -> TeamVersion:
@@ -133,7 +157,10 @@ class TeamRepository:
         team = self._get_locked_team(team_id)
         self._assert_expected_revision(team, expected_revision)
         draft = self._get_locked_draft(team.id)
-        normalized = self._normalize_definition(draft.definition)
+        editable = self._normalize_definition(draft.definition)
+        normalized = self._normalize_definition(
+            definition if definition is not None else draft.definition
+        )
         next_version = int(
             self.session.scalar(
                 select(func.coalesce(func.max(TeamVersion.version), 0)).where(
@@ -141,31 +168,40 @@ class TeamRepository:
                 )
             )
         ) + 1
-        published = TeamVersion(
-            team_id=team.id,
-            version=next_version,
-            status="published",
-            definition=deepcopy(normalized),
-            tool_ids=deepcopy(normalized["tool_ids"]),
-            skill_names=deepcopy(normalized["skill_names"]),
-            knowledge_source_ids=deepcopy(normalized["knowledge_source_ids"]),
-            max_steps=normalized["max_steps"],
-            max_parallel_members=normalized["max_parallel_members"],
-            timeout_seconds=normalized["timeout_seconds"],
-            failure_strategy=normalized["failure_strategy"],
-            approval_policy_id=normalized["approval_policy_id"],
-            definition_digest=definition_digest,
-            published_by=published_by,
-            published_at=datetime.now(timezone.utc),
-        )
-        self.session.add(published)
+        self._replace_draft_definition(draft, normalized)
         self.session.flush()
-        for position, member in enumerate(self._members_from_definition(normalized)):
-            self.session.add(self._member_record(published.id, member, position))
-        team.published_version_id = published.id
+        published_at = datetime.now(timezone.utc)
+        self.session.execute(
+            update(TeamVersion)
+            .where(TeamVersion.id == draft.id, TeamVersion.status == "draft")
+            .values(
+                version=next_version,
+                status="published",
+                definition_digest=definition_digest,
+                published_by=published_by,
+                published_at=published_at,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        self.session.flush()
+        self.session.expire(draft)
+
+        replacement_draft = TeamVersion(
+            team_id=team.id,
+            version=0,
+            status="draft",
+            definition={},
+            max_steps=1,
+            max_parallel_members=1,
+            timeout_seconds=1,
+        )
+        self.session.add(replacement_draft)
+        self.session.flush()
+        self._replace_draft_definition(replacement_draft, editable)
+        team.published_version_id = draft.id
         team.updated_by = published_by
         self.session.flush()
-        return published
+        return draft
 
     def replace_published_definition(
         self, team_version_id: str, definition: dict[str, Any]
@@ -250,7 +286,7 @@ class TeamRepository:
         agent_ids = [member["agent_id"] for member in [supervisor, *members]]
         if len(agent_ids) != len(set(agent_ids)):
             raise TeamDefinitionValidationError("Team supervisor and members must be distinct")
-        return {
+        normalized = {
             "supervisor": supervisor,
             "members": members,
             "tool_ids": cls._string_list(definition.get("tool_ids", []), "tool_ids"),
@@ -272,6 +308,14 @@ class TeamRepository:
                 definition.get("approval_policy_id"), "approval_policy_id"
             ),
         }
+        if "name" in definition:
+            normalized["name"] = cls._non_empty_string(definition.get("name"), "name")
+        if "description" in definition:
+            description = definition.get("description")
+            if not isinstance(description, str):
+                raise TeamDefinitionValidationError("description must be a string")
+            normalized["description"] = description
+        return normalized
 
     @classmethod
     def _normalize_member(cls, member: Any, role: str) -> dict[str, Any]:
@@ -283,10 +327,8 @@ class TeamRepository:
         agent_definition = member.get("agent_definition")
         if agent_definition is not None and not isinstance(agent_definition, dict):
             raise TeamDefinitionValidationError("agent_definition must be an object")
-        return {
+        normalized = {
             "agent_id": cls._non_empty_string(member.get("agent_id"), "agent_id"),
-            "agent_definition_digest": digest,
-            "agent_definition": deepcopy(agent_definition),
             "role": role,
             "responsibility": cls._non_empty_string(
                 member.get("responsibility"), "responsibility"
@@ -297,6 +339,10 @@ class TeamRepository:
                 member.get("knowledge_source_ids", []), "knowledge_source_ids"
             ),
         }
+        if digest is not None:
+            normalized["agent_definition_digest"] = digest
+            normalized["agent_definition"] = deepcopy(agent_definition)
+        return normalized
 
     @staticmethod
     def _non_empty_string(value: Any, field: str) -> str:

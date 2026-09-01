@@ -1,14 +1,111 @@
+from datetime import UTC, datetime
+from types import SimpleNamespace
+
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
+from app.agents.schemas import AgentInfo
+from app.agents.service import AgentNotFoundError
 from app.audit.models import AuditEvent
 from app.collaboration.schemas import TeamCreateRequest, TeamDraft, TeamDraftUpdate, TeamMemberDraft, TeamMetadataUpdate
-from app.collaboration.repository import TeamNotFoundError
+from app.collaboration.repository import TeamDefinitionValidationError, TeamNotFoundError
 from app.collaboration.service import TeamPermissionError, TeamService, TeamUnavailableError
 from app.core.request_context import RequestContext
 from app.db.base import Base
 from app.identity.schemas import AuthorizationContext, PermissionGrant
+from app.skills.service import SkillNotFoundError
+from app.tools.service import ToolNotFoundError, ToolValidationError
+
+
+def agent(agent_id: str, *, enabled: bool = True, tool_ids=None, skill_names=None):
+    return AgentInfo(
+        id=agent_id,
+        name=f"{agent_id} name",
+        description=f"{agent_id} description",
+        runtime_form="common",
+        language="zh-CN",
+        provider_id="provider-1",
+        model=f"{agent_id}-model",
+        system_prompt=f"{agent_id} system prompt",
+        context_prompt=f"{agent_id} context prompt",
+        approval_policy="control_commands",
+        skill_names=skill_names or [],
+        tool_ids=tool_ids or [],
+        enabled=enabled,
+        pinned=False,
+        is_builtin=False,
+        is_default=False,
+        startup_status="ready" if enabled else "disabled",
+        workspace_dir=f"/workspace/{agent_id}",
+        created_at=datetime(2026, 9, 1, tzinfo=UTC),
+        updated_at=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+
+
+def tool(tool_id: str, *, enabled: bool = True):
+    return SimpleNamespace(
+        tool_id=tool_id,
+        version="1",
+        name=tool_id,
+        description=f"{tool_id} description",
+        input_schema={"type": "object"},
+        published=True,
+        enabled=enabled,
+        source_available=True,
+    )
+
+
+class StaticToolService:
+    def __init__(self, tools):
+        self.tools = {item.tool_id: item for item in tools}
+
+    def resolve_bindable(self, tool_ids):
+        resolved = []
+        for tool_id in tool_ids:
+            item = self.tools.get(tool_id)
+            if item is None:
+                raise ToolNotFoundError(tool_id)
+            if not item.published or not item.enabled or not item.source_available:
+                raise ToolValidationError(f"Tool '{tool_id}' is not available for binding")
+            resolved.append(item)
+        return resolved
+
+
+class StaticSkillService:
+    def __init__(self, skills):
+        self.skills = {item.name: item for item in skills}
+
+    def get(self, name):
+        item = self.skills.get(name)
+        if item is None:
+            raise SkillNotFoundError(name)
+        return item
+
+
+class StaticAgentService:
+    def __init__(self, agents=None, tools=None, skills=None):
+        self.agents = agents or {
+            "supervisor": agent(
+                "supervisor", tool_ids=["forecast.read"], skill_names=["forecast"]
+            ),
+            "member": agent(
+                "member", tool_ids=["forecast.read"], skill_names=["forecast"]
+            ),
+        }
+        self.tool_service = StaticToolService(
+            tools or [tool("forecast.read"), tool("review.write")]
+        )
+        self.skill_service = StaticSkillService(
+            skills or [SimpleNamespace(name="forecast", enabled=True, version="1")]
+        )
+
+    def get(self, agent_id):
+        try:
+            return self.agents[agent_id]
+        except KeyError as error:
+            raise AgentNotFoundError(agent_id) from error
 
 
 @pytest.fixture
@@ -16,7 +113,7 @@ def service():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
-        yield TeamService(session)
+        yield TeamService(session, agent_service=StaticAgentService())
 
 
 def admin(project="p1"):
@@ -66,10 +163,150 @@ def unit_grant(permission: str):
 
 def draft():
     return TeamDraft(
-        supervisor=TeamMemberDraft(agent_id="supervisor", responsibility="coordinate", agent_definition_digest="a" * 64),
-        members=[TeamMemberDraft(agent_id="member", responsibility="review", agent_definition_digest="b" * 64)],
+        supervisor=TeamMemberDraft(agent_id="supervisor", responsibility="coordinate"),
+        members=[TeamMemberDraft(agent_id="member", responsibility="review")],
         max_steps=4, max_parallel_members=1, timeout_seconds=60,
     )
+
+
+@pytest.mark.parametrize("forged_field", ["agent_definition", "agent_definition_digest"])
+def test_team_member_draft_rejects_client_snapshot_fields(forged_field):
+    payload = {
+        "agent_id": "supervisor",
+        "responsibility": "coordinate",
+        forged_field: {"system_prompt": "forged"}
+        if forged_field == "agent_definition"
+        else "a" * 64,
+    }
+
+    with pytest.raises(ValidationError, match=forged_field):
+        TeamMemberDraft.model_validate(payload)
+
+
+def test_publish_captures_complete_canonical_agent_definitions(service):
+    context = admin()
+    team = service.create(context, TeamCreateRequest(name="联合研判"))
+    requested = draft().model_copy(
+        update={
+            "tool_ids": ["forecast.read"],
+            "skill_names": ["forecast"],
+            "supervisor": draft().supervisor.model_copy(
+                update={"tool_ids": ["forecast.read"], "skill_names": ["forecast"]}
+            ),
+        }
+    )
+    service.save_draft(
+        context, team.id, TeamDraftUpdate(revision=1, draft=requested)
+    )
+
+    published = service.publish(context, team.id)
+
+    supervisor = next(member for member in published.members if member.role == "supervisor")
+    stored = service.repository.get_version_by_id(published.id)
+    stored_supervisor = next(member for member in stored.members if member.role == "supervisor")
+    assert supervisor.agent_definition_digest == stored_supervisor.agent_definition_digest
+    assert len(supervisor.agent_definition_digest) == 64
+    assert stored_supervisor.agent_definition == {
+        "approval_policy": "control_commands",
+        "context_prompt": "supervisor context prompt",
+        "description": "supervisor description",
+        "id": "supervisor",
+        "language": "zh-CN",
+        "model": "supervisor-model",
+        "name": "supervisor name",
+        "knowledge_source_ids": [],
+        "provider_id": "provider-1",
+        "runtime_form": "common",
+        "skill_names": ["forecast"],
+        "system_prompt": "supervisor system prompt",
+        "tool_ids": ["forecast.read"],
+        "tools": [
+            {
+                "description": "forecast.read description",
+                "enabled": True,
+                "input_schema": {"type": "object"},
+                "name": "forecast.read",
+                "published": True,
+                "source_available": True,
+                "tool_id": "forecast.read",
+                "version": "1",
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize("unavailable", ["missing", "disabled", "cross_project"])
+def test_publish_rejects_unavailable_agents(unavailable):
+    agent_service = StaticAgentService()
+    if unavailable == "missing":
+        del agent_service.agents["member"]
+    elif unavailable == "disabled":
+        agent_service.agents["member"] = agent("member", enabled=False)
+    else:
+        scoped = agent("member").model_dump()
+        agent_service.agents["member"] = SimpleNamespace(
+            **scoped, unit_id="unit-1", project_id="other-project"
+        )
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        service = TeamService(session, agent_service=agent_service)
+        context = admin()
+        team = service.create(context, TeamCreateRequest(name="联合研判"))
+        service.save_draft(
+            context, team.id, TeamDraftUpdate(revision=1, draft=draft())
+        )
+
+        with pytest.raises(TeamDefinitionValidationError, match="Agent 'member'"):
+            service.publish(context, team.id)
+
+
+def test_publish_rejects_whitelists_outside_team_agent_and_availability_intersection():
+    agent_service = StaticAgentService()
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        service = TeamService(session, agent_service=agent_service)
+        context = admin()
+        team = service.create(context, TeamCreateRequest(name="联合研判"))
+        invalid = draft().model_copy(
+            update={
+                "tool_ids": ["review.write"],
+                "members": [
+                    draft().members[0].model_copy(
+                        update={"tool_ids": ["review.write"]}
+                    )
+                ],
+            }
+        )
+        service.save_draft(
+            context, team.id, TeamDraftUpdate(revision=1, draft=invalid)
+        )
+
+        with pytest.raises(TeamDefinitionValidationError, match="review.write"):
+            service.publish(context, team.id)
+
+
+def test_publish_rejects_agent_bindings_that_are_no_longer_available():
+    agent_service = StaticAgentService(
+        agents={
+            "supervisor": agent("supervisor", tool_ids=["disabled.tool"]),
+            "member": agent("member"),
+        },
+        tools=[tool("disabled.tool", enabled=False)],
+    )
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        service = TeamService(session, agent_service=agent_service)
+        context = admin()
+        team = service.create(context, TeamCreateRequest(name="联合研判"))
+        service.save_draft(
+            context, team.id, TeamDraftUpdate(revision=1, draft=draft())
+        )
+
+        with pytest.raises(TeamDefinitionValidationError, match="disabled.tool"):
+            service.publish(context, team.id)
 
 
 def test_team_publish_enable_and_resolve_uses_immutable_version(service):
@@ -118,6 +355,8 @@ def test_team_draft_definition_is_visible_only_to_managers(service):
 
     assert saved.status == "draft"
     assert saved.definition["supervisor"]["agent_id"] == "supervisor"
+    assert "agent_definition" not in saved.definition["supervisor"]
+    assert "agent_definition_digest" not in saved.definition["supervisor"]
     with pytest.raises(TeamPermissionError):
         service.get_version(reader(), team.id, 0)
 

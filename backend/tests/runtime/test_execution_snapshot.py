@@ -1,4 +1,5 @@
 import hashlib
+import json
 from datetime import UTC, datetime
 
 import pytest
@@ -8,6 +9,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.agents.schemas import AgentInfo
 from app.db.base import Base
+from app.collaboration.repository import TeamRepository
 from app.runtime.execution_snapshot import (
     ExecutionSnapshotPayload,
     ExecutionSnapshotService,
@@ -56,8 +58,16 @@ class Tool:
 
 
 class Run:
-    def __init__(self, actor_id: str):
+    def __init__(
+        self,
+        actor_id: str,
+        *,
+        actor_type: str = "agent",
+        actor_version_id: str | None = None,
+    ):
         self.actor_id = actor_id
+        self.actor_type = actor_type
+        self.actor_version_id = actor_version_id
 
 
 class Message:
@@ -88,6 +98,142 @@ class StaticConversationRepository:
         if run_id != "run-1":
             return []
         return [Message("message-1", 1, "user", "水位是多少？")]
+
+
+class TeamConversationRepository(StaticConversationRepository):
+    def __init__(self, version_id, *, actor_id="team-1", project_id="project-1"):
+        self.version_id = version_id
+        self.actor_id = actor_id
+        self.project_id = project_id
+
+    def get_run_execution_context(self, run_id):
+        if run_id != "run-team":
+            return None
+        return {
+            "run_id": run_id,
+            "unit_id": "unit-1",
+            "project_id": self.project_id,
+            "user_id": "user-1",
+            "actor_roles": ("operator",),
+        }
+
+    def get_run_by_id(self, run_id):
+        if run_id != "run-team":
+            return None
+        return Run(
+            self.actor_id,
+            actor_type="team",
+            actor_version_id=self.version_id,
+        )
+
+    def get_run_messages(self, run_id):
+        return [Message("team-message-1", 1, "user", "联合研判")]
+
+
+class NoLiveAgentService:
+    def get(self, agent_id):
+        raise AssertionError(f"live AgentService.get called for {agent_id}")
+
+
+def canonical_digest(value):
+    return hashlib.sha256(
+        json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def captured_agent_definition(agent_id, *, prompt, model, tool_id):
+    return {
+        "id": agent_id,
+        "name": f"{agent_id} name",
+        "description": f"{agent_id} description",
+        "runtime_form": "common",
+        "language": "zh-CN",
+        "provider_id": "provider-1",
+        "model": model,
+        "system_prompt": prompt,
+        "context_prompt": f"{agent_id} context",
+        "approval_policy": "control_commands",
+        "skill_names": ["forecast"],
+        "tool_ids": [tool_id],
+        "knowledge_source_ids": [],
+        "tools": [
+            {
+                "tool_id": tool_id,
+                "version": "3",
+                "name": tool_id,
+                "description": f"{tool_id} description",
+                "input_schema": {"type": "object"},
+                "published": True,
+                "enabled": True,
+                "source_available": True,
+            }
+        ],
+    }
+
+
+def published_team_version(session):
+    repository = TeamRepository(session)
+    team = repository.create(
+        unit_id="unit-1",
+        project_id="project-1",
+        name="联合研判",
+        created_by="user-1",
+    )
+    supervisor = captured_agent_definition(
+        "supervisor", prompt="original supervisor prompt", model="supervisor-v1",
+        tool_id="forecast.read",
+    )
+    member = captured_agent_definition(
+        "member", prompt="original member prompt", model="member-v1",
+        tool_id="review.read",
+    )
+    definition = {
+        "name": "联合研判",
+        "description": "immutable team",
+        "supervisor": {
+            "agent_id": "supervisor",
+            "agent_definition_digest": canonical_digest(supervisor),
+            "agent_definition": supervisor,
+            "responsibility": "coordinate",
+            "tool_ids": ["forecast.read"],
+            "skill_names": ["forecast"],
+            "knowledge_source_ids": [],
+        },
+        "members": [
+            {
+                "agent_id": "member",
+                "agent_definition_digest": canonical_digest(member),
+                "agent_definition": member,
+                "responsibility": "review",
+                "tool_ids": ["review.read"],
+                "skill_names": ["forecast"],
+                "knowledge_source_ids": [],
+            }
+        ],
+        "tool_ids": ["forecast.read", "review.read"],
+        "skill_names": ["forecast"],
+        "knowledge_source_ids": [],
+        "max_steps": 4,
+        "max_parallel_members": 1,
+        "timeout_seconds": 60,
+        "failure_strategy": "fail_fast",
+        "approval_policy_id": None,
+    }
+    repository.save_draft(
+        team.id, expected_revision=1, definition=definition, updated_by="user-1"
+    )
+    stored_definition = repository.get_version(team.id, 0).definition
+    published = repository.publish(
+        team.id,
+        expected_revision=2,
+        definition=stored_definition,
+        definition_digest=canonical_digest(stored_definition),
+        published_by="user-1",
+    )
+    session.commit()
+    return team, published
 
 
 @pytest.fixture
@@ -166,6 +312,71 @@ def test_snapshot_rejects_disabled_agents(snapshot_service):
 
     with pytest.raises(ValueError, match="Agent 'agent-1' is disabled"):
         snapshot_service.create("run-1")
+
+
+def test_team_snapshot_uses_only_captured_agent_definitions():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        team, published = published_team_version(session)
+        service = ExecutionSnapshotService(
+            session,
+            NoLiveAgentService(),
+            TeamConversationRepository(published.id, actor_id=team.id),
+            clock=lambda: datetime(2026, 9, 1, tzinfo=UTC),
+        )
+
+        stored = service.create("run-team")
+
+        actor = stored.payload.actor
+        assert actor.kind == "team"
+        assert actor.supervisor.agent.system_prompt == "original supervisor prompt"
+        assert actor.supervisor.model.model == "supervisor-v1"
+        assert actor.supervisor.tools[0].tool_id == "forecast.read"
+        assert actor.members[0].agent.system_prompt == "original member prompt"
+        assert actor.members[0].model.model == "member-v1"
+        assert actor.members[0].tools[0].tool_id == "review.read"
+
+
+@pytest.mark.parametrize(
+    ("actor_id", "project_id"),
+    [("other-team", "project-1"), ("team-1", "other-project")],
+)
+def test_team_snapshot_rejects_selected_version_outside_run_actor_scope(
+    actor_id, project_id
+):
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        team, published = published_team_version(session)
+        selected_actor = team.id if actor_id == "team-1" else actor_id
+        service = ExecutionSnapshotService(
+            session,
+            NoLiveAgentService(),
+            TeamConversationRepository(
+                published.id, actor_id=selected_actor, project_id=project_id
+            ),
+        )
+
+        with pytest.raises(ValueError, match="Selected Team version is unavailable"):
+            service.create("run-team")
+
+
+def test_team_snapshot_rejects_tampered_member_definition_digest():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        team, published = published_team_version(session)
+        published.members[0].agent_definition_digest = "f" * 64
+        session.commit()
+        service = ExecutionSnapshotService(
+            session,
+            NoLiveAgentService(),
+            TeamConversationRepository(published.id, actor_id=team.id),
+        )
+
+        with pytest.raises(SnapshotIntegrityError, match="Agent definition digest"):
+            service.create("run-team")
 
 
 def test_snapshot_rejects_payloads_larger_than_configured_limit(snapshot_service):

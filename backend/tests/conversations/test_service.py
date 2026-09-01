@@ -35,10 +35,32 @@ class RecordingDispatcher(RunDispatcher):
 class StubAgentService:
     def __init__(self):
         self.agents = {
-            BUILTIN_AGENT_ID: SimpleNamespace(id=BUILTIN_AGENT_ID, enabled=True),
-            "flood": SimpleNamespace(id="flood", enabled=True),
-            "disabled-agent": SimpleNamespace(id="disabled-agent", enabled=False),
+            BUILTIN_AGENT_ID: self._agent(BUILTIN_AGENT_ID),
+            "flood": self._agent("flood"),
+            "supervisor": self._agent("supervisor"),
+            "member": self._agent("member"),
+            "disabled-agent": self._agent("disabled-agent", enabled=False),
         }
+        self.tool_service = SimpleNamespace(resolve_bindable=lambda tool_ids: [])
+        self.skill_service = SimpleNamespace()
+
+    @staticmethod
+    def _agent(agent_id: str, *, enabled: bool = True):
+        return SimpleNamespace(
+            id=agent_id,
+            name=agent_id,
+            description="",
+            runtime_form="common",
+            language="zh-CN",
+            provider_id="provider-1",
+            model="model-1",
+            system_prompt="",
+            context_prompt="",
+            approval_policy="control_commands",
+            skill_names=[],
+            tool_ids=[],
+            enabled=enabled,
+        )
 
     def get_default(self):
         return self.agents[BUILTIN_AGENT_ID]
@@ -263,7 +285,7 @@ def test_requires_actor_id_for_team_without_persisting():
 def test_team_message_acceptance_records_selected_version_and_run_audit():
     session, dispatcher, _ = build_service()
     manager_context = _team_context("collaboration.manage", "collaboration.run")
-    team_service = TeamService(session)
+    team_service = TeamService(session, agent_service=StubAgentService())
     team = team_service.create(manager_context, TeamCreateRequest(name="联合研判"))
     team_service.save_draft(
         manager_context,
@@ -326,13 +348,11 @@ def _team_draft() -> TeamDraft:
         supervisor=TeamMemberDraft(
             agent_id="supervisor",
             responsibility="coordinate",
-            agent_definition_digest="a" * 64,
         ),
         members=[
             TeamMemberDraft(
                 agent_id="member",
                 responsibility="review",
-                agent_definition_digest="b" * 64,
             )
         ],
         max_steps=4,

@@ -33,38 +33,6 @@ class PublishedAgentSnapshot(BaseModel):
     kind: Literal["agent"] = "agent"
 
 
-class SnapshotTeamMember(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    agent_id: str
-    role: Literal["supervisor", "member"]
-    responsibility: str
-    agent_definition_digest: str | None = None
-
-
-class PublishedTeamSnapshot(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    kind: Literal["team"] = "team"
-    id: str
-    version_id: str
-    version: int
-    definition_digest: str
-    supervisor: SnapshotTeamMember
-    members: tuple[SnapshotTeamMember, ...]
-    max_steps: int
-    max_parallel_members: int
-    timeout_seconds: int
-    failure_strategy: str
-    name: str
-    description: str
-    runtime_form: str
-    language: str
-    system_prompt: str
-    context_prompt: str
-    approval_policy: str
-
-
 class SnapshotModelSelection(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -105,6 +73,46 @@ class SnapshotTool(BaseModel):
     published: bool
     enabled: bool
     source_available: bool
+
+
+class SnapshotTeamMember(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    agent_id: str
+    role: Literal["supervisor", "member"]
+    responsibility: str
+    agent_definition_digest: str | None = None
+    agent: PublishedAgentSnapshot | None = None
+    model: SnapshotModelSelection | None = None
+    skill_names: tuple[str, ...] = ()
+    tool_ids: tuple[str, ...] = ()
+    knowledge_source_ids: tuple[str, ...] = ()
+    skills: tuple[SnapshotSkill, ...] = ()
+    knowledge_sources: tuple[SnapshotKnowledgeSource, ...] = ()
+    tools: tuple[SnapshotTool, ...] = ()
+
+
+class PublishedTeamSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["team"] = "team"
+    id: str
+    version_id: str
+    version: int
+    definition_digest: str
+    supervisor: SnapshotTeamMember
+    members: tuple[SnapshotTeamMember, ...]
+    max_steps: int
+    max_parallel_members: int
+    timeout_seconds: int
+    failure_strategy: str
+    name: str
+    description: str
+    runtime_form: str
+    language: str
+    system_prompt: str
+    context_prompt: str
+    approval_policy: str
 
 
 class SnapshotRuntimeLimits(BaseModel):
@@ -246,6 +254,94 @@ class ExecutionSnapshotService:
         row = self.session.get(RuntimeExecutionSnapshot, snapshot_id)
         return self._stored(row) if row is not None else None
 
+    @staticmethod
+    def _definition_digest(definition: dict) -> str:
+        serialized = json.dumps(
+            definition,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(serialized).hexdigest()
+
+    @classmethod
+    def _team_member_snapshot(cls, member) -> SnapshotTeamMember:
+        definition = member.agent_definition
+        digest = member.agent_definition_digest
+        if not isinstance(definition, dict) or not digest:
+            raise SnapshotIntegrityError("Published Agent definition is missing")
+        if not hmac.compare_digest(cls._definition_digest(definition), digest):
+            raise SnapshotIntegrityError("Agent definition digest mismatch")
+        try:
+            agent = PublishedAgentSnapshot(
+                id=definition["id"],
+                name=definition["name"],
+                description=definition["description"],
+                runtime_form=definition["runtime_form"],
+                language=definition["language"],
+                system_prompt=definition["system_prompt"],
+                context_prompt=definition["context_prompt"],
+                approval_policy=definition["approval_policy"],
+            )
+            model = SnapshotModelSelection(
+                provider_id=definition["provider_id"],
+                model=definition["model"],
+            )
+            tools = tuple(
+                SnapshotTool.model_validate(tool)
+                for tool in definition.get("tools", ())
+            )
+            skill_names = tuple(definition.get("skill_names", ()))
+        except (KeyError, TypeError, ValueError) as error:
+            raise SnapshotIntegrityError(
+                "Published Agent definition is incomplete"
+            ) from error
+        return SnapshotTeamMember(
+            agent_id=member.agent_id,
+            role=member.role,
+            responsibility=member.responsibility,
+            agent_definition_digest=digest,
+            agent=agent,
+            model=model,
+            skill_names=tuple(member.skill_names),
+            tool_ids=tuple(member.tool_ids),
+            knowledge_source_ids=tuple(member.knowledge_source_ids),
+            skills=tuple(SnapshotSkill(name=name) for name in skill_names),
+            knowledge_sources=tuple(
+                SnapshotKnowledgeSource(tool_id=source_id)
+                for source_id in member.knowledge_source_ids
+            ),
+            tools=tools,
+        )
+
+    @classmethod
+    def _verify_team_version(cls, team_version) -> None:
+        digest = team_version.definition_digest
+        if not digest or not hmac.compare_digest(
+            cls._definition_digest(team_version.definition), digest
+        ):
+            raise SnapshotIntegrityError("Team definition digest mismatch")
+        stored_members = {
+            (member.role, member.agent_id): member for member in team_version.members
+        }
+        defined_members = [
+            team_version.definition.get("supervisor"),
+            *team_version.definition.get("members", ()),
+        ]
+        if any(not isinstance(member, dict) for member in defined_members):
+            raise SnapshotIntegrityError("Team member definition is missing")
+        for defined in defined_members:
+            stored = stored_members.get((defined.get("role"), defined.get("agent_id")))
+            if stored is None:
+                raise SnapshotIntegrityError("Team member definition mismatch")
+            cls._team_member_snapshot(stored)
+            if (
+                stored.agent_definition != defined.get("agent_definition")
+                or stored.agent_definition_digest
+                != defined.get("agent_definition_digest")
+            ):
+                raise SnapshotIntegrityError("Team member definition mismatch")
+
     def create(self, run_id: str) -> StoredExecutionSnapshot:
         existing = self.session.scalar(
             select(RuntimeExecutionSnapshot).where(
@@ -264,47 +360,67 @@ class ExecutionSnapshotService:
                 raise ValueError("Team Run has no selected version")
             from app.collaboration.repository import TeamRepository
 
-            team_version = TeamRepository(self.session).get_version_by_id(run.actor_version_id)
-            if team_version is None or team_version.status != "published":
+            team_version = TeamRepository(self.session).get_published_version_scoped(
+                str(context["unit_id"]),
+                str(context["project_id"]),
+                run.actor_id,
+                run.actor_version_id,
+            )
+            if team_version is None:
                 raise ValueError("Selected Team version is unavailable")
+            self._verify_team_version(team_version)
             supervisor = next((member for member in team_version.members if member.role == "supervisor"), None)
             if supervisor is None:
                 raise ValueError("Published Team has no supervisor")
-            agent = self.agent_service.get(supervisor.agent_id)
-            if not agent.enabled:
-                raise ValueError(f"Agent '{agent.id}' is disabled")
+            supervisor_snapshot = self._team_member_snapshot(supervisor)
+            member_snapshots = tuple(
+                self._team_member_snapshot(member)
+                for member in team_version.members
+                if member.role == "member"
+            )
+            if supervisor_snapshot.agent is None or supervisor_snapshot.model is None:
+                raise SnapshotIntegrityError("Published supervisor definition is incomplete")
+            captured_tools = {
+                tool.tool_id: tool
+                for member in (supervisor_snapshot, *member_snapshots)
+                for tool in member.tools
+            }
+            try:
+                snapshot_tools = tuple(
+                    captured_tools[tool_id] for tool_id in team_version.tool_ids
+                )
+            except KeyError as error:
+                raise SnapshotIntegrityError(
+                    "Team Tool whitelist is missing a captured definition"
+                ) from error
             actor = PublishedTeamSnapshot(
                 id=team_version.team_id,
                 version_id=team_version.id,
                 version=team_version.version,
-                definition_digest=team_version.definition_digest or hashlib.sha256(
-                    json.dumps(team_version.definition, ensure_ascii=False, sort_keys=True,
-                               separators=(",", ":")).encode("utf-8")
-                ).hexdigest(),
-                supervisor=SnapshotTeamMember(
-                    agent_id=supervisor.agent_id, role="supervisor",
-                    responsibility=supervisor.responsibility,
-                    agent_definition_digest=supervisor.agent_definition_digest,
-                ),
-                members=tuple(
-                    SnapshotTeamMember(
-                        agent_id=member.agent_id, role="member",
-                        responsibility=member.responsibility,
-                        agent_definition_digest=member.agent_definition_digest,
-                    )
-                    for member in team_version.members if member.role == "member"
-                ),
+                definition_digest=team_version.definition_digest,
+                supervisor=supervisor_snapshot,
+                members=member_snapshots,
                 max_steps=team_version.max_steps,
                 max_parallel_members=team_version.max_parallel_members,
                 timeout_seconds=team_version.timeout_seconds,
                 failure_strategy=team_version.failure_strategy,
-                name=agent.name,
-                description=agent.description,
-                runtime_form=agent.runtime_form,
-                language=agent.language,
-                system_prompt=agent.system_prompt,
-                context_prompt=agent.context_prompt,
-                approval_policy=agent.approval_policy,
+                name=team_version.definition.get("name", team_version.team.name),
+                description=team_version.definition.get(
+                    "description", team_version.team.description
+                ),
+                runtime_form=supervisor_snapshot.agent.runtime_form,
+                language=supervisor_snapshot.agent.language,
+                system_prompt=supervisor_snapshot.agent.system_prompt,
+                context_prompt=supervisor_snapshot.agent.context_prompt,
+                approval_policy=supervisor_snapshot.agent.approval_policy,
+            )
+            snapshot_model = supervisor_snapshot.model
+            snapshot_skills = tuple(
+                SnapshotSkill(name=name) for name in team_version.skill_names
+            )
+            snapshot_knowledge_sources = tuple(
+                SnapshotKnowledgeSource(tool_id=source_id)
+                for source_id in team_version.knowledge_source_ids
             )
             schema_version = "4"
         else:
@@ -320,38 +436,20 @@ class ExecutionSnapshotService:
                 approval_policy=agent.approval_policy,
             )
             schema_version = "3"
-        if not agent.enabled:
-            raise ValueError(f"Agent '{agent.id}' is disabled")
-
-        created_at = self.clock()
-        tools = self.agent_service.tool_service.resolve_bindable(agent.tool_ids)
-        payload = ExecutionSnapshotPayload(
-            schema_version=schema_version,
-            snapshot_id=str(uuid4()),
-            run_id=run_id,
-            unit_id=str(context["unit_id"]),
-            project_id=str(context["project_id"]),
-            user_id=str(context["user_id"]),
-            actor=actor,
-            model=SnapshotModelSelection(
+            if not agent.enabled:
+                raise ValueError(f"Agent '{agent.id}' is disabled")
+            tools = self.agent_service.tool_service.resolve_bindable(agent.tool_ids)
+            snapshot_model = SnapshotModelSelection(
                 provider_id=agent.provider_id,
                 model=agent.model,
-            ),
-            messages=tuple(
-                SnapshotMessage(
-                    id=message.id,
-                    sequence=message.sequence,
-                    role=message.role,
-                    content=message.content,
-                    created_at=message.created_at,
-                )
-                for message in self.conversation_repository.get_run_messages(run_id)
-            ),
-            skills=tuple(SnapshotSkill(name=name) for name in agent.skill_names),
-            knowledge_sources=tuple(
+            )
+            snapshot_skills = tuple(
+                SnapshotSkill(name=name) for name in agent.skill_names
+            )
+            snapshot_knowledge_sources = tuple(
                 SnapshotKnowledgeSource(tool_id=tool_id) for tool_id in agent.tool_ids
-            ),
-            tools=tuple(
+            )
+            snapshot_tools = tuple(
                 SnapshotTool(
                     tool_id=tool.tool_id,
                     version=tool.version,
@@ -363,7 +461,31 @@ class ExecutionSnapshotService:
                     source_available=tool.source_available,
                 )
                 for tool in tools
+            )
+
+        created_at = self.clock()
+        payload = ExecutionSnapshotPayload(
+            schema_version=schema_version,
+            snapshot_id=str(uuid4()),
+            run_id=run_id,
+            unit_id=str(context["unit_id"]),
+            project_id=str(context["project_id"]),
+            user_id=str(context["user_id"]),
+            actor=actor,
+            model=snapshot_model,
+            messages=tuple(
+                SnapshotMessage(
+                    id=message.id,
+                    sequence=message.sequence,
+                    role=message.role,
+                    content=message.content,
+                    created_at=message.created_at,
+                )
+                for message in self.conversation_repository.get_run_messages(run_id)
             ),
+            skills=snapshot_skills,
+            knowledge_sources=snapshot_knowledge_sources,
+            tools=snapshot_tools,
             limits=SnapshotRuntimeLimits(
                 snapshot_max_bytes=self.max_bytes,
                 max_iterations=self.max_iterations,

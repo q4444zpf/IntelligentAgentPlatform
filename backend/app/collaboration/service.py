@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+from copy import deepcopy
 from datetime import UTC, datetime
 from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
+from app.agents.service import AgentNotFoundError, AgentService
 from app.audit.recorder import AuditRecordRequest, AuditRecorder
 from app.core.request_context import RequestContext
 from app.identity.authorization import AuthorizationService
 from app.identity.schemas import ResourceScope
+from app.skills.service import SkillNotFoundError, SkillValidationError
+from app.tools.service import ToolNotFoundError, ToolValidationError
 
 from .models import Team, TeamVersion
 from .repository import (
@@ -38,15 +43,28 @@ class TeamUnavailableError(LookupError):
 
 
 def _digest(value: dict) -> str:
-    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    payload = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
 
 class TeamService:
-    def __init__(self, session: Session, *, audit_recorder: AuditRecorder | None = None):
+    def __init__(
+        self,
+        session: Session,
+        *,
+        audit_recorder: AuditRecorder | None = None,
+        agent_service: AgentService | None = None,
+        max_snapshot_bytes: int | None = None,
+    ):
         self.session = session
         self.repository = TeamRepository(session)
         self.audit_recorder = audit_recorder or AuditRecorder()
+        self.agent_service = agent_service or AgentService()
+        self.max_snapshot_bytes = max_snapshot_bytes or int(
+            os.getenv("IAP_RUNNER_SNAPSHOT_MAX_BYTES", "1048576")
+        )
 
     @staticmethod
     def _require(context: RequestContext, permission: str) -> None:
@@ -176,21 +194,232 @@ class TeamService:
 
     def publish(self, context: RequestContext, team_id: str) -> TeamVersionInfo:
         self._require(context, "collaboration.manage")
-        team = self.repository.get_scoped(context.unit_id, context.project_id, team_id)
-        if team is None:
-            raise TeamNotFoundError(team_id)
-        draft = self.repository.get_version(team.id, 0)
-        if draft is None:
-            raise TeamDefinitionValidationError("Team has no draft definition")
-        published = self.repository.publish(team.id, expected_revision=team.draft_revision,
-                                             definition_digest=_digest(draft.definition), published_by=context.user_id)
-        self._commit_mutation(
-            context,
-            team,
-            action="resource.published",
-            metadata={"version_id": published.id},
-        )
+        try:
+            team = self.repository.get_scoped(
+                context.unit_id, context.project_id, team_id
+            )
+            if team is None:
+                raise TeamNotFoundError(team_id)
+            draft = self.repository.get_version(team.id, 0)
+            if draft is None:
+                raise TeamDefinitionValidationError("Team has no draft definition")
+            trusted_definition = self._trusted_definition(
+                context, team, draft.definition
+            )
+            if len(self._canonical_bytes(trusted_definition)) > self.max_snapshot_bytes:
+                raise TeamDefinitionValidationError(
+                    f"Team definition exceeds {self.max_snapshot_bytes} bytes"
+                )
+            published = self.repository.publish(
+                team.id,
+                expected_revision=team.draft_revision,
+                definition=trusted_definition,
+                definition_digest=_digest(trusted_definition),
+                published_by=context.user_id,
+            )
+            self._commit_mutation(
+                context,
+                team,
+                action="resource.published",
+                metadata={"version_id": published.id},
+            )
+        except Exception:
+            self.session.rollback()
+            raise
         return self._version_info(published)
+
+    @staticmethod
+    def _canonical_bytes(value: dict) -> bytes:
+        return json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+
+    def _trusted_definition(
+        self, context: RequestContext, team: Team, draft: dict
+    ) -> dict:
+        editable = self.repository._normalize_definition(draft)
+        members = [editable["supervisor"], *editable["members"]]
+        captured: dict[str, dict] = {}
+        agent_tool_ids: dict[str, set[str]] = {}
+        agent_skill_names: dict[str, set[str]] = {}
+        agent_knowledge_ids: dict[str, set[str]] = {}
+
+        for member in members:
+            agent_id = member["agent_id"]
+            try:
+                agent = self.agent_service.get(agent_id)
+            except (AgentNotFoundError, KeyError) as error:
+                raise TeamDefinitionValidationError(
+                    f"Agent '{agent_id}' is unavailable"
+                ) from error
+            if not getattr(agent, "enabled", False):
+                raise TeamDefinitionValidationError(
+                    f"Agent '{agent_id}' is disabled"
+                )
+            agent_unit_id = getattr(agent, "unit_id", None)
+            agent_project_id = getattr(agent, "project_id", None)
+            if agent_unit_id not in (None, "", context.unit_id) or agent_project_id not in (
+                None,
+                "",
+                context.project_id,
+            ):
+                raise TeamDefinitionValidationError(
+                    f"Agent '{agent_id}' is outside the current project"
+                )
+
+            tool_ids = list(agent.tool_ids)
+            try:
+                tools = self.agent_service.tool_service.resolve_bindable(tool_ids)
+            except (ToolNotFoundError, ToolValidationError, ValueError) as error:
+                raise TeamDefinitionValidationError(
+                    f"Agent '{agent_id}' has unavailable Tool binding: {error}"
+                ) from error
+
+            skill_names = list(agent.skill_names)
+            for skill_name in skill_names:
+                try:
+                    skill = self.agent_service.skill_service.get(skill_name)
+                except (SkillNotFoundError, SkillValidationError, ValueError) as error:
+                    raise TeamDefinitionValidationError(
+                        f"Agent '{agent_id}' has unavailable Skill '{skill_name}'"
+                    ) from error
+                if not getattr(skill, "enabled", True):
+                    raise TeamDefinitionValidationError(
+                        f"Agent '{agent_id}' has unavailable Skill '{skill_name}'"
+                    )
+
+            knowledge_source_ids = list(
+                getattr(agent, "knowledge_source_ids", ())
+            )
+            definition = {
+                "id": agent.id,
+                "name": agent.name,
+                "description": agent.description,
+                "runtime_form": agent.runtime_form,
+                "language": agent.language,
+                "provider_id": agent.provider_id,
+                "model": agent.model,
+                "system_prompt": agent.system_prompt,
+                "context_prompt": agent.context_prompt,
+                "approval_policy": agent.approval_policy,
+                "skill_names": skill_names,
+                "tool_ids": tool_ids,
+                "knowledge_source_ids": knowledge_source_ids,
+                "tools": [
+                    {
+                        "tool_id": tool.tool_id,
+                        "version": tool.version,
+                        "name": tool.name,
+                        "description": tool.description,
+                        "input_schema": deepcopy(tool.input_schema),
+                        "published": tool.published,
+                        "enabled": tool.enabled,
+                        "source_available": tool.source_available,
+                    }
+                    for tool in tools
+                ],
+            }
+            captured[agent_id] = definition
+            agent_tool_ids[agent_id] = set(tool_ids)
+            agent_skill_names[agent_id] = set(skill_names)
+            agent_knowledge_ids[agent_id] = set(knowledge_source_ids)
+
+        self._validate_team_whitelists(
+            editable,
+            agent_tool_ids=agent_tool_ids,
+            agent_skill_names=agent_skill_names,
+            agent_knowledge_ids=agent_knowledge_ids,
+        )
+        self._validate_current_team_capabilities(editable)
+
+        trusted_members = []
+        for member in members:
+            trusted_member = deepcopy(member)
+            definition = captured[member["agent_id"]]
+            trusted_member["agent_definition"] = definition
+            trusted_member["agent_definition_digest"] = _digest(definition)
+            trusted_members.append(trusted_member)
+
+        return {
+            "name": team.name,
+            "description": team.description,
+            "supervisor": trusted_members[0],
+            "members": trusted_members[1:],
+            "tool_ids": deepcopy(editable["tool_ids"]),
+            "skill_names": deepcopy(editable["skill_names"]),
+            "knowledge_source_ids": deepcopy(editable["knowledge_source_ids"]),
+            "max_steps": editable["max_steps"],
+            "max_parallel_members": editable["max_parallel_members"],
+            "timeout_seconds": editable["timeout_seconds"],
+            "failure_strategy": editable["failure_strategy"],
+            "approval_policy_id": editable["approval_policy_id"],
+        }
+
+    def _validate_current_team_capabilities(self, definition: dict) -> None:
+        try:
+            self.agent_service.tool_service.resolve_bindable(definition["tool_ids"])
+        except (ToolNotFoundError, ToolValidationError, ValueError) as error:
+            raise TeamDefinitionValidationError(
+                f"Team has unavailable Tool whitelist value: {error}"
+            ) from error
+        for skill_name in definition["skill_names"]:
+            try:
+                skill = self.agent_service.skill_service.get(skill_name)
+            except (SkillNotFoundError, SkillValidationError, ValueError) as error:
+                raise TeamDefinitionValidationError(
+                    f"Team has unavailable Skill '{skill_name}'"
+                ) from error
+            if not getattr(skill, "enabled", True):
+                raise TeamDefinitionValidationError(
+                    f"Team has unavailable Skill '{skill_name}'"
+                )
+
+    @staticmethod
+    def _validate_team_whitelists(
+        definition: dict,
+        *,
+        agent_tool_ids: dict[str, set[str]],
+        agent_skill_names: dict[str, set[str]],
+        agent_knowledge_ids: dict[str, set[str]],
+    ) -> None:
+        team_tools = set(definition["tool_ids"])
+        team_skills = set(definition["skill_names"])
+        team_knowledge = set(definition["knowledge_source_ids"])
+        unions = (
+            ("Tool", team_tools, set().union(*agent_tool_ids.values())),
+            ("Skill", team_skills, set().union(*agent_skill_names.values())),
+            ("knowledge source", team_knowledge, set().union(*agent_knowledge_ids.values())),
+        )
+        for label, requested, available in unions:
+            outside = requested - available
+            if outside:
+                raise TeamDefinitionValidationError(
+                    f"Team {label} whitelist is outside Agent bindings: {sorted(outside)[0]}"
+                )
+
+        for member in [definition["supervisor"], *definition["members"]]:
+            agent_id = member["agent_id"]
+            checks = (
+                ("Tool", set(member["tool_ids"]), team_tools, agent_tool_ids[agent_id]),
+                (
+                    "Skill",
+                    set(member["skill_names"]),
+                    team_skills,
+                    agent_skill_names[agent_id],
+                ),
+                (
+                    "knowledge source",
+                    set(member["knowledge_source_ids"]),
+                    team_knowledge,
+                    agent_knowledge_ids[agent_id],
+                ),
+            )
+            for label, requested, team_allowed, agent_allowed in checks:
+                outside = requested - (team_allowed & agent_allowed)
+                if outside:
+                    raise TeamDefinitionValidationError(
+                        f"Agent '{agent_id}' {label} whitelist is invalid: {sorted(outside)[0]}"
+                    )
 
     def set_enabled(self, context: RequestContext, team_id: str, enabled: bool) -> TeamSummary:
         self._require(context, "collaboration.manage")

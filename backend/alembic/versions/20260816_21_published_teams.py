@@ -117,9 +117,16 @@ def upgrade() -> None:
         CREATE FUNCTION reject_published_team_member_mutation()
         RETURNS trigger AS $$
         BEGIN
-            IF EXISTS (
+            IF TG_OP <> 'INSERT' AND EXISTS (
                 SELECT 1 FROM collaboration_team_versions
                 WHERE id = OLD.team_version_id
+                AND status = 'published'
+            ) THEN
+                RAISE EXCEPTION 'published team versions are immutable';
+            END IF;
+            IF TG_OP <> 'DELETE' AND EXISTS (
+                SELECT 1 FROM collaboration_team_versions
+                WHERE id = NEW.team_version_id
                 AND status = 'published'
             ) THEN
                 RAISE EXCEPTION 'published team versions are immutable';
@@ -135,7 +142,7 @@ def upgrade() -> None:
     """)
     op.execute("""
         CREATE TRIGGER collaboration_team_version_members_immutable
-        BEFORE UPDATE OR DELETE ON collaboration_team_version_members
+        BEFORE INSERT OR UPDATE OR DELETE ON collaboration_team_version_members
         FOR EACH ROW EXECUTE FUNCTION reject_published_team_member_mutation()
     """)
 
