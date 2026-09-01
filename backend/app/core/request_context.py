@@ -12,7 +12,7 @@ from .database import get_session
 UserRole: TypeAlias = Literal["user", "project_admin", "unit_admin", "unit_auditor"]
 VALID_ROLES = frozenset({"user", "project_admin", "unit_admin", "unit_auditor"})
 
-from app.identity.catalogue import ROLE_PERMISSION_CODES
+from app.identity.catalogue import PERMISSION_CODES, ROLE_PERMISSION_CODES
 from app.identity.schemas import AuthorizationContext, PermissionGrant
 
 
@@ -61,7 +61,8 @@ def require_request_context(
             status_code=401,
             detail="Unit, user, and project headers are required",
         )
-    if dev_role not in {None, "user", "admin", *ROLE_PERMISSION_CODES}:
+    allowed_roles = {"user", "unit_admin", *ROLE_PERMISSION_CODES}
+    if dev_role not in {None, "user", "admin", *allowed_roles}:
         raise HTTPException(status_code=401, detail="Invalid development identity")
     parsed_roles = {
         value.strip() for value in dev_roles.split(",") if value.strip()
@@ -70,7 +71,7 @@ def require_request_context(
         parsed_roles = {"project_admin" if dev_role == "admin" else dev_role}
     if not parsed_roles:
         parsed_roles = {"user"}
-    if not parsed_roles <= {"user", *ROLE_PERMISSION_CODES}:
+    if not parsed_roles <= allowed_roles:
         raise HTTPException(status_code=401, detail="Invalid development identity")
     authorization = _authorization_context_from_roles(
         user_id=dev_user_id,
@@ -173,7 +174,7 @@ def require_dev_authorization_context(
     if not user_id or not unit_id:
         raise HTTPException(status_code=401, detail="Unit and user headers are required")
     parsed = {item.strip() for item in (roles or "viewer").split(",") if item.strip()}
-    allowed = {"user", *ROLE_PERMISSION_CODES}
+    allowed = {"user", "unit_admin", *ROLE_PERMISSION_CODES}
     if not parsed or not set(parsed) <= allowed:
         raise HTTPException(status_code=401, detail="Invalid development identity")
     return _authorization_context_from_roles(
@@ -195,10 +196,15 @@ def _authorization_context_from_roles(
     grants: list[PermissionGrant] = []
     for role in roles:
         catalogue_role = "viewer" if role == "user" else role
-        if catalogue_role in ROLE_PERMISSION_CODES:
-            scope = "unit" if catalogue_role == "unit_auditor" else "project"
+        permission_codes = (
+            PERMISSION_CODES
+            if catalogue_role == "unit_admin"
+            else ROLE_PERMISSION_CODES.get(catalogue_role, ())
+        )
+        if permission_codes:
+            scope = "unit" if catalogue_role in {"unit_admin", "unit_auditor"} else "project"
             project_ids = frozenset({project_id}) if scope == "project" and project_id else frozenset()
-            for code in ROLE_PERMISSION_CODES[catalogue_role]:
+            for code in permission_codes:
                 grants.append(PermissionGrant(code, scope, project_ids, None))
     return AuthorizationContext(
         session_id="dev-test",

@@ -58,13 +58,7 @@ class TeamService:
             permission,
             ResourceScope(context.unit_id, context.project_id, context.user_id),
         )
-        has_project_grant = any(
-            grant.permission_code == permission
-            and grant.data_scope != "unit"
-            and context.project_id in grant.project_ids
-            for grant in authorization.grants
-        )
-        if not allowed or not has_project_grant:
+        if not allowed:
             raise TeamPermissionError(f"{permission} is required")
 
     def _commit_mutation(

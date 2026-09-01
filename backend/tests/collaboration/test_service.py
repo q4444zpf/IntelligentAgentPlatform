@@ -60,6 +60,10 @@ def project_grant(permission: str, project="p1"):
     return PermissionGrant(permission, "project", frozenset({project}), None)
 
 
+def unit_grant(permission: str):
+    return PermissionGrant(permission, "unit", frozenset(), None)
+
+
 def draft():
     return TeamDraft(
         supervisor=TeamMemberDraft(agent_id="supervisor", responsibility="coordinate", agent_definition_digest="a" * 64),
@@ -137,6 +141,23 @@ def test_project_scoped_manage_grant_can_create_and_publish_without_admin_role(s
     published = service.publish(context, team.id)
 
     assert published.team_id == team.id
+
+
+def test_unit_scoped_collaboration_grants_authorize_current_project_team_operations(service):
+    context = scoped_context(
+        unit_grant("collaboration.read"),
+        unit_grant("collaboration.manage"),
+        unit_grant("collaboration.run"),
+        roles=("unit_admin",),
+    )
+
+    team = service.create(context, TeamCreateRequest(name="联合研判"))
+    service.save_draft(context, team.id, TeamDraftUpdate(revision=1, draft=draft()))
+    service.publish(context, team.id)
+    service.set_enabled(context, team.id, True)
+
+    assert service.get(context, team.id).id == team.id
+    assert service.resolve_for_run(context, team.id).team_id == team.id
 
 
 def test_team_operations_require_the_exact_project_permission(service):

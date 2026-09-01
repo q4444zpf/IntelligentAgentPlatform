@@ -3,11 +3,13 @@ from fastapi.testclient import TestClient
 
 from app.core.request_context import (
     RequestContext,
+    _cookie_request_context,
     _is_trusted_dev_client,
     require_admin_context,
     require_dev_authorization_context,
     require_request_context,
 )
+from app.identity.schemas import AuthorizationContext, PermissionGrant
 
 
 def build_client(allow_dev_identity: bool) -> TestClient:
@@ -133,3 +135,82 @@ def test_dev_authorization_adapter_returns_scoped_context_without_legacy_fields(
         "can_run": False,
         "has_legacy_project": False,
     }
+
+
+def test_dev_unit_admin_header_retains_unit_scoped_collaboration_grants():
+    app = FastAPI()
+
+    @app.get("/grants")
+    def grants(value: RequestContext = Depends(require_request_context)):
+        assert value.authorization_context is not None
+        return [
+            {"code": grant.permission_code, "scope": grant.data_scope}
+            for grant in value.authorization_context.grants
+            if grant.permission_code == "collaboration.manage"
+        ]
+
+    app.state.allow_dev_identity = True
+    response = TestClient(app).get(
+        "/grants",
+        headers={
+            "X-Unit-ID": "unit-1",
+            "X-User-ID": "user-1",
+            "X-Project-ID": "project-1",
+            "X-User-Roles": "unit_admin",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == [{"code": "collaboration.manage", "scope": "unit"}]
+
+
+def test_cookie_context_retains_server_authorization_snapshot(monkeypatch):
+    class CookieSession:
+        def __init__(self):
+            self.values = iter((
+                type("Auth", (), {
+                    "user_id": "user-1",
+                    "id": "server-session",
+                    "unit_id": "unit-1",
+                    "idle_expires_at": None,
+                    "absolute_expires_at": None,
+                    "authorization_version": 1,
+                })(),
+                type("Membership", (), {"status": "active"})(),
+            ))
+
+        def scalar(self, _query):
+            return next(self.values)
+
+        def get(self, model, _value):
+            if model.__name__ == "User":
+                return type(
+                    "User",
+                    (),
+                    {"id": "user-1", "status": "active", "authorization_version": 1},
+                )()
+            return None
+
+    authorization = AuthorizationContext(
+        session_id="server-session",
+        user_id="user-1",
+        unit_id="unit-1",
+        current_project_id="project-1",
+        auth_method="local",
+        authorization_version=1,
+        role_codes=("unit_admin",),
+        grants=(PermissionGrant("collaboration.run", "unit", frozenset(), None),),
+    )
+    from app.identity.repository import AuthorizationRepository
+
+    monkeypatch.setattr(
+        AuthorizationRepository,
+        "load_context",
+        lambda _self, _session_id: authorization,
+    )
+
+    context = _cookie_request_context(CookieSession(), "cookie-token")
+
+    assert context.authorization_context is authorization
+    assert context.role_codes == ("unit_admin",)
+    assert context.authorization_context.grants[0].data_scope == "unit"

@@ -15,6 +15,8 @@ from app.conversations.schemas import ConversationCreate, MessageCreate
 from app.conversations.service import AgentSelectionError, ConversationService
 from app.core.request_context import RequestContext
 from app.db.base import Base
+from app.identity.catalogue import ROLE_PERMISSION_CODES
+from app.identity.schemas import AuthorizationContext, PermissionGrant
 from app.runtime.execution_contract import RunExecutionRequest
 from app.runtime.artifact_backend import ArtifactBackend
 from app.runtime.execution_snapshot import (
@@ -35,7 +37,28 @@ class NoopDispatcher:
 
 
 def context(*, project="project-1", roles=frozenset({"project_admin"})):
-    return RequestContext(user_id="user-1", unit_id="unit-1", project_id=project, roles=roles)
+    role_codes = tuple(sorted(roles))
+    grants = tuple(
+        PermissionGrant(code, "project", frozenset({project}), None)
+        for role in role_codes
+        for code in ROLE_PERMISSION_CODES.get("viewer" if role == "user" else role, ())
+    )
+    return RequestContext(
+        user_id="user-1",
+        unit_id="unit-1",
+        project_id=project,
+        roles=roles,
+        authorization_context=AuthorizationContext(
+            session_id="e2e-session",
+            user_id="user-1",
+            unit_id="unit-1",
+            current_project_id=project,
+            auth_method="dev_test",
+            authorization_version=1,
+            role_codes=role_codes,
+            grants=grants,
+        ),
+    )
 
 
 def team_draft():
