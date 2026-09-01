@@ -202,6 +202,16 @@ def test_preserves_explicit_enabled_agent():
     session.close()
 
 
+def test_message_contract_accepts_team_uuid_actor_id():
+    request = MessageCreate(
+        content="联合研判",
+        actor_type="team",
+        actor_id="8c3c8a65-709b-4187-aec8-4a9341f817de",
+    )
+
+    assert request.actor_id == "8c3c8a65-709b-4187-aec8-4a9341f817de"
+
+
 @pytest.mark.parametrize("actor_id", ["missing-agent", "disabled-agent"])
 def test_rejects_unavailable_explicit_agent_without_persisting(actor_id):
     session, dispatcher, service = build_service()

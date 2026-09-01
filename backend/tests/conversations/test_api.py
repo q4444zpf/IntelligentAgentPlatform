@@ -325,6 +325,19 @@ def test_agent_run_list_rejects_unsafe_or_oversized_filters(name, value):
     assert response.status_code == 422
 
 
+def test_agent_run_list_accepts_team_uuid_filter():
+    client = build_client()
+
+    response = client.get(
+        "/api/agent-runs",
+        params={"actor_id": "8c3c8a65-709b-4187-aec8-4a9341f817de"},
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["items"] == []
+
+
 def test_agent_run_list_rejects_naive_time_filters():
     client = build_client()
 

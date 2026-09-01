@@ -146,7 +146,7 @@ def create_router(
             str | None,
             Query(
                 max_length=64,
-                pattern=r"^[a-z][a-z0-9_-]{0,63}$",
+                pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$",
             ),
         ] = None,
         query: Annotated[str | None, Query(max_length=200)] = None,
