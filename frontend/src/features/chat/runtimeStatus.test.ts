@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isRunActive, runtimeStatusLabel } from './runtimeStatus';
+import { isRunActive, runtimeStatusLabel, teamRunEventLabel } from './runtimeStatus';
 
 describe('runtimeStatusLabel', () => {
   it('does not claim isolation while a run is only queued', () => {
@@ -23,3 +23,11 @@ describe('runtimeStatusLabel', () => {
     expect(isRunActive('failed')).toBe(false);
     expect(isRunActive('cancelled')).toBe(false);
   });});
+
+describe('teamRunEventLabel', () => {
+  it('formats bounded Team progress without exposing arbitrary payload fields', () => {
+    expect(teamRunEventLabel({ sequence: 1, event_type: 'team.task.started', payload: { agent_id: 'forecast', task_id: 't1', prompt: 'secret' } })).toBe('forecast · 任务 t1 执行中');
+    expect(teamRunEventLabel({ sequence: 2, event_type: 'team.task.failed', payload: { agent_id: 'review', task_id: 't2' } })).toBe('review · 任务 t2 失败');
+    expect(teamRunEventLabel({ sequence: 3, event_type: 'team.synthesis.completed', payload: { partial: true } })).toBe('团队汇总已完成（部分完成）');
+  });
+});

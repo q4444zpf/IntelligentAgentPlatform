@@ -9,6 +9,12 @@ describe('parseSseFrame', () => {
       payload: { status: 'running' },
     });
   });
+
+  it('retains typed Team task event payloads', () => {
+    expect(parseSseFrame('id: 7\nevent: team.task.completed\ndata: {"agent_id":"review","task_id":"t1"}')).toEqual({
+      sequence: 7, event_type: 'team.task.completed', payload: { agent_id: 'review', task_id: 't1' },
+    });
+  });
 });
 
 describe('getRunEvents', () => {

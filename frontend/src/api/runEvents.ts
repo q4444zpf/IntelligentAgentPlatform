@@ -6,6 +6,18 @@ export interface RunEvent {
   payload: Record<string, unknown>;
 }
 
+export type TeamRunEventType =
+  | 'team.plan.created'
+  | 'team.task.started'
+  | 'team.task.completed'
+  | 'team.task.failed'
+  | 'team.synthesis.started'
+  | 'team.synthesis.completed';
+
+export interface TeamRunEvent extends RunEvent {
+  event_type: TeamRunEventType;
+}
+
 export function parseSseFrame(frame: string): RunEvent {
   const lines = Object.fromEntries(
     frame.split('\n').map((line) => {
