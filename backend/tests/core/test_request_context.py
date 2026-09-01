@@ -3,8 +3,9 @@ from fastapi.testclient import TestClient
 
 from app.core.request_context import (
     RequestContext,
-    require_dev_authorization_context,
+    _is_trusted_dev_client,
     require_admin_context,
+    require_dev_authorization_context,
     require_request_context,
 )
 
@@ -26,6 +27,11 @@ def build_client(allow_dev_identity: bool) -> TestClient:
 
 def test_rejects_missing_identity():
     assert build_client(True).get("/context").status_code == 401
+
+
+def test_accepts_explicitly_trusted_docker_client():
+    assert _is_trusted_dev_client("172.28.0.1", ("172.28.0.0/16",))
+    assert not _is_trusted_dev_client("192.168.1.10", ("172.28.0.0/16",))
 
 
 def test_rejects_headers_when_dev_identity_is_disabled():

@@ -108,6 +108,12 @@ export const routes: RouteRecordRaw[] = [
     meta: { title: '登录', public: true },
   },
   {
+    path: '/403',
+    name: 'Forbidden',
+    component: () => import('@/views/errors/ForbiddenView.vue'),
+    meta: { title: '无权访问' },
+  },
+  {
     path: '/',
     component: AppLayout,
     redirect: '/dashboard',
@@ -153,5 +159,6 @@ export const routes: RouteRecordRaw[] = [
     ],
   },
   { path: '/chat/focus', name: 'ChatFocus', component: () => import('@/views/agent/AgentConsoleView.vue'), meta: { title: 'AI 对话', permission: 'chat:view', focus: true } },
+  { path: '/artifacts/:artifactId/preview', name: 'ArtifactPreview', component: () => import('@/views/artifacts/ArtifactPreviewView.vue'), meta: { title: 'HTML 成果预览', permission: 'platform:view' } },
   { path: '/:pathMatch(.*)*', redirect: '/dashboard' },
 ];

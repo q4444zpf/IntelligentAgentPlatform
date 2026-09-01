@@ -102,6 +102,28 @@ def test_storage_can_force_download_with_response_content_disposition():
     )
 
 
+def test_storage_can_override_inline_preview_response_headers():
+    client = FakeS3()
+    storage = S3ObjectStorage(client=client, bucket="artifacts")
+
+    storage.presigned_get_url(
+        "report.html",
+        300,
+        response_content_type="text/html; charset=utf-8",
+        response_content_disposition="inline; filename*=UTF-8''report.html",
+        response_cache_control="private, no-store, max-age=0",
+    )
+
+    assert client.url_calls[-1]["ExpiresIn"] == 300
+    assert client.url_calls[-1]["Params"] == {
+        "Bucket": "artifacts",
+        "Key": "report.html",
+        "ResponseContentType": "text/html; charset=utf-8",
+        "ResponseContentDisposition": "inline; filename*=UTF-8''report.html",
+        "ResponseCacheControl": "private, no-store, max-age=0",
+    }
+
+
 def test_storage_creates_missing_bucket_before_upload():
     client = MissingBucketS3()
     storage = S3ObjectStorage(client=client, bucket="artifacts")

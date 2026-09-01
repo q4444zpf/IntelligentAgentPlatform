@@ -16,11 +16,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 ALEMBIC = (sys.executable, "-m", "alembic", "-c", "backend/alembic.ini")
-IDENTITY_TABLES = {
+IDENTITY_FOUNDATION_TABLES = {
     "users",
     "external_identities",
     "external_identity_history",
-    "local_credentials",
     "units",
     "projects",
     "unit_memberships",
@@ -81,12 +80,16 @@ def _load_models() -> None:
 
 @pytest.fixture(scope="module")
 def postgres_engine():
+    _alembic("downgrade", "base")
     _alembic("upgrade", "20260804_08")
     _alembic("upgrade", "20260804_09")
     _load_models()
     engine = create_engine(os.environ["TEST_DATABASE_URL"])
-    yield engine
-    engine.dispose()
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+        _alembic("upgrade", "head")
 
 
 @pytest.fixture
@@ -273,7 +276,7 @@ def delete_role_permission_project_scope_fixture(connection, prefix: str) -> Non
 
 def test_identity_revision_upgrades_downgrades_and_reupgrades(postgres_engine):
     inspector = inspect(postgres_engine)
-    assert IDENTITY_TABLES <= set(inspector.get_table_names())
+    assert IDENTITY_FOUNDATION_TABLES <= set(inspector.get_table_names())
     assert "ck_menu_catalogue" in {
         constraint["name"] for constraint in inspector.get_check_constraints("menus")
     }
@@ -293,7 +296,7 @@ def test_identity_revision_upgrades_downgrades_and_reupgrades(postgres_engine):
     downgraded_engine = create_engine(os.environ["TEST_DATABASE_URL"])
     try:
         downgraded_tables = set(inspect(downgraded_engine).get_table_names())
-        assert not (IDENTITY_TABLES & downgraded_tables)
+        assert not (IDENTITY_FOUNDATION_TABLES & downgraded_tables)
         assert "audit_events" in downgraded_tables
     finally:
         downgraded_engine.dispose()
@@ -301,7 +304,9 @@ def test_identity_revision_upgrades_downgrades_and_reupgrades(postgres_engine):
     _alembic("upgrade", "20260804_09")
     reupgraded_engine = create_engine(os.environ["TEST_DATABASE_URL"])
     try:
-        assert IDENTITY_TABLES <= set(inspect(reupgraded_engine).get_table_names())
+        assert IDENTITY_FOUNDATION_TABLES <= set(
+            inspect(reupgraded_engine).get_table_names()
+        )
     finally:
         reupgraded_engine.dispose()
 

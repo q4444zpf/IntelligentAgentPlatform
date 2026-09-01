@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { flushPromises, mount } from '@vue/test-utils';
-import { nextTick } from 'vue';
+import { message } from 'ant-design-vue';
+import { defineComponent, nextTick } from 'vue';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import RoleManagementView from './RoleManagementView.vue';
 import UserManagementView from './UserManagementView.vue';
@@ -9,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   listUsers: vi.fn(),
   listRoles: vi.fn(),
   listProjects: vi.fn(),
+  createUser: vi.fn(),
   updateUser: vi.fn(),
   resetPassword: vi.fn(),
   listUserRoles: vi.fn(),
@@ -22,6 +24,7 @@ vi.mock('@/api/identity', () => ({
   listIdentityUsers: mocks.listUsers,
   listIdentityRoles: mocks.listRoles,
   listIdentityProjects: mocks.listProjects,
+  createIdentityUser: mocks.createUser,
   updateIdentityUser: mocks.updateUser,
   resetIdentityUserPassword: mocks.resetPassword,
   listIdentityUserRoles: mocks.listUserRoles,
@@ -31,6 +34,31 @@ vi.mock('@/api/identity', () => ({
   grantIdentityRolePermission: mocks.grantRolePermission,
   deleteIdentityUser: mocks.deleteUser,
 }));
+
+const SelectStub = defineComponent({
+  props: {
+    value: { type: [String, Array], default: '' },
+    options: { type: Array, default: () => [] },
+    mode: { type: String, default: '' },
+  },
+  emits: ['update:value', 'change'],
+  setup(props, { emit }) {
+    function onChange(event: Event) {
+      const target = event.target as HTMLSelectElement;
+      const value = props.mode === 'multiple'
+        ? Array.from(target.selectedOptions).map((option) => option.value)
+        : target.value;
+      emit('update:value', value);
+      emit('change', value);
+    }
+    return { onChange };
+  },
+  template: `<select
+    :multiple="mode === 'multiple'"
+    :value="value"
+    @change="onChange"
+  ><option v-for="option in options" :key="option.value" :value="option.value">{{ option.label }}</option></select>`,
+});
 
 const stubs = {
   'a-card': { template: '<section><slot /><slot name="title" /></section>' },
@@ -45,15 +73,22 @@ const stubs = {
   'a-form': { template: '<form><slot /></form>' },
   'a-form-item': { template: '<div><slot /></div>' },
   'a-modal': { props: ['open'], emits: ['ok'], template: '<div v-if="open"><slot /><slot name="title" /><button @click="$emit(\'ok\')">保存</button></div>' },
-  'a-select': { props: ['value', 'options'], emits: ['update:value', 'change'], template: '<select :value="value" @change="$emit(\'update:value\', $event.target.value); $emit(\'change\', $event.target.value)"><option v-for="option in options || []" :key="option.value" :value="option.value">{{ option.label }}</option><slot /></select>' },
+  'a-select': SelectStub,
   'a-table': { props: ['dataSource', 'loading', 'columns'], template: '<div><span v-if="loading">加载中</span><div v-for="row in dataSource" :key="row.id">{{ row.display_name || row.name }}<template v-for="column in columns" :key="column.key || column.dataIndex"><slot name="bodyCell" :column="column" :record="row" /></template></div><slot name="emptyText" /></div>' },
 };
 const wrappers: ReturnType<typeof mount>[] = [];
 function render(component: typeof UserManagementView | typeof RoleManagementView) {
   const wrapper = mount(component, { global: { stubs } }); wrappers.push(wrapper); return wrapper;
 }
+function selectMultipleValues(select: HTMLSelectElement, values: string[]): void {
+  Array.from(select.options).forEach((option) => { option.selected = values.includes(option.value); });
+}
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  return { promise: new Promise((done) => { resolve = done; }), resolve };
+}
 
-beforeEach(() => { mocks.listUsers.mockReset(); mocks.listRoles.mockReset(); mocks.listProjects.mockReset(); mocks.updateUser.mockReset(); mocks.resetPassword.mockReset(); mocks.listUserRoles.mockReset(); mocks.replaceUserRoles.mockReset(); mocks.deleteRole.mockReset(); mocks.listPermissions.mockReset(); mocks.grantRolePermission.mockReset(); });
+beforeEach(() => { mocks.listUsers.mockReset(); mocks.listRoles.mockReset(); mocks.listProjects.mockReset(); mocks.createUser.mockReset(); mocks.updateUser.mockReset(); mocks.resetPassword.mockReset(); mocks.listUserRoles.mockReset(); mocks.replaceUserRoles.mockReset(); mocks.deleteRole.mockReset(); mocks.listPermissions.mockReset(); mocks.grantRolePermission.mockReset(); });
 afterEach(() => wrappers.splice(0).forEach((wrapper) => wrapper.unmount()));
 
 describe('identity administration views', () => {
@@ -115,6 +150,193 @@ describe('identity administration views', () => {
     expect(wrapper.text()).toContain('编辑');
   });
 
+  it('requires an active unit role to create a local user atomically', async () => {
+    mocks.listUsers.mockResolvedValue([]);
+    mocks.listRoles.mockResolvedValue([
+      { id: 'role-1', code: 'unit_admin', name: '单位管理员', scope_type: 'unit', unit_id: 'unit-1', built_in: true, status: 'active' },
+      { id: 'role-project', code: 'project_operator', name: '项目操作员', scope_type: 'project', unit_id: 'unit-1', built_in: false, status: 'active' },
+      { id: 'role-inactive', code: 'former_operator', name: '历史调度员', scope_type: 'unit', unit_id: 'unit-1', built_in: false, status: 'inactive' },
+    ]);
+    mocks.createUser.mockResolvedValue({ id: 'user-1' });
+    const messageError = vi.spyOn(message, 'error').mockImplementation(() => undefined as never);
+    const wrapper = render(UserManagementView);
+    await flushPromises();
+
+    await wrapper.findAll('button').find((button) => button.text() === '新建用户')!.trigger('click');
+    await flushPromises();
+    expect(wrapper.findAll('select')).toHaveLength(1);
+    expect(wrapper.find('select').text()).toContain('单位管理员 (unit_admin)');
+    expect(wrapper.find('select').text()).not.toContain('项目操作员');
+    expect(wrapper.find('select').text()).not.toContain('历史调度员');
+    const passwordInput = wrapper.find('input[type="password"]');
+    expect(passwordInput.exists()).toBe(true);
+
+    const inputs = wrapper.findAll('input');
+    await inputs[0].setValue('Alice');
+    await inputs[1].setValue('alice@example.test');
+    await passwordInput.setValue('InitialPassword123!');
+    await wrapper.findAll('button').find((button) => button.text() === '保存')!.trigger('click');
+    await flushPromises();
+
+    expect(mocks.createUser).not.toHaveBeenCalled();
+    expect(messageError).toHaveBeenCalledWith('请至少选择一个单位角色');
+    const createRoleSelect = wrapper.find('select');
+    selectMultipleValues(createRoleSelect.element as HTMLSelectElement, ['role-1']);
+    await createRoleSelect.trigger('change');
+    await wrapper.findAll('button').find((button) => button.text() === '保存')!.trigger('click');
+    await flushPromises();
+
+    expect(mocks.createUser).toHaveBeenCalledWith({
+      display_name: 'Alice',
+      email: 'alice@example.test',
+      initial_password: 'InitialPassword123!',
+      role_ids: ['role-1'],
+    });
+    expect(mocks.replaceUserRoles).not.toHaveBeenCalled();
+    messageError.mockRestore();
+  });
+
+  it('edits a user with only current unit roles preselected', async () => {
+    mocks.listUsers.mockResolvedValue([{ id: 'user-1', display_name: 'Alice', email: 'alice@example.test', status: 'active', membership_status: 'active', project_memberships: [], role_summaries: [] }]);
+    mocks.listRoles.mockResolvedValue([
+      { id: 'role-2', code: 'operator', name: '调度员', scope_type: 'unit', unit_id: 'unit-1', built_in: false, status: 'active' },
+      { id: 'role-project', code: 'project_operator', name: '项目操作员', scope_type: 'project', unit_id: 'unit-1', built_in: false, status: 'active' },
+      { id: 'role-inactive', code: 'former_operator', name: '历史调度员', scope_type: 'unit', unit_id: 'unit-1', built_in: false, status: 'inactive' },
+    ]);
+    mocks.listUserRoles.mockResolvedValue([
+      { role_id: 'role-2', code: 'operator', name: '调度员', scope_type: 'unit', project_id: null },
+      { role_id: 'role-project', code: 'project_operator', name: '项目操作员', scope_type: 'project', project_id: 'project-1' },
+    ]);
+    mocks.updateUser.mockResolvedValue({ id: 'user-1' });
+    const messageError = vi.spyOn(message, 'error').mockImplementation(() => undefined as never);
+    const wrapper = render(UserManagementView);
+    await flushPromises();
+
+    await wrapper.findAll('a').find((link) => link.text() === '编辑')!.trigger('click');
+    await flushPromises();
+
+    expect(mocks.listUserRoles).toHaveBeenCalledWith('user-1', null, expect.any(AbortSignal));
+    expect(wrapper.findAll('select')).toHaveLength(1);
+    expect((wrapper.find('select').element as HTMLSelectElement).selectedOptions[0].value).toBe('role-2');
+    expect(wrapper.find('select').text()).not.toContain('项目操作员');
+    expect(wrapper.find('select').text()).not.toContain('历史调度员');
+
+    const editRoleSelector = wrapper.findComponent(SelectStub);
+    editRoleSelector.vm.$emit('update:value', []);
+    await nextTick();
+    await wrapper.findAll('button').find((button) => button.text() === '保存')!.trigger('click');
+    await flushPromises();
+    expect(mocks.updateUser).not.toHaveBeenCalled();
+    expect(messageError).toHaveBeenCalledWith('请至少选择一个单位角色');
+
+    editRoleSelector.vm.$emit('update:value', ['role-2']);
+    await nextTick();
+    await wrapper.findAll('input')[0].setValue('Alice Updated');
+    await wrapper.findAll('button').find((button) => button.text() === '保存')!.trigger('click');
+    await flushPromises();
+    expect(mocks.updateUser).toHaveBeenCalledWith('user-1', {
+      display_name: 'Alice Updated',
+      email: 'alice@example.test',
+      role_ids: ['role-2'],
+    });
+    messageError.mockRestore();
+  });
+
+  it('keeps a roleless user from saving edits until an active unit role is selected', async () => {
+    mocks.listUsers.mockResolvedValue([{ id: 'user-1', display_name: 'Alice', email: 'alice@example.test', status: 'active', membership_status: 'active', project_memberships: [], role_summaries: [] }]);
+    mocks.listRoles.mockResolvedValue([{ id: 'role-2', code: 'operator', name: '调度员', scope_type: 'unit', unit_id: 'unit-1', built_in: false, status: 'active' }]);
+    mocks.listUserRoles.mockResolvedValue([]);
+    mocks.updateUser.mockResolvedValue({ id: 'user-1' });
+    const messageError = vi.spyOn(message, 'error').mockImplementation(() => undefined as never);
+    const wrapper = render(UserManagementView);
+    await flushPromises();
+
+    await wrapper.findAll('a').find((link) => link.text() === '编辑')!.trigger('click');
+    await flushPromises();
+    expect((wrapper.find('select').element as HTMLSelectElement).selectedOptions).toHaveLength(0);
+
+    await wrapper.findAll('button').find((button) => button.text() === '保存')!.trigger('click');
+    await flushPromises();
+    expect(mocks.updateUser).not.toHaveBeenCalled();
+    expect(messageError).toHaveBeenCalledWith('请至少选择一个单位角色');
+
+    const legacyRoleSelector = wrapper.findComponent(SelectStub);
+    legacyRoleSelector.vm.$emit('update:value', ['role-2']);
+    await nextTick();
+    await wrapper.findAll('button').find((button) => button.text() === '保存')!.trigger('click');
+    await flushPromises();
+    expect(mocks.updateUser).toHaveBeenCalledWith('user-1', {
+      display_name: 'Alice',
+      email: 'alice@example.test',
+      role_ids: ['role-2'],
+    });
+    messageError.mockRestore();
+  });
+
+  it('ignores stale edit unit role responses after another user is opened', async () => {
+    mocks.listUsers.mockResolvedValue([
+      { id: 'user-a', display_name: 'Alice', email: 'alice@example.test', status: 'active', membership_status: 'active', project_memberships: [], role_summaries: [] },
+      { id: 'user-b', display_name: 'Bob', email: 'bob@example.test', status: 'active', membership_status: 'active', project_memberships: [], role_summaries: [] },
+    ]);
+    const rolesA = deferred<unknown[]>();
+    const currentA = deferred<unknown[]>();
+    const rolesB = deferred<unknown[]>();
+    const currentB = deferred<unknown[]>();
+    mocks.listRoles.mockReturnValueOnce(rolesA.promise).mockReturnValueOnce(rolesB.promise);
+    mocks.listUserRoles.mockReturnValueOnce(currentA.promise).mockReturnValueOnce(currentB.promise);
+    mocks.updateUser.mockResolvedValue({ id: 'user-b' });
+    const wrapper = render(UserManagementView);
+    await flushPromises();
+
+    const editLinks = wrapper.findAll('a').filter((link) => link.text() === '编辑');
+    await editLinks[0].trigger('click');
+    await editLinks[1].trigger('click');
+
+    rolesB.resolve([{ id: 'role-b', code: 'operator_b', name: '乙调度员', scope_type: 'unit', unit_id: 'unit-1', built_in: false, status: 'active' }]);
+    currentB.resolve([{ role_id: 'role-b', code: 'operator_b', name: '乙调度员', scope_type: 'unit', project_id: null }]);
+    await flushPromises();
+    rolesA.resolve([{ id: 'role-a', code: 'operator_a', name: '甲调度员', scope_type: 'unit', unit_id: 'unit-1', built_in: false, status: 'active' }]);
+    currentA.resolve([{ role_id: 'role-a', code: 'operator_a', name: '甲调度员', scope_type: 'unit', project_id: null }]);
+    await flushPromises();
+
+    expect(wrapper.findAll('input')[0].element.value).toBe('Bob');
+    expect((wrapper.find('select').element as HTMLSelectElement).selectedOptions[0].value).toBe('role-b');
+    expect(wrapper.find('select').text()).toContain('乙调度员 (operator_b)');
+    expect(wrapper.find('select').text()).not.toContain('甲调度员');
+    await wrapper.findAll('button').find((button) => button.text() === '保存')!.trigger('click');
+    await flushPromises();
+    expect(mocks.updateUser).toHaveBeenCalledWith('user-b', {
+      display_name: 'Bob',
+      email: 'bob@example.test',
+      role_ids: ['role-b'],
+    });
+  });
+
+  it('blocks an inactive current unit role from being submitted', async () => {
+    mocks.listUsers.mockResolvedValue([{ id: 'user-1', display_name: 'Alice', email: 'alice@example.test', status: 'active', membership_status: 'active', project_memberships: [], role_summaries: [] }]);
+    mocks.listRoles.mockResolvedValue([
+      { id: 'role-active', code: 'operator', name: '调度员', scope_type: 'unit', unit_id: 'unit-1', built_in: false, status: 'active' },
+      { id: 'role-inactive', code: 'former_operator', name: '历史调度员', scope_type: 'unit', unit_id: 'unit-1', built_in: false, status: 'inactive' },
+    ]);
+    mocks.listUserRoles.mockResolvedValue([{ role_id: 'role-inactive', code: 'former_operator', name: '历史调度员', scope_type: 'unit', project_id: null }]);
+    mocks.updateUser.mockResolvedValue({ id: 'user-1' });
+    const messageError = vi.spyOn(message, 'error').mockImplementation(() => undefined as never);
+    const wrapper = render(UserManagementView);
+    await flushPromises();
+
+    await wrapper.findAll('a').find((link) => link.text() === '编辑')!.trigger('click');
+    await flushPromises();
+    expect(wrapper.find('select').text()).toContain('调度员 (operator)');
+    expect(wrapper.find('select').text()).not.toContain('历史调度员');
+    expect((wrapper.find('select').element as HTMLSelectElement).selectedOptions).toHaveLength(0);
+
+    await wrapper.findAll('button').find((button) => button.text() === '保存')!.trigger('click');
+    await flushPromises();
+    expect(mocks.updateUser).not.toHaveBeenCalled();
+    expect(messageError).toHaveBeenCalledWith('请至少选择一个单位角色');
+    messageError.mockRestore();
+  });
+
   it('shows password reset and role management actions for local users', async () => {
     mocks.listUsers.mockResolvedValue([{ id: 'user-1', display_name: 'Alice', email: 'alice@example.test', status: 'active', membership_status: 'active', project_memberships: [], role_summaries: [] }]);
     const wrapper = render(UserManagementView);
@@ -137,6 +359,25 @@ describe('identity administration views', () => {
     await wrapper.findAll('button').find((button) => button.text() === '保存')?.trigger('click');
     await flushPromises();
     expect(mocks.resetPassword).toHaveBeenCalledWith('user-1', { new_password: 'NewPassword123!' });
+  });
+
+  it('copies a generated password when the async clipboard API is unavailable', async () => {
+    mocks.listUsers.mockResolvedValue([{ id: 'user-1', display_name: 'Alice', email: 'alice@example.test', status: 'active', membership_status: 'active', project_memberships: [], role_summaries: [] }]);
+    const clipboardWrite = vi.spyOn(navigator.clipboard, 'writeText').mockRejectedValue(new DOMException('Clipboard unavailable', 'NotAllowedError'));
+    const execCommand = vi.fn(() => true);
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: execCommand });
+    const successMessage = vi.spyOn(message, 'success').mockImplementation(() => undefined as never);
+    const wrapper = render(UserManagementView);
+    await flushPromises();
+    await wrapper.findAll('a').find((link) => link.text() === '重置密码')!.trigger('click');
+
+    await wrapper.findAll('button').find((button) => button.text() === '复制')!.trigger('click');
+    await flushPromises();
+
+    expect(execCommand).toHaveBeenCalledWith('copy');
+    expect(successMessage).toHaveBeenCalledWith('密码已复制');
+    clipboardWrite.mockRestore();
+    successMessage.mockRestore();
   });
 
   it('loads and replaces the selected user roles', async () => {

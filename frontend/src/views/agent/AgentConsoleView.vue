@@ -28,7 +28,7 @@
       <button :class="{ active: mobilePanel === 'context' }" @click="mobilePanel = 'context'">上下文</button>
     </div>
 
-    <div class="conversation-layout">
+    <div class="conversation-layout" :class="{ 'preview-open': selectedHtmlArtifact, 'preview-medium': isMediumPreviewLayout }">
       <aside class="history-panel" :class="{ 'mobile-active': mobilePanel === 'history' }">
         <button class="new-chat-button" @click="newConversation"><PlusOutlined /> 新建对话</button>
         <label class="search-box">
@@ -93,7 +93,15 @@
             <div class="message-avatar">{{ message.role === 'user' ? '张' : message.avatar }}</div>
             <div class="message-content">
               <div class="message-meta"><strong>{{ message.author }}</strong><span>{{ message.time }}</span></div>
-              <div class="message-bubble">{{ message.content }}</div>
+              <div class="message-bubble">
+                <AssistantMessageContent v-if="message.role === 'assistant'" :content="message.content" />
+                <span v-else>{{ message.content }}</span>
+                <AssistantArtifactCards
+                  v-if="message.role === 'assistant' && artifactsForRun(message.runId).length"
+                  :artifacts="artifactsForRun(message.runId)"
+                  @preview="selectedHtmlArtifact = $event"
+                />
+              </div>
             </div>
           </article>
           <div v-if="conversationStore.toolActivities.length" class="tool-activity" aria-label="工具活动">
@@ -126,7 +134,7 @@
         </div>
       </section>
 
-      <aside class="context-panel" :class="{ 'mobile-active': mobilePanel === 'context' }">
+      <aside v-if="!isMediumPreviewLayout" class="context-panel" :class="{ 'mobile-active': mobilePanel === 'context' }">
         <section>
           <header><span>运行上下文</span><SlidersOutlined /></header>
           <dl>
@@ -170,6 +178,12 @@
           <small>所有工具调用写入项目审计日志</small>
         </section>
       </aside>
+
+      <HtmlArtifactPreview
+        v-if="selectedHtmlArtifact"
+        :artifact="selectedHtmlArtifact"
+        @close="selectedHtmlArtifact = null"
+      />
     </div>
   </main>
 </template>
@@ -181,14 +195,18 @@ import {
   MessageOutlined, MoreOutlined, PaperClipOutlined, PlusOutlined, RadarChartOutlined, RightOutlined,
   SafetyCertificateOutlined, SearchOutlined, SendOutlined, SlidersOutlined, TeamOutlined, UserOutlined,
 } from '@ant-design/icons-vue';
-import { computed, nextTick, onMounted, ref, useTemplateRef, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, useTemplateRef, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { agentsApi, type AgentInfo } from '@/api/agents';
+import { artifactsApi, type ArtifactInfo } from '@/api/artifacts';
+import AssistantArtifactCards from '@/components/chat/AssistantArtifactCards.vue';
+import AssistantMessageContent from '@/components/chat/AssistantMessageContent.vue';
+import HtmlArtifactPreview from '@/components/chat/HtmlArtifactPreview.vue';
 import { isRunActive, runtimeStatusLabel } from '@/features/chat/runtimeStatus';
 import { useConversationStore } from '@/stores/conversations';
 
 type ChatMode = 'single' | 'team';
-interface ChatMessage { id: string; role: 'user' | 'agent'; author: string; avatar: string; time: string; content: string }
+interface ChatMessage { id: string; role: 'user' | 'assistant' | 'system' | 'tool'; author: string; avatar: string; time: string; content: string; runId: string | null }
 
 const route = useRoute();
 const router = useRouter();
@@ -204,7 +222,13 @@ const selectedKnowledgeIds = ref<string[]>(['dispatch', 'regulation']);
 const selectedResourceIds = ref<string[]>(['beijiang-topology', 'qingyuan-dem']);
 const historySearch = ref('');
 const input = ref('');
+const artifactsByRun = ref<Map<string, ArtifactInfo[]>>(new Map());
+const selectedHtmlArtifact = ref<ArtifactInfo | null>(null);
+const isMediumViewport = ref(false);
 const messageList = useTemplateRef<HTMLElement>('message-list');
+let artifactListController: AbortController | undefined;
+let artifactListVersion = 0;
+let mediumViewportQuery: MediaQueryList | undefined;
 
 const agentOptions = computed(() => availableAgents.value.map((agent) => ({ value: agent.id, label: agent.name })));
 const teamOptions = [
@@ -235,18 +259,76 @@ const teamMembers = [
 const suggestedPrompts = ['对比三套预泄方案', '生成沿程水位过程线', '研判未来 24 小时洪峰'];
 const messages = computed<ChatMessage[]>(() => conversationStore.messages.map((message) => ({
   id: message.id,
-  role: message.role === 'user' ? 'user' : 'agent',
-  author: message.role === 'user' ? '当前用户' : activeActorName.value,
-  avatar: message.role === 'user' ? '用' : mode.value === 'team' ? '协' : '智',
+  role: message.role,
+  author: message.role === 'user' ? '当前用户' : message.role === 'assistant' ? activeActorName.value : message.role === 'system' ? '系统' : '工具',
+  avatar: message.role === 'user' ? '用' : message.role === 'assistant' ? mode.value === 'team' ? '协' : '智' : message.role === 'system' ? '系' : '工',
   time: formatTime(message.created_at),
   content: message.content,
+  runId: message.run_id ?? null,
 })));
+const isMediumPreviewLayout = computed(() => Boolean(selectedHtmlArtifact.value) && isMediumViewport.value);
+const assistantRunSignature = computed(() => [...new Set(conversationStore.messages
+  .flatMap((message) => message.role === 'assistant' && message.run_id ? [message.run_id] : []))]
+  .sort()
+  .join('\u0000'));
 
 watch(messages, async () => { await nextTick(); messageList.value?.scrollTo({ top: messageList.value.scrollHeight, behavior: 'smooth' }); }, { deep: true });
+watch(assistantRunSignature, loadArtifactsForRuns, { immediate: true });
+watch(() => conversationStore.activeConversationId, () => { selectedHtmlArtifact.value = null; });
 onMounted(() => {
   void conversationStore.loadConversations();
   void loadAgents();
+  if (typeof window.matchMedia === 'function') {
+    mediumViewportQuery = window.matchMedia('(min-width: 901px) and (max-width: 1250px)');
+    isMediumViewport.value = mediumViewportQuery.matches;
+    mediumViewportQuery.addEventListener('change', updateMediumViewport);
+  }
 });
+onBeforeUnmount(() => {
+  artifactListVersion += 1;
+  artifactListController?.abort();
+  mediumViewportQuery?.removeEventListener('change', updateMediumViewport);
+});
+
+function updateMediumViewport(event: MediaQueryListEvent) {
+  isMediumViewport.value = event.matches;
+}
+
+function isHtmlArtifact(artifact: ArtifactInfo): boolean {
+  const contentType = artifact.content_type.trim().toLowerCase().split(';', 1)[0].trim();
+  return contentType === 'text/html'
+    || contentType === 'application/xhtml+xml'
+    || /\.html?$/i.test(artifact.filename.trim());
+}
+
+async function loadArtifactsForRuns(runSignature: string) {
+  const version = ++artifactListVersion;
+  artifactListController?.abort();
+  artifactsByRun.value = new Map();
+  if (!runSignature) return;
+
+  const controller = new AbortController();
+  artifactListController = controller;
+  try {
+    const artifacts = await artifactsApi.list(controller.signal);
+    if (version !== artifactListVersion || controller.signal.aborted) return;
+    const grouped = new Map<string, ArtifactInfo[]>();
+    for (const artifact of artifacts) {
+      if (artifact.run_id === null || artifact.run_id === undefined || !isHtmlArtifact(artifact)) continue;
+      const runArtifacts = grouped.get(artifact.run_id) ?? [];
+      runArtifacts.push(artifact);
+      grouped.set(artifact.run_id, runArtifacts);
+    }
+    artifactsByRun.value = grouped;
+  } catch (value) {
+    if (version !== artifactListVersion || controller.signal.aborted) return;
+    if (!(value instanceof Error && value.name === 'AbortError')) artifactsByRun.value = new Map();
+  }
+}
+
+function artifactsForRun(runId: string | null): ArtifactInfo[] {
+  return runId ? artifactsByRun.value.get(runId) ?? [] : [];
+}
 
 async function loadAgents() {
   try {
@@ -268,8 +350,8 @@ function formatTime(value: string) {
   return new Date(value).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
 function setMode(value: ChatMode) { mode.value = value; }
-async function selectSession(id: string) { await conversationStore.selectConversation(id); mobilePanel.value = 'chat'; }
-function newConversation() { conversationStore.startNewConversation(); input.value = ''; mobilePanel.value = 'chat'; }
+async function selectSession(id: string) { selectedHtmlArtifact.value = null; await conversationStore.selectConversation(id); mobilePanel.value = 'chat'; }
+function newConversation() { selectedHtmlArtifact.value = null; conversationStore.startNewConversation(); input.value = ''; mobilePanel.value = 'chat'; }
 async function sendMessage() {
   const content = input.value.trim();
   if (!content || conversationStore.sending) return;
@@ -287,7 +369,7 @@ async function sendMessage() {
 .conversation-brand,.topbar-actions,.chat-toolbar,.toolbar-selectors,.conversation-summary,.message-meta,.composer-tools,.composer-tools > div { display: flex; align-items: center; }
 .conversation-brand { gap: 10px; }.conversation-brand strong,.conversation-brand small { display: block; }.conversation-brand strong { font-size: 14px; }.conversation-brand small { margin-top: 3px; color: var(--muted); font-size: 10px; }
 .brand-pulse { display: grid; width: 34px; height: 34px; place-items: center; color: #fff; background: #2563eb; border-radius: 5px; }.icon-button,.quiet-button { border: 1px solid var(--line); background: #fff; cursor: pointer; }.icon-button { width: 32px; height: 32px; border-radius: 5px; }.back-button { margin-right: 2px; }.topbar-actions { gap: 10px; }.runtime-state { color: #4e6b60; font-size: 11px; }.runtime-state i,.green-dot { display: inline-block; width: 7px; height: 7px; margin-right: 5px; background: #16a47a; border-radius: 50%; }.quiet-button { height: 32px; padding: 0 11px; color: #436176; border-radius: 5px; }
-.conversation-layout { display: grid; grid-template-columns: 250px minmax(480px, 1fr) 280px; height: calc(100vh - 166px); height: calc(100dvh - 166px); min-height: 560px; }.focus-mode .conversation-layout { height: calc(100vh - 62px); height: calc(100dvh - 62px); }.history-panel,.context-panel { min-width: 0; padding: 14px; background: #f9fcfe; }.history-panel { display: flex; flex-direction: column; border-right: 1px solid var(--line); }.context-panel { overflow-y: auto; border-left: 1px solid var(--line); }
+.conversation-layout { display: grid; grid-template-columns: 250px minmax(480px, 1fr) 280px; height: calc(100vh - 166px); height: calc(100dvh - 166px); min-height: 560px; }.conversation-layout.preview-open { grid-template-columns: 250px minmax(360px, 1fr) 280px minmax(360px, 30vw); }.focus-mode .conversation-layout { height: calc(100vh - 62px); height: calc(100dvh - 62px); }.history-panel,.context-panel { min-width: 0; padding: 14px; background: #f9fcfe; }.history-panel { display: flex; flex-direction: column; border-right: 1px solid var(--line); }.context-panel { overflow-y: auto; border-left: 1px solid var(--line); }
 .new-chat-button { width: 100%; height: 38px; color: #fff; background: #2563eb; border: 0; border-radius: 5px; cursor: pointer; font-weight: 700; }.search-box { display: flex; height: 34px; align-items: center; gap: 7px; margin: 12px 0 16px; padding: 0 9px; color: #8da0ad; background: #fff; border: 1px solid var(--line); border-radius: 5px; }.search-box input { width: 100%; min-width: 0; border: 0; outline: 0; color: var(--ink); background: transparent; font-size: 11px; }.history-heading { display: flex; justify-content: space-between; margin-bottom: 7px; color: #8294a1; font-size: 10px; font-weight: 700; }.history-list { display: grid; gap: 3px; overflow-y: auto; }.history-list button { display: grid; grid-template-columns: 25px 1fr 14px; gap: 7px; padding: 9px 7px; color: #7b8f9d; background: transparent; border: 1px solid transparent; border-radius: 5px; cursor: pointer; text-align: left; }.history-list button:hover,.history-list button.active { background: #eaf2ff; border-color: #d3e2fb; }.history-list button.active .history-icon { color: #fff; background: #2563eb; }.history-icon { display: grid; width: 25px; height: 25px; place-items: center; color: #4d79a9; background: #e6f0f8; border-radius: 4px; }.history-copy { min-width: 0; }.history-copy strong,.history-copy small,.history-copy em { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.history-copy strong { color: #29475d; font-size: 11px; }.history-copy small { margin-top: 3px; color: #778b99; font-size: 9px; }.history-copy em { margin-top: 5px; color: #9aabb6; font-size: 8px; font-style: normal; }.archive-button { display: flex; margin-top: auto; padding: 12px 4px 2px; align-items: center; justify-content: space-between; color: #667e8e; background: transparent; border: 0; border-top: 1px solid var(--line); cursor: pointer; font-size: 10px; }
 .chat-workspace { display: flex; min-width: 0; min-height: 0; overflow: hidden; flex-direction: column; background: #fff; }.chat-toolbar { min-height: 58px; flex-wrap: wrap; justify-content: space-between; gap: 8px 12px; padding: 8px 16px; border-bottom: 1px solid var(--line); }.mode-switch { display: flex; flex: none; padding: 3px; background: #eef4f8; border-radius: 5px; }.mode-switch button { height: 30px; padding: 0 10px; color: #688090; background: transparent; border: 0; border-radius: 4px; cursor: pointer; font-size: 11px; }.mode-switch button.active { color: #2059be; background: #fff; box-shadow: 0 1px 4px rgb(48 78 100 / 12%); font-weight: 700; }.toolbar-selectors { min-width: 0; align-items: end; justify-content: flex-end; gap: 8px; }.selector-field { display: grid; min-width: 0; gap: 3px; }.selector-field > span { color: #7f919f; font-size: 11px; line-height: 16px; }.actor-field { width: 165px; }.knowledge-field { width: 150px; }.resource-field { width: 180px; }.actor-select,.knowledge-select,.resource-select { width: 100%; }.conversation-summary { gap: 10px; padding: 12px 18px; background: #f5f9ff; border-bottom: 1px solid #dfebf6; }.summary-avatar { display: grid; width: 35px; height: 35px; flex: none; place-items: center; color: #fff; background: #0891b2; border-radius: 5px; }.summary-avatar.single { background: #2563eb; }.conversation-summary div:nth-child(2) { min-width: 0; }.conversation-summary strong { font-size: 12px; }.conversation-summary p { margin: 3px 0 0; overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }.conversation-summary > span { margin-left: auto; color: #0f8064; font-size: 9px; white-space: nowrap; }
 .message-stream { flex: 1 1 0; min-height: 0; padding: 12px 5%; overflow-y: auto; }.date-divider { display: flex; align-items: center; justify-content: center; margin: 3px 0 16px; color: #94a5b0; font-size: 9px; }.date-divider::before,.date-divider::after { width: 60px; height: 1px; margin: 0 8px; content: ''; background: #e7eef3; }.message-row { display: flex; gap: 9px; margin-bottom: 17px; }.message-row.user { flex-direction: row-reverse; }.message-avatar { display: grid; width: 30px; height: 30px; flex: none; place-items: center; color: #fff; background: #0891b2; border-radius: 5px; font-size: 10px; font-weight: 700; }.message-row.user .message-avatar { background: #49697d; }.message-content { max-width: min(700px, 85%); }.message-row.user .message-content { display: flex; align-items: flex-end; flex-direction: column; }.message-meta { gap: 7px; margin-bottom: 5px; }.message-meta strong { font-size: 10px; }.message-meta span { color: #98a7b1; font-size: 8px; }.message-bubble { padding: 10px 12px; color: #344f62; background: #f3f7fa; border: 1px solid #e0e9ef; border-radius: 3px 7px 7px; font-size: 11px; line-height: 1.75; }.message-row.user .message-bubble { color: #fff; background: #2563eb; border-color: #2563eb; border-radius: 7px 3px 7px 7px; }.run-card { margin-top: 8px; overflow: hidden; background: #fff; border: 1px solid #d6e3eb; border-radius: 5px; }.run-card header { display: flex; padding: 9px 11px; align-items: center; justify-content: space-between; color: #31526a; background: #f5fafc; border-bottom: 1px solid #dfebf1; font-size: 10px; font-weight: 700; }.run-card header em { color: #168265; font-size: 8px; font-style: normal; }.run-step { display: grid; grid-template-columns: 20px 1fr auto; gap: 8px; padding: 8px 11px; align-items: center; border-bottom: 1px solid #edf2f5; }.run-step > i { display: grid; width: 17px; height: 17px; place-items: center; color: #fff; background: #16a47a; border-radius: 50%; font-size: 8px; }.run-step strong,.run-step small { display: block; }.run-step strong { color: #315064; font-size: 9px; }.run-step small { margin-top: 2px; color: #8698a4; font-size: 8px; }.run-step > span { color: #92a2ac; font-size: 8px; }.run-card footer { display: flex; gap: 7px; padding: 9px 11px; }.run-card footer button { height: 27px; color: #275fbc; background: #edf4ff; border: 1px solid #d2e2fb; border-radius: 4px; cursor: pointer; font-size: 9px; }.citations { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }.citations span { padding: 4px 7px; color: #537084; background: #f7fafc; border: 1px solid #e0e8ed; border-radius: 3px; font-size: 8px; }.thinking { display: flex; height: 34px; align-items: center; gap: 4px; padding: 0 12px; background: #f3f7fa; border-radius: 6px; }.thinking i { width: 5px; height: 5px; background: #0891b2; border-radius: 50%; animation: pulse 1s infinite alternate; }.thinking i:nth-child(2) { animation-delay: .2s; }.thinking i:nth-child(3) { animation-delay: .4s; }.thinking span { margin-left: 5px; color: #6d8493; font-size: 9px; }
@@ -326,7 +408,8 @@ async function sendMessage() {
 @keyframes pulse { to { opacity: .25; transform: translateY(-2px); } }
 @media (prefers-reduced-motion: reduce) { .thinking i { animation: none; } }
 @media (max-width: 1250px) { .conversation-layout { grid-template-columns: 230px minmax(420px, 1fr) 250px; }.toolbar-selectors { width: 100%; }.selector-field { flex: 1; width: auto; } }
-@media (max-width: 900px) { .conversation-page { min-height: calc(100vh - 84px); min-height: calc(100dvh - 84px); }.conversation-topbar { height: 56px; padding: 0 12px; }.runtime-state { display: none; }.mobile-tabs { display: grid; grid-template-columns: repeat(3, 1fr); height: 38px; padding: 3px; background: #edf3f7; }.mobile-tabs button { color: #688090; background: transparent; border: 0; border-radius: 4px; }.mobile-tabs button.active { color: #2059be; background: #fff; font-weight: 700; }.conversation-layout,.focus-mode .conversation-layout { display: block; height: calc(100vh - 178px); height: calc(100dvh - 178px); min-height: 430px; }.focus-mode .conversation-layout { height: calc(100vh - 94px); height: calc(100dvh - 94px); }.history-panel,.chat-workspace,.context-panel { display: none; height: 100%; box-sizing: border-box; border: 0; }.history-panel.mobile-active,.chat-workspace.mobile-active,.context-panel.mobile-active { display: flex; }.context-panel.mobile-active { display: block; }.history-panel { max-width: none; }.toolbar-selectors { flex: 1; }.conversation-layout .chat-workspace { min-height: 0; }.message-stream { min-height: 120px; } }
+@media (min-width: 901px) and (max-width: 1250px) { .conversation-layout.preview-open.preview-medium { grid-template-columns: minmax(180px, 20vw) minmax(0, 1fr) minmax(360px, 40vw); } }
+@media (max-width: 900px) { .conversation-page { min-height: calc(100vh - 84px); min-height: calc(100dvh - 84px); }.conversation-topbar { height: 56px; padding: 0 12px; }.runtime-state { display: none; }.mobile-tabs { display: grid; grid-template-columns: repeat(3, 1fr); height: 38px; padding: 3px; background: #edf3f7; }.mobile-tabs button { color: #688090; background: transparent; border: 0; border-radius: 4px; }.mobile-tabs button.active { color: #2059be; background: #fff; font-weight: 700; }.conversation-layout,.conversation-layout.preview-open,.focus-mode .conversation-layout { display: block; height: calc(100vh - 178px); height: calc(100dvh - 178px); min-height: 430px; }.focus-mode .conversation-layout { height: calc(100vh - 94px); height: calc(100dvh - 94px); }.history-panel,.chat-workspace,.context-panel { display: none; height: 100%; box-sizing: border-box; border: 0; }.history-panel.mobile-active,.chat-workspace.mobile-active,.context-panel.mobile-active { display: flex; }.context-panel.mobile-active { display: block; }.history-panel { max-width: none; }.toolbar-selectors { flex: 1; }.conversation-layout .chat-workspace { min-height: 0; }.message-stream { min-height: 120px; } }
 @media (min-width: 761px) and (max-width: 900px) { .conversation-page { min-height: calc(100vh - 95px); min-height: calc(100dvh - 95px); }.conversation-layout { height: calc(100vh - 189px); height: calc(100dvh - 189px); } }
 @media (max-width: 580px) { .tool-activity { max-width: calc(100% - 43px); } .tool-activity-row { grid-template-columns: 8px minmax(0, 1fr) auto; } .tool-activity-row time { grid-column: 2 / -1; } .conversation-brand small,.quiet-button span { display: none; }.conversation-brand strong { font-size: 16px; }.conversation-topbar .quiet-button { width: 34px; padding: 0; font-size: 0; }.conversation-topbar .quiet-button :deep(svg) { width: 14px; height: 14px; }.chat-toolbar { align-items: stretch; flex-direction: column; gap: 7px; }.mode-switch { display: grid; grid-template-columns: 1fr 1fr; }.toolbar-selectors { display: grid; grid-template-columns: 1fr 1fr; }.selector-field { width: 100%; }.resource-field { grid-column: 1 / -1; }.conversation-summary { padding: 9px 12px; }.conversation-summary > span { display: none; }.message-stream { padding: 10px 12px; }.message-content { max-width: calc(100% - 43px); }.run-card footer { flex-direction: column; }.suggestion-row { padding-left: 10px; }.composer-shell { margin: 7px 10px 10px; }.composer-tools span { display: none; } }
 @media (max-width: 360px) { .conversation-topbar { padding-inline: 8px; }.brand-pulse { display: none; }.toolbar-selectors { grid-template-columns: 1fr; }.resource-field { grid-column: auto; }.conversation-summary p { white-space: normal; }.suggestion-row { max-width: 100%; }.run-card header { align-items: flex-start; flex-direction: column; gap: 4px; }.run-step { grid-template-columns: 18px minmax(0, 1fr); }.run-step > span { display: none; } }

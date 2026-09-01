@@ -51,9 +51,17 @@ def test_requires_database_url(monkeypatch):
 def test_reads_database_and_dev_identity_settings(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@db/app")
     monkeypatch.setenv("IAP_ALLOW_DEV_IDENTITY", "true")
+    monkeypatch.setenv(
+        "IAP_DEV_IDENTITY_TRUSTED_CIDRS",
+        "172.28.0.0/16, 10.20.0.0/24",
+    )
     settings = Settings.from_env()
     assert settings.database_url.endswith("@db/app")
     assert settings.allow_dev_identity is True
+    assert settings.dev_identity_trusted_cidrs == (
+        "172.28.0.0/16",
+        "10.20.0.0/24",
+    )
 
 
 def test_production_rejects_development_identity(monkeypatch):

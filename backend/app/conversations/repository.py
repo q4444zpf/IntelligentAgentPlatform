@@ -260,6 +260,7 @@ class ConversationRepository:
         return self.add(
             Message(
                 conversation_id=run.conversation_id,
+                run_id=run.id,
                 sequence=self.next_message_sequence(run.conversation_id),
                 role="assistant",
                 content=content,

@@ -19,26 +19,29 @@
     </div>
     </a-spin>
 
-    <a-card class="section-card">
+    <a-card class="section-card service-status-card">
       <template #title>基础服务状态</template>
       <template #extra>
-        <a-button size="small" :loading="servicesLoading" @click="refreshServices">
-          <template #icon><ReloadOutlined /></template>
-          刷新服务状态
-        </a-button>
+        <a-space size="small">
+          <a-typography-text v-if="services" type="secondary">{{ checkedAt }}</a-typography-text>
+          <a-button size="small" :loading="servicesLoading" @click="refreshServices">
+            <template #icon><ReloadOutlined /></template>
+            刷新服务状态
+          </a-button>
+        </a-space>
       </template>
       <a-alert v-if="serviceError" type="warning" show-icon :message="serviceError" />
-      <a-list :data-source="services?.services ?? []" size="small" :loading="servicesLoading && !services">
-        <template #renderItem="{ item }">
-          <a-list-item>
-            <a-list-item-meta :title="item.name" :description="item.detail" />
-            <a-tag :color="serviceState(item.status).color">{{ serviceState(item.status).label }}</a-tag>
-          </a-list-item>
-        </template>
-        <template #footer>
-          <a-typography-text type="secondary">最后检查：{{ checkedAt }}</a-typography-text>
-        </template>
-      </a-list>
+      <a-spin :spinning="servicesLoading && !services">
+        <div class="service-status-grid">
+          <div v-for="service in services?.services ?? []" :key="service.name" class="service-status-item">
+            <div>
+              <div class="service-name">{{ service.name }}</div>
+              <a-typography-text type="secondary">{{ service.detail }}</a-typography-text>
+            </div>
+            <a-tag :color="serviceState(service.status).color">{{ serviceState(service.status).label }}</a-tag>
+          </div>
+        </div>
+      </a-spin>
     </a-card>
 
     <a-row :gutter="16">
@@ -199,3 +202,31 @@ onUnmounted(() => {
   if (servicesTimer !== undefined) window.clearInterval(servicesTimer);
 });
 </script>
+
+<style scoped>
+.service-status-card {
+  margin-top: 16px;
+}
+
+.service-status-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+}
+
+.service-status-item {
+  min-height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 12px;
+  border: 1px solid #f0f0f0;
+  border-radius: 6px;
+}
+
+.service-name {
+  margin-bottom: 2px;
+  font-weight: 600;
+}
+</style>

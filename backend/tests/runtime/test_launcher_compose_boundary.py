@@ -25,3 +25,13 @@ def test_compose_declares_dedicated_internal_runner_gateway_network():
     assert "runner-gateway" in compose["services"]["api"]["networks"]
     assert compose["services"]["workflow-runner"]["networks"] == ["runner-gateway"]
     assert compose["services"]["sandbox-launcher"]["networks"] == ["runner-gateway"]
+
+
+def test_api_receives_workflow_runner_health_url_for_platform_status():
+    compose = yaml.safe_load(
+        Path(__file__).parents[3].joinpath("compose.yaml").read_text(encoding="utf-8")
+    )
+
+    assert compose["services"]["api"]["environment"][
+        "IAP_WORKFLOW_RUNNER_HEALTH_URL"
+    ] == "${IAP_WORKFLOW_RUNNER_HEALTH_URL:-http://workflow-runner:8090/health}"

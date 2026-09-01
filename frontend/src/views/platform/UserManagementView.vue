@@ -65,12 +65,35 @@
       <a-form layout="vertical">
         <a-form-item label="用户名称"><a-input v-model:value="createForm.display_name" /></a-form-item>
         <a-form-item label="邮箱"><a-input v-model:value="createForm.email" /></a-form-item>
+        <a-form-item label="初始密码">
+          <a-input-password v-model:value="createForm.initial_password" />
+          <a-button @click="generateCreatePassword">随机生成</a-button>
+          <a-button @click="copyCreatePassword">复制</a-button>
+        </a-form-item>
+        <a-form-item label="单位角色" required>
+          <a-select
+            v-model:value="createForm.role_ids"
+            mode="multiple"
+            :loading="accountRolesLoading"
+            :options="unitRoleOptions"
+            placeholder="请选择至少一个单位角色"
+          />
+        </a-form-item>
       </a-form>
     </a-modal>
     <a-modal v-model:open="editOpen" title="编辑用户" :confirm-loading="editing" @ok="submitEdit">
       <a-form layout="vertical">
         <a-form-item label="用户名称"><a-input v-model:value="editForm.display_name" /></a-form-item>
         <a-form-item label="邮箱"><a-input v-model:value="editForm.email" /></a-form-item>
+        <a-form-item label="单位角色" required>
+          <a-select
+            v-model:value="editForm.role_ids"
+            mode="multiple"
+            :loading="accountRolesLoading"
+            :options="unitRoleOptions"
+            placeholder="请选择至少一个单位角色"
+          />
+        </a-form-item>
       </a-form>
     </a-modal>
     <a-modal v-model:open="resetOpen" title="重置密码" :confirm-loading="resetting" @ok="submitReset">
@@ -95,6 +118,7 @@
 </template>
 
 <script setup lang="ts">
+import { message } from 'ant-design-vue';
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 
 import { ApiError } from '@/api/client';
@@ -113,20 +137,23 @@ import {
   type IdentityRole,
   type IdentityUser,
 } from '@/api/identity';
+import { copyText } from '@/utils/clipboard';
 
 const users = ref<IdentityUser[]>([]);
 const loading = ref(false);
 const errorMessage = ref('');
 let controller: AbortController | null = null;
 let roleController: AbortController | null = null;
+let accountRoleController: AbortController | null = null;
 const createOpen = ref(false);
 const creating = ref(false);
 const savingId = ref<string | null>(null);
-const createForm = ref({ display_name: '', email: '' });
+const accountRolesLoading = ref(false);
+const createForm = ref({ display_name: '', email: '', initial_password: '', role_ids: [] as string[] });
 const editOpen = ref(false);
 const editing = ref(false);
 const editUserId = ref('');
-const editForm = ref({ display_name: '', email: '' });
+const editForm = ref({ display_name: '', email: '', role_ids: [] as string[] });
 const resetOpen = ref(false);
 const resetting = ref(false);
 const resetUserId = ref('');
@@ -147,6 +174,9 @@ const scopeOptions = [
 
 const roleOptions = computed(() => availableRoles.value
   .filter((role) => role.status === 'active' && role.scope_type === roleScope.value)
+  .map((role) => ({ label: `${role.name} (${role.code})`, value: role.id })));
+const unitRoleOptions = computed(() => availableRoles.value
+  .filter((role) => role.status === 'active' && role.scope_type === 'unit')
   .map((role) => ({ label: `${role.name} (${role.code})`, value: role.id })));
 const projectOptions = computed(() => projects.value
   .filter((project) => project.status === 'active')
@@ -174,8 +204,55 @@ function statusColor(status: string): string {
   return status === 'active' ? 'green' : 'default';
 }
 
-function openCreate(): void { createForm.value = { display_name: '', email: '' }; createOpen.value = true; }
-function openEdit(user: IdentityUser): void { editUserId.value = user.id; editForm.value = { display_name: user.display_name, email: user.email || '' }; editOpen.value = true; }
+async function loadCreateUnitRoles(): Promise<void> {
+  accountRoleController?.abort();
+  accountRoleController = new AbortController();
+  accountRolesLoading.value = true;
+  try {
+    availableRoles.value = await listIdentityRoles(accountRoleController.signal);
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') return;
+    errorMessage.value = error instanceof ApiError ? error.message : '单位角色加载失败';
+  } finally {
+    accountRolesLoading.value = false;
+  }
+}
+
+function openCreate(): void {
+  createForm.value = { display_name: '', email: '', initial_password: randomPassword(), role_ids: [] };
+  createOpen.value = true;
+  void loadCreateUnitRoles();
+}
+
+async function openEdit(user: IdentityUser): Promise<void> {
+  editUserId.value = user.id;
+  editForm.value = { display_name: user.display_name, email: user.email || '', role_ids: [] };
+  editOpen.value = true;
+  accountRoleController?.abort();
+  const currentController = new AbortController();
+  accountRoleController = currentController;
+  accountRolesLoading.value = true;
+  try {
+    const [roles, current] = await Promise.all([
+      listIdentityRoles(currentController.signal),
+      listIdentityUserRoles(user.id, null, currentController.signal),
+    ]);
+    if (accountRoleController !== currentController) return;
+    availableRoles.value = roles;
+    const activeUnitRoleIds = new Set(roles
+      .filter((role) => role.status === 'active' && role.scope_type === 'unit')
+      .map((role) => role.id));
+    editForm.value.role_ids = current
+      .filter((role) => role.scope_type === 'unit' && activeUnitRoleIds.has(role.role_id))
+      .map((role) => role.role_id);
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') return;
+    if (accountRoleController !== currentController) return;
+    errorMessage.value = error instanceof ApiError ? error.message : '单位角色加载失败';
+  } finally {
+    if (accountRoleController === currentController) accountRolesLoading.value = false;
+  }
+}
 function isOidcUser(user: IdentityUser): boolean { return user.auth_method === 'oidc' || user.external_identity === true; }
 function randomPassword(): string {
   const sets = ['ABCDEFGHJKLMNPQRSTUVWXYZ', 'abcdefghijkmnopqrstuvwxyz', '23456789', '!@#$%^&*'];
@@ -186,8 +263,19 @@ function randomPassword(): string {
   return chars.sort(() => Math.random() - 0.5).join('');
 }
 function openReset(user: IdentityUser): void { resetUserId.value = user.id; resetForm.value = { new_password: randomPassword() }; resetOpen.value = true; }
+function generateCreatePassword(): void { createForm.value.initial_password = randomPassword(); }
 function generateResetPassword(): void { resetForm.value.new_password = randomPassword(); }
-async function copyResetPassword(): Promise<void> { if (resetForm.value.new_password) await navigator.clipboard.writeText(resetForm.value.new_password); }
+async function copyPassword(password: string): Promise<void> {
+  if (!password) return;
+  try {
+    await copyText(password);
+    message.success('密码已复制');
+  } catch {
+    message.error('复制失败，请手动选择密码复制');
+  }
+}
+async function copyCreatePassword(): Promise<void> { await copyPassword(createForm.value.initial_password); }
+async function copyResetPassword(): Promise<void> { await copyPassword(resetForm.value.new_password); }
 async function deleteUser(user: IdentityUser): Promise<void> { try { await deleteIdentityUser(user.id); await loadUsers(); } catch (error) { errorMessage.value = error instanceof ApiError ? error.message : '删除用户失败'; } }
 function openRoles(user: IdentityUser): void {
   roleUserId.value = user.id;
@@ -200,8 +288,21 @@ function openRoles(user: IdentityUser): void {
 
 async function submitCreate(): Promise<void> {
   if (!createForm.value.display_name.trim()) return;
+  if (!createForm.value.email.trim()) return message.error('请输入邮箱');
+  if (createForm.value.initial_password.length < 12) return message.error('初始密码至少需要 12 位');
+  if (!createForm.value.role_ids.length) return message.error('请至少选择一个单位角色');
   creating.value = true;
-  try { await createIdentityUser({ display_name: createForm.value.display_name.trim(), email: createForm.value.email || null }); createOpen.value = false; await loadUsers(); }
+  try {
+    await createIdentityUser({
+      display_name: createForm.value.display_name.trim(),
+      email: createForm.value.email.trim(),
+      initial_password: createForm.value.initial_password,
+      role_ids: createForm.value.role_ids,
+    });
+    createOpen.value = false;
+    createForm.value = { display_name: '', email: '', initial_password: '', role_ids: [] };
+    await loadUsers();
+  }
   catch (error) { errorMessage.value = error instanceof ApiError ? error.message : '创建用户失败'; }
   finally { creating.value = false; }
 }
@@ -214,8 +315,17 @@ async function toggleStatus(user: IdentityUser): Promise<void> {
 }
 async function submitEdit(): Promise<void> {
   if (!editForm.value.display_name.trim() || !editUserId.value) return;
+  if (!editForm.value.role_ids.length) return message.error('请至少选择一个单位角色');
   editing.value = true;
-  try { await updateIdentityUser(editUserId.value, { display_name: editForm.value.display_name.trim(), email: editForm.value.email || null }); editOpen.value = false; await loadUsers(); }
+  try {
+    await updateIdentityUser(editUserId.value, {
+      display_name: editForm.value.display_name.trim(),
+      email: editForm.value.email || null,
+      role_ids: editForm.value.role_ids,
+    });
+    editOpen.value = false;
+    await loadUsers();
+  }
   catch (error) { errorMessage.value = error instanceof ApiError ? error.message : '编辑用户失败'; }
   finally { editing.value = false; }
 }
@@ -300,7 +410,7 @@ async function loadUsers(): Promise<void> {
 }
 
 onMounted(loadUsers);
-onBeforeUnmount(() => { controller?.abort(); roleController?.abort(); });
+onBeforeUnmount(() => { controller?.abort(); roleController?.abort(); accountRoleController?.abort(); });
 </script>
 
 <style scoped>

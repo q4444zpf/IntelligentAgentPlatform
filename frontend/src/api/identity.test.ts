@@ -3,12 +3,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { request } from './client';
 import {
   assignIdentityUserRole,
+  createIdentityUser,
   deleteIdentityRole,
   grantIdentityRolePermission,
   listIdentityUserRoles,
   removeIdentityUserRole,
   replaceIdentityUserRoles,
   resetIdentityUserPassword,
+  updateIdentityUser,
 } from './identity';
 
 vi.mock('./client', async (importOriginal) => {
@@ -24,6 +26,46 @@ describe('identity role API', () => {
     const controller = new AbortController();
     await listIdentityUserRoles('user/1', 'project 1', controller.signal);
     expect(request).toHaveBeenCalledWith('/identity/users/user%2F1/roles?project_id=project%201', { signal: controller.signal });
+  });
+
+  it('creates a local user with an initial password', async () => {
+    vi.mocked(request).mockResolvedValue({});
+
+    await createIdentityUser({
+      display_name: 'Alice',
+      email: 'alice@example.test',
+      initial_password: 'InitialPassword123!',
+      role_ids: ['role-1'],
+    });
+
+    expect(request).toHaveBeenCalledWith('/identity/users', {
+      method: 'POST',
+      body: JSON.stringify({
+        display_name: 'Alice',
+        email: 'alice@example.test',
+        initial_password: 'InitialPassword123!',
+        role_ids: ['role-1'],
+      }),
+    });
+  });
+
+  it('updates a user profile and role bindings in one request', async () => {
+    vi.mocked(request).mockResolvedValue({});
+
+    await updateIdentityUser('user-1', {
+      display_name: 'Alice Updated',
+      email: 'alice.updated@example.test',
+      role_ids: ['role-2'],
+    });
+
+    expect(request).toHaveBeenCalledWith('/identity/users/user-1', {
+      method: 'PATCH',
+      body: JSON.stringify({
+        display_name: 'Alice Updated',
+        email: 'alice.updated@example.test',
+        role_ids: ['role-2'],
+      }),
+    });
   });
 
   it('assigns, removes, and replaces role bindings using the role contract', async () => {

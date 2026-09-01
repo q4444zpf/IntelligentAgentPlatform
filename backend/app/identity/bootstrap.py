@@ -98,11 +98,12 @@ def bootstrap_initial_unit_admin(
             status="active",
             authorization_version=1,
         )
+        session.add_all([unit, user])
+        session.flush()
+        session.add(project)
+        session.flush()
         session.add_all(
             [
-                unit,
-                project,
-                user,
                 ExternalIdentity(
                     id=new_id(),
                     user_id=user_id,
@@ -117,14 +118,17 @@ def bootstrap_initial_unit_admin(
                     unit_id=unit_id,
                     status="active",
                 ),
-                ProjectMembership(
-                    id=new_id(),
-                    user_id=user_id,
-                    unit_id=unit_id,
-                    project_id=project_id,
-                    status="active",
-                ),
             ]
+        )
+        session.flush()
+        session.add(
+            ProjectMembership(
+                id=new_id(),
+                user_id=user_id,
+                unit_id=unit_id,
+                project_id=project_id,
+                status="active",
+            )
         )
         session.flush()
 

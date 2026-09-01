@@ -117,6 +117,7 @@ class Settings:
     oidc_read_timeout_seconds: float
     oidc_clock_skew_seconds: int
     trusted_proxy_cidrs: tuple[str, ...]
+    dev_identity_trusted_cidrs: tuple[str, ...]
 
     @property
     def current_encryption_key_id(self) -> str | None:
@@ -142,6 +143,11 @@ class Settings:
             for cidr in os.getenv("TRUSTED_PROXY_CIDRS", "").split(",")
             if cidr.strip()
         )
+        dev_identity_trusted_cidrs = tuple(
+            cidr.strip()
+            for cidr in os.getenv("IAP_DEV_IDENTITY_TRUSTED_CIDRS", "").split(",")
+            if cidr.strip()
+        )
         return cls(
             database_url=os.getenv(
                 "DATABASE_URL",
@@ -164,6 +170,7 @@ class Settings:
             oidc_read_timeout_seconds=_read_positive_float("OIDC_READ_TIMEOUT_SECONDS", 10.0),
             oidc_clock_skew_seconds=_read_nonnegative_int("OIDC_CLOCK_SKEW_SECONDS", 60),
             trusted_proxy_cidrs=trusted_proxy_cidrs,
+            dev_identity_trusted_cidrs=dev_identity_trusted_cidrs,
         )
 
     def validate_startup(self) -> None:

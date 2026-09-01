@@ -70,6 +70,7 @@ class S3ObjectStorage:
         *,
         response_content_type: str | None = None,
         response_content_disposition: str | None = None,
+        response_cache_control: str | None = None,
     ) -> str:
         expires = min(max(60, int(expires_seconds)), self.max_url_expiry)
         params = {"Bucket": self.bucket, "Key": object_key}
@@ -77,6 +78,8 @@ class S3ObjectStorage:
             params["ResponseContentType"] = response_content_type
         if response_content_disposition:
             params["ResponseContentDisposition"] = response_content_disposition
+        if response_cache_control:
+            params["ResponseCacheControl"] = response_cache_control
         url = self.client.generate_presigned_url(
             "get_object",
             Params=params,

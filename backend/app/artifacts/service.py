@@ -37,6 +37,10 @@ class ArtifactContentTypeError(ValueError):
     pass
 
 
+class ArtifactNotPreviewableError(ValueError):
+    pass
+
+
 _RUNNER_CONTENT_TYPES = frozenset(
     {
         "application/json",
@@ -99,6 +103,21 @@ class ArtifactService:
         if row is None:
             raise ArtifactNotFoundError(artifact_id)
         return row
+
+    def get_html_preview(
+        self,
+        artifact_id: str,
+        context: RequestContext,
+    ) -> tuple[ArtifactRecord, str]:
+        artifact = self.get(artifact_id, context)
+        content_type = artifact.content_type.split(";", 1)[0].strip().lower()
+        if content_type == "text/html":
+            return artifact, "text/html; charset=utf-8"
+        if content_type == "application/xhtml+xml":
+            return artifact, "application/xhtml+xml; charset=utf-8"
+        if artifact.filename.strip().lower().endswith((".html", ".htm")):
+            return artifact, "text/html; charset=utf-8"
+        raise ArtifactNotPreviewableError(artifact_id)
 
     def list(self, context: RequestContext) -> list[ArtifactRecord]:
         return list(self.session.scalars(select(ArtifactRecord).where(
