@@ -66,7 +66,7 @@
 ```powershell
 $contract = Get-Content -Raw '.tmp\ppt-platform-plan\content-contract.json' | ConvertFrom-Json
 if ($contract.slides.Count -ne 3) { throw 'Expected exactly 3 slides' }
-if (($contract.slides.title | Select-String '总体架构|核心功能|应用场景').Count -ne 3) { throw 'Missing required section' }
+if (($contract.slides.section | Select-String '总体架构|核心功能|应用场景').Count -ne 3) { throw 'Missing required section' }
 ```
 
 预期：命令成功，无输出。
