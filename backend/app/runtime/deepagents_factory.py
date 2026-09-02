@@ -38,6 +38,14 @@ class AgentToolDefinition:
     input_schema: dict[str, Any]
 
 
+def create_in_memory_checkpointer():
+    try:
+        from langgraph.checkpoint.memory import InMemorySaver
+    except ImportError as error:
+        raise RuntimeError("LangGraph runtime is not installed") from error
+    return InMemorySaver()
+
+
 class DeepAgentFactory:
     def __init__(self, creator: Callable[..., Any] | None = None):
         self.creator = creator or self._default_creator
@@ -57,6 +65,7 @@ class DeepAgentFactory:
         model: Any,
         tools: list[Any] | None = None,
         backend: Any | None = None,
+        checkpointer: Any | None = None,
     ) -> Any:
         if not snapshot.agent_id:
             raise ValueError("agent_id is required")
@@ -82,6 +91,8 @@ class DeepAgentFactory:
         }
         if backend is not None:
             arguments["backend"] = backend
+        if checkpointer is not None:
+            arguments["checkpointer"] = checkpointer
         return self.creator(
             **arguments,
         )

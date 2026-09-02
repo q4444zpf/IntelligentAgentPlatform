@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import HumanMessage
+from langgraph.checkpoint.memory import InMemorySaver
 
 from app.runtime import run_worker
 from app.runtime.execution_contract import RunExecutionRequest
@@ -402,6 +403,7 @@ def test_runtime_builds_agent_restores_checkpoint_streams_events_and_completes()
     assert gateway.completions[0][0]["status"] == "completed"
     assert gateway.completions[0][0]["final_assistant_content"] == "completed"
     assert factory.calls[0][1]["backend"].list("/artifacts") == []
+    assert isinstance(factory.calls[0][1]["checkpointer"], InMemorySaver)
 
 
 def test_digest_mismatch_stops_before_checkpoint_model_or_tool_call():

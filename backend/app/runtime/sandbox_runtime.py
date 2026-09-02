@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from .artifact_backend import ArtifactBackend
 from .deepagents_factory import (
     DeepAgentFactory,
+    create_in_memory_checkpointer,
 )
 from .deepagents_factory import (
     PublishedAgentSnapshot as FactoryAgentSnapshot,
@@ -179,7 +180,10 @@ class SandboxRuntime:
                         system_prompt=actor.system_prompt, context_prompt=context_prompt,
                         tools=(),
                     ),
-                    model=model, tools=tools, backend=backend,
+                    model=model,
+                    tools=tools,
+                    backend=backend,
+                    checkpointer=create_in_memory_checkpointer(),
                 )
                 result = self.runtime_adapter_type(graph, checkpoint_store=checkpoint_store).invoke(
                     RuntimeState(run_id=request.run_id, messages=messages, status="running"),
@@ -735,6 +739,7 @@ class SandboxRuntime:
             member_agent_snapshot(actor, actor.supervisor.agent_id),
             model=supervisor_model,
             tools=supervisor_tools,
+            checkpointer=create_in_memory_checkpointer(),
             backend=ArtifactBackend(
                 self.gateway,
                 provenance={
@@ -840,6 +845,7 @@ class SandboxRuntime:
             model=supervisor_model,
             tools=[],
             backend=None,
+            checkpointer=create_in_memory_checkpointer(),
         )
         member_lines = "\n".join(
             f"- {member.agent_id}: {member.responsibility}"
@@ -908,6 +914,7 @@ class SandboxRuntime:
             member_agent_snapshot(actor, task.member_id),
             model=model,
             tools=tools,
+            checkpointer=create_in_memory_checkpointer(),
             backend=ArtifactBackend(
                 self.gateway,
                 provenance={
