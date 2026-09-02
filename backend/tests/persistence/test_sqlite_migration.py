@@ -53,6 +53,10 @@ def test_imports_all_legacy_sqlite_domains_once(tmp_path):
     assert ProviderStore(factory).load()["providers"]["deepseek"]["api_key"] == "legacy"
     assert ProviderStore(factory).load()["providers"]["existing"]["api_key"] == "postgres"
     migrated_agent = AgentStore(factory).get("flood")
+    assert migrated_agent["availability_scope"] == "common"
+    assert migrated_agent["unit_id"] is None
+    assert migrated_agent["project_id"] is None
+    assert migrated_agent["allowed_project_ids"] == ["*"]
     assert migrated_agent["pinned"] is True
     assert migrated_agent["created_at"] == datetime(2025, 1, 2, 3, 4, 5)
     assert migrated_agent["updated_at"] == datetime(2025, 2, 3, 4, 5, 6)
