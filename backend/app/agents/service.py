@@ -321,6 +321,12 @@ class AgentService:
             raise AgentNotFoundError(agent_id)
         return agent
 
+    def get_default_available(self, *, unit_id: str, project_id: str) -> AgentInfo:
+        agent = self.get_default()
+        if not agent.is_available_to(unit_id, project_id):
+            raise AgentNotFoundError(agent.id)
+        return agent
+
     def get_default(self) -> AgentInfo:
         self._ensure_default_agent()
         pointer = self.store.get_default_id()

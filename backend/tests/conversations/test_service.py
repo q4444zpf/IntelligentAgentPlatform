@@ -71,11 +71,24 @@ class StubAgentService:
     def get_default(self):
         return self.agents[BUILTIN_AGENT_ID]
 
+    def get_default_available(self, *, unit_id: str, project_id: str):
+        return self.get_available(
+            BUILTIN_AGENT_ID,
+            unit_id=unit_id,
+            project_id=project_id,
+        )
+
     def get(self, agent_id: str):
         try:
             return self.agents[agent_id]
         except KeyError as error:
             raise AgentNotFoundError(agent_id) from error
+
+    def get_available(self, agent_id: str, *, unit_id: str, project_id: str):
+        agent = self.get(agent_id)
+        if agent.unit_id != unit_id or agent.project_id != project_id:
+            raise AgentNotFoundError(agent_id)
+        return agent
 
 
 class StubProviderService:

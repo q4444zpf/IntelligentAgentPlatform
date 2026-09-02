@@ -419,6 +419,34 @@ def test_creates_and_lists_runtime_specific_agent(client):
     }
 
 
+def test_agent_list_detail_and_default_fail_closed_outside_persisted_scope(client):
+    created = client.post("/api/agents", json=agent_payload())
+    assert created.status_code == 201
+    service = client.app.state.agent_service
+    with service.store.session_factory.begin() as session:
+        scoped = session.get(ManagedAgentRecord, "reservoir-dispatch")
+        scoped.unit_id = "unit-2"
+        scoped.project_id = "p2"
+    pointer = service.store.get_default_id()
+    service.store.set_default_id(
+        "reservoir-dispatch",
+        expected_version=pointer.version,
+    )
+
+    listed = client.get("/api/agents")
+    detail = client.get("/api/agents/reservoir-dispatch")
+    default = client.get("/api/agents/default")
+    common = client.get(f"/api/agents/{BUILTIN_AGENT_ID}")
+
+    assert listed.status_code == 200
+    assert "reservoir-dispatch" not in {item["id"] for item in listed.json()}
+    assert detail.status_code == 404
+    assert default.status_code == 404
+    assert common.status_code == 200
+    assert common.json()["availability_scope"] == "common"
+    assert common.json()["allowed_project_ids"] == ["*"]
+
+
 def test_agent_knowledge_sources_are_persisted_and_must_be_available_knowledge_tools(client):
     service = client.app.state.agent_service
     with service.tool_service.store.session_factory.begin() as session:

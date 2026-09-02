@@ -66,9 +66,16 @@ class ConversationService:
 
         try:
             agent = (
-                self.agent_service.get_default()
+                self.agent_service.get_default_available(
+                    unit_id=context.unit_id,
+                    project_id=context.project_id,
+                )
                 if request.actor_id is None
-                else self.agent_service.get(request.actor_id)
+                else self.agent_service.get_available(
+                    request.actor_id,
+                    unit_id=context.unit_id,
+                    project_id=context.project_id,
+                )
             )
         except AgentNotFoundError as error:
             selected_id = request.actor_id or "default"
