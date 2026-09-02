@@ -193,14 +193,7 @@ class FakeGateway:
 
     def get_latest_checkpoint(self):
         self.checkpoint_reads += 1
-        return {
-            "checkpoint_key": "restored",
-            "snapshot_digest": self.snapshot.digest,
-            "state": {
-                "messages": [{"role": "assistant", "content": "restored"}],
-                "status": "running",
-            },
-        }
+        raise RunnerGatewayBusinessError("checkpoint_not_found")
 
     def save_checkpoint(self, checkpoint_key, state, idempotency_key):
         self.saved_checkpoints.append((checkpoint_key, state, idempotency_key))
@@ -288,7 +281,7 @@ class FakeFactory:
 
 class CompletingGraph:
     def invoke(self, state, *, config=None):
-        assert state["messages"][-1]["content"] == "restored"
+        assert state["messages"][-1]["content"] == "execute"
         return {
             **state,
             "messages": [
@@ -428,7 +421,7 @@ class ModelInvokingGateway(FakeGateway):
         }
 
 
-def test_runtime_builds_agent_restores_checkpoint_streams_events_and_completes():
+def test_runtime_builds_agent_on_fresh_run_streams_events_and_completes():
     snapshot = _snapshot()
     gateway = FakeGateway(snapshot)
     factory = FakeFactory(CompletingGraph())
@@ -448,6 +441,46 @@ def test_runtime_builds_agent_restores_checkpoint_streams_events_and_completes()
     assert gateway.completions[0][0]["final_assistant_content"] == "completed"
     assert factory.calls[0][1]["backend"].list("/artifacts") == []
     assert isinstance(factory.calls[0][1]["checkpointer"], InMemorySaver)
+
+
+@pytest.mark.parametrize(
+    "checkpoint_state",
+    [
+        {},
+        {
+            "status": "waiting_approval",
+            "approval_id": "legacy-approval",
+        },
+        {
+            "__langgraph_checkpoint__": {
+                "version": 1,
+            },
+        },
+    ],
+    ids=("minimal", "legacy-approval", "adapter-only"),
+)
+def test_agent_restart_fails_closed_for_checkpoint_without_runtime_metadata(
+    checkpoint_state,
+):
+    snapshot = _snapshot()
+    gateway = DurableApprovalGateway(snapshot)
+    gateway.latest_checkpoint = {
+        "checkpoint_key": "legacy-agent-checkpoint",
+        "snapshot_digest": snapshot.digest,
+        "state": deepcopy(checkpoint_state),
+    }
+    factory = FakeFactory(CompletingGraph())
+
+    result = SandboxRuntime(gateway, agent_factory=factory).execute(
+        _request(snapshot)
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "agent_recovery_required"
+    assert factory.calls == []
+    assert gateway.model_calls == []
+    assert gateway.tool_calls == []
+    assert gateway.events == []
 
 
 def test_digest_mismatch_stops_before_checkpoint_model_or_tool_call():
@@ -547,6 +580,72 @@ def test_agent_approval_restart_preserves_exact_graph_frontier_and_gateway_seque
         "runner.completed",
     ]
     assert [event["sequence"] for event in gateway.events] == [1, 2, 3]
+
+
+def test_agent_approval_checkpoint_save_failure_is_fail_closed_before_event():
+    from typing import TypedDict
+
+    from langgraph.graph import END, START, StateGraph
+
+    class WorkflowState(TypedDict, total=False):
+        messages: list[dict]
+        prepared: bool
+
+    class RejectingApprovalCheckpointGateway(DurableApprovalGateway):
+        def save_checkpoint(self, checkpoint_key, state, idempotency_key):
+            if "__sandbox_runtime__" in state:
+                raise RunnerGatewayBusinessError("checkpoint_too_large")
+            return super().save_checkpoint(
+                checkpoint_key,
+                state,
+                idempotency_key,
+            )
+
+    prepared_calls = []
+    factory_calls = []
+
+    class Factory:
+        def build(self, _agent, **kwargs):
+            factory_calls.append("build")
+            graph = StateGraph(WorkflowState)
+
+            def prepare(_state):
+                prepared_calls.append("prepare")
+                return {"prepared": True}
+
+            def approval(_state):
+                raise RunnerApprovalInterruption("oversized-approval")
+
+            graph.add_node("prepare", prepare)
+            graph.add_node("approval", approval)
+            graph.add_edge(START, "prepare")
+            graph.add_edge("prepare", "approval")
+            graph.add_edge("approval", END)
+            return graph.compile(checkpointer=kwargs["checkpointer"])
+
+    snapshot = _snapshot()
+    gateway = RejectingApprovalCheckpointGateway(snapshot)
+
+    failed_save = SandboxRuntime(gateway, agent_factory=Factory()).execute(
+        _request(snapshot)
+    )
+
+    assert failed_save.status == "failed"
+    assert failed_save.error_code == "checkpoint_too_large"
+    assert gateway.latest_checkpoint["checkpoint_key"] == "interrupted"
+    assert "__langgraph_checkpoint__" in gateway.latest_checkpoint["state"]
+    assert "__sandbox_runtime__" not in gateway.latest_checkpoint["state"]
+    assert [event["event_type"] for event in gateway.events] == ["runner.started"]
+
+    restarted = SandboxRuntime(gateway, agent_factory=Factory()).execute(
+        _request(snapshot)
+    )
+
+    assert restarted.status == "failed"
+    assert restarted.error_code == "agent_recovery_required"
+    assert factory_calls == ["build"]
+    assert prepared_calls == ["prepare"]
+    assert [event["event_type"] for event in gateway.events] == ["runner.started"]
 
 
 def test_raw_runtime_error_is_sanitized():

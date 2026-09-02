@@ -54,6 +54,10 @@ class _TeamRecoveryRequired(RuntimeError):
     pass
 
 
+class _AgentRecoveryRequired(RuntimeError):
+    pass
+
+
 @dataclass
 class _TeamMemberCheckpointStore:
     state: dict[str, Any] | None
@@ -75,6 +79,11 @@ class _GatewayCheckpointStore:
     snapshot_digest: str
     _loaded: bool = field(default=False, init=False)
     _state: dict[str, Any] | None = field(default=None, init=False)
+    _checkpoint_found: bool = field(default=False, init=False)
+
+    @property
+    def checkpoint_found(self) -> bool:
+        return self._checkpoint_found
 
     def load_latest(self, _run_id: str) -> dict[str, Any] | None:
         if self._loaded:
@@ -86,6 +95,7 @@ class _GatewayCheckpointStore:
                 self._loaded = True
                 return None
             raise
+        self._checkpoint_found = True
         if not isinstance(checkpoint, dict):
             self._loaded = True
             return None
@@ -104,6 +114,7 @@ class _GatewayCheckpointStore:
         )
         self._state = state
         self._loaded = True
+        self._checkpoint_found = True
         return saved
 
 
@@ -165,12 +176,7 @@ class SandboxRuntime:
                 )
             else:
                 restored_state = checkpoint_store.load_latest(request.run_id)
-                runtime_metadata = (
-                    restored_state.get(self._RUNTIME_METADATA_KEY)
-                    if isinstance(restored_state, dict)
-                    else None
-                )
-                if runtime_metadata is None:
+                if restored_state is None and not checkpoint_store.checkpoint_found:
                     model_budget = GatewayModelBudget(
                         max_iterations=limits.max_iterations,
                         max_tool_calls=limits.max_tool_calls,
@@ -178,24 +184,27 @@ class SandboxRuntime:
                     )
                     self._append_event("runner.started", {})
                 else:
+                    if not isinstance(restored_state, dict):
+                        raise _AgentRecoveryRequired
+                    runtime_metadata = restored_state.get(
+                        self._RUNTIME_METADATA_KEY
+                    )
                     if (
                         not isinstance(runtime_metadata, dict)
                         or not isinstance(
                             restored_state.get("__langgraph_checkpoint__"), dict
                         )
                     ):
-                        raise ValueError("invalid sandbox runtime checkpoint")
+                        raise _AgentRecoveryRequired
                     event_sequence = runtime_metadata.get("event_sequence")
                     if type(event_sequence) is not int or event_sequence < 0:
-                        raise ValueError("invalid sandbox runtime checkpoint")
+                        raise _AgentRecoveryRequired
                     try:
                         budget = TeamBudgetState.model_validate(
                             runtime_metadata.get("budget")
                         )
                     except ValidationError as error:
-                        raise ValueError(
-                            "invalid sandbox runtime checkpoint"
-                        ) from error
+                        raise _AgentRecoveryRequired from error
                     self._event_sequence = event_sequence
                     model_budget = GatewayModelBudget(
                         max_iterations=limits.max_iterations,
@@ -266,38 +275,47 @@ class SandboxRuntime:
             checkpoint_key = self._approval_checkpoint_key
             if checkpoint_key is None:
                 checkpoint_key = f"approval-{interruption.approval_id}"
-                self._append_event(
-                    "approval.required",
-                    {"approval_id": interruption.approval_id},
-                )
-                interrupted_state = (
-                    checkpoint_store.load_latest(request.run_id)
-                    if checkpoint_store is not None
-                    else None
-                )
-                state = {
-                    **(
-                        interrupted_state
-                        if isinstance(interrupted_state, dict)
-                        else {}
-                    ),
-                    "status": "waiting_approval",
-                    "approval_id": interruption.approval_id,
-                    self._RUNTIME_METADATA_KEY: {
-                        "event_sequence": self._event_sequence,
-                        "budget": self._budget_snapshot(model_budget).model_dump(
-                            mode="json"
-                        ),
-                    },
-                }
-                if checkpoint_store is None:
-                    self.gateway.save_checkpoint(
-                        checkpoint_key,
-                        state,
-                        f"checkpoint:{checkpoint_key}",
+                try:
+                    interrupted_state = (
+                        checkpoint_store.load_latest(request.run_id)
+                        if checkpoint_store is not None
+                        else None
                     )
-                else:
-                    checkpoint_store.save(request.run_id, checkpoint_key, state)
+                    state = {
+                        **(
+                            interrupted_state
+                            if isinstance(interrupted_state, dict)
+                            else {}
+                        ),
+                        "status": "waiting_approval",
+                        "approval_id": interruption.approval_id,
+                        self._RUNTIME_METADATA_KEY: {
+                            "event_sequence": self._event_sequence + 1,
+                            "budget": self._budget_snapshot(
+                                model_budget
+                            ).model_dump(mode="json"),
+                        },
+                    }
+                    if checkpoint_store is None:
+                        self.gateway.save_checkpoint(
+                            checkpoint_key,
+                            state,
+                            f"checkpoint:{checkpoint_key}",
+                        )
+                    else:
+                        checkpoint_store.save(
+                            request.run_id,
+                            checkpoint_key,
+                            state,
+                        )
+                    self._append_event(
+                        "approval.required",
+                        {"approval_id": interruption.approval_id},
+                    )
+                except RunnerGatewayClientError as error:
+                    return self._fail(error.code)
+                except Exception:  # noqa: BLE001
+                    return self._fail("sandbox_failed")
             self.gateway.complete(
                 {
                     "status": "interrupted",
@@ -320,6 +338,8 @@ class SandboxRuntime:
             )
         except _TeamRecoveryRequired:
             return self._fail("team_recovery_required")
+        except _AgentRecoveryRequired:
+            return self._fail("agent_recovery_required")
         except RunnerGatewayModelError as error:
             return self._fail(error.code)
         except RunnerGatewayClientError as error:
