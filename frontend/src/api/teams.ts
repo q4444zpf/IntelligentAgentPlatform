@@ -5,8 +5,6 @@ export type TeamFailureStrategy = 'fail_fast' | 'continue_then_synthesize';
 export interface TeamMemberDraft {
   agent_id: string;
   responsibility: string;
-  agent_definition_digest?: string | null;
-  agent_definition?: Record<string, unknown> | null;
   tool_ids: string[];
   skill_names: string[];
   knowledge_source_ids: string[];
@@ -67,6 +65,31 @@ export interface TeamListFilters { enabled?: boolean; published?: boolean }
 const body = (value: unknown): RequestInit => ({ body: JSON.stringify(value) });
 const teamPath = (id: string) => `/collaboration/teams/${encodeURIComponent(id)}`;
 
+function editableMember(member: TeamMemberDraft): TeamMemberDraft {
+  return {
+    agent_id: member.agent_id,
+    responsibility: member.responsibility,
+    tool_ids: [...member.tool_ids],
+    skill_names: [...member.skill_names],
+    knowledge_source_ids: [...member.knowledge_source_ids],
+  };
+}
+
+function editableDraft(draft: TeamDraft): TeamDraft {
+  return {
+    supervisor: editableMember(draft.supervisor),
+    members: draft.members.map(editableMember),
+    tool_ids: [...draft.tool_ids],
+    skill_names: [...draft.skill_names],
+    knowledge_source_ids: [...draft.knowledge_source_ids],
+    max_steps: draft.max_steps,
+    max_parallel_members: draft.max_parallel_members,
+    timeout_seconds: draft.timeout_seconds,
+    failure_strategy: draft.failure_strategy,
+    approval_policy_id: draft.approval_policy_id,
+  };
+}
+
 export const teamsApi = {
   list(filters: TeamListFilters = {}, signal?: AbortSignal) {
     const query = new URLSearchParams();
@@ -76,9 +99,9 @@ export const teamsApi = {
     return request<TeamSummary[]>(`/collaboration/teams${suffix}`, { signal });
   },
   get: (id: string, signal?: AbortSignal) => request<TeamSummary>(teamPath(id), { signal }),
-  create: (value: { id?: string; name: string; description: string }) => request<TeamSummary>('/collaboration/teams', { method: 'POST', ...body(value) }),
+  create: (value: { name: string; description: string }) => request<TeamSummary>('/collaboration/teams', { method: 'POST', ...body({ name: value.name, description: value.description }) }),
   update: (id: string, value: { name: string; description: string }) => request<TeamSummary>(teamPath(id), { method: 'PATCH', ...body(value) }),
-  saveDraft: (id: string, revision: number, draft: TeamDraft) => request<TeamSummary>(`${teamPath(id)}/draft`, { method: 'PUT', ...body({ revision, draft }) }),
+  saveDraft: (id: string, revision: number, draft: TeamDraft) => request<TeamSummary>(`${teamPath(id)}/draft`, { method: 'PUT', ...body({ revision, draft: editableDraft(draft) }) }),
   publish: (id: string) => request<TeamVersionInfo>(`${teamPath(id)}/publish`, { method: 'POST' }),
   setEnabled: (id: string, enabled: boolean) => request<TeamSummary>(`${teamPath(id)}/${enabled ? 'enable' : 'disable'}`, { method: 'POST' }),
   listVersions: (id: string, signal?: AbortSignal) => request<TeamVersionInfo[]>(`${teamPath(id)}/versions`, { signal }),

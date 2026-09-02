@@ -5,7 +5,7 @@ import TeamManageView from './TeamManageView.vue';
 
 const mocks = vi.hoisted(() => ({
   list: vi.fn(), getVersion: vi.fn(), listVersions: vi.fn(), saveDraft: vi.fn(), publish: vi.fn(),
-  create: vi.fn(), update: vi.fn(), setEnabled: vi.fn(), agents: vi.fn(), error: vi.fn(), success: vi.fn(),
+  create: vi.fn(), update: vi.fn(), setEnabled: vi.fn(), agents: vi.fn(), tools: vi.fn(), skills: vi.fn(), error: vi.fn(), success: vi.fn(),
   canManage: true,
 }));
 vi.mock('@/api/teams', () => ({ teamsApi: {
@@ -14,7 +14,9 @@ vi.mock('@/api/teams', () => ({ teamsApi: {
   update: mocks.update, setEnabled: mocks.setEnabled,
 } }));
 vi.mock('@/api/agents', () => ({ agentsApi: { list: mocks.agents } }));
-vi.mock('@/stores/permission', () => ({ usePermissionStore: () => ({ get isAdmin() { return mocks.canManage; } }) }));
+vi.mock('@/api/tools', () => ({ toolsApi: { list: mocks.tools } }));
+vi.mock('@/api/skills', () => ({ skillsApi: { list: mocks.skills } }));
+vi.mock('@/stores/permission', () => ({ usePermissionStore: () => ({ hasPermission: (permission: string) => mocks.canManage && permission.startsWith('collaboration.manage:') }) }));
 vi.mock('ant-design-vue', () => ({ message: { error: mocks.error, success: mocks.success } }));
 
 const team = { id: 'team-1', unit_id: 'u1', project_id: 'p1', name: '北江联合研判', description: '防洪会商', enabled: false, draft_revision: 2, published_version: 1, member_count: 1, supervisor: { agent_id: 'forecast', role: 'supervisor', responsibility: '统筹', agent_definition_digest: 'a'.repeat(64) }, updated_at: '2026-09-01T00:00:00Z' };
@@ -38,6 +40,8 @@ beforeEach(() => {
     { id: 'review', name: '成果复核智能体', enabled: true, startup_status: 'ready' },
   ]); mocks.getVersion.mockResolvedValue(draft); mocks.listVersions.mockResolvedValue([published]);
   mocks.saveDraft.mockResolvedValue(team); mocks.publish.mockResolvedValue(published); mocks.setEnabled.mockResolvedValue(team);
+  mocks.tools.mockResolvedValue([{ tool_id: 'forecast.read', name: '预报查询', published: true, enabled: true, source_available: true, source: 'builtin' }]);
+  mocks.skills.mockResolvedValue([{ name: 'forecast', description: '预报技能', enabled: true }]);
 });
 
 describe('TeamManageView', () => {
@@ -69,5 +73,28 @@ describe('TeamManageView', () => {
     await wrapper.get('[data-testid="team-history"]').trigger('click'); await flushPromises();
     expect(wrapper.text()).toContain('版本 1');
     expect(wrapper.find('[data-testid="team-publish"]').exists()).toBe(false);
+  });
+
+  it('allows a project collaboration manager to edit Team and member capability controls', async () => {
+    const wrapper = render(); await flushPromises();
+    expect(wrapper.find('[data-testid="team-create"]').exists()).toBe(true);
+    await wrapper.get('[data-testid="team-edit"]').trigger('click'); await flushPromises();
+    expect(wrapper.text()).toContain('团队工具白名单');
+    expect(wrapper.text()).toContain('成员工具白名单');
+    expect(wrapper.text()).toContain('团队 Skill 白名单');
+    expect(wrapper.text()).toContain('成员知识库白名单');
+    expect(wrapper.text()).toContain('人工确认策略');
+  });
+
+  it('reports field-level capability validation before sending an invalid draft', async () => {
+    mocks.getVersion.mockResolvedValue({ ...draft, definition: {
+      ...draft.definition,
+      tool_ids: ['unbound.tool'],
+      supervisor: { ...draft.definition.supervisor, tool_ids: ['unbound.tool'] },
+    } });
+    const wrapper = render(); await flushPromises(); await wrapper.get('[data-testid="team-edit"]').trigger('click'); await flushPromises();
+    await wrapper.get('[data-testid="team-publish"]').trigger('click');
+    expect(wrapper.text()).toContain('团队工具白名单包含不可用或未绑定工具');
+    expect(mocks.saveDraft).not.toHaveBeenCalled();
   });
 });

@@ -30,7 +30,8 @@ class TeamDraft(BaseModel):
 
 
 class TeamCreateRequest(BaseModel):
-    id: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(min_length=1, max_length=120)
     description: str = Field(default="", max_length=500)
 

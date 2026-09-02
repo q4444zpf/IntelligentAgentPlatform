@@ -159,9 +159,20 @@ class TeamService:
             updated_at=team.updated_at,
         )
 
-    def list(self, context: RequestContext) -> list[TeamSummary]:
+    def list(
+        self,
+        context: RequestContext,
+        *,
+        enabled: bool | None = None,
+        published: bool | None = None,
+    ) -> list[TeamSummary]:
         self._require(context, "collaboration.read")
-        return [self._summary(team) for team in self.repository.list_scoped(context.unit_id, context.project_id)]
+        teams = self.repository.list_scoped(context.unit_id, context.project_id)
+        if enabled is not None:
+            teams = [team for team in teams if team.enabled is enabled]
+        if published is not None:
+            teams = [team for team in teams if (team.published_version_id is not None) is published]
+        return [self._summary(team) for team in teams]
 
     def get(self, context: RequestContext, team_id: str) -> TeamSummary:
         self._require(context, "collaboration.read")

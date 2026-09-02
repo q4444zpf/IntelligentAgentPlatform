@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.core.database import get_session
 from app.core.request_context import RequestContext, require_request_context
@@ -33,9 +33,14 @@ def _error(error: Exception) -> HTTPException:
 
 
 @router.get("/teams")
-def list_teams(context: RequestContext = Depends(_context), service: TeamService = Depends(_service)):
+def list_teams(
+    enabled: bool | None = Query(default=None),
+    published: bool | None = Query(default=None),
+    context: RequestContext = Depends(_context),
+    service: TeamService = Depends(_service),
+):
     try:
-        return service.list(context)
+        return service.list(context, enabled=enabled, published=published)
     except Exception as error:
         raise _error(error) from error
 

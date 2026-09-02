@@ -326,6 +326,8 @@ describe('AgentConsoleView Team runs', () => {
     await wrapper.get('[data-testid="send-message"]').trigger('click'); await flushPromises();
     expect(store.sendMessage).toHaveBeenCalledWith('联合研判', 'team', 'team-1');
     expect(wrapper.text()).toContain('统筹研判'); expect(wrapper.text()).toContain('复核成果');
+    expect(wrapper.text()).toContain('防洪会商');
+    expect(wrapper.text()).not.toContain('统筹预报分析、GIS 空间研判和调度方案生成');
     wrapper.unmount();
   });
 

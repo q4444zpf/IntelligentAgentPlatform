@@ -82,7 +82,7 @@
           <div class="summary-avatar" :class="mode"><TeamOutlined v-if="mode === 'team'" /><RadarChartOutlined v-else /></div>
           <div>
             <strong>{{ activeActorName }}</strong>
-            <p>{{ mode === 'team' ? '统筹预报分析、GIS 空间研判和调度方案生成' : '面向水情检索、趋势分析与调度建议的专业智能体' }}</p>
+            <p>{{ mode === 'team' ? activeTeam?.description || '团队协同执行' : '面向水情检索、趋势分析与调度建议的专业智能体' }}</p>
           </div>
           <span>{{ runtimeStatusLabel(conversationStore.activeRun?.status) }}</span>
         </div>

@@ -36,4 +36,40 @@ describe('teamsApi', () => {
     expect(request).toHaveBeenNthCalledWith(2, '/collaboration/teams/team%2F1/publish', { method: 'POST' });
     expect(request).toHaveBeenNthCalledWith(3, '/collaboration/teams/team%2F1/disable', { method: 'POST' });
   });
+
+  it('submits only user-editable Team fields without client identifiers or Agent snapshots', async () => {
+    vi.mocked(request).mockResolvedValue({});
+    const draft = {
+      supervisor: {
+        agent_id: 'forecast', responsibility: '统筹研判', tool_ids: ['forecast.read'], skill_names: ['forecast'], knowledge_source_ids: ['knowledge.rainfall'],
+        agent_definition_digest: 'forged-digest', agent_definition: { system_prompt: 'forged' },
+      },
+      members: [{
+        agent_id: 'review', responsibility: '复核结论', tool_ids: ['review.read'], skill_names: [], knowledge_source_ids: [],
+        agent_definition_digest: 'forged-digest', agent_definition: { system_prompt: 'forged' },
+      }],
+      tool_ids: ['forecast.read', 'review.read'], skill_names: ['forecast'], knowledge_source_ids: ['knowledge.rainfall'],
+      max_steps: 8, max_parallel_members: 1, timeout_seconds: 600, failure_strategy: 'fail_fast' as const,
+      approval_policy_id: 'control-commands',
+    };
+
+    await teamsApi.create({ name: '联合研判', description: '防洪会商' });
+    await teamsApi.saveDraft('team/1', 3, draft);
+
+    expect(request).toHaveBeenNthCalledWith(1, '/collaboration/teams', {
+      method: 'POST', body: JSON.stringify({ name: '联合研判', description: '防洪会商' }),
+    });
+    expect(request).toHaveBeenNthCalledWith(2, '/collaboration/teams/team%2F1/draft', {
+      method: 'PUT',
+      body: JSON.stringify({
+        revision: 3,
+        draft: {
+          supervisor: { agent_id: 'forecast', responsibility: '统筹研判', tool_ids: ['forecast.read'], skill_names: ['forecast'], knowledge_source_ids: ['knowledge.rainfall'] },
+          members: [{ agent_id: 'review', responsibility: '复核结论', tool_ids: ['review.read'], skill_names: [], knowledge_source_ids: [] }],
+          tool_ids: ['forecast.read', 'review.read'], skill_names: ['forecast'], knowledge_source_ids: ['knowledge.rainfall'],
+          max_steps: 8, max_parallel_members: 1, timeout_seconds: 600, failure_strategy: 'fail_fast', approval_policy_id: 'control-commands',
+        },
+      }),
+    });
+  });
 });
