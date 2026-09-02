@@ -15,7 +15,7 @@ vi.mock('@/api/skills', () => ({ skillsApi: { list: mocks.skillsList } }));
 vi.mock('@/api/tools', () => ({ toolsApi: { list: mocks.toolsList } }));
 vi.mock('ant-design-vue', () => ({ message: { error: mocks.showError, success: mocks.showSuccess } }));
 
-const agent = { id: 'default-agent', name: '默认智能体', description: '', runtime_form: 'common', language: 'zh-CN', provider_id: '', model: '', system_prompt: '', context_prompt: '', approval_policy: 'never', skill_names: [], tool_ids: ['disabled.tool'], enabled: true, is_builtin: true, is_default: true, pinned: false, startup_status: 'ready', workspace_dir: 'agents/default', created_at: '2026-08-02T00:00:00Z', updated_at: '2026-08-02T00:00:00Z' };
+const agent = { id: 'default-agent', name: '默认智能体', description: '', runtime_form: 'common', language: 'zh-CN', provider_id: '', model: '', system_prompt: '', context_prompt: '', approval_policy: 'never', skill_names: [], tool_ids: ['disabled.tool'], knowledge_source_ids: [], enabled: true, availability_scope: 'common', unit_id: null, project_id: null, allowed_project_ids: ['*'], is_builtin: true, is_default: true, pinned: false, startup_status: 'ready', workspace_dir: 'agents/default', created_at: '2026-08-02T00:00:00Z', updated_at: '2026-08-02T00:00:00Z' };
 const disabledTool = { tool_id: 'disabled.tool', version: '1.0.0', name: '停用工具', description: '', source: 'builtin', risk_level: 'low', input_schema: {}, output_schema: {}, source_resource_id: null, source_capability_id: null, source_available: true, requires_approval: false, published: true, enabled: false, is_builtin: true, created_at: '', updated_at: '' };
 const stubs = {
   'a-alert': { props: ['description', 'message'], template: '<div class="alert"><slot />{{ message }}{{ description }}<slot name="action" /></div>' },
@@ -121,11 +121,42 @@ describe('AgentManageView tool interactions', () => {
     await flushPromises();
     expect(mocks.update).toHaveBeenCalledWith('default-agent', expect.objectContaining({ tool_ids: [] }));
   });
+
+  it('preserves knowledge bindings without submitting read-only availability scope', async () => {
+    const scopedAgent = {
+      ...structuredClone(agent),
+      tool_ids: [],
+      knowledge_source_ids: ['knowledge.reservoir.manual'],
+      availability_scope: 'project',
+      unit_id: 'unit-1',
+      project_id: 'project-1',
+      allowed_project_ids: [],
+      is_default: false,
+      is_builtin: false,
+    };
+    mocks.agentsList.mockResolvedValue([scopedAgent]);
+    mocks.update.mockResolvedValue(scopedAgent);
+    const wrapper = render();
+    await flushPromises();
+
+    await wrapper.get('[aria-label="编辑智能体"]').trigger('click');
+    await wrapper.get('.modal-ok').trigger('click');
+    await flushPromises();
+
+    const payload = mocks.update.mock.calls[0][1];
+    expect(payload.knowledge_source_ids).toEqual([
+      'knowledge.reservoir.manual',
+    ]);
+    expect(payload).not.toHaveProperty('availability_scope');
+    expect(payload).not.toHaveProperty('unit_id');
+    expect(payload).not.toHaveProperty('project_id');
+    expect(payload).not.toHaveProperty('allowed_project_ids');
+  });
 });
 
 describe('AgentManageView contracts', () => {
   it('keeps default protection and tool contracts explicit', () => {
-    expect(apiSource).toContain('tool_ids: string[]'); expect(source).toContain('agentsApi.setDefault');
+    expect(apiSource).toContain('tool_ids: string[]'); expect(apiSource).toContain('knowledge_source_ids: string[]'); expect(source).toContain('agentsApi.setDefault');
     expect(source).toContain('agent.is_builtin || agent.is_default'); expect(source).toContain('toolsApi.list');
     expect(source).toContain('平台默认'); expect(source).toContain('系统内置'); expect(source).toContain('agentsApi.setDefault');
   });
