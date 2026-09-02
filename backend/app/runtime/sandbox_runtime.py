@@ -83,14 +83,6 @@ class SandboxRuntime:
                 self.gateway, request.snapshot_digest
             )
             limits = snapshot.payload.limits
-            model = GatewayChatModel(
-                self.gateway,
-                max_iterations=limits.max_iterations,
-                max_tool_calls=limits.max_tool_calls,
-                max_subagents=limits.max_subagents,
-                max_output_bytes=limits.max_output_bytes,
-            )
-            tools = build_gateway_tools(snapshot.payload, self.gateway)
             backend = ArtifactBackend(self.gateway)
             actor = snapshot.payload.actor
             skill_context = ", ".join(skill.name for skill in snapshot.payload.skills)
@@ -113,6 +105,19 @@ class SandboxRuntime:
             if isinstance(actor, PublishedTeamSnapshot):
                 if len(actor.members) > limits.max_subagents:
                     raise TeamLimitError("team_limit_exceeded: max_subagents")
+                legacy_model = None
+                legacy_tools = None
+                if snapshot.payload.schema_version != "5":
+                    legacy_model = GatewayChatModel(
+                        self.gateway,
+                        max_iterations=limits.max_iterations,
+                        max_tool_calls=limits.max_tool_calls,
+                        max_subagents=limits.max_subagents,
+                        max_output_bytes=limits.max_output_bytes,
+                    )
+                    legacy_tools = build_gateway_tools(
+                        snapshot.payload, self.gateway
+                    )
                 plan = TeamPlan(tasks=tuple(
                     TeamTask(
                         id=f"member-{position + 1}", member_id=member.agent_id,
@@ -134,9 +139,37 @@ class SandboxRuntime:
                         "task_id": task.id, "position": task.position,
                     })
                     try:
+                        member = next(
+                            item
+                            for item in actor.members
+                            if item.agent_id == task.member_id
+                        )
+                        if snapshot.payload.schema_version == "5":
+                            member_model = GatewayChatModel(
+                                self.gateway,
+                                max_iterations=limits.max_iterations,
+                                max_tool_calls=limits.max_tool_calls,
+                                max_subagents=limits.max_subagents,
+                                max_output_bytes=limits.max_output_bytes,
+                                provider_id=member.model.provider_id,
+                                model_id=member.model.model,
+                                member_agent_id=member.agent_id,
+                            )
+                            member_tools = build_gateway_tools(
+                                snapshot.payload,
+                                self.gateway,
+                                allowed_tool_ids=(
+                                    set(member.tool_ids)
+                                    | set(member.knowledge_source_ids)
+                                ),
+                                member_agent_id=member.agent_id,
+                            )
+                        else:
+                            member_model = legacy_model
+                            member_tools = legacy_tools
                         graph = self.agent_factory.build(
                             member_agent_snapshot(actor, task.member_id),
-                            model=model, tools=tools,
+                            model=member_model, tools=member_tools,
                             backend=ArtifactBackend(self.gateway, provenance={
                                 "team_version_id": actor.version_id,
                                 "member_agent_id": task.member_id,
@@ -171,9 +204,32 @@ class SandboxRuntime:
                     "role": "user",
                     "content": "Synthesize these bounded member results:\n" + "\n".join(member_results),
                 }]
+                if snapshot.payload.schema_version == "5":
+                    supervisor_model = GatewayChatModel(
+                        self.gateway,
+                        max_iterations=limits.max_iterations,
+                        max_tool_calls=limits.max_tool_calls,
+                        max_subagents=limits.max_subagents,
+                        max_output_bytes=limits.max_output_bytes,
+                        provider_id=actor.supervisor.model.provider_id,
+                        model_id=actor.supervisor.model.model,
+                        member_agent_id=actor.supervisor.agent_id,
+                    )
+                    supervisor_tools = build_gateway_tools(
+                        snapshot.payload,
+                        self.gateway,
+                        allowed_tool_ids=(
+                            set(actor.supervisor.tool_ids)
+                            | set(actor.supervisor.knowledge_source_ids)
+                        ),
+                        member_agent_id=actor.supervisor.agent_id,
+                    )
+                else:
+                    supervisor_model = legacy_model
+                    supervisor_tools = legacy_tools
                 graph = self.agent_factory.build(
                     member_agent_snapshot(actor, actor.supervisor.agent_id),
-                    model=model, tools=tools,
+                    model=supervisor_model, tools=supervisor_tools,
                     backend=ArtifactBackend(self.gateway, provenance={
                         "team_version_id": actor.version_id,
                         "member_agent_id": actor.supervisor.agent_id,
@@ -188,6 +244,14 @@ class SandboxRuntime:
                     **team_fields, "partial": bool(failed_members),
                 })
             else:
+                model = GatewayChatModel(
+                    self.gateway,
+                    max_iterations=limits.max_iterations,
+                    max_tool_calls=limits.max_tool_calls,
+                    max_subagents=limits.max_subagents,
+                    max_output_bytes=limits.max_output_bytes,
+                )
+                tools = build_gateway_tools(snapshot.payload, self.gateway)
                 graph = self.agent_factory.build(
                     FactoryAgentSnapshot(
                         agent_id=actor.id, name=actor.name,

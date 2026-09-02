@@ -14,6 +14,7 @@ from app.audit.recorder import AuditRecordRequest, AuditRecorder
 from app.core.request_context import RequestContext
 from app.identity.authorization import AuthorizationService
 from app.identity.schemas import ResourceScope
+from app.model_providers.service import ProviderService
 from app.skills.service import SkillNotFoundError, SkillValidationError
 from app.tools.service import ToolNotFoundError, ToolValidationError
 
@@ -56,14 +57,37 @@ class TeamService:
         *,
         audit_recorder: AuditRecorder | None = None,
         agent_service: AgentService | None = None,
+        provider_service: ProviderService | None = None,
         max_snapshot_bytes: int | None = None,
+        max_team_steps: int | None = None,
+        max_parallel_members: int | None = None,
+        max_subagents: int | None = None,
+        max_team_members: int | None = None,
     ):
         self.session = session
         self.repository = TeamRepository(session)
         self.audit_recorder = audit_recorder or AuditRecorder()
         self.agent_service = agent_service or AgentService()
+        self.provider_service = provider_service or ProviderService()
         self.max_snapshot_bytes = max_snapshot_bytes or int(
             os.getenv("IAP_RUNNER_SNAPSHOT_MAX_BYTES", "1048576")
+        )
+        self.max_team_steps = max_team_steps or int(
+            os.getenv("IAP_RUNNER_MAX_TEAM_STEPS", "128")
+        )
+        self.max_subagents = (
+            max_subagents
+            if max_subagents is not None
+            else int(os.getenv("IAP_RUNNER_MAX_SUBAGENTS", "4"))
+        )
+        self.max_parallel_members = max_parallel_members or int(
+            os.getenv(
+                "IAP_RUNNER_MAX_PARALLEL_MEMBERS",
+                str(max(1, self.max_subagents)),
+            )
+        )
+        self.max_team_members = max_team_members or int(
+            os.getenv("IAP_RUNNER_MAX_TEAM_MEMBERS", "32")
         )
 
     @staticmethod
@@ -195,14 +219,10 @@ class TeamService:
     def publish(self, context: RequestContext, team_id: str) -> TeamVersionInfo:
         self._require(context, "collaboration.manage")
         try:
-            team = self.repository.get_scoped(
+            team, draft = self.repository.lock_publication_draft_scoped(
                 context.unit_id, context.project_id, team_id
             )
-            if team is None:
-                raise TeamNotFoundError(team_id)
-            draft = self.repository.get_version(team.id, 0)
-            if draft is None:
-                raise TeamDefinitionValidationError("Team has no draft definition")
+            revision = team.draft_revision
             trusted_definition = self._trusted_definition(
                 context, team, draft.definition
             )
@@ -212,7 +232,7 @@ class TeamService:
                 )
             published = self.repository.publish(
                 team.id,
-                expected_revision=team.draft_revision,
+                expected_revision=revision,
                 definition=trusted_definition,
                 definition_digest=_digest(trusted_definition),
                 published_by=context.user_id,
@@ -244,6 +264,8 @@ class TeamService:
         agent_skill_names: dict[str, set[str]] = {}
         agent_knowledge_ids: dict[str, set[str]] = {}
 
+        self._validate_runner_ceilings(editable)
+
         for member in members:
             agent_id = member["agent_id"]
             try:
@@ -256,16 +278,12 @@ class TeamService:
                 raise TeamDefinitionValidationError(
                     f"Agent '{agent_id}' is disabled"
                 )
-            agent_unit_id = getattr(agent, "unit_id", None)
-            agent_project_id = getattr(agent, "project_id", None)
-            if agent_unit_id not in (None, "", context.unit_id) or agent_project_id not in (
-                None,
-                "",
-                context.project_id,
-            ):
+            if not self._agent_is_available(agent, context):
                 raise TeamDefinitionValidationError(
                     f"Agent '{agent_id}' is outside the current project"
                 )
+
+            provider_id, model_id = self._resolve_model(agent_id, agent)
 
             tool_ids = list(agent.tool_ids)
             try:
@@ -276,6 +294,7 @@ class TeamService:
                 ) from error
 
             skill_names = list(agent.skill_names)
+            skills = []
             for skill_name in skill_names:
                 try:
                     skill = self.agent_service.skill_service.get(skill_name)
@@ -287,36 +306,42 @@ class TeamService:
                     raise TeamDefinitionValidationError(
                         f"Agent '{agent_id}' has unavailable Skill '{skill_name}'"
                     )
+                skills.append(self._skill_definition(skill))
 
-            knowledge_source_ids = list(
-                getattr(agent, "knowledge_source_ids", ())
-            )
+            knowledge_source_ids = list(agent.knowledge_source_ids)
+            try:
+                knowledge_sources = (
+                    self.agent_service.tool_service.resolve_knowledge_sources(
+                        knowledge_source_ids
+                    )
+                )
+            except (ToolNotFoundError, ToolValidationError, ValueError) as error:
+                raise TeamDefinitionValidationError(
+                    f"Agent '{agent_id}' has unavailable knowledge source: {error}"
+                ) from error
             definition = {
                 "id": agent.id,
                 "name": agent.name,
                 "description": agent.description,
                 "runtime_form": agent.runtime_form,
                 "language": agent.language,
-                "provider_id": agent.provider_id,
-                "model": agent.model,
+                "provider_id": provider_id,
+                "model": model_id,
                 "system_prompt": agent.system_prompt,
                 "context_prompt": agent.context_prompt,
                 "approval_policy": agent.approval_policy,
+                "enabled": True,
+                "availability_scope": agent.availability_scope,
+                "unit_id": agent.unit_id,
+                "project_id": agent.project_id,
+                "allowed_project_ids": list(agent.allowed_project_ids),
                 "skill_names": skill_names,
+                "skills": skills,
                 "tool_ids": tool_ids,
                 "knowledge_source_ids": knowledge_source_ids,
-                "tools": [
-                    {
-                        "tool_id": tool.tool_id,
-                        "version": tool.version,
-                        "name": tool.name,
-                        "description": tool.description,
-                        "input_schema": deepcopy(tool.input_schema),
-                        "published": tool.published,
-                        "enabled": tool.enabled,
-                        "source_available": tool.source_available,
-                    }
-                    for tool in tools
+                "tools": [self._tool_definition(tool) for tool in tools],
+                "knowledge_sources": [
+                    self._tool_definition(source) for source in knowledge_sources
                 ],
             }
             captured[agent_id] = definition
@@ -373,6 +398,122 @@ class TeamService:
                 raise TeamDefinitionValidationError(
                     f"Team has unavailable Skill '{skill_name}'"
                 )
+        try:
+            self.agent_service.tool_service.resolve_knowledge_sources(
+                definition["knowledge_source_ids"]
+            )
+        except (ToolNotFoundError, ToolValidationError, ValueError) as error:
+            raise TeamDefinitionValidationError(
+                f"Team has unavailable knowledge source: {error}"
+            ) from error
+
+    @staticmethod
+    def _agent_is_available(agent, context: RequestContext) -> bool:
+        scope = getattr(agent, "availability_scope", None)
+        allowed = getattr(agent, "allowed_project_ids", None)
+        if scope == "project":
+            return (
+                getattr(agent, "unit_id", None) == context.unit_id
+                and getattr(agent, "project_id", None) == context.project_id
+                and allowed == []
+            )
+        if scope == "common":
+            return (
+                getattr(agent, "unit_id", None) is None
+                and getattr(agent, "project_id", None) is None
+                and isinstance(allowed, list)
+                and bool(allowed)
+                and ("*" in allowed or context.project_id in allowed)
+                and ("*" not in allowed or allowed == ["*"])
+            )
+        return False
+
+    def _resolve_model(self, agent_id: str, agent) -> tuple[str, str]:
+        provider_id = agent.provider_id
+        model_id = agent.model
+        if not provider_id or not model_id:
+            active = self.provider_service.get_active()
+            provider_id, model_id = active.provider_id, active.model
+        try:
+            provider = self.provider_service.get(provider_id)
+        except (KeyError, ValueError) as error:
+            raise TeamDefinitionValidationError(
+                f"Agent '{agent_id}' Provider is unavailable"
+            ) from error
+        model = next((item for item in provider.models if item.id == model_id), None)
+        if not provider.configured or not provider.enabled:
+            raise TeamDefinitionValidationError(
+                f"Agent '{agent_id}' Provider is unavailable"
+            )
+        if model is None or not model.enabled:
+            raise TeamDefinitionValidationError(
+                f"Agent '{agent_id}' model is unavailable"
+            )
+        return provider_id, model_id
+
+    @staticmethod
+    def _skill_definition(skill) -> dict:
+        fields = (
+            "name",
+            "description",
+            "version",
+            "content",
+            "source",
+            "enabled",
+            "tags",
+            "metadata",
+            "file_count",
+            "updated_at",
+        )
+        if hasattr(skill, "model_dump"):
+            raw = skill.model_dump(mode="json")
+            return {field: deepcopy(raw[field]) for field in fields}
+        result = {field: deepcopy(getattr(skill, field)) for field in fields}
+        updated_at = result["updated_at"]
+        if isinstance(updated_at, datetime):
+            result["updated_at"] = updated_at.isoformat().replace("+00:00", "Z")
+        return result
+
+    @staticmethod
+    def _tool_definition(tool) -> dict:
+        return {
+            "tool_id": tool.tool_id,
+            "version": tool.version,
+            "name": tool.name,
+            "description": tool.description,
+            "source": tool.source,
+            "risk_level": tool.risk_level,
+            "input_schema": deepcopy(tool.input_schema),
+            "output_schema": deepcopy(tool.output_schema),
+            "source_resource_id": tool.source_resource_id,
+            "source_capability_id": tool.source_capability_id,
+            "source_available": tool.source_available,
+            "requires_approval": tool.requires_approval,
+            "published": tool.published,
+            "enabled": tool.enabled,
+        }
+
+    def _validate_runner_ceilings(self, definition: dict) -> None:
+        member_count = 1 + len(definition["members"])
+        subagent_count = len(definition["members"])
+        if member_count > self.max_team_members:
+            raise TeamDefinitionValidationError(
+                "Team member count exceeds configured Runner ceiling"
+            )
+        if subagent_count > self.max_subagents:
+            raise TeamDefinitionValidationError(
+                "Team member count exceeds max_subagents"
+            )
+        if definition["max_steps"] > self.max_team_steps:
+            raise TeamDefinitionValidationError(
+                "Team max_steps exceeds configured Runner ceiling"
+            )
+        if definition["max_parallel_members"] > min(
+            self.max_parallel_members, self.max_subagents, subagent_count
+        ):
+            raise TeamDefinitionValidationError(
+                "Team max_parallel_members exceeds configured Runner ceiling"
+            )
 
     @staticmethod
     def _validate_team_whitelists(

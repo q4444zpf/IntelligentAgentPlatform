@@ -5,7 +5,11 @@ from collections import defaultdict, deque
 from pydantic import BaseModel, Field
 
 from .execution_snapshot import PublishedTeamSnapshot
-from .deepagents_factory import PublishedAgentSnapshot
+from .deepagents_factory import (
+    PublishedAgentSnapshot,
+    PublishedSkillSnapshot,
+    PublishedToolSnapshot,
+)
 
 
 class TeamPlanError(ValueError):
@@ -34,12 +38,39 @@ def member_agent_snapshot(snapshot: PublishedTeamSnapshot, member_id: str) -> Pu
     member = next((item for item in candidates if item.agent_id == member_id), None)
     if member is None:
         raise TeamPlanError("team_plan_invalid: unknown member")
+    if member.agent is None and member.model is None:
+        return PublishedAgentSnapshot(
+            agent_id=member.agent_id,
+            name=member.agent_id,
+            system_prompt=(
+                f"You are the {member.role} member. "
+                f"Responsibility: {member.responsibility}"
+            ),
+            context_prompt="",
+            tools=(),
+        )
+    if member.agent is None or member.model is None:
+        raise TeamPlanError("team_plan_invalid: incomplete member snapshot")
     return PublishedAgentSnapshot(
         agent_id=member.agent_id,
-        name=member.agent_id,
-        system_prompt=f"You are the {member.role} member. Responsibility: {member.responsibility}",
-        context_prompt="",
-        tools=(),
+        name=member.agent.name,
+        system_prompt=member.agent.system_prompt,
+        context_prompt=member.agent.context_prompt,
+        tools=tuple(
+            PublishedToolSnapshot(
+                name=tool.tool_id,
+                description=tool.description,
+                input_schema=tool.input_schema,
+                published=tool.published,
+                enabled=tool.enabled,
+            )
+            for tool in member.tools
+        ),
+        skills=tuple(
+            PublishedSkillSnapshot(name=skill.name, content=skill.content)
+            for skill in member.skills
+        ),
+        knowledge_source_ids=member.knowledge_source_ids,
     )
 
 

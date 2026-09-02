@@ -35,6 +35,8 @@ from app.tools.schemas import (
 from .checkpoint_store import CheckpointStore, RunnerRequestStore
 from .execution_snapshot import (
     ExecutionSnapshotService,
+    PublishedTeamSnapshot,
+    SnapshotTeamMember,
     SnapshotIntegrityError,
     StoredExecutionSnapshot,
     verify_snapshot_digest,
@@ -304,6 +306,11 @@ class RunnerGatewayService:
         repository = self._require_conversation_repository()
         model_gateway = self._require_model_gateway()
         snapshot = self._verified_snapshot(run_id, claims)
+        team_member = self._schema_v5_team_member(
+            snapshot,
+            request.member_agent_id,
+            error_code="model_not_authorized",
+        )
         self._lock_run(repository, run_id)
         requests = RunnerRequestStore(repository.session)
         action = "model.invoke"
@@ -319,17 +326,56 @@ class RunnerGatewayService:
         if replay is not None:
             return ModelInvocationResponse.model_validate(replay)
 
-        selection = ModelSelection(
-            snapshot.payload.model.provider_id,
-            snapshot.payload.model.model,
-        )
+        if team_member is None:
+            selection = ModelSelection(
+                snapshot.payload.model.provider_id,
+                snapshot.payload.model.model,
+            )
+            tools = [
+                ToolDefinition(tool.tool_id, tool.description, tool.input_schema)
+                for tool in request.tools
+            ]
+        else:
+            if team_member.model is None or (
+                request.provider_id,
+                request.model,
+            ) != (
+                team_member.model.provider_id,
+                team_member.model.model,
+            ):
+                raise RunnerGatewayError(
+                    403, "model_not_authorized", "该成员模型未获授权"
+                )
+            captured_tools = {
+                tool.tool_id: tool
+                for tool in (*team_member.tools, *team_member.knowledge_sources)
+                if tool.published and tool.enabled and tool.source_available
+            }
+            allowed_tool_ids = set(team_member.tool_ids) | set(
+                team_member.knowledge_source_ids
+            )
+            requested_tools = []
+            for requested in request.tools:
+                captured = captured_tools.get(requested.tool_id)
+                if requested.tool_id not in allowed_tool_ids or captured is None:
+                    raise RunnerGatewayError(
+                        403, "model_not_authorized", "成员工具未获授权"
+                    )
+                requested_tools.append(
+                    ToolDefinition(
+                        captured.tool_id,
+                        captured.description,
+                        captured.input_schema,
+                    )
+                )
+            selection = ModelSelection(
+                team_member.model.provider_id,
+                team_member.model.model,
+            )
+            tools = requested_tools
         messages = [
             message.model_dump(mode="json", exclude_none=True)
             for message in request.messages
-        ]
-        tools = [
-            ToolDefinition(tool.tool_id, tool.description, tool.input_schema)
-            for tool in request.tools
         ]
         started = perf_counter()
         try:
@@ -468,6 +514,19 @@ class RunnerGatewayService:
         repository = self._require_conversation_repository()
         tool_gateway = self._require_tool_gateway()
         snapshot = self._verified_snapshot(run_id, claims)
+        team_member = self._schema_v5_team_member(
+            snapshot,
+            request.member_agent_id,
+            error_code="tool_not_authorized",
+        )
+        if team_member is not None:
+            allowed_tool_ids = set(team_member.tool_ids) | set(
+                team_member.knowledge_source_ids
+            )
+            if request.tool_id not in allowed_tool_ids:
+                raise RunnerGatewayError(
+                    403, "tool_not_authorized", "该工具当前不可用"
+                )
         snapshot_tools = {
             tool.tool_id: tool
             for tool in snapshot.payload.tools
@@ -590,6 +649,32 @@ class RunnerGatewayService:
         )
         repository.session.commit()
         return response
+
+    @staticmethod
+    def _schema_v5_team_member(
+        snapshot: StoredExecutionSnapshot,
+        member_agent_id: str | None,
+        *,
+        error_code: str,
+    ) -> SnapshotTeamMember | None:
+        actor = snapshot.payload.actor
+        if snapshot.payload.schema_version != "5" or not isinstance(
+            actor, PublishedTeamSnapshot
+        ):
+            return None
+        if not member_agent_id:
+            raise RunnerGatewayError(403, error_code, "Team 成员未获授权")
+        member = next(
+            (
+                candidate
+                for candidate in (actor.supervisor, *actor.members)
+                if candidate.agent_id == member_agent_id
+            ),
+            None,
+        )
+        if member is None or member.agent is None or member.model is None:
+            raise RunnerGatewayError(403, error_code, "Team 成员未获授权")
+        return member
 
     def create_artifact(
         self,

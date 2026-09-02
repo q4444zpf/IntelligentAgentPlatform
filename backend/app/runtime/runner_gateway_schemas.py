@@ -66,6 +66,7 @@ class ModelInvocationRequest(BaseModel):
 
     provider_id: str | None = None
     model: str | None = None
+    member_agent_id: str | None = None
     messages: list[ModelMessage] = Field(min_length=1)
     tools: list[ModelToolDefinition] = Field(default_factory=list)
     temperature: float | None = Field(default=None, allow_inf_nan=False)
@@ -97,6 +98,7 @@ class ToolInvocationRequest(BaseModel):
     tool_call_id: str = Field(min_length=1, max_length=128)
     tool_id: str = Field(min_length=1, max_length=128)
     version: str = Field(min_length=1, max_length=32)
+    member_agent_id: str | None = None
     arguments: dict[str, Any]
     invocation_sequence: int = Field(ge=0)
 

@@ -342,6 +342,9 @@ def test_gateway_chat_model_normalizes_tool_calls():
     request, idempotency_key = transport.requests[0]
     assert request["messages"] == [{"role": "user", "content": "查询水位"}]
     assert request["tools"][0]["tool_id"] == "water.query_level"
+    assert "provider_id" not in request
+    assert "model" not in request
+    assert "member_agent_id" not in request
     assert idempotency_key == "model-0"
 
 

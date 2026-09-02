@@ -9,9 +9,12 @@ from app.runtime.execution_contract import RunExecutionRequest
 from app.runtime.execution_snapshot import (
     ExecutionSnapshotPayload,
     PublishedAgentSnapshot,
+    PublishedTeamSnapshot,
     SnapshotMessage,
     SnapshotModelSelection,
     SnapshotRuntimeLimits,
+    SnapshotSkill,
+    SnapshotTeamMember,
     SnapshotTool,
     canonical_snapshot_bytes,
 )
@@ -160,6 +163,18 @@ class CompletingGraph:
         }
 
 
+class TeamCompletingGraph:
+    def invoke(self, state, *, config=None):
+        return {
+            **state,
+            "messages": [
+                *state["messages"],
+                {"role": "assistant", "content": "completed"},
+            ],
+            "status": "completed",
+        }
+
+
 def test_runtime_builds_agent_restores_checkpoint_streams_events_and_completes():
     snapshot = _snapshot()
     gateway = FakeGateway(snapshot)
@@ -265,6 +280,179 @@ def test_runtime_passes_snapshot_limits_to_gateway_model():
     assert model.max_tool_calls == snapshot.payload.limits.max_tool_calls
     assert model.max_subagents == snapshot.payload.limits.max_subagents
     assert model.max_output_bytes == snapshot.payload.limits.max_output_bytes
+
+
+def test_team_runtime_builds_each_member_from_its_own_immutable_boundary():
+    base = _snapshot()
+    supervisor = SnapshotTeamMember(
+        agent_id="supervisor",
+        role="supervisor",
+        responsibility="coordinate",
+        agent_definition_digest="a" * 64,
+        agent=PublishedAgentSnapshot(
+            id="supervisor",
+            name="Supervisor",
+            description="",
+            runtime_form="common",
+            language="zh-CN",
+            system_prompt="supervisor prompt",
+            context_prompt="supervisor context",
+            approval_policy="never",
+        ),
+        model=SnapshotModelSelection(
+            provider_id="supervisor-provider", model="supervisor-model"
+        ),
+        skill_names=("coordinate",),
+        tool_ids=("water.supervise",),
+        skills=(SnapshotSkill(name="coordinate"),),
+        tools=(
+            base.payload.tools[0].model_copy(
+                update={"tool_id": "water.supervise"}
+            ),
+        ),
+    )
+    member = SnapshotTeamMember(
+        agent_id="reviewer",
+        role="member",
+        responsibility="review",
+        agent_definition_digest="b" * 64,
+        agent=PublishedAgentSnapshot(
+            id="reviewer",
+            name="Reviewer",
+            description="",
+            runtime_form="common",
+            language="zh-CN",
+            system_prompt="member prompt",
+            context_prompt="member context",
+            approval_policy="never",
+        ),
+        model=SnapshotModelSelection(
+            provider_id="member-provider", model="member-model"
+        ),
+        skill_names=("review",),
+        tool_ids=("water.review",),
+        skills=(SnapshotSkill(name="review"),),
+        tools=(
+            base.payload.tools[0].model_copy(update={"tool_id": "water.review"}),
+        ),
+    )
+    payload = base.payload.model_copy(
+        update={
+            "schema_version": "5",
+            "actor": PublishedTeamSnapshot(
+                id="team-1",
+                version_id="version-1",
+                version=1,
+                definition_digest="c" * 64,
+                supervisor=supervisor,
+                members=(member,),
+                max_steps=2,
+                max_parallel_members=1,
+                timeout_seconds=60,
+                failure_strategy="fail_fast",
+                name="Team",
+                description="",
+                runtime_form="common",
+                language="zh-CN",
+                system_prompt="supervisor prompt",
+                context_prompt="supervisor context",
+                approval_policy="never",
+            ),
+            "model": supervisor.model,
+            "skills": supervisor.skills,
+            "tools": (*supervisor.tools, *member.tools),
+        }
+    )
+    snapshot = base.model_copy(
+        update={
+            "payload": payload,
+            "digest": hashlib.sha256(canonical_snapshot_bytes(payload)).hexdigest(),
+        }
+    )
+    gateway = FakeGateway(snapshot)
+    factory = FakeFactory(TeamCompletingGraph())
+
+    result = SandboxRuntime(gateway, agent_factory=factory).execute(_request(snapshot))
+
+    assert result.status == "completed"
+    member_snapshot, member_kwargs = factory.calls[0]
+    supervisor_snapshot, supervisor_kwargs = factory.calls[1]
+    assert member_snapshot.system_prompt == "member prompt"
+    assert member_snapshot.context_prompt == "member context"
+    assert [skill.name for skill in member_snapshot.skills] == ["review"]
+    assert member_kwargs["model"].provider_id == "member-provider"
+    assert member_kwargs["model"].model_id == "member-model"
+    assert member_kwargs["model"].member_agent_id == "reviewer"
+    assert [tool.name for tool in member_kwargs["tools"]] == ["water.review"]
+    assert supervisor_snapshot.system_prompt == "supervisor prompt"
+    assert [skill.name for skill in supervisor_snapshot.skills] == ["coordinate"]
+    assert supervisor_kwargs["model"].provider_id == "supervisor-provider"
+    assert [tool.name for tool in supervisor_kwargs["tools"]] == [
+        "water.supervise"
+    ]
+
+
+def test_schema_v4_team_runtime_preserves_legacy_team_wide_construction():
+    base = _snapshot()
+    supervisor = SnapshotTeamMember(
+        agent_id="supervisor",
+        role="supervisor",
+        responsibility="coordinate",
+    )
+    member = SnapshotTeamMember(
+        agent_id="reviewer",
+        role="member",
+        responsibility="review",
+    )
+    payload = base.payload.model_copy(
+        update={
+            "schema_version": "4",
+            "actor": PublishedTeamSnapshot(
+                id="team-legacy",
+                version_id="version-legacy",
+                version=1,
+                definition_digest="d" * 64,
+                supervisor=supervisor,
+                members=(member,),
+                max_steps=2,
+                max_parallel_members=1,
+                timeout_seconds=60,
+                failure_strategy="fail_fast",
+                name="Legacy Team",
+                description="",
+                runtime_form="common",
+                language="zh-CN",
+                system_prompt="legacy supervisor",
+                context_prompt="",
+                approval_policy="never",
+            ),
+        }
+    )
+    snapshot = base.model_copy(
+        update={
+            "payload": payload,
+            "digest": hashlib.sha256(canonical_snapshot_bytes(payload)).hexdigest(),
+        }
+    )
+    gateway = FakeGateway(snapshot)
+    factory = FakeFactory(TeamCompletingGraph())
+
+    result = SandboxRuntime(gateway, agent_factory=factory).execute(
+        _request(snapshot)
+    )
+
+    assert result.status == "completed"
+    member_snapshot, member_kwargs = factory.calls[0]
+    supervisor_snapshot, supervisor_kwargs = factory.calls[1]
+    assert member_snapshot.system_prompt == (
+        "You are the member member. Responsibility: review"
+    )
+    assert supervisor_snapshot.system_prompt == (
+        "You are the supervisor member. Responsibility: coordinate"
+    )
+    assert member_kwargs["model"] is supervisor_kwargs["model"]
+    assert [tool.name for tool in member_kwargs["tools"]] == ["water.query"]
+    assert member_kwargs["tools"] is supervisor_kwargs["tools"]
 
 
 @pytest.mark.parametrize(

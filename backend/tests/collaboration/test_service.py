@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import create_engine, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.agents.schemas import AgentInfo
 from app.agents.service import AgentNotFoundError
@@ -15,11 +15,23 @@ from app.collaboration.service import TeamPermissionError, TeamService, TeamUnav
 from app.core.request_context import RequestContext
 from app.db.base import Base
 from app.identity.schemas import AuthorizationContext, PermissionGrant
+from app.model_providers.schemas import ModelInfo, ProviderInfo
 from app.skills.service import SkillNotFoundError
 from app.tools.service import ToolNotFoundError, ToolValidationError
 
 
-def agent(agent_id: str, *, enabled: bool = True, tool_ids=None, skill_names=None):
+def agent(
+    agent_id: str,
+    *,
+    enabled: bool = True,
+    tool_ids=None,
+    skill_names=None,
+    knowledge_source_ids=None,
+    availability_scope="project",
+    unit_id="unit-1",
+    project_id="p1",
+    allowed_project_ids=None,
+):
     return AgentInfo(
         id=agent_id,
         name=f"{agent_id} name",
@@ -33,7 +45,12 @@ def agent(agent_id: str, *, enabled: bool = True, tool_ids=None, skill_names=Non
         approval_policy="control_commands",
         skill_names=skill_names or [],
         tool_ids=tool_ids or [],
+        knowledge_source_ids=knowledge_source_ids or [],
         enabled=enabled,
+        availability_scope=availability_scope,
+        unit_id=unit_id,
+        project_id=project_id,
+        allowed_project_ids=allowed_project_ids or [],
         pinned=False,
         is_builtin=False,
         is_default=False,
@@ -44,13 +61,19 @@ def agent(agent_id: str, *, enabled: bool = True, tool_ids=None, skill_names=Non
     )
 
 
-def tool(tool_id: str, *, enabled: bool = True):
+def tool(tool_id: str, *, enabled: bool = True, source="builtin"):
     return SimpleNamespace(
         tool_id=tool_id,
         version="1",
         name=tool_id,
         description=f"{tool_id} description",
         input_schema={"type": "object"},
+        output_schema={"type": "object"},
+        source=source,
+        risk_level="low",
+        source_resource_id=(tool_id if source == "knowledge" else None),
+        source_capability_id=None,
+        requires_approval=False,
         published=True,
         enabled=enabled,
         source_available=True,
@@ -70,6 +93,15 @@ class StaticToolService:
             if not item.published or not item.enabled or not item.source_available:
                 raise ToolValidationError(f"Tool '{tool_id}' is not available for binding")
             resolved.append(item)
+        return resolved
+
+    def resolve_knowledge_sources(self, tool_ids):
+        resolved = self.resolve_bindable(tool_ids)
+        for item in resolved:
+            if item.source != "knowledge":
+                raise ToolValidationError(
+                    f"Tool '{item.tool_id}' is not a knowledge source"
+                )
         return resolved
 
 
@@ -98,7 +130,21 @@ class StaticAgentService:
             tools or [tool("forecast.read"), tool("review.write")]
         )
         self.skill_service = StaticSkillService(
-            skills or [SimpleNamespace(name="forecast", enabled=True, version="1")]
+            skills
+            or [
+                SimpleNamespace(
+                    name="forecast",
+                    description="Forecast water levels",
+                    version="1",
+                    content="---\nname: forecast\ndescription: Forecast water levels\nversion: '1'\n---\n",
+                    source="created",
+                    enabled=True,
+                    tags=["hydrology"],
+                    metadata={"owner": "platform"},
+                    file_count=1,
+                    updated_at=datetime(2026, 9, 1, tzinfo=UTC),
+                )
+            ]
         )
 
     def get(self, agent_id):
@@ -108,12 +154,44 @@ class StaticAgentService:
             raise AgentNotFoundError(agent_id) from error
 
 
+class StaticProviderService:
+    def __init__(self, *, configured=True, provider_enabled=True, model_enabled=True):
+        self.provider = ProviderInfo(
+            id="provider-1",
+            name="Provider",
+            base_url="https://models.example.test/v1",
+            configured=configured,
+            enabled=provider_enabled,
+            models=[
+                ModelInfo(
+                    id="supervisor-model",
+                    name="Supervisor",
+                    enabled=model_enabled,
+                ),
+                ModelInfo(
+                    id="member-model",
+                    name="Member",
+                    enabled=model_enabled,
+                ),
+            ],
+        )
+
+    def get(self, provider_id):
+        if provider_id != self.provider.id:
+            raise KeyError(provider_id)
+        return self.provider
+
+
 @pytest.fixture
 def service():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
-        yield TeamService(session, agent_service=StaticAgentService())
+        yield TeamService(
+            session,
+            agent_service=StaticAgentService(),
+            provider_service=StaticProviderService(),
+        )
 
 
 def admin(project="p1"):
@@ -207,17 +285,36 @@ def test_publish_captures_complete_canonical_agent_definitions(service):
     assert supervisor.agent_definition_digest == stored_supervisor.agent_definition_digest
     assert len(supervisor.agent_definition_digest) == 64
     assert stored_supervisor.agent_definition == {
+        "allowed_project_ids": [],
         "approval_policy": "control_commands",
+        "availability_scope": "project",
         "context_prompt": "supervisor context prompt",
         "description": "supervisor description",
+        "enabled": True,
         "id": "supervisor",
         "language": "zh-CN",
         "model": "supervisor-model",
         "name": "supervisor name",
         "knowledge_source_ids": [],
+        "knowledge_sources": [],
         "provider_id": "provider-1",
+        "project_id": "p1",
         "runtime_form": "common",
         "skill_names": ["forecast"],
+        "skills": [
+            {
+                "content": "---\nname: forecast\ndescription: Forecast water levels\nversion: '1'\n---\n",
+                "description": "Forecast water levels",
+                "enabled": True,
+                "file_count": 1,
+                "metadata": {"owner": "platform"},
+                "name": "forecast",
+                "source": "created",
+                "tags": ["hydrology"],
+                "updated_at": "2026-09-01T00:00:00Z",
+                "version": "1",
+            }
+        ],
         "system_prompt": "supervisor system prompt",
         "tool_ids": ["forecast.read"],
         "tools": [
@@ -226,12 +323,19 @@ def test_publish_captures_complete_canonical_agent_definitions(service):
                 "enabled": True,
                 "input_schema": {"type": "object"},
                 "name": "forecast.read",
+                "output_schema": {"type": "object"},
                 "published": True,
+                "requires_approval": False,
+                "risk_level": "low",
+                "source": "builtin",
+                "source_capability_id": None,
+                "source_resource_id": None,
                 "source_available": True,
                 "tool_id": "forecast.read",
                 "version": "1",
             }
         ],
+        "unit_id": "unit-1",
     }
 
 
@@ -243,14 +347,17 @@ def test_publish_rejects_unavailable_agents(unavailable):
     elif unavailable == "disabled":
         agent_service.agents["member"] = agent("member", enabled=False)
     else:
-        scoped = agent("member").model_dump()
-        agent_service.agents["member"] = SimpleNamespace(
-            **scoped, unit_id="unit-1", project_id="other-project"
+        agent_service.agents["member"] = agent(
+            "member", unit_id="unit-1", project_id="other-project"
         )
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
-        service = TeamService(session, agent_service=agent_service)
+        service = TeamService(
+            session,
+            agent_service=agent_service,
+            provider_service=StaticProviderService(),
+        )
         context = admin()
         team = service.create(context, TeamCreateRequest(name="联合研判"))
         service.save_draft(
@@ -266,7 +373,11 @@ def test_publish_rejects_whitelists_outside_team_agent_and_availability_intersec
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
-        service = TeamService(session, agent_service=agent_service)
+        service = TeamService(
+            session,
+            agent_service=agent_service,
+            provider_service=StaticProviderService(),
+        )
         context = admin()
         team = service.create(context, TeamCreateRequest(name="联合研判"))
         invalid = draft().model_copy(
@@ -298,7 +409,11 @@ def test_publish_rejects_agent_bindings_that_are_no_longer_available():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
-        service = TeamService(session, agent_service=agent_service)
+        service = TeamService(
+            session,
+            agent_service=agent_service,
+            provider_service=StaticProviderService(),
+        )
         context = admin()
         team = service.create(context, TeamCreateRequest(name="联合研判"))
         service.save_draft(
@@ -307,6 +422,169 @@ def test_publish_rejects_agent_bindings_that_are_no_longer_available():
 
         with pytest.raises(TeamDefinitionValidationError, match="disabled.tool"):
             service.publish(context, team.id)
+
+
+@pytest.mark.parametrize(
+    ("availability_scope", "unit_id", "project_id", "allowed_project_ids"),
+    [
+        ("project", "unit-1", "other-project", []),
+        ("common", None, None, ["other-project"]),
+        ("common", None, None, []),
+    ],
+)
+def test_publish_rejects_agents_not_explicitly_available_to_project(
+    availability_scope, unit_id, project_id, allowed_project_ids
+):
+    agent_service = StaticAgentService()
+    agent_service.agents["member"] = agent(
+        "member",
+        availability_scope=availability_scope,
+        unit_id=unit_id,
+        project_id=project_id,
+        allowed_project_ids=allowed_project_ids,
+    )
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        team_service = TeamService(
+            session,
+            agent_service=agent_service,
+            provider_service=StaticProviderService(),
+        )
+        context = admin()
+        team = team_service.create(
+            context, TeamCreateRequest(name="Unavailable Agent")
+        )
+        team_service.save_draft(
+            context, team.id, TeamDraftUpdate(revision=1, draft=draft())
+        )
+
+        with pytest.raises(TeamDefinitionValidationError, match="Agent 'member'"):
+            team_service.publish(context, team.id)
+
+
+@pytest.mark.parametrize(
+    ("provider_kwargs", "expected"),
+    [
+        ({"configured": False}, "Provider"),
+        ({"provider_enabled": False}, "Provider"),
+        ({"model_enabled": False}, "model"),
+    ],
+)
+def test_publish_rejects_unavailable_provider_or_model(provider_kwargs, expected):
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        team_service = TeamService(
+            session,
+            agent_service=StaticAgentService(),
+            provider_service=StaticProviderService(**provider_kwargs),
+        )
+        context = admin()
+        team = team_service.create(context, TeamCreateRequest(name="Invalid model"))
+        team_service.save_draft(
+            context, team.id, TeamDraftUpdate(revision=1, draft=draft())
+        )
+
+        with pytest.raises(TeamDefinitionValidationError, match=expected):
+            team_service.publish(context, team.id)
+
+
+def test_publish_captures_and_validates_full_knowledge_source_definition():
+    knowledge_id = "knowledge.reservoir.manual"
+    agent_service = StaticAgentService(
+        agents={
+            "supervisor": agent(
+                "supervisor", knowledge_source_ids=[knowledge_id]
+            ),
+            "member": agent("member"),
+        },
+        tools=[tool(knowledge_id, source="knowledge")],
+    )
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        team_service = TeamService(
+            session,
+            agent_service=agent_service,
+            provider_service=StaticProviderService(),
+        )
+        context = admin()
+        team = team_service.create(context, TeamCreateRequest(name="Knowledge"))
+        requested = draft().model_copy(
+            update={
+                "knowledge_source_ids": [knowledge_id],
+                "supervisor": draft().supervisor.model_copy(
+                    update={"knowledge_source_ids": [knowledge_id]}
+                ),
+            }
+        )
+        team_service.save_draft(
+            context,
+            team.id,
+            TeamDraftUpdate(revision=1, draft=requested),
+        )
+
+        published = team_service.publish(context, team.id)
+        stored = team_service.repository.get_version_by_id(published.id)
+        supervisor = next(item for item in stored.members if item.role == "supervisor")
+        assert supervisor.agent_definition["knowledge_sources"] == [
+            {
+                "description": f"{knowledge_id} description",
+                "enabled": True,
+                "input_schema": {"type": "object"},
+                "name": knowledge_id,
+                "output_schema": {"type": "object"},
+                "published": True,
+                "requires_approval": False,
+                "risk_level": "low",
+                "source": "knowledge",
+                "source_available": True,
+                "source_capability_id": None,
+                "source_resource_id": knowledge_id,
+                "tool_id": knowledge_id,
+                "version": "1",
+            }
+        ]
+
+
+@pytest.mark.parametrize(
+    ("max_steps", "max_parallel_members", "max_subagents", "max_members", "message"),
+    [
+        (5, 1, 4, 8, "max_steps"),
+        (4, 2, 1, 8, "max_parallel_members"),
+        (4, 1, 4, 1, "member count"),
+    ],
+)
+def test_publish_enforces_configured_runner_ceilings(
+    max_steps, max_parallel_members, max_subagents, max_members, message
+):
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        team_service = TeamService(
+            session,
+            agent_service=StaticAgentService(),
+            provider_service=StaticProviderService(),
+            max_team_steps=4,
+            max_parallel_members=1,
+            max_subagents=max_subagents,
+            max_team_members=max_members,
+        )
+        context = admin()
+        team = team_service.create(context, TeamCreateRequest(name="Limits"))
+        requested = draft().model_copy(
+            update={
+                "max_steps": max_steps,
+                "max_parallel_members": max_parallel_members,
+            }
+        )
+        team_service.save_draft(
+            context, team.id, TeamDraftUpdate(revision=1, draft=requested)
+        )
+
+        with pytest.raises(TeamDefinitionValidationError, match=message):
+            team_service.publish(context, team.id)
 
 
 def test_team_publish_enable_and_resolve_uses_immutable_version(service):
@@ -322,6 +600,57 @@ def test_team_publish_enable_and_resolve_uses_immutable_version(service):
     resolved = service.resolve_for_run(context, team.id)
     assert resolved.version_id == version.id
     assert len(resolved.definition_digest) == 64
+
+
+def test_publish_refreshes_stale_session_and_captures_latest_draft(tmp_path):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'teams.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    first_session = factory()
+    second_session = factory()
+    try:
+        first = TeamService(
+            first_session,
+            agent_service=StaticAgentService(),
+            provider_service=StaticProviderService(),
+        )
+        second = TeamService(
+            second_session,
+            agent_service=StaticAgentService(),
+            provider_service=StaticProviderService(),
+        )
+        context = admin()
+        team = first.create(context, TeamCreateRequest(name="联合研判"))
+        first.save_draft(
+            context,
+            team.id,
+            TeamDraftUpdate(revision=1, draft=draft()),
+        )
+
+        stale_team = first.repository.get_scoped("unit-1", "p1", team.id)
+        stale_draft = first.repository.get_version(team.id, 0)
+        assert stale_team.draft_revision == 2
+        assert stale_draft.max_steps == 4
+
+        second.save_draft(
+            context,
+            team.id,
+            TeamDraftUpdate(
+                revision=2,
+                draft=draft().model_copy(update={"max_steps": 7}),
+            ),
+        )
+
+        published = first.publish(context, team.id)
+
+        assert published.max_steps == 7
+        assert first.repository.get_version_by_id(published.id).definition[
+            "max_steps"
+        ] == 7
+    finally:
+        first_session.close()
+        second_session.close()
+        engine.dispose()
 
 
 def test_team_resolution_is_project_scoped(service):

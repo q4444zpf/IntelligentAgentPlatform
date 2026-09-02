@@ -96,6 +96,9 @@ class GatewayChatModel(BaseChatModel):
     max_tool_calls: int = Field(default=8, ge=0)
     max_subagents: int = Field(default=4, ge=0)
     max_output_bytes: int = Field(default=4 * 1024 * 1024, gt=0)
+    provider_id: str | None = None
+    model_id: str | None = None
+    member_agent_id: str | None = None
     _next_invocation_sequence: int = PrivateAttr(default=0)
     _tool_call_count: int = PrivateAttr(default=0)
     _subagent_call_count: int = PrivateAttr(default=0)
@@ -133,6 +136,12 @@ class GatewayChatModel(BaseChatModel):
             ),
             "invocation_sequence": sequence,
         }
+        if self.provider_id is not None:
+            request["provider_id"] = self.provider_id
+        if self.model_id is not None:
+            request["model"] = self.model_id
+        if self.member_agent_id is not None:
+            request["member_agent_id"] = self.member_agent_id
         try:
             raw_response = self.transport.invoke_model(
                 request,

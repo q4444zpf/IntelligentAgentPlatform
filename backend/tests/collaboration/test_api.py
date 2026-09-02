@@ -5,7 +5,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from app.collaboration.models import Team
-from app.collaboration.router import router
+from app.collaboration.router import _service, router
+from app.collaboration.service import TeamService
 from app.core.database import get_session
 from app.core.request_context import RequestContext, require_request_context
 from app.identity.schemas import AuthorizationContext, PermissionGrant
@@ -41,6 +42,11 @@ def test_team_create_returns_403_when_context_lacks_collaboration_manage():
     app.include_router(router, prefix="/api/collaboration")
     app.dependency_overrides[require_request_context] = lambda: context
     app.dependency_overrides[get_session] = lambda: session
+    app.dependency_overrides[_service] = lambda: TeamService(
+        session,
+        agent_service=object(),
+        provider_service=object(),
+    )
 
     response = TestClient(app).post("/api/collaboration/teams", json={"name": "联合研判"})
 

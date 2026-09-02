@@ -42,6 +42,7 @@ class StubAgentService:
             "disabled-agent": self._agent("disabled-agent", enabled=False),
         }
         self.tool_service = SimpleNamespace(resolve_bindable=lambda tool_ids: [])
+        self.tool_service.resolve_knowledge_sources = lambda tool_ids: []
         self.skill_service = SimpleNamespace()
 
     @staticmethod
@@ -59,7 +60,12 @@ class StubAgentService:
             approval_policy="control_commands",
             skill_names=[],
             tool_ids=[],
+            knowledge_source_ids=[],
             enabled=enabled,
+            availability_scope="project",
+            unit_id="unit-1",
+            project_id="p1",
+            allowed_project_ids=[],
         )
 
     def get_default(self):
@@ -70,6 +76,18 @@ class StubAgentService:
             return self.agents[agent_id]
         except KeyError as error:
             raise AgentNotFoundError(agent_id) from error
+
+
+class StubProviderService:
+    def get(self, provider_id: str):
+        if provider_id != "provider-1":
+            raise KeyError(provider_id)
+        return SimpleNamespace(
+            id=provider_id,
+            configured=True,
+            enabled=True,
+            models=[SimpleNamespace(id="model-1", enabled=True)],
+        )
 
 
 def build_service():
@@ -285,7 +303,11 @@ def test_requires_actor_id_for_team_without_persisting():
 def test_team_message_acceptance_records_selected_version_and_run_audit():
     session, dispatcher, _ = build_service()
     manager_context = _team_context("collaboration.manage", "collaboration.run")
-    team_service = TeamService(session, agent_service=StubAgentService())
+    team_service = TeamService(
+        session,
+        agent_service=StubAgentService(),
+        provider_service=StubProviderService(),
+    )
     team = team_service.create(manager_context, TeamCreateRequest(name="联合研判"))
     team_service.save_draft(
         manager_context,

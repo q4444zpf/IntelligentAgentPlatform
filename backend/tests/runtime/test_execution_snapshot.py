@@ -3,7 +3,7 @@ import json
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, update
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
@@ -14,19 +14,23 @@ from app.runtime.execution_snapshot import (
     ExecutionSnapshotPayload,
     ExecutionSnapshotService,
     PublishedAgentSnapshot,
+    PublishedTeamSnapshot,
     RuntimeExecutionSnapshot,
     SnapshotIntegrityError,
     SnapshotModelSelection,
     SnapshotRuntimeLimits,
+    SnapshotSkill,
+    SnapshotTeamMember,
+    SnapshotTool,
     canonical_snapshot_bytes,
     verify_snapshot_digest,
 )
 
 
 class StaticAgentService:
-    def __init__(self, agent: AgentInfo, tools):
+    def __init__(self, agent: AgentInfo, tools, knowledge_sources=()):
         self.agent = agent
-        self.tool_service = StaticToolService(tools)
+        self.tool_service = StaticToolService(tools, knowledge_sources)
 
     def get(self, agent_id: str) -> AgentInfo:
         assert agent_id == self.agent.id
@@ -34,12 +38,17 @@ class StaticAgentService:
 
 
 class StaticToolService:
-    def __init__(self, tools):
+    def __init__(self, tools, knowledge_sources=()):
         self.tools = tools
+        self.knowledge_sources = list(knowledge_sources)
 
     def resolve_bindable(self, tool_ids):
         assert tool_ids == [tool.tool_id for tool in self.tools]
         return self.tools
+
+    def resolve_knowledge_sources(self, tool_ids):
+        assert tool_ids == [tool.tool_id for tool in self.knowledge_sources]
+        return self.knowledge_sources
 
 
 class Tool:
@@ -55,6 +64,21 @@ class Tool:
         self.published = True
         self.enabled = True
         self.source_available = True
+
+
+class KnowledgeTool(Tool):
+    def __init__(self):
+        super().__init__()
+        self.tool_id = "knowledge.reservoir.manual"
+        self.version = "7"
+        self.name = "水库规程"
+        self.description = "水库调度规程知识源"
+        self.source = "knowledge"
+        self.risk_level = "low"
+        self.output_schema = {"type": "object"}
+        self.source_resource_id = "reservoir-manual"
+        self.source_capability_id = None
+        self.requires_approval = False
 
 
 class Run:
@@ -156,8 +180,10 @@ def captured_agent_definition(agent_id, *, prompt, model, tool_id):
         "context_prompt": f"{agent_id} context",
         "approval_policy": "control_commands",
         "skill_names": ["forecast"],
+        "skills": [{"name": "forecast"}],
         "tool_ids": [tool_id],
         "knowledge_source_ids": [],
+        "knowledge_sources": [],
         "tools": [
             {
                 "tool_id": tool_id,
@@ -257,6 +283,7 @@ def snapshot_service():
         approval_policy="control_commands",
         skill_names=["forecast"],
         tool_ids=["mcp.water.level"],
+        knowledge_source_ids=["knowledge.reservoir.manual"],
         enabled=True,
         pinned=False,
         is_builtin=False,
@@ -268,7 +295,7 @@ def snapshot_service():
     )
     yield ExecutionSnapshotService(
         Session(engine),
-        StaticAgentService(agent, [Tool()]),
+        StaticAgentService(agent, [Tool()], [KnowledgeTool()]),
         StaticConversationRepository(),
         clock=lambda: datetime(2026, 8, 14, 10, 1, tzinfo=UTC),
     )
@@ -290,6 +317,14 @@ def test_snapshot_digest_is_deterministic_and_covers_complete_payload(snapshot_s
     assert first.payload.tools[0].version == "3"
     assert first.payload.tools[0].input_schema["properties"]["station"] == {
         "type": "string"
+    }
+    assert first.payload.knowledge_sources[0].tool_id == (
+        "knowledge.reservoir.manual"
+    )
+    assert first.payload.knowledge_sources[0].source == "knowledge"
+    assert {tool.tool_id for tool in first.payload.tools} == {
+        "mcp.water.level",
+        "knowledge.reservoir.manual",
     }
     assert first.payload.limits.max_iterations == 4
     assert first.payload.limits.max_tool_calls == 8
@@ -336,6 +371,7 @@ def test_team_snapshot_uses_only_captured_agent_definitions():
         assert actor.members[0].agent.system_prompt == "original member prompt"
         assert actor.members[0].model.model == "member-v1"
         assert actor.members[0].tools[0].tool_id == "review.read"
+        assert stored.payload.schema_version == "5"
 
 
 @pytest.mark.parametrize(
@@ -376,6 +412,54 @@ def test_team_snapshot_rejects_tampered_member_definition_digest():
         )
 
         with pytest.raises(SnapshotIntegrityError, match="Agent definition digest"):
+            service.create("run-team")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "responsibility",
+        "position",
+        "tool_whitelist",
+        "member_count",
+        "limits",
+        "policy",
+    ],
+)
+def test_team_snapshot_rejects_any_mirrored_state_drift(mutation):
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        team, published = published_team_version(session)
+        if mutation == "responsibility":
+            published.members[1].responsibility = "tampered"
+        elif mutation == "position":
+            published.members[1].position = 7
+        elif mutation == "tool_whitelist":
+            published.members[1].tool_ids = []
+        elif mutation == "member_count":
+            session.delete(published.members[1])
+        elif mutation == "limits":
+            session.execute(
+                update(type(published))
+                .where(type(published).id == published.id)
+                .values(max_steps=published.max_steps + 1)
+            )
+        else:
+            session.execute(
+                update(type(published))
+                .where(type(published).id == published.id)
+                .values(failure_strategy="continue_then_synthesize")
+            )
+        session.commit()
+        session.expire_all()
+        service = ExecutionSnapshotService(
+            session,
+            NoLiveAgentService(),
+            TeamConversationRepository(published.id, actor_id=team.id),
+        )
+
+        with pytest.raises(SnapshotIntegrityError, match="Team .* mismatch"):
             service.create("run-team")
 
 
@@ -437,3 +521,89 @@ def test_legacy_snapshot_digest_vectors_ignore_v3_runtime_limits(
     )
 
     assert hashlib.sha256(canonical_snapshot_bytes(payload)).hexdigest() == expected_digest
+
+
+def test_schema_v4_team_snapshot_digest_vector_remains_frozen():
+    definition = captured_agent_definition(
+        "supervisor", prompt="p", model="m", tool_id="t"
+    )
+    legacy_definition = {
+        key: value
+        for key, value in definition.items()
+        if key not in {"skills", "knowledge_sources"}
+    }
+    member = SnapshotTeamMember(
+        agent_id="supervisor",
+        role="supervisor",
+        responsibility="r",
+        agent_definition_digest=canonical_digest(legacy_definition),
+        agent=PublishedAgentSnapshot(
+            id="supervisor",
+            name="n",
+            description="d",
+            runtime_form="common",
+            language="zh-CN",
+            system_prompt="p",
+            context_prompt="c",
+            approval_policy="never",
+        ),
+        model=SnapshotModelSelection(provider_id="provider-1", model="m"),
+        skill_names=("forecast",),
+        tool_ids=("t",),
+        skills=(SnapshotSkill(name="forecast"),),
+        tools=(
+            SnapshotTool(
+                tool_id="t",
+                version="1",
+                name="t",
+                description="d",
+                input_schema={"type": "object"},
+                published=True,
+                enabled=True,
+                source_available=True,
+            ),
+        ),
+    )
+    payload = ExecutionSnapshotPayload(
+        schema_version="4",
+        snapshot_id="s",
+        run_id="r",
+        unit_id="u",
+        project_id="p",
+        user_id="x",
+        actor=PublishedTeamSnapshot(
+            id="team",
+            version_id="version",
+            version=1,
+            definition_digest="a" * 64,
+            supervisor=member,
+            members=(),
+            max_steps=4,
+            max_parallel_members=1,
+            timeout_seconds=60,
+            failure_strategy="fail_fast",
+            name="team",
+            description="d",
+            runtime_form="common",
+            language="zh-CN",
+            system_prompt="p",
+            context_prompt="c",
+            approval_policy="never",
+        ),
+        model=member.model,
+        messages=(),
+        skills=(SnapshotSkill(name="forecast"),),
+        tools=member.tools,
+        limits=SnapshotRuntimeLimits(
+            snapshot_max_bytes=1048576,
+            max_iterations=4,
+            max_tool_calls=8,
+            max_subagents=4,
+            max_output_bytes=4194304,
+        ),
+        created_at=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+
+    assert hashlib.sha256(canonical_snapshot_bytes(payload)).hexdigest() == (
+        "5ad4041dfb4eaff7fc1188ccdb54595ea71b73fc9084ad649cb31d5d6105be42"
+    )

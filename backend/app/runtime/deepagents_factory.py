@@ -15,12 +15,20 @@ class PublishedToolSnapshot:
 
 
 @dataclass(frozen=True)
+class PublishedSkillSnapshot:
+    name: str
+    content: str = ""
+
+
+@dataclass(frozen=True)
 class PublishedAgentSnapshot:
     agent_id: str
     name: str
     system_prompt: str
     context_prompt: str
     tools: tuple[PublishedToolSnapshot, ...]
+    skills: tuple[PublishedSkillSnapshot, ...] = ()
+    knowledge_source_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -56,6 +64,11 @@ class DeepAgentFactory:
         context = snapshot.context_prompt.strip()
         if context:
             prompt = f"{prompt}\n\n{context}" if prompt else context
+        skill_content = "\n\n".join(
+            skill.content.strip() for skill in snapshot.skills if skill.content.strip()
+        )
+        if skill_content:
+            prompt = f"{prompt}\n\n{skill_content}" if prompt else skill_content
         resolved_tools = tools if tools is not None else [
             AgentToolDefinition(tool.name, tool.description, tool.input_schema)
             for tool in snapshot.tools

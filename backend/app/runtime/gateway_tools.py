@@ -44,17 +44,25 @@ class GatewayStructuredTool(StructuredTool):
 def build_gateway_tools(
     snapshot: ExecutionSnapshotPayload,
     client: RunnerToolClient,
+    *,
+    allowed_tool_ids: set[str] | None = None,
+    member_agent_id: str | None = None,
 ) -> list[StructuredTool]:
     return [
-        _build_tool(tool, client)
+        _build_tool(tool, client, member_agent_id=member_agent_id)
         for tool in snapshot.tools
-        if tool.published and tool.enabled and tool.source_available
+        if tool.published
+        and tool.enabled
+        and tool.source_available
+        and (allowed_tool_ids is None or tool.tool_id in allowed_tool_ids)
     ]
 
 
 def _build_tool(
     tool: SnapshotTool,
     client: RunnerToolClient,
+    *,
+    member_agent_id: str | None = None,
 ) -> StructuredTool:
     sequences = count()
 
@@ -63,13 +71,18 @@ def _build_tool(
             raise RunnerGatewayToolError("tool_execution_failed")
         sequence = next(sequences)
         try:
+            request = {
+                "tool_id": tool.tool_id,
+                "version": tool.version,
+                "tool_call_id": _tool_call_id,
+                "arguments": arguments,
+                "invocation_sequence": sequence,
+                "idempotency_key": f"tool:{_tool_call_id}:{sequence}",
+            }
+            if member_agent_id is not None:
+                request["member_agent_id"] = member_agent_id
             return client.invoke_tool(
-                tool_id=tool.tool_id,
-                version=tool.version,
-                tool_call_id=_tool_call_id,
-                arguments=arguments,
-                invocation_sequence=sequence,
-                idempotency_key=f"tool:{_tool_call_id}:{sequence}",
+                **request,
             )
         except RunnerGatewayToolError as error:
             if (

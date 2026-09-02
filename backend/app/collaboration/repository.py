@@ -137,11 +137,40 @@ class TeamRepository:
         draft = self._get_locked_draft(team.id)
         normalized = self._normalize_definition(definition)
         self._replace_draft_definition(draft, normalized)
-        team.draft_revision += 1
-        if updated_by is not None:
-            team.updated_by = updated_by
+        result = self.session.execute(
+            update(Team)
+            .where(
+                Team.id == team_id,
+                Team.draft_revision == expected_revision,
+            )
+            .values(
+                draft_revision=expected_revision + 1,
+                updated_by=updated_by if updated_by is not None else team.updated_by,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            raise TeamDraftConflictError("Team draft revision changed concurrently")
         self.session.flush()
+        self.session.refresh(team)
         return draft
+
+    def lock_publication_draft_scoped(
+        self, unit_id: str, project_id: str, team_id: str
+    ) -> tuple[Team, TeamVersion]:
+        team = self.session.scalar(
+            select(Team)
+            .where(
+                Team.id == team_id,
+                Team.unit_id == unit_id,
+                Team.project_id == project_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if team is None:
+            raise TeamNotFoundError(team_id)
+        return team, self._get_locked_draft(team.id)
 
     def publish(
         self,
@@ -157,6 +186,17 @@ class TeamRepository:
         team = self._get_locked_team(team_id)
         self._assert_expected_revision(team, expected_revision)
         draft = self._get_locked_draft(team.id)
+        revision_guard = self.session.execute(
+            update(Team)
+            .where(
+                Team.id == team.id,
+                Team.draft_revision == expected_revision,
+            )
+            .values(updated_by=published_by)
+            .execution_options(synchronize_session=False)
+        )
+        if revision_guard.rowcount != 1:
+            raise TeamDraftConflictError("Team draft revision changed concurrently")
         editable = self._normalize_definition(draft.definition)
         normalized = self._normalize_definition(
             definition if definition is not None else draft.definition
@@ -214,7 +254,12 @@ class TeamRepository:
         raise TeamDefinitionValidationError("Only draft versions can be replaced")
 
     def _get_locked_team(self, team_id: str) -> Team:
-        team = self.session.scalar(select(Team).where(Team.id == team_id).with_for_update())
+        team = self.session.scalar(
+            select(Team)
+            .where(Team.id == team_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         if team is None:
             raise TeamNotFoundError(team_id)
         return team
@@ -222,8 +267,10 @@ class TeamRepository:
     def _get_locked_draft(self, team_id: str) -> TeamVersion:
         draft = self.session.scalar(
             select(TeamVersion)
+            .options(selectinload(TeamVersion.members))
             .where(TeamVersion.team_id == team_id, TeamVersion.status == "draft")
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if draft is None:
             raise TeamDefinitionValidationError("Team has no draft definition")
