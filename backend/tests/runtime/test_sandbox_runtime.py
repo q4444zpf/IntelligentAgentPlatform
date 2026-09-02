@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from langchain_core.messages import HumanMessage
 
 from app.runtime import run_worker
 from app.runtime.execution_contract import RunExecutionRequest
@@ -85,6 +86,76 @@ def _request(snapshot):
         snapshot_digest=snapshot.digest,
         gateway_url="http://api:8000/internal/runner",
         run_token="secret-token",
+    )
+
+
+def _schema_v5_team_snapshot(*, limits=None):
+    base = _snapshot()
+    tool = base.payload.tools[0]
+
+    def member(agent_id, role, responsibility):
+        return SnapshotTeamMember(
+            agent_id=agent_id,
+            role=role,
+            responsibility=responsibility,
+            agent_definition_digest=hashlib.sha256(agent_id.encode()).hexdigest(),
+            agent=PublishedAgentSnapshot(
+                id=agent_id,
+                name=agent_id,
+                description="",
+                runtime_form="common",
+                language="zh-CN",
+                system_prompt=f"{agent_id} prompt",
+                context_prompt="",
+                approval_policy="never",
+            ),
+            model=SnapshotModelSelection(
+                provider_id=f"{agent_id}-provider",
+                model=f"{agent_id}-model",
+            ),
+            tool_ids=(tool.tool_id,),
+            tools=(tool,),
+        )
+
+    supervisor = member("supervisor", "supervisor", "coordinate")
+    members = (
+        member("member-1", "member", "inspect"),
+        member("member-2", "member", "review"),
+    )
+    actor = PublishedTeamSnapshot(
+        id="team-1",
+        version_id="version-1",
+        version=1,
+        definition_digest="d" * 64,
+        supervisor=supervisor,
+        members=members,
+        max_steps=3,
+        max_parallel_members=2,
+        timeout_seconds=60,
+        failure_strategy="fail_fast",
+        tool_ids=(tool.tool_id,),
+        name="Team",
+        description="",
+        runtime_form="common",
+        language="zh-CN",
+        system_prompt="supervisor prompt",
+        context_prompt="",
+        approval_policy="never",
+    )
+    payload = base.payload.model_copy(
+        update={
+            "schema_version": "5",
+            "actor": actor,
+            "model": supervisor.model,
+            "tools": (tool,),
+            "limits": limits or base.payload.limits,
+        }
+    )
+    return base.model_copy(
+        update={
+            "payload": payload,
+            "digest": hashlib.sha256(canonical_snapshot_bytes(payload)).hexdigest(),
+        }
     )
 
 
@@ -172,6 +243,59 @@ class TeamCompletingGraph:
                 {"role": "assistant", "content": "completed"},
             ],
             "status": "completed",
+        }
+
+
+class ModelInvokingFactory:
+    def __init__(self):
+        self.calls = []
+
+    def build(self, snapshot, **kwargs):
+        self.calls.append((snapshot, kwargs))
+        model = kwargs["model"]
+
+        class ModelInvokingGraph:
+            def invoke(self, state, *, config=None):
+                response = model.invoke([HumanMessage(content="execute")])
+                return {
+                    **state,
+                    "messages": [
+                        *state["messages"],
+                        {"role": "assistant", "content": response.content or "done"},
+                    ],
+                    "status": "completed",
+                }
+
+        return ModelInvokingGraph()
+
+
+class ModelInvokingGateway(FakeGateway):
+    def __init__(self, snapshot, *, tool_name=None, reject_duplicate_keys=False):
+        super().__init__(snapshot)
+        self.tool_name = tool_name
+        self.reject_duplicate_keys = reject_duplicate_keys
+        self.idempotency_keys = set()
+
+    def invoke_model(self, request, idempotency_key):
+        if self.reject_duplicate_keys and idempotency_key in self.idempotency_keys:
+            raise RunnerGatewayModelError("idempotency_conflict")
+        self.idempotency_keys.add(idempotency_key)
+        self.model_calls.append((request, idempotency_key))
+        tool_calls = []
+        if self.tool_name is not None:
+            tool_calls.append(
+                {
+                    "id": f"call-{len(self.model_calls)}",
+                    "name": self.tool_name,
+                    "arguments": {},
+                }
+            )
+        return {
+            "content": "done",
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "total_tokens": 2,
+            "tool_calls": tool_calls,
         }
 
 
@@ -390,6 +514,53 @@ def test_team_runtime_builds_each_member_from_its_own_immutable_boundary():
     assert [tool.name for tool in supervisor_kwargs["tools"]] == [
         "water.supervise"
     ]
+
+
+def test_team_runtime_allocates_unique_model_requests_across_members_and_supervisor():
+    snapshot = _schema_v5_team_snapshot()
+    gateway = ModelInvokingGateway(snapshot, reject_duplicate_keys=True)
+
+    result = SandboxRuntime(
+        gateway,
+        agent_factory=ModelInvokingFactory(),
+    ).execute(_request(snapshot))
+
+    assert result.status == "completed"
+    assert [
+        (request["member_agent_id"], request["invocation_sequence"], key)
+        for request, key in gateway.model_calls
+    ] == [
+        ("member-1", 0, "model-member-1-0"),
+        ("member-2", 1, "model-member-2-1"),
+        ("supervisor", 2, "model-supervisor-2"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("limit_updates", "tool_name", "expected_error"),
+    [
+        ({"max_iterations": 2}, None, "runtime_iteration_limit"),
+        ({"max_tool_calls": 2}, "water.query", "runtime_tool_call_limit"),
+        ({"max_subagents": 2}, "task", "runtime_subagent_limit"),
+    ],
+)
+def test_team_runtime_enforces_one_model_budget_across_all_members(
+    limit_updates,
+    tool_name,
+    expected_error,
+):
+    base = _snapshot()
+    limits = base.payload.limits.model_copy(update=limit_updates)
+    snapshot = _schema_v5_team_snapshot(limits=limits)
+    gateway = ModelInvokingGateway(snapshot, tool_name=tool_name)
+
+    result = SandboxRuntime(
+        gateway,
+        agent_factory=ModelInvokingFactory(),
+    ).execute(_request(snapshot))
+
+    assert result.status == "failed"
+    assert result.error_code == expected_error
 
 
 def test_schema_v4_team_runtime_preserves_legacy_team_wide_construction():

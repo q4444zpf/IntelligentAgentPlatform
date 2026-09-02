@@ -465,6 +465,8 @@ class RunnerGatewayService:
             "model": selection.model,
             "iteration": request.invocation_sequence,
         }
+        if request.member_agent_id is not None:
+            metadata["member_agent_id"] = request.member_agent_id
         if response is not None:
             metadata.update(
                 {
@@ -494,7 +496,12 @@ class RunnerGatewayService:
                 resource_id=selection.model,
                 idempotency_key=(
                     f"llm:{snapshot.run_id}:"
-                    f"{request.invocation_sequence}:{status}"
+                    + (
+                        f"{request.member_agent_id}:"
+                        if request.member_agent_id is not None
+                        else ""
+                    )
+                    + f"{request.invocation_sequence}:{status}"
                 ),
                 occurred_at=datetime.now(UTC),
                 duration_ms=duration_ms,

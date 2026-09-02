@@ -16,7 +16,7 @@ from app.runtime.execution_snapshot import (
 from app.runtime.model_gateway import ModelResult
 
 
-def _install_team_snapshot(env):
+def _install_team_snapshot(env, *, include_second_member=False):
     stored = env.snapshots["run-1"]
     tools = {tool.tool_id: tool for tool in stored.payload.tools}
     supervisor_tool = tools["system.get_runtime_context"]
@@ -63,14 +63,26 @@ def _install_team_snapshot(env):
         tool_ids=(member_tool.tool_id,),
         tools=(member_tool,),
     )
+    second_member = member.model_copy(
+        update={
+            "agent_id": "member-2",
+            "agent_definition_digest": "d" * 64,
+            "agent": member.agent.model_copy(
+                update={"id": "member-2", "name": "Member 2"}
+            ),
+            "model": SnapshotModelSelection(
+                provider_id="member-2-provider", model="member-2-model"
+            ),
+        }
+    )
     actor = PublishedTeamSnapshot(
         id="team-1",
         version_id="team-version-1",
         version=1,
         definition_digest="c" * 64,
         supervisor=supervisor,
-        members=(member,),
-        max_steps=2,
+        members=(member, second_member) if include_second_member else (member,),
+        max_steps=3 if include_second_member else 2,
         max_parallel_members=1,
         timeout_seconds=60,
         failure_strategy="fail_fast",
@@ -311,6 +323,64 @@ def test_team_model_invocation_uses_only_the_captured_member_boundary(
         (member_tool.tool_id, member_tool.description, member_tool.input_schema)
     ]
     assert snapshot.payload.schema_version == "5"
+
+
+def test_team_model_audits_are_attributed_without_cross_member_idempotency_conflicts(
+    runner_gateway_env,
+    monkeypatch,
+):
+    env = runner_gateway_env
+    snapshot, _, _ = _install_team_snapshot(env, include_second_member=True)
+    token = env.issue_token()
+    monkeypatch.setattr(
+        env.model_gateway,
+        "generate",
+        lambda messages, selection, tools=None: ModelResult("done", 1, 1, 2),
+    )
+
+    responses = []
+    for sequence, member in enumerate(
+        (*snapshot.payload.actor.members, snapshot.payload.actor.supervisor)
+    ):
+        responses.append(
+            env.client.post(
+                "/internal/runner/runs/run-1/model-invocations",
+                headers=env.headers(
+                    token,
+                    f"model:{member.agent_id}:{sequence}",
+                ),
+                json={
+                    "provider_id": member.model.provider_id,
+                    "model": member.model.model,
+                    "member_agent_id": member.agent_id,
+                    "messages": [{"role": "user", "content": "inspect"}],
+                    "tools": [],
+                    "invocation_sequence": sequence,
+                },
+            )
+        )
+
+    assert [response.status_code for response in responses] == [200, 200, 200]
+    audits = list(
+        env.session.scalars(
+            select(AuditEvent)
+            .where(
+                AuditEvent.run_id == "run-1",
+                AuditEvent.action == "llm.invoke.succeeded",
+            )
+            .order_by(AuditEvent.id)
+        )
+    )
+    assert {audit.metadata_json["member_agent_id"] for audit in audits} == {
+        "member-1",
+        "member-2",
+        "supervisor",
+    }
+    assert {audit.idempotency_key for audit in audits} == {
+        "llm:run-1:member-1:0:succeeded",
+        "llm:run-1:member-2:1:succeeded",
+        "llm:run-1:supervisor:2:succeeded",
+    }
 
 
 def test_team_tool_invocation_is_restricted_to_the_captured_member(

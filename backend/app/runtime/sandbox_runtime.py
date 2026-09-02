@@ -16,7 +16,7 @@ from .execution_contract import RunExecutionRequest, RunExecutionResult
 from .execution_snapshot import verify_snapshot_digest
 from .execution_snapshot import PublishedTeamSnapshot
 from .team_graph import TeamLimitError, TeamPlan, TeamTask, member_agent_snapshot, validate_team_plan
-from .gateway_model import GatewayChatModel, RunnerGatewayModelError
+from .gateway_model import GatewayChatModel, GatewayModelBudget, RunnerGatewayModelError
 from .gateway_tools import RunnerApprovalInterruption, build_gateway_tools
 from .langgraph_runtime import LangGraphRuntimeAdapter, RuntimeState
 from .runner_gateway_client import (
@@ -83,6 +83,11 @@ class SandboxRuntime:
                 self.gateway, request.snapshot_digest
             )
             limits = snapshot.payload.limits
+            model_budget = GatewayModelBudget(
+                max_iterations=limits.max_iterations,
+                max_tool_calls=limits.max_tool_calls,
+                max_subagents=limits.max_subagents,
+            )
             backend = ArtifactBackend(self.gateway)
             actor = snapshot.payload.actor
             skill_context = ", ".join(skill.name for skill in snapshot.payload.skills)
@@ -114,6 +119,7 @@ class SandboxRuntime:
                         max_tool_calls=limits.max_tool_calls,
                         max_subagents=limits.max_subagents,
                         max_output_bytes=limits.max_output_bytes,
+                        budget_state=model_budget,
                     )
                     legacy_tools = build_gateway_tools(
                         snapshot.payload, self.gateway
@@ -154,6 +160,7 @@ class SandboxRuntime:
                                 provider_id=member.model.provider_id,
                                 model_id=member.model.model,
                                 member_agent_id=member.agent_id,
+                                budget_state=model_budget,
                             )
                             member_tools = build_gateway_tools(
                                 snapshot.payload,
@@ -214,6 +221,7 @@ class SandboxRuntime:
                         provider_id=actor.supervisor.model.provider_id,
                         model_id=actor.supervisor.model.model,
                         member_agent_id=actor.supervisor.agent_id,
+                        budget_state=model_budget,
                     )
                     supervisor_tools = build_gateway_tools(
                         snapshot.payload,
@@ -250,6 +258,7 @@ class SandboxRuntime:
                     max_tool_calls=limits.max_tool_calls,
                     max_subagents=limits.max_subagents,
                     max_output_bytes=limits.max_output_bytes,
+                    budget_state=model_budget,
                 )
                 tools = build_gateway_tools(snapshot.payload, self.gateway)
                 graph = self.agent_factory.build(
