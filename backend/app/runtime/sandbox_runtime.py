@@ -91,7 +91,7 @@ class _GatewayCheckpointStore:
         try:
             checkpoint = self.gateway.get_latest_checkpoint()
         except RunnerGatewayBusinessError as error:
-            if error.code in {"checkpoint_not_found", "runner_gateway_not_found"}:
+            if error.code == "checkpoint_not_found":
                 self._loaded = True
                 return None
             raise

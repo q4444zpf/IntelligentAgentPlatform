@@ -443,6 +443,32 @@ def test_runtime_builds_agent_on_fresh_run_streams_events_and_completes():
     assert isinstance(factory.calls[0][1]["checkpointer"], InMemorySaver)
 
 
+def test_agent_checkpoint_gateway_not_found_fails_closed_without_starting_fresh():
+    class MissingGatewayRoute(FakeGateway):
+        def get_latest_checkpoint(self):
+            self.checkpoint_reads += 1
+            raise RunnerGatewayBusinessError("runner_gateway_not_found")
+
+    snapshot = _snapshot()
+    gateway = MissingGatewayRoute(snapshot)
+    factory = FakeFactory(CompletingGraph())
+
+    result = SandboxRuntime(gateway, agent_factory=factory).execute(
+        _request(snapshot)
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "runner_gateway_not_found"
+    assert factory.calls == []
+    assert gateway.model_calls == []
+    assert gateway.tool_calls == []
+    assert gateway.events == []
+    assert gateway.completions[-1][0] == {
+        "status": "failed",
+        "error_code": "runner_gateway_not_found",
+    }
+
+
 @pytest.mark.parametrize(
     "checkpoint_state",
     [
