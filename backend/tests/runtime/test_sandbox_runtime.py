@@ -232,6 +232,50 @@ class FakeGateway:
         return []
 
 
+class DurableApprovalGateway(FakeGateway):
+    def __init__(self, snapshot):
+        super().__init__(snapshot)
+        self.latest_checkpoint = None
+        self.approval_granted = False
+
+    def get_latest_checkpoint(self):
+        self.checkpoint_reads += 1
+        if self.latest_checkpoint is None:
+            raise RunnerGatewayBusinessError("checkpoint_not_found")
+        return deepcopy(self.latest_checkpoint)
+
+    def save_checkpoint(self, checkpoint_key, state, idempotency_key):
+        saved = {
+            "checkpoint_key": checkpoint_key,
+            "snapshot_digest": self.snapshot.digest,
+            "state": deepcopy(state),
+        }
+        self.saved_checkpoints.append(
+            (checkpoint_key, deepcopy(state), idempotency_key)
+        )
+        self.latest_checkpoint = saved
+        return deepcopy(saved)
+
+    def invoke_model(self, request, idempotency_key):
+        self.model_calls.append((deepcopy(request), idempotency_key))
+        return {
+            "content": "prepared",
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "total_tokens": 2,
+            "tool_calls": [],
+        }
+
+    def invoke_tool(self, **request):
+        self.tool_calls.append(deepcopy(request))
+        if not self.approval_granted:
+            raise RunnerGatewayToolError(
+                "tool_approval_required",
+                approval_id="approval-1",
+            )
+        return {"approved": True}
+
+
 class FakeFactory:
     def __init__(self, graph):
         self.graph = graph
@@ -436,6 +480,73 @@ def test_approval_interruption_saves_checkpoint_and_returns_accepted_result():
     assert gateway.saved_checkpoints[-1][0] == "approval-approval-1"
     assert gateway.events[-1]["event_type"] == "approval.required"
     assert gateway.completions[-1][0]["approval_id"] == "approval-1"
+
+
+def test_agent_approval_restart_preserves_exact_graph_frontier_and_gateway_sequences():
+    from typing import TypedDict
+
+    from langgraph.graph import END, START, StateGraph
+
+    class WorkflowState(TypedDict, total=False):
+        messages: list[dict]
+        prepared: bool
+
+    prepared_calls = []
+
+    class Factory:
+        def build(self, _agent, **kwargs):
+            model = kwargs["model"]
+            tool = kwargs["tools"][0]
+            graph = StateGraph(WorkflowState)
+
+            def prepare(_state):
+                prepared_calls.append("prepare")
+                model.invoke([HumanMessage(content="prepare operation")])
+                return {"prepared": True}
+
+            def approval(state):
+                tool.run({}, tool_call_id="approval-tool-call")
+                return {
+                    "messages": [
+                        *state["messages"],
+                        {"role": "assistant", "content": "approved"},
+                    ]
+                }
+
+            graph.add_node("prepare", prepare)
+            graph.add_node("approval", approval)
+            graph.add_edge(START, "prepare")
+            graph.add_edge("prepare", "approval")
+            graph.add_edge("approval", END)
+            return graph.compile(checkpointer=kwargs["checkpointer"])
+
+    snapshot = _snapshot()
+    gateway = DurableApprovalGateway(snapshot)
+
+    interrupted = SandboxRuntime(gateway, agent_factory=Factory()).execute(
+        _request(snapshot)
+    )
+
+    assert interrupted.status == "interrupted"
+    assert gateway.latest_checkpoint["checkpoint_key"] == "approval-approval-1"
+
+    gateway.approval_granted = True
+    resumed = SandboxRuntime(gateway, agent_factory=Factory()).execute(
+        _request(snapshot)
+    )
+
+    assert resumed.status == "completed"
+    assert prepared_calls == ["prepare"]
+    assert [key for _request_body, key in gateway.model_calls] == ["model-0"]
+    assert len(gateway.tool_calls) == 2
+    assert gateway.tool_calls[0] == gateway.tool_calls[1]
+    assert gateway.tool_calls[0]["tool_call_id"] == "approval-tool-call"
+    assert [event["event_type"] for event in gateway.events] == [
+        "runner.started",
+        "approval.required",
+        "runner.completed",
+    ]
+    assert [event["sequence"] for event in gateway.events] == [1, 2, 3]
 
 
 def test_raw_runtime_error_is_sanitized():
@@ -1432,6 +1543,93 @@ def test_langgraph_approval_restart_uses_interrupted_node_state_without_replayin
             RuntimeState(run_id="run-1", messages=[])
         )
     assert prepared_calls == ["prepare"]
+
+
+def test_team_synthesis_approval_restart_preserves_exact_graph_frontier():
+    from typing import TypedDict
+
+    from langgraph.graph import END, START, StateGraph
+
+    class WorkflowState(TypedDict, total=False):
+        messages: list[dict]
+        prepared: bool
+
+    snapshot = _schema_v5_team_snapshot()
+    gateway = DurableApprovalGateway(snapshot)
+    member_calls = []
+    synthesis_prepared_calls = []
+    plan = {
+        "tasks": [
+            {
+                "id": "member-task",
+                "member_id": "member-1",
+                "objective": "inspect",
+                "depends_on": [],
+                "position": 0,
+            }
+        ]
+    }
+
+    class Factory:
+        def build(self, member, **kwargs):
+            if member.agent_id == "member-1":
+                return TextGraph("member result", calls=member_calls)
+            if kwargs["tools"] == []:
+                return TeamPlanGraph(plan)
+
+            tool = kwargs["tools"][0]
+            graph = StateGraph(WorkflowState)
+
+            def prepare(_state):
+                synthesis_prepared_calls.append("prepare")
+                return {"prepared": True}
+
+            def approval(state):
+                tool.run({}, tool_call_id="synthesis-approval-tool-call")
+                return {
+                    "messages": [
+                        *state["messages"],
+                        {"role": "assistant", "content": "team summary"},
+                    ]
+                }
+
+            graph.add_node("prepare", prepare)
+            graph.add_node("approval", approval)
+            graph.add_edge(START, "prepare")
+            graph.add_edge("prepare", "approval")
+            graph.add_edge("approval", END)
+            return graph.compile(checkpointer=kwargs["checkpointer"])
+
+    interrupted = SandboxRuntime(gateway, agent_factory=Factory()).execute(
+        _request(snapshot)
+    )
+
+    assert interrupted.status == "interrupted"
+
+    gateway.approval_granted = True
+    resumed = SandboxRuntime(gateway, agent_factory=Factory()).execute(
+        _request(snapshot)
+    )
+
+    assert resumed.status == "completed"
+    assert len(member_calls) == 1
+    assert synthesis_prepared_calls == ["prepare"]
+    synthesis_tool_calls = [
+        request
+        for request in gateway.tool_calls
+        if request["tool_call_id"] == "synthesis-approval-tool-call"
+    ]
+    assert len(synthesis_tool_calls) == 2
+    assert synthesis_tool_calls[0] == synthesis_tool_calls[1]
+    assert [event["sequence"] for event in gateway.events] == list(
+        range(1, len(gateway.events) + 1)
+    )
+    assert [event["event_type"] for event in gateway.events].count(
+        "team.synthesis.started"
+    ) == 1
+    assert [event["event_type"] for event in gateway.events].count(
+        "team.task.started"
+    ) == 1
 
 
 @pytest.mark.parametrize(

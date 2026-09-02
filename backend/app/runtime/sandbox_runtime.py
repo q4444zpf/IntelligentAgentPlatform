@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Any
@@ -73,30 +73,43 @@ class _TeamMemberCheckpointStore:
 class _GatewayCheckpointStore:
     gateway: Any
     snapshot_digest: str
+    _loaded: bool = field(default=False, init=False)
+    _state: dict[str, Any] | None = field(default=None, init=False)
 
     def load_latest(self, _run_id: str) -> dict[str, Any] | None:
+        if self._loaded:
+            return self._state
         try:
             checkpoint = self.gateway.get_latest_checkpoint()
         except RunnerGatewayBusinessError as error:
             if error.code in {"checkpoint_not_found", "runner_gateway_not_found"}:
+                self._loaded = True
                 return None
             raise
         if not isinstance(checkpoint, dict):
+            self._loaded = True
             return None
         if checkpoint.get("snapshot_digest") != self.snapshot_digest:
             raise ValueError("checkpoint snapshot digest mismatch")
         state = checkpoint.get("state")
-        return state if isinstance(state, dict) else None
+        self._state = state if isinstance(state, dict) else None
+        self._loaded = True
+        return self._state
 
     def save(self, _run_id: str, checkpoint_key: str, state: dict[str, Any]):
-        return self.gateway.save_checkpoint(
+        saved = self.gateway.save_checkpoint(
             checkpoint_key,
             state,
             f"checkpoint:{checkpoint_key}",
         )
+        self._state = state
+        self._loaded = True
+        return saved
 
 
 class SandboxRuntime:
+    _RUNTIME_METADATA_KEY = "__sandbox_runtime__"
+
     def __init__(
         self,
         gateway,
@@ -112,6 +125,8 @@ class SandboxRuntime:
     def execute(self, request: RunExecutionRequest) -> RunExecutionResult:
         if request.deadline_at <= datetime.now(timezone.utc):
             return RunExecutionResult(status="failed", error_code="sandbox_timeout")
+        checkpoint_store = None
+        model_budget = None
         try:
             snapshot = self.gateway.get_snapshot()
             if (
@@ -149,12 +164,49 @@ class SandboxRuntime:
                     checkpoint_store=checkpoint_store,
                 )
             else:
-                self._append_event("runner.started", {})
-                model_budget = GatewayModelBudget(
-                    max_iterations=limits.max_iterations,
-                    max_tool_calls=limits.max_tool_calls,
-                    max_subagents=limits.max_subagents,
+                restored_state = checkpoint_store.load_latest(request.run_id)
+                runtime_metadata = (
+                    restored_state.get(self._RUNTIME_METADATA_KEY)
+                    if isinstance(restored_state, dict)
+                    else None
                 )
+                if runtime_metadata is None:
+                    model_budget = GatewayModelBudget(
+                        max_iterations=limits.max_iterations,
+                        max_tool_calls=limits.max_tool_calls,
+                        max_subagents=limits.max_subagents,
+                    )
+                    self._append_event("runner.started", {})
+                else:
+                    if (
+                        not isinstance(runtime_metadata, dict)
+                        or not isinstance(
+                            restored_state.get("__langgraph_checkpoint__"), dict
+                        )
+                    ):
+                        raise ValueError("invalid sandbox runtime checkpoint")
+                    event_sequence = runtime_metadata.get("event_sequence")
+                    if type(event_sequence) is not int or event_sequence < 0:
+                        raise ValueError("invalid sandbox runtime checkpoint")
+                    try:
+                        budget = TeamBudgetState.model_validate(
+                            runtime_metadata.get("budget")
+                        )
+                    except ValidationError as error:
+                        raise ValueError(
+                            "invalid sandbox runtime checkpoint"
+                        ) from error
+                    self._event_sequence = event_sequence
+                    model_budget = GatewayModelBudget(
+                        max_iterations=limits.max_iterations,
+                        max_tool_calls=limits.max_tool_calls,
+                        max_subagents=limits.max_subagents,
+                        next_invocation_sequence=(
+                            budget.next_invocation_sequence
+                        ),
+                        tool_call_count=budget.tool_call_count,
+                        subagent_call_count=budget.subagent_call_count,
+                    )
                 skill_context = ", ".join(
                     skill.name for skill in snapshot.payload.skills
                 )
@@ -214,19 +266,38 @@ class SandboxRuntime:
             checkpoint_key = self._approval_checkpoint_key
             if checkpoint_key is None:
                 checkpoint_key = f"approval-{interruption.approval_id}"
-                state = {
-                    "status": "waiting_approval",
-                    "approval_id": interruption.approval_id,
-                }
-                self.gateway.save_checkpoint(
-                    checkpoint_key,
-                    state,
-                    f"checkpoint:{checkpoint_key}",
-                )
                 self._append_event(
                     "approval.required",
                     {"approval_id": interruption.approval_id},
                 )
+                interrupted_state = (
+                    checkpoint_store.load_latest(request.run_id)
+                    if checkpoint_store is not None
+                    else None
+                )
+                state = {
+                    **(
+                        interrupted_state
+                        if isinstance(interrupted_state, dict)
+                        else {}
+                    ),
+                    "status": "waiting_approval",
+                    "approval_id": interruption.approval_id,
+                    self._RUNTIME_METADATA_KEY: {
+                        "event_sequence": self._event_sequence,
+                        "budget": self._budget_snapshot(model_budget).model_dump(
+                            mode="json"
+                        ),
+                    },
+                }
+                if checkpoint_store is None:
+                    self.gateway.save_checkpoint(
+                        checkpoint_key,
+                        state,
+                        f"checkpoint:{checkpoint_key}",
+                    )
+                else:
+                    checkpoint_store.save(request.run_id, checkpoint_key, state)
             self.gateway.complete(
                 {
                     "status": "interrupted",
@@ -751,20 +822,92 @@ class SandboxRuntime:
                 capability=synthesis_artifact_capability,
             ),
         )
-        result = self.runtime_adapter_type(graph).invoke(
-            RuntimeState(
-                run_id=request.run_id,
-                messages=synthesis_messages,
-                status="running",
-                values={
-                    "team_version_id": actor.version_id,
-                    "team_task_id": "synthesis",
-                    "team_member_agent_id": actor.supervisor.agent_id,
-                    "team_task_invocation_id": synthesis_invocation.invocation_id,
-                },
-            ),
-            metadata=metadata,
+
+        def save_synthesis_runtime_state(checkpoint_key, runtime_state):
+            nonlocal state
+            checkpoint_status = (
+                "interrupted"
+                if checkpoint_key == "interrupted"
+                else "completed"
+            )
+            active = tuple(
+                item.model_copy(
+                    update={
+                        "runtime_state": runtime_state,
+                        "checkpoint_status": checkpoint_status,
+                    }
+                )
+                if item.task_id == "synthesis"
+                else item
+                for item in state.active_invocations
+            )
+            state = self._state_with_results(
+                state,
+                completed,
+                failed,
+                started,
+                stage="synthesizing",
+                active_invocations=active,
+            )
+            state = self._save_team_state(state, model_budget)
+
+        synthesis_checkpoint_store = _TeamMemberCheckpointStore(
+            synthesis_invocation.runtime_state,
+            save_synthesis_runtime_state,
         )
+        try:
+            result = self.runtime_adapter_type(
+                graph,
+                checkpoint_store=synthesis_checkpoint_store,
+            ).invoke(
+                RuntimeState(
+                    run_id=request.run_id,
+                    messages=synthesis_messages,
+                    status="running",
+                    values={
+                        "team_version_id": actor.version_id,
+                        "team_task_id": "synthesis",
+                        "team_member_agent_id": actor.supervisor.agent_id,
+                        "team_task_invocation_id": (
+                            synthesis_invocation.invocation_id
+                        ),
+                    },
+                ),
+                metadata=metadata,
+            )
+        except RunnerApprovalInterruption as interruption:
+            active = tuple(
+                item.model_copy(
+                    update={
+                        "checkpoint_status": "interrupted",
+                        "approval_id": interruption.approval_id,
+                    }
+                )
+                if item.task_id == "synthesis"
+                else item
+                for item in state.active_invocations
+            )
+            state = self._state_with_results(
+                state,
+                completed,
+                failed,
+                started,
+                stage="synthesizing",
+                active_invocations=active,
+            )
+            self._append_event(
+                "approval.required",
+                {
+                    **team_fields,
+                    "approval_id": interruption.approval_id,
+                    "agent_id": actor.supervisor.agent_id,
+                    "task_id": "synthesis",
+                    "invocation_id": synthesis_invocation.invocation_id,
+                },
+            )
+            state = self._save_team_state(state, model_budget)
+            self._approval_checkpoint_key = "team-scheduler"
+            raise
         content = result.content
         if failed:
             failed_ids = ", ".join(
@@ -1040,9 +1183,25 @@ class SandboxRuntime:
         ):
             raise TeamPlanError("team_checkpoint_invalid: task state")
         active_task_ids = [item.task_id for item in state.active_invocations]
-        if (
-            len(active_task_ids) != len(set(active_task_ids))
-            or not set(active_task_ids) <= task_ids
+        if len(active_task_ids) != len(set(active_task_ids)):
+            raise TeamPlanError("team_checkpoint_invalid: active task")
+        synthesis_invocations = tuple(
+            item
+            for item in state.active_invocations
+            if item.task_id == "synthesis"
+        )
+        if synthesis_invocations:
+            synthesis = synthesis_invocations[0]
+            if (
+                state.stage != "synthesizing"
+                or len(state.active_invocations) != 1
+                or synthesis.member_agent_id != actor.supervisor.agent_id
+                or synthesis.invocation_id
+                != self._task_invocation_id(actor, "synthesis")
+            ):
+                raise TeamPlanError("team_checkpoint_invalid: active task")
+        elif (
+            not set(active_task_ids) <= task_ids
             or not set(active_task_ids) <= set(state.started_task_ids)
             or set(active_task_ids) & settled_ids
         ):
