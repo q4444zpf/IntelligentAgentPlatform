@@ -485,6 +485,9 @@ def _team_scheduler_checkpoint(snapshot):
         },
         "pending_task_ids": ["forecast-task", "review-task"],
         "started_task_ids": ["forecast-task"],
+        "active_task_id": "forecast-task",
+        "active_member_agent_id": "forecast",
+        "active_invocation_id": "team:team-version-1:forecast-task",
         "completed_results": [],
         "failed_results": [],
         "event_sequence": 1,
@@ -505,21 +508,25 @@ def _team_scheduler_checkpoint(snapshot):
             "team_version_id": "spoofed-version",
             "member_agent_id": "forecast",
             "task_id": "forecast-task",
+            "invocation_id": "team:team-version-1:forecast-task",
         },
         {
             "team_version_id": "team-version-1",
             "member_agent_id": "outside",
             "task_id": "forecast-task",
+            "invocation_id": "team:team-version-1:forecast-task",
         },
         {
             "team_version_id": "team-version-1",
             "member_agent_id": "review",
             "task_id": "forecast-task",
+            "invocation_id": "team:team-version-1:forecast-task",
         },
         {
             "team_version_id": "team-version-1",
             "member_agent_id": "review",
             "task_id": "review-task",
+            "invocation_id": "team:team-version-1:review-task",
         },
     ],
 )
@@ -553,6 +560,7 @@ def test_team_artifact_gateway_derives_version_and_persists_validated_provenance
         json=_artifact_request(provenance={
             "member_agent_id": "forecast",
             "task_id": "forecast-task",
+            "invocation_id": "team:team-version-1:forecast-task",
         }),
     )
 
@@ -567,6 +575,33 @@ def test_team_artifact_gateway_derives_version_and_persists_validated_provenance
     }
 
 
+def test_team_artifact_gateway_rejects_another_started_task_than_active_invocation():
+    snapshot = _gateway_snapshot(team=True)
+    checkpoint = _team_scheduler_checkpoint(snapshot) | {
+        "started_task_ids": ["forecast-task", "review-task"],
+        "active_task_id": "forecast-task",
+        "active_member_agent_id": "forecast",
+        "active_invocation_id": "team:team-version-1:forecast-task",
+    }
+    client, _, _, _ = _gateway_client(
+        snapshot=snapshot,
+        checkpoint_state=checkpoint,
+    )
+
+    response = client.post(
+        "/internal/runner/runs/run-1/artifacts",
+        headers=_headers(key="artifact-team-other-started-task"),
+        json=_artifact_request(provenance={
+            "member_agent_id": "review",
+            "task_id": "review-task",
+            "invocation_id": "team:team-version-1:review-task",
+        }),
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "artifact_provenance_invalid"
+
+
 def test_agent_artifact_gateway_rejects_team_provenance_but_keeps_legacy_upload():
     client, _, _, _ = _gateway_client()
 
@@ -577,6 +612,7 @@ def test_agent_artifact_gateway_rejects_team_provenance_but_keeps_legacy_upload(
             "team_version_id": "team-version-1",
             "member_agent_id": "forecast",
             "task_id": "forecast-task",
+            "invocation_id": "team:team-version-1:forecast-task",
         }),
     )
     accepted = client.post(

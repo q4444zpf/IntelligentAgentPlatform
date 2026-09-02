@@ -74,6 +74,53 @@ def test_team_plan_rejects_max_steps_and_runner_subagent_ceiling(snapshot):
         )
 
 
+def test_team_plan_rejects_parallel_width_above_team_or_runner_ceiling(snapshot):
+    plan = TeamPlan(tasks=(
+        TeamTask(id="supervisor-task", member_id="supervisor", objective="one", position=0),
+        TeamTask(id="member-task", member_id="member", objective="two", position=1),
+    ))
+
+    constrained = snapshot.model_copy(update={"max_parallel_members": 1})
+    with pytest.raises(TeamLimitError, match="max_parallel_members"):
+        validate_team_plan(plan, constrained, runner_max_subagents=2)
+    with pytest.raises(TeamLimitError, match="max_subagents"):
+        validate_team_plan(plan, snapshot, runner_max_subagents=1)
+
+
+def test_supervisor_plan_requires_a_bounded_output_contract(snapshot):
+    plan = team_graph.parse_supervisor_plan(
+        {
+            "tasks": [{
+                "id": "review",
+                "member_id": "member",
+                "objective": "Review flood forecast",
+                "depends_on": [],
+                "position": 0,
+                "output_contract": {"max_output_bytes": 1024},
+            }],
+        },
+        snapshot,
+        runner_max_subagents=1,
+    )
+
+    assert plan.tasks[0].output_contract.max_output_bytes == 1024
+    with pytest.raises(TeamPlanError, match="invalid schema"):
+        team_graph.parse_supervisor_plan(
+            {
+                "tasks": [{
+                    "id": "invalid-output",
+                    "member_id": "member",
+                    "objective": "Review flood forecast",
+                    "depends_on": [],
+                    "position": 0,
+                    "output_contract": {"max_output_bytes": 0},
+                }],
+            },
+            snapshot,
+            runner_max_subagents=1,
+        )
+
+
 def test_platform_plan_parser_accepts_only_typed_validated_json(snapshot):
     parser = getattr(team_graph, "parse_supervisor_plan", None)
     assert callable(parser), "platform supervisor plan parser is missing"

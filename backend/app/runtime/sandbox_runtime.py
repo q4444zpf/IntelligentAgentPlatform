@@ -4,6 +4,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from threading import Lock
 from typing import Any
 
 from pydantic import ValidationError
@@ -20,6 +21,7 @@ from .execution_snapshot import verify_snapshot_digest
 from .execution_snapshot import PublishedTeamSnapshot
 from .team_graph import (
     TeamBudgetState,
+    TeamActiveInvocation,
     TeamLimitError,
     TeamPlan,
     TeamPlanError,
@@ -45,6 +47,25 @@ logger = logging.getLogger(__name__)
 
 class _TeamCancelled(RuntimeError):
     pass
+
+
+class _TeamRecoveryRequired(RuntimeError):
+    pass
+
+
+@dataclass
+class _TeamMemberCheckpointStore:
+    state: dict[str, Any] | None
+    save_callback: Any
+
+    def load_latest(self, _run_id: str) -> dict[str, Any] | None:
+        return self.state
+
+    def save(
+        self, _run_id: str, checkpoint_key: str, state: dict[str, Any]
+    ) -> None:
+        self.state = state
+        self.save_callback(checkpoint_key, state)
 
 
 @dataclass
@@ -222,6 +243,8 @@ class SandboxRuntime:
                 error_code="sandbox_cancelled",
                 checkpoint_key="team-scheduler",
             )
+        except _TeamRecoveryRequired:
+            return self._fail("team_recovery_required")
         except RunnerGatewayModelError as error:
             return self._fail(error.code)
         except RunnerGatewayClientError as error:
@@ -311,6 +334,39 @@ class SandboxRuntime:
         started = set(state.started_task_ids)
         task_by_id = {task.id: task for task in state.plan.tasks}
         team_fields = {"team_id": actor.id, "version_id": actor.version_id}
+        state = self._normalize_active_invocations(state)
+        recovered = (
+            self._recover_completed_invocations(
+                state.active_invocations, task_by_id
+            )
+            if state.stage not in {"synthesizing", "completed"}
+            else ()
+        )
+        if recovered:
+            for result in recovered:
+                completed[result.task_id] = result
+                self._append_event(
+                    "team.task.completed",
+                    {
+                        **team_fields,
+                        "agent_id": result.member_agent_id,
+                        "task_id": result.task_id,
+                        "position": result.position,
+                    },
+                )
+            state = self._state_with_results(
+                state,
+                completed,
+                failed,
+                started,
+                stage="executing",
+                active_invocations=tuple(
+                    item
+                    for item in state.active_invocations
+                    if item.checkpoint_status != "completed"
+                ),
+            )
+            state = self._save_team_state(state, model_budget)
 
         if state.stage not in {"synthesizing", "completed"}:
             while len(completed) + len(failed) < len(state.plan.tasks):
@@ -342,11 +398,12 @@ class SandboxRuntime:
                         raise RuntimeError("team member failed")
                     continue
 
-                if state.active_task_id is not None:
-                    active = task_by_id.get(state.active_task_id)
-                    if active is None or active.id in completed or active.id in failed:
-                        raise TeamPlanError("team_checkpoint_invalid: active task")
-                    batch = (active,)
+                if state.active_invocations:
+                    batch = tuple(
+                        task_by_id[item.task_id]
+                        for item in state.active_invocations
+                        if item.task_id not in completed and item.task_id not in failed
+                    )
                 else:
                     batch = schedule_ready_tasks(
                         state.plan,
@@ -373,19 +430,72 @@ class SandboxRuntime:
                                 "position": task.position,
                             },
                         )
+                previous_invocations = {
+                    item.task_id: item for item in state.active_invocations
+                }
+                active_invocations = tuple(
+                    previous_invocations.get(
+                        task.id,
+                        TeamActiveInvocation(
+                            task_id=task.id,
+                            member_agent_id=task.member_id,
+                            invocation_id=self._task_invocation_id(actor, task.id),
+                            checkpoint_status="running",
+                        ),
+                    ).model_copy(
+                        update={
+                            "checkpoint_status": "running",
+                            "approval_id": None,
+                        }
+                    )
+                    for task in batch
+                )
                 state = self._state_with_results(
                     state,
                     completed,
                     failed,
                     started,
                     stage="executing",
-                    active_task_id=None,
-                    active_member_agent_id=None,
-                    active_invocation_id=None,
+                    active_invocations=active_invocations,
                 )
                 state = self._save_team_state(state, model_budget)
+                state_lock = Lock()
+
+                def save_member_runtime_state(task, checkpoint_key, runtime_state):
+                    nonlocal state
+                    checkpoint_status = (
+                        "interrupted"
+                        if checkpoint_key == "interrupted"
+                        else "completed"
+                    )
+                    with state_lock:
+                        active = tuple(
+                            item.model_copy(
+                                update={
+                                    "runtime_state": runtime_state,
+                                    "checkpoint_status": checkpoint_status,
+                                }
+                            )
+                            if item.task_id == task.id
+                            else item
+                            for item in state.active_invocations
+                        )
+                        state = self._state_with_results(
+                            state,
+                            completed,
+                            failed,
+                            started,
+                            stage="executing",
+                            active_invocations=active,
+                        )
+                        state = self._save_team_state(state, model_budget)
 
                 def invoke(task: TeamTask):
+                    invocation = next(
+                        item
+                        for item in active_invocations
+                        if item.task_id == task.id
+                    )
                     return self._invoke_team_member(
                         request=request,
                         snapshot=snapshot,
@@ -397,6 +507,10 @@ class SandboxRuntime:
                         completed=completed,
                         legacy_model=legacy_model,
                         legacy_tools=legacy_tools,
+                        runtime_state=invocation.runtime_state,
+                        checkpoint_callback=lambda key, runtime_state: (
+                            save_member_runtime_state(task, key, runtime_state)
+                        ),
                     )
 
                 with ThreadPoolExecutor(max_workers=len(batch)) as executor:
@@ -408,13 +522,22 @@ class SandboxRuntime:
                         except Exception as error:  # noqa: BLE001
                             outcomes.append((task, None, error))
 
-                interruption = None
+                interruptions = []
                 first_failure = None
+                active_by_task = {
+                    item.task_id: item for item in state.active_invocations
+                }
                 for task, member_result, error in sorted(
                     outcomes, key=lambda item: (item[0].position, item[0].id)
                 ):
                     if isinstance(error, RunnerApprovalInterruption):
-                        interruption = interruption or (task, error)
+                        interruptions.append((task, error))
+                        active_by_task[task.id] = active_by_task[task.id].model_copy(
+                            update={
+                                "checkpoint_status": "interrupted",
+                                "approval_id": error.approval_id,
+                            }
+                        )
                         continue
                     if error is not None:
                         first_failure = first_failure or error
@@ -435,7 +558,33 @@ class SandboxRuntime:
                                 "error_code": failure.error_code,
                             },
                         )
+                        active_by_task.pop(task.id, None)
                     else:
+                        if (
+                            len(member_result.content.encode("utf-8"))
+                            > task.output_contract.max_output_bytes
+                        ):
+                            error = RunnerGatewayModelError("runtime_output_limit")
+                            first_failure = first_failure or error
+                            failure = TeamTaskFailure(
+                                task_id=task.id,
+                                member_agent_id=task.member_id,
+                                position=task.position,
+                                error_code=error.code,
+                            )
+                            failed[task.id] = failure
+                            self._append_event(
+                                "team.task.failed",
+                                {
+                                    **team_fields,
+                                    "agent_id": task.member_id,
+                                    "task_id": task.id,
+                                    "position": task.position,
+                                    "error_code": failure.error_code,
+                                },
+                            )
+                            active_by_task.pop(task.id, None)
+                            continue
                         completed[task.id] = TeamTaskResult(
                             task_id=task.id,
                             member_agent_id=task.member_id,
@@ -451,36 +600,37 @@ class SandboxRuntime:
                                 "position": task.position,
                             },
                         )
+                        active_by_task.pop(task.id, None)
 
-                if interruption is not None:
-                    task, approval = interruption
-                    invocation_id = self._task_invocation_id(actor, task.id)
+                if interruptions:
                     state = self._state_with_results(
                         state,
                         completed,
                         failed,
                         started,
                         stage="waiting_approval",
-                        active_task_id=task.id,
-                        active_member_agent_id=task.member_id,
-                        active_invocation_id=invocation_id,
+                        active_invocations=tuple(
+                            active_by_task[task.id]
+                            for task, _approval in interruptions
+                        ),
                     )
-                    self._append_event(
-                        "approval.required",
-                        {
-                            **team_fields,
-                            "approval_id": approval.approval_id,
-                            "agent_id": task.member_id,
-                            "task_id": task.id,
-                            "invocation_id": invocation_id,
-                        },
-                    )
+                    for task, approval in interruptions:
+                        self._append_event(
+                            "approval.required",
+                            {
+                                **team_fields,
+                                "approval_id": approval.approval_id,
+                                "agent_id": task.member_id,
+                                "task_id": task.id,
+                                "invocation_id": self._task_invocation_id(actor, task.id),
+                            },
+                        )
                     state = state.model_copy(
                         update={"event_sequence": self._event_sequence}
                     )
                     self._save_team_state(state, model_budget)
                     self._approval_checkpoint_key = "team-scheduler"
-                    raise approval
+                    raise interruptions[0][1]
 
                 state = self._state_with_results(
                     state, completed, failed, started, stage="executing"
@@ -514,9 +664,14 @@ class SandboxRuntime:
                 failed,
                 started,
                 stage="synthesizing",
-                active_task_id="synthesis",
-                active_member_agent_id=actor.supervisor.agent_id,
-                active_invocation_id=self._task_invocation_id(actor, "synthesis"),
+                active_invocations=(
+                    TeamActiveInvocation(
+                        task_id="synthesis",
+                        member_agent_id=actor.supervisor.agent_id,
+                        invocation_id=self._task_invocation_id(actor, "synthesis"),
+                        checkpoint_status="running",
+                    ),
+                ),
             )
             state = self._save_team_state(state, model_budget)
 
@@ -557,6 +712,9 @@ class SandboxRuntime:
                     "team_version_id": actor.version_id,
                     "member_agent_id": actor.supervisor.agent_id,
                     "task_id": "synthesis",
+                    "invocation_id": self._task_invocation_id(
+                        actor, "synthesis"
+                    ),
                 },
             ),
         )
@@ -607,6 +765,8 @@ class SandboxRuntime:
             active_task_id=None,
             active_member_agent_id=None,
             active_invocation_id=None,
+            active_runtime_state=None,
+            active_invocations=(),
         )
         state = state.model_copy(update={"final_assistant_content": content})
         self._save_team_state(state, model_budget)
@@ -667,7 +827,8 @@ class SandboxRuntime:
                     "Create the bounded Team execution plan. Return only one JSON "
                     "object matching {\"tasks\":[{\"id\":string,"
                     "\"member_id\":string,\"objective\":string,"
-                    "\"depends_on\":[string],\"position\":integer}]}. "
+                    "\"depends_on\":[string],\"position\":integer,"
+                    "\"output_contract\":{\"max_output_bytes\":integer}}]}. "
                     f"Use at most {actor.max_steps} tasks and only these members:\n"
                     f"{member_lines}"
                 ),
@@ -704,6 +865,8 @@ class SandboxRuntime:
         completed,
         legacy_model,
         legacy_tools,
+        runtime_state,
+        checkpoint_callback,
     ):
         model, tools = self._member_runtime_dependencies(
             snapshot,
@@ -723,6 +886,7 @@ class SandboxRuntime:
                     "team_version_id": actor.version_id,
                     "member_agent_id": task.member_id,
                     "task_id": task.id,
+                    "invocation_id": self._task_invocation_id(actor, task.id),
                 },
             ),
         )
@@ -745,7 +909,11 @@ class SandboxRuntime:
                 ),
             },
         ]
-        return self.runtime_adapter_type(graph).invoke(
+        checkpoint_store = _TeamMemberCheckpointStore(
+            runtime_state,
+            checkpoint_callback,
+        )
+        return self.runtime_adapter_type(graph, checkpoint_store=checkpoint_store).invoke(
             RuntimeState(
                 run_id=request.run_id,
                 messages=task_messages,
@@ -837,6 +1005,14 @@ class SandboxRuntime:
             != len(state.completed_results) + len(state.failed_results)
         ):
             raise TeamPlanError("team_checkpoint_invalid: task state")
+        active_task_ids = [item.task_id for item in state.active_invocations]
+        if (
+            len(active_task_ids) != len(set(active_task_ids))
+            or not set(active_task_ids) <= task_ids
+            or not set(active_task_ids) <= set(state.started_task_ids)
+            or set(active_task_ids) & settled_ids
+        ):
+            raise TeamPlanError("team_checkpoint_invalid: active task")
         return state
 
     def _save_team_state(
@@ -875,6 +1051,76 @@ class SandboxRuntime:
         )
 
     @staticmethod
+    def _normalize_active_invocations(state: TeamSchedulerState) -> TeamSchedulerState:
+        if state.active_invocations:
+            return state
+        legacy = (
+            state.active_task_id,
+            state.active_member_agent_id,
+            state.active_invocation_id,
+        )
+        if legacy == (None, None, None):
+            return state
+        if any(value is None for value in legacy):
+            raise TeamPlanError("team_checkpoint_invalid: active task")
+        return state.model_copy(
+            update={
+                "active_invocations": (
+                    TeamActiveInvocation(
+                        task_id=state.active_task_id,
+                        member_agent_id=state.active_member_agent_id,
+                        invocation_id=state.active_invocation_id,
+                        runtime_state=state.active_runtime_state,
+                        checkpoint_status=(
+                            "interrupted"
+                            if state.stage == "waiting_approval"
+                            else "running"
+                        ),
+                    ),
+                ),
+            }
+        )
+
+    @staticmethod
+    def _recover_completed_invocations(active_invocations, task_by_id):
+        recovered = []
+        for invocation in active_invocations:
+            task = task_by_id.get(invocation.task_id)
+            if task is None or task.member_id != invocation.member_agent_id:
+                raise TeamPlanError("team_checkpoint_invalid: active task")
+            if invocation.runtime_state is None:
+                raise _TeamRecoveryRequired()
+            if invocation.checkpoint_status != "completed":
+                continue
+            messages = invocation.runtime_state.get("messages")
+            if not isinstance(messages, list):
+                raise _TeamRecoveryRequired()
+            content = next(
+                (
+                    message.get("content")
+                    for message in reversed(messages)
+                    if isinstance(message, dict)
+                    and message.get("role") == "assistant"
+                    and isinstance(message.get("content"), str)
+                    and message["content"].strip()
+                ),
+                None,
+            )
+            if content is None:
+                raise _TeamRecoveryRequired()
+            if len(content.encode("utf-8")) > task.output_contract.max_output_bytes:
+                raise _TeamRecoveryRequired()
+            recovered.append(
+                TeamTaskResult(
+                    task_id=task.id,
+                    member_agent_id=task.member_id,
+                    position=task.position,
+                    content=content,
+                )
+            )
+        return tuple(recovered)
+
+    @staticmethod
     def _state_with_results(
         state,
         completed,
@@ -885,7 +1131,17 @@ class SandboxRuntime:
         active_task_id=None,
         active_member_agent_id=None,
         active_invocation_id=None,
+        active_runtime_state=None,
+        active_invocations=(),
     ):
+        if active_invocations:
+            legacy = active_invocations[0] if len(active_invocations) == 1 else None
+            active_task_id = legacy.task_id if legacy is not None else None
+            active_member_agent_id = (
+                legacy.member_agent_id if legacy is not None else None
+            )
+            active_invocation_id = legacy.invocation_id if legacy is not None else None
+            active_runtime_state = legacy.runtime_state if legacy is not None else None
         return state.model_copy(
             update={
                 "stage": stage,
@@ -899,6 +1155,8 @@ class SandboxRuntime:
                 "active_task_id": active_task_id,
                 "active_member_agent_id": active_member_agent_id,
                 "active_invocation_id": active_invocation_id,
+                "active_runtime_state": active_runtime_state,
+                "active_invocations": active_invocations,
             }
         )
 

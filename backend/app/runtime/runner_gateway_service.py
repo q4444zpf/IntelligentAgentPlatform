@@ -63,7 +63,12 @@ from .runner_gateway_schemas import (
     ToolInvocationRequest,
     ToolInvocationResponse,
 )
-from .team_graph import TeamPlanError, TeamSchedulerState, validate_team_plan
+from .team_graph import (
+    TeamActiveInvocation,
+    TeamPlanError,
+    TeamSchedulerState,
+    validate_team_plan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -843,10 +848,36 @@ class RunnerGatewayService:
                 "成果来源无效",
             )
 
+        active_invocations = state.active_invocations
+        if not active_invocations and state.active_task_id is not None:
+            active_invocations = (
+                TeamActiveInvocation(
+                    task_id=state.active_task_id,
+                    member_agent_id=state.active_member_agent_id or "",
+                    invocation_id=state.active_invocation_id or "",
+                    runtime_state=state.active_runtime_state,
+                    checkpoint_status=(
+                        "interrupted"
+                        if state.stage == "waiting_approval"
+                        else "running"
+                    ),
+                ),
+            )
+        active = next(
+            (
+                item
+                for item in active_invocations
+                if item.task_id == requested.task_id
+                and item.member_agent_id == requested.member_agent_id
+                and item.invocation_id == requested.invocation_id
+            ),
+            None,
+        )
         if requested.task_id == "synthesis":
             valid = (
                 requested.member_agent_id == actor.supervisor.agent_id
-                and state.stage in {"synthesizing", "completed"}
+                and state.stage == "synthesizing"
+                and active is not None
             )
         else:
             task = next(
@@ -860,7 +891,7 @@ class RunnerGatewayService:
             valid = (
                 task is not None
                 and task.member_id == requested.member_agent_id
-                and requested.task_id in state.started_task_ids
+                and active is not None
             )
         if not valid:
             raise RunnerGatewayError(

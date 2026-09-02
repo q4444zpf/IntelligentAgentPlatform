@@ -60,7 +60,12 @@ class RunnerArtifactClient(Protocol):
 class ArtifactBackend(BackendProtocol):
     def __init__(self, client: RunnerArtifactClient, *, provenance: dict[str, str] | None = None) -> None:
         self.client = client
-        allowed = {"team_version_id", "member_agent_id", "task_id"}
+        allowed = {
+            "team_version_id",
+            "member_agent_id",
+            "task_id",
+            "invocation_id",
+        }
         self.provenance = {
             key: value for key, value in (provenance or {}).items()
             if key in allowed and isinstance(value, str) and value

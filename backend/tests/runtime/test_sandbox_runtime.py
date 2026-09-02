@@ -31,6 +31,12 @@ from app.runtime.gateway_tools import (
 from app.runtime.runner_gateway_client import RunnerGatewayBusinessError
 from app.runtime.runner_gateway_schemas import SnapshotResponse
 from app.runtime.sandbox_runtime import SandboxRuntime
+from app.runtime.team_graph import (
+    TeamBudgetState,
+    TeamPlan,
+    TeamSchedulerState,
+    TeamTask,
+)
 
 
 def _snapshot():
@@ -750,7 +756,7 @@ def test_team_runtime_executes_typed_plan_in_bounded_parallel_batches_and_joins_
                 "id": "fast",
                 "member_id": "member-2",
                 "objective": "review",
-                "depends_on": [],
+                "depends_on": ["slow"] if max_subagents == 1 else [],
                 "position": 1,
             },
         ]
@@ -815,7 +821,7 @@ def test_team_runtime_applies_failure_strategy_and_labels_partial_content(
     base = _schema_v5_team_snapshot()
     actor = base.payload.actor.model_copy(update={
         "failure_strategy": failure_strategy,
-        "max_parallel_members": 1,
+        "max_parallel_members": 2,
     })
     payload = base.payload.model_copy(update={
         "actor": actor,
@@ -1053,13 +1059,17 @@ def test_team_approval_restart_restores_exact_task_events_and_shared_budget_stat
                 "status": "completed",
             }
 
-    class ApprovalToolGraph:
-        def __init__(self, tool, calls):
+    class ApprovalAfterModelGraph:
+        def __init__(self, model, tool, calls):
+            self.model = model
             self.tool = tool
             self.calls = calls
 
         def invoke(self, state, *, config=None):
             self.calls.append(deepcopy(state))
+            if state.get("member_progress") != "model-completed":
+                self.model.invoke([HumanMessage(content="prepare operation")])
+                state["member_progress"] = "model-completed"
             self.tool.run({}, tool_call_id="approval-tool-call")
             return {
                 **state,
@@ -1085,7 +1095,8 @@ def test_team_approval_restart_restores_exact_task_events_and_shared_budget_stat
                 return ModelGraph(kwargs["model"], [])
             if member.agent_id == "member-1":
                 return ModelGraph(kwargs["model"], [])
-            return ApprovalToolGraph(
+            return ApprovalAfterModelGraph(
+                kwargs["model"],
                 kwargs["tools"][0],
                 resumed_states if self.resumed else interrupted_states,
             )
@@ -1104,7 +1115,7 @@ def test_team_approval_restart_restores_exact_task_events_and_shared_budget_stat
     assert approval_checkpoint["team_version_id"] == "version-1"
     assert approval_checkpoint["snapshot_digest"] == snapshot.digest
     assert approval_checkpoint["budget"] == {
-        "next_invocation_sequence": 1,
+        "next_invocation_sequence": 2,
         "tool_call_count": 2,
         "subagent_call_count": 1,
     }
@@ -1120,14 +1131,20 @@ def test_team_approval_restart_restores_exact_task_events_and_shared_budget_stat
     assert "member-1" not in second_factory.built_members
     assert [key for _, key in gateway.model_calls] == [
         "model-member-1-0",
-        "model-supervisor-1",
+        "model-member-2-1",
+        "model-supervisor-2",
     ]
+    assert sum(
+        request["member_agent_id"] == "member-2"
+        for request, _ in gateway.model_calls
+    ) == 1
     assert len(gateway.tool_calls) == 2
     assert gateway.tool_calls[0] == gateway.tool_calls[1]
     assert gateway.tool_calls[0]["member_agent_id"] == "member-2"
     assert interrupted_states[0]["team_task_invocation_id"] == (
         resumed_states[0]["team_task_invocation_id"]
     )
+    assert resumed_states[0]["member_progress"] == "model-completed"
     event_types = [event["event_type"] for event in gateway.events]
     assert event_types.count("runner.started") == 1
     assert event_types.count("team.plan.created") == 1
@@ -1151,6 +1168,203 @@ def test_team_approval_restart_restores_exact_task_events_and_shared_budget_stat
     assert completed_restart.status == "completed"
     assert gateway.events == events_before_restart
     assert len(gateway.model_calls) == model_call_count_before_restart
+
+
+def test_team_restart_fails_closed_for_an_inflight_task_without_runtime_checkpoint():
+    snapshot = _schema_v5_team_snapshot()
+    plan = TeamPlan(tasks=(
+        TeamTask(
+            id="approval-task",
+            member_id="member-2",
+            objective="operate gate",
+            position=0,
+        ),
+    ))
+    checkpoint = TeamSchedulerState(
+        stage="executing",
+        snapshot_digest=snapshot.digest,
+        team_version_id="version-1",
+        plan=plan,
+        pending_task_ids=("approval-task",),
+        started_task_ids=("approval-task",),
+        active_task_id="approval-task",
+        active_member_agent_id="member-2",
+        active_invocation_id="team:version-1:approval-task",
+        budget=TeamBudgetState(
+            next_invocation_sequence=1,
+            tool_call_count=0,
+            subagent_call_count=0,
+        ),
+    ).model_dump(mode="json")
+
+    class DurableGateway(FakeGateway):
+        def __init__(self):
+            super().__init__(snapshot)
+            self.latest_checkpoint = {
+                "checkpoint_key": "team-scheduler",
+                "snapshot_digest": snapshot.digest,
+                "state": checkpoint,
+            }
+
+        def get_latest_checkpoint(self):
+            return deepcopy(self.latest_checkpoint)
+
+    class RejectingFactory:
+        def __init__(self):
+            self.build_calls = 0
+
+        def build(self, *_args, **_kwargs):
+            self.build_calls += 1
+            raise AssertionError("unsafe in-flight task was replayed")
+
+    gateway = DurableGateway()
+    factory = RejectingFactory()
+    result = SandboxRuntime(gateway, agent_factory=factory).execute(
+        _request(snapshot)
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "team_recovery_required"
+    assert factory.build_calls == 0
+    assert gateway.model_calls == []
+    assert gateway.tool_calls == []
+
+
+def test_team_parallel_approval_interruptions_persist_every_active_invocation():
+    snapshot = _schema_v5_team_snapshot()
+    plan = {
+        "tasks": [
+            {
+                "id": "member-1-task",
+                "member_id": "member-1",
+                "objective": "inspect",
+                "depends_on": [],
+                "position": 0,
+            },
+            {
+                "id": "member-2-task",
+                "member_id": "member-2",
+                "objective": "operate",
+                "depends_on": [],
+                "position": 1,
+            },
+        ]
+    }
+
+    class DurableGateway(FakeGateway):
+        def __init__(self):
+            super().__init__(snapshot)
+            self.latest_checkpoint = None
+
+        def get_latest_checkpoint(self):
+            if self.latest_checkpoint is None:
+                raise RunnerGatewayBusinessError("checkpoint_not_found")
+            return deepcopy(self.latest_checkpoint)
+
+        def save_checkpoint(self, checkpoint_key, state, idempotency_key):
+            self.latest_checkpoint = {
+                "checkpoint_key": checkpoint_key,
+                "snapshot_digest": snapshot.digest,
+                "state": deepcopy(state),
+            }
+            return deepcopy(self.latest_checkpoint)
+
+        def invoke_tool(self, **request):
+            self.tool_calls.append(deepcopy(request))
+            raise RunnerGatewayToolError(
+                "tool_approval_required",
+                approval_id=f"approval-{request['member_agent_id']}",
+            )
+
+    class ApprovalGraph:
+        def __init__(self, member_id, tool):
+            self.member_id = member_id
+            self.tool = tool
+
+        def invoke(self, state, *, config=None):
+            state["member_progress"] = "awaiting-approval"
+            self.tool.run({}, tool_call_id=f"{self.member_id}-tool")
+            raise AssertionError("approval tool unexpectedly returned")
+
+    class Factory:
+        def build(self, member, **kwargs):
+            if member.agent_id == "supervisor":
+                return TeamPlanGraph(plan)
+            return ApprovalGraph(member.agent_id, kwargs["tools"][0])
+
+    gateway = DurableGateway()
+    result = SandboxRuntime(gateway, agent_factory=Factory()).execute(
+        _request(snapshot)
+    )
+
+    assert result.status == "interrupted"
+    active = gateway.latest_checkpoint["state"]["active_invocations"]
+    assert {item["task_id"] for item in active} == {
+        "member-1-task",
+        "member-2-task",
+    }
+    assert {item["approval_id"] for item in active} == {
+        "approval-member-1",
+        "approval-member-2",
+    }
+    assert all(item["checkpoint_status"] == "interrupted" for item in active)
+    assert all(
+        item["runtime_state"]["member_progress"] == "awaiting-approval"
+        for item in active
+    )
+
+
+def test_team_runtime_rejects_member_output_above_its_task_contract():
+    snapshot = _schema_v5_team_snapshot()
+    plan = {
+        "tasks": [
+            {
+                "id": "bounded-task",
+                "member_id": "member-1",
+                "objective": "inspect",
+                "depends_on": [],
+                "position": 0,
+                "output_contract": {"max_output_bytes": 4},
+            },
+        ]
+    }
+
+    class Factory:
+        def __init__(self):
+            self.supervisor_calls = 0
+
+        def build(self, member, **_kwargs):
+            if member.agent_id == "supervisor":
+                self.supervisor_calls += 1
+                if self.supervisor_calls == 1:
+                    return TeamPlanGraph(plan)
+                return TextGraph("partial synthesis")
+            return TextGraph("too large")
+
+    gateway = FakeGateway(snapshot)
+    result = SandboxRuntime(gateway, agent_factory=Factory()).execute(
+        _request(snapshot)
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "runtime_output_limit"
+    assert any(
+        event["event_type"] == "team.task.failed"
+        and event["payload"] == {
+            "team_id": "team-1",
+            "version_id": "version-1",
+            "agent_id": "member-1",
+            "task_id": "bounded-task",
+            "position": 0,
+            "error_code": "runtime_output_limit",
+        }
+        for event in gateway.events
+    )
+    assert not any(
+        event["event_type"] == "team.task.completed"
+        and event["payload"]["task_id"] == "bounded-task"
+        for event in gateway.events
+    )
 
 
 @pytest.mark.parametrize(

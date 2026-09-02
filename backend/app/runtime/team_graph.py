@@ -22,6 +22,12 @@ class TeamLimitError(TeamPlanError):
     pass
 
 
+class TeamTaskOutputContract(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    max_output_bytes: int = Field(default=65_536, gt=0, le=4 * 1024 * 1024)
+
+
 class TeamTask(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -30,6 +36,9 @@ class TeamTask(BaseModel):
     objective: str = Field(min_length=1, max_length=4000)
     depends_on: tuple[str, ...] = ()
     position: int = Field(ge=0)
+    output_contract: TeamTaskOutputContract = Field(
+        default_factory=TeamTaskOutputContract
+    )
 
 
 class TeamPlan(BaseModel):
@@ -64,6 +73,17 @@ class TeamBudgetState(BaseModel):
     subagent_call_count: int = Field(ge=0)
 
 
+class TeamActiveInvocation(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    task_id: str
+    member_agent_id: str
+    invocation_id: str
+    runtime_state: dict[str, Any] | None = None
+    checkpoint_status: Literal["running", "interrupted", "completed"]
+    approval_id: str | None = None
+
+
 class TeamSchedulerState(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -84,6 +104,8 @@ class TeamSchedulerState(BaseModel):
     active_task_id: str | None = None
     active_member_agent_id: str | None = None
     active_invocation_id: str | None = None
+    active_runtime_state: dict[str, Any] | None = None
+    active_invocations: tuple[TeamActiveInvocation, ...] = ()
     final_assistant_content: str | None = None
     event_sequence: int = Field(default=0, ge=0)
     checkpoint_revision: int = Field(default=0, ge=0)
@@ -175,6 +197,11 @@ def validate_team_plan(
     positions = [task.position for task in plan.tasks]
     if len(positions) != len(set(positions)):
         raise TeamPlanError("team_plan_invalid: duplicate position")
+    width = parallel_width(plan)
+    if width > snapshot.max_parallel_members:
+        raise TeamLimitError("team_limit_exceeded: max_parallel_members")
+    if runner_max_subagents is not None and width > runner_max_subagents:
+        raise TeamLimitError("team_limit_exceeded: max_subagents")
 
 
 def parse_supervisor_plan(

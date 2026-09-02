@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from .gateway_tools import RunnerApprovalInterruption
+
 
 class InvokableGraph(Protocol):
     def invoke(self, state: dict[str, Any], *, config: dict[str, Any] | None = None) -> dict[str, Any]: ...
@@ -72,7 +74,14 @@ class LangGraphRuntimeAdapter:
             "configurable": {"thread_id": state.run_id},
             "metadata": dict(metadata or {}),
         }
-        output = self.graph.invoke(initial_state, config=config)
+        try:
+            output = self.graph.invoke(initial_state, config=config)
+        except RunnerApprovalInterruption:
+            if self.checkpoint_store is not None:
+                self.checkpoint_store.save(
+                    state.run_id, "interrupted", initial_state
+                )
+            raise
         messages = output.get("messages") if isinstance(output, dict) else None
         if not isinstance(messages, list):
             raise RuntimeError("Graph did not produce an assistant result")

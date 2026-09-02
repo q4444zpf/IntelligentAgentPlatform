@@ -116,6 +116,7 @@ class ArtifactProvenance(BaseModel):
     team_version_id: str | None = Field(default=None, min_length=1, max_length=128)
     member_agent_id: str = Field(min_length=1, max_length=128)
     task_id: str = Field(min_length=1, max_length=128)
+    invocation_id: str = Field(min_length=1, max_length=256)
 
 
 class ArtifactCreateRequest(BaseModel):
