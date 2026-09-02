@@ -58,8 +58,15 @@ class RunnerArtifactClient(Protocol):
 
 
 class ArtifactBackend(BackendProtocol):
-    def __init__(self, client: RunnerArtifactClient, *, provenance: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        client: RunnerArtifactClient,
+        *,
+        provenance: dict[str, str] | None = None,
+        capability: str | None = None,
+    ) -> None:
         self.client = client
+        self.capability = capability
         allowed = {
             "team_version_id",
             "member_agent_id",
@@ -87,6 +94,7 @@ class ArtifactBackend(BackendProtocol):
             content_type=content_type,
             sha256=digest,
             provenance=self.provenance or None,
+            capability=self.capability,
             idempotency_key=f"artifact:{hashlib.sha256(normalized.encode()).hexdigest()}:{digest}",
         )
         return _artifact_file(response)

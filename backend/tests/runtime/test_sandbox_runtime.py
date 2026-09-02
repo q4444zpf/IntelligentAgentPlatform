@@ -31,6 +31,7 @@ from app.runtime.gateway_tools import (
 from app.runtime.runner_gateway_client import RunnerGatewayBusinessError
 from app.runtime.runner_gateway_schemas import SnapshotResponse
 from app.runtime.sandbox_runtime import SandboxRuntime
+from app.runtime.langgraph_runtime import LangGraphRuntimeAdapter, RuntimeState
 from app.runtime.team_graph import (
     TeamBudgetState,
     TeamPlan,
@@ -183,6 +184,7 @@ class FakeGateway:
         self.completions = []
         self.model_calls = []
         self.tool_calls = []
+        self.artifact_capability_registrations = []
 
     def get_snapshot(self):
         self.snapshot_reads += 1
@@ -220,6 +222,10 @@ class FakeGateway:
 
     def invoke_tool(self, **request):
         self.tool_calls.append(request)
+
+    def register_artifact_capability(self, **request):
+        self.artifact_capability_registrations.append(deepcopy(request))
+        return f"capability:{request['invocation_id']}"
 
     def list_artifacts(self):
         return []
@@ -756,7 +762,7 @@ def test_team_runtime_executes_typed_plan_in_bounded_parallel_batches_and_joins_
                 "id": "fast",
                 "member_id": "member-2",
                 "objective": "review",
-                "depends_on": ["slow"] if max_subagents == 1 else [],
+                "depends_on": [],
                 "position": 1,
             },
         ]
@@ -1121,6 +1127,17 @@ def test_team_approval_restart_restores_exact_task_events_and_shared_budget_stat
     }
     assert approval_checkpoint["event_sequence"] == len(gateway.events)
 
+    persisted_invocation_id = "persisted-approval-invocation"
+    gateway.latest_checkpoint["state"]["active_invocation_id"] = (
+        persisted_invocation_id
+    )
+    gateway.latest_checkpoint["state"]["active_invocations"][0][
+        "invocation_id"
+    ] = persisted_invocation_id
+    gateway.latest_checkpoint["state"]["active_invocations"][0][
+        "runtime_state"
+    ]["team_task_invocation_id"] = persisted_invocation_id
+
     gateway.approval_granted = True
     second_factory = Factory(resumed=True)
     second = SandboxRuntime(gateway, agent_factory=second_factory).execute(
@@ -1141,9 +1158,13 @@ def test_team_approval_restart_restores_exact_task_events_and_shared_budget_stat
     assert len(gateway.tool_calls) == 2
     assert gateway.tool_calls[0] == gateway.tool_calls[1]
     assert gateway.tool_calls[0]["member_agent_id"] == "member-2"
-    assert interrupted_states[0]["team_task_invocation_id"] == (
-        resumed_states[0]["team_task_invocation_id"]
-    )
+    assert resumed_states[0]["team_task_invocation_id"] == persisted_invocation_id
+    approval_registrations = [
+        registration
+        for registration in gateway.artifact_capability_registrations
+        if registration["task_id"] == "approval-task"
+    ]
+    assert approval_registrations[-1]["invocation_id"] == persisted_invocation_id
     assert resumed_states[0]["member_progress"] == "model-completed"
     event_types = [event["event_type"] for event in gateway.events]
     assert event_types.count("runner.started") == 1
@@ -1365,6 +1386,50 @@ def test_team_runtime_rejects_member_output_above_its_task_contract():
         and event["payload"]["task_id"] == "bounded-task"
         for event in gateway.events
     )
+
+
+def test_langgraph_approval_restart_uses_interrupted_node_state_without_replaying_prior_node():
+    from typing import TypedDict
+
+    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.graph import END, START, StateGraph
+
+    class WorkflowState(TypedDict, total=False):
+        prepared: bool
+        messages: list[dict]
+
+    class Store:
+        state = None
+
+        def load_latest(self, _run_id):
+            return self.state
+
+        def save(self, _run_id, _key, state):
+            self.state = deepcopy(state)
+
+    prepared_calls = []
+
+    def build_graph():
+        graph = StateGraph(WorkflowState)
+        graph.add_node("prepare", lambda _state: (prepared_calls.append("prepare") or {"prepared": True}))
+        graph.add_node("approval", lambda _state: (_ for _ in ()).throw(RunnerApprovalInterruption("approval-1")))
+        graph.add_conditional_edges(START, lambda state: "approval" if state.get("prepared") else "prepare")
+        graph.add_edge("prepare", "approval")
+        graph.add_edge("approval", END)
+        return graph.compile(checkpointer=MemorySaver())
+
+    store = Store()
+    with pytest.raises(RunnerApprovalInterruption):
+        LangGraphRuntimeAdapter(build_graph(), checkpoint_store=store).invoke(
+            RuntimeState(run_id="run-1", messages=[])
+        )
+    assert store.state["prepared"] is True
+
+    with pytest.raises(RunnerApprovalInterruption):
+        LangGraphRuntimeAdapter(build_graph(), checkpoint_store=store).invoke(
+            RuntimeState(run_id="run-1", messages=[])
+        )
+    assert prepared_calls == ["prepare"]
 
 
 @pytest.mark.parametrize(

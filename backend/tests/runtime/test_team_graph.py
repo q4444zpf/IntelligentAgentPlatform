@@ -74,17 +74,25 @@ def test_team_plan_rejects_max_steps_and_runner_subagent_ceiling(snapshot):
         )
 
 
-def test_team_plan_rejects_parallel_width_above_team_or_runner_ceiling(snapshot):
+def test_team_plan_accepts_parallel_ready_tasks_when_execution_capacity_is_one(snapshot):
     plan = TeamPlan(tasks=(
         TeamTask(id="supervisor-task", member_id="supervisor", objective="one", position=0),
         TeamTask(id="member-task", member_id="member", objective="two", position=1),
     ))
 
     constrained = snapshot.model_copy(update={"max_parallel_members": 1})
-    with pytest.raises(TeamLimitError, match="max_parallel_members"):
-        validate_team_plan(plan, constrained, runner_max_subagents=2)
-    with pytest.raises(TeamLimitError, match="max_subagents"):
-        validate_team_plan(plan, snapshot, runner_max_subagents=1)
+    validate_team_plan(plan, constrained, runner_max_subagents=2)
+    validate_team_plan(plan, snapshot, runner_max_subagents=1)
+
+    first = schedule_ready_tasks(plan, set(), max_parallel_members=1)
+    second = schedule_ready_tasks(
+        plan,
+        {first[0].id},
+        max_parallel_members=1,
+    )
+
+    assert [task.id for task in first] == ["supervisor-task"]
+    assert [task.id for task in second] == ["member-task"]
 
 
 def test_supervisor_plan_requires_a_bounded_output_contract(snapshot):

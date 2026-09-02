@@ -12,6 +12,13 @@ from sqlalchemy.orm import Mapped, Session, mapped_column
 from app.db.base import Base
 
 
+RUNNER_GATEWAY_RESERVED_CHECKPOINT_PREFIX = "__runner_gateway__:"
+
+
+def is_runner_gateway_reserved_checkpoint(checkpoint_key: str) -> bool:
+    return checkpoint_key.startswith(RUNNER_GATEWAY_RESERVED_CHECKPOINT_PREFIX)
+
+
 class RuntimeCheckpoint(Base):
     __tablename__ = "runtime_checkpoints"
     __table_args__ = (UniqueConstraint("run_id", "checkpoint_key", name="uq_runtime_checkpoint_run_key"),)
@@ -86,6 +93,47 @@ class CheckpointStore:
         *,
         commit: bool = True,
     ) -> StoredCheckpoint:
+        if is_runner_gateway_reserved_checkpoint(checkpoint_key):
+            raise ValueError("checkpoint namespace is reserved")
+        return self._save(
+            run_id,
+            checkpoint_key,
+            state,
+            snapshot_digest,
+            idempotency_key,
+            commit=commit,
+        )
+
+    def save_reserved(
+        self,
+        run_id: str,
+        checkpoint_key: str,
+        state: dict[str, Any],
+        snapshot_digest: str | None = None,
+        *,
+        commit: bool = True,
+    ) -> StoredCheckpoint:
+        if not is_runner_gateway_reserved_checkpoint(checkpoint_key):
+            raise ValueError("checkpoint namespace is not reserved")
+        return self._save(
+            run_id,
+            checkpoint_key,
+            state,
+            snapshot_digest,
+            None,
+            commit=commit,
+        )
+
+    def _save(
+        self,
+        run_id: str,
+        checkpoint_key: str,
+        state: dict[str, Any],
+        snapshot_digest: str | None,
+        idempotency_key: str | None,
+        *,
+        commit: bool,
+    ) -> StoredCheckpoint:
         try:
             encoded = json.dumps(
                 state,
@@ -133,7 +181,25 @@ class CheckpointStore:
     def load_latest_record(self, run_id: str) -> StoredCheckpoint | None:
         row = self.session.scalar(select(RuntimeCheckpoint).where(
             RuntimeCheckpoint.run_id == run_id,
+            ~RuntimeCheckpoint.checkpoint_key.startswith(
+                RUNNER_GATEWAY_RESERVED_CHECKPOINT_PREFIX
+            ),
         ).order_by(RuntimeCheckpoint.updated_at.desc(), RuntimeCheckpoint.id.desc()))
+        return self._stored_checkpoint(row)
+
+    def load_reserved(
+        self, run_id: str, checkpoint_key: str
+    ) -> StoredCheckpoint | None:
+        if not is_runner_gateway_reserved_checkpoint(checkpoint_key):
+            raise ValueError("checkpoint namespace is not reserved")
+        row = self.session.scalar(select(RuntimeCheckpoint).where(
+            RuntimeCheckpoint.run_id == run_id,
+            RuntimeCheckpoint.checkpoint_key == checkpoint_key,
+        ))
+        return self._stored_checkpoint(row)
+
+    @staticmethod
+    def _stored_checkpoint(row: RuntimeCheckpoint | None) -> StoredCheckpoint | None:
         if row is None:
             return None
         return StoredCheckpoint(

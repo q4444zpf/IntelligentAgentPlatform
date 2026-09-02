@@ -459,6 +459,15 @@ class SandboxRuntime:
                     active_invocations=active_invocations,
                 )
                 state = self._save_team_state(state, model_budget)
+                artifact_capabilities = {
+                    invocation.task_id: self.gateway.register_artifact_capability(
+                        team_version_id=actor.version_id,
+                        member_agent_id=invocation.member_agent_id,
+                        task_id=invocation.task_id,
+                        invocation_id=invocation.invocation_id,
+                    )
+                    for invocation in active_invocations
+                }
                 state_lock = Lock()
 
                 def save_member_runtime_state(task, checkpoint_key, runtime_state):
@@ -508,6 +517,8 @@ class SandboxRuntime:
                         legacy_model=legacy_model,
                         legacy_tools=legacy_tools,
                         runtime_state=invocation.runtime_state,
+                        invocation=invocation,
+                        artifact_capability=artifact_capabilities[task.id],
                         checkpoint_callback=lambda key, runtime_state: (
                             save_member_runtime_state(task, key, runtime_state)
                         ),
@@ -622,7 +633,7 @@ class SandboxRuntime:
                                 "approval_id": approval.approval_id,
                                 "agent_id": task.member_id,
                                 "task_id": task.id,
-                                "invocation_id": self._task_invocation_id(actor, task.id),
+                                "invocation_id": active_by_task[task.id].invocation_id,
                             },
                         )
                     state = state.model_copy(
@@ -675,6 +686,24 @@ class SandboxRuntime:
             )
             state = self._save_team_state(state, model_budget)
 
+        synthesis_invocation = next(
+            (
+                invocation
+                for invocation in state.active_invocations
+                if invocation.task_id == "synthesis"
+                and invocation.member_agent_id == actor.supervisor.agent_id
+            ),
+            None,
+        )
+        if synthesis_invocation is None:
+            raise TeamPlanError("team_checkpoint_invalid: synthesis invocation")
+        synthesis_artifact_capability = self.gateway.register_artifact_capability(
+            team_version_id=actor.version_id,
+            member_agent_id=synthesis_invocation.member_agent_id,
+            task_id=synthesis_invocation.task_id,
+            invocation_id=synthesis_invocation.invocation_id,
+        )
+
         synthesis_lines = [
             f"{item.task_id}: {item.content}"
             for item in sorted(completed.values(), key=lambda item: item.position)
@@ -712,10 +741,9 @@ class SandboxRuntime:
                     "team_version_id": actor.version_id,
                     "member_agent_id": actor.supervisor.agent_id,
                     "task_id": "synthesis",
-                    "invocation_id": self._task_invocation_id(
-                        actor, "synthesis"
-                    ),
+                    "invocation_id": synthesis_invocation.invocation_id,
                 },
+                capability=synthesis_artifact_capability,
             ),
         )
         result = self.runtime_adapter_type(graph).invoke(
@@ -727,9 +755,7 @@ class SandboxRuntime:
                     "team_version_id": actor.version_id,
                     "team_task_id": "synthesis",
                     "team_member_agent_id": actor.supervisor.agent_id,
-                    "team_task_invocation_id": self._task_invocation_id(
-                        actor, "synthesis"
-                    ),
+                    "team_task_invocation_id": synthesis_invocation.invocation_id,
                 },
             ),
             metadata=metadata,
@@ -866,6 +892,8 @@ class SandboxRuntime:
         legacy_model,
         legacy_tools,
         runtime_state,
+        invocation,
+        artifact_capability,
         checkpoint_callback,
     ):
         model, tools = self._member_runtime_dependencies(
@@ -886,8 +914,9 @@ class SandboxRuntime:
                     "team_version_id": actor.version_id,
                     "member_agent_id": task.member_id,
                     "task_id": task.id,
-                    "invocation_id": self._task_invocation_id(actor, task.id),
+                    "invocation_id": invocation.invocation_id,
                 },
+                capability=artifact_capability,
             ),
         )
         dependency_content = "\n".join(
@@ -922,9 +951,7 @@ class SandboxRuntime:
                     "team_version_id": actor.version_id,
                     "team_task_id": task.id,
                     "team_member_agent_id": task.member_id,
-                    "team_task_invocation_id": self._task_invocation_id(
-                        actor, task.id
-                    ),
+                    "team_task_invocation_id": invocation.invocation_id,
                 },
             ),
             metadata=metadata,

@@ -78,8 +78,15 @@ class LangGraphRuntimeAdapter:
             output = self.graph.invoke(initial_state, config=config)
         except RunnerApprovalInterruption:
             if self.checkpoint_store is not None:
+                interrupted_state = initial_state
+                get_state = getattr(self.graph, "get_state", None)
+                if callable(get_state):
+                    checkpoint = get_state(config)
+                    values = getattr(checkpoint, "values", None)
+                    if isinstance(values, dict):
+                        interrupted_state = values
                 self.checkpoint_store.save(
-                    state.run_id, "interrupted", initial_state
+                    state.run_id, "interrupted", interrupted_state
                 )
             raise
         messages = output.get("messages") if isinstance(output, dict) else None

@@ -184,7 +184,7 @@ class GatewayTokenService:
             project_id="project-1",
             snapshot_id=self.snapshot.snapshot_id,
             snapshot_digest=self.snapshot.digest,
-            actions=("artifact.create",),
+            actions=(action,),
             iat=1,
             nbf=1,
             exp=9999999999,
@@ -445,10 +445,10 @@ def test_runner_artifact_gateway_is_scoped_idempotent_and_emits_ready_event():
     assert base64.b64decode(read.json()["data_base64"]) == data
 
 
-def _artifact_request(*, provenance=None):
+def _artifact_request(*, provenance=None, capability=None, path="/artifacts/result.txt"):
     data = b"result"
     request = {
-        "path": "/artifacts/result.txt",
+        "path": path,
         "content_type": "text/plain",
         "size_bytes": len(data),
         "sha256": hashlib.sha256(data).hexdigest(),
@@ -456,6 +456,8 @@ def _artifact_request(*, provenance=None):
     }
     if provenance is not None:
         request["provenance"] = provenance
+    if capability is not None:
+        request["capability"] = capability
     return request
 
 
@@ -498,6 +500,132 @@ def _team_scheduler_checkpoint(snapshot):
             "subagent_call_count": 0,
         },
     }
+
+
+def _register_artifact_capability(client, *, member_agent_id, task_id, invocation_id):
+    response = client.post(
+        "/internal/runner/runs/run-1/artifact-capabilities",
+        headers=_headers(),
+        json={
+            "team_version_id": "team-version-1",
+            "member_agent_id": member_agent_id,
+            "task_id": task_id,
+            "invocation_id": invocation_id,
+        },
+    )
+    assert response.status_code == 201
+    return response.json()["capability"]
+
+
+def test_concurrent_team_artifact_capability_is_bound_to_one_active_invocation():
+    snapshot = _gateway_snapshot(team=True)
+    checkpoint = _team_scheduler_checkpoint(snapshot)
+    checkpoint["plan"]["tasks"][1]["depends_on"] = []
+    checkpoint.update({
+        "started_task_ids": ["forecast-task", "review-task"],
+        "active_task_id": None,
+        "active_member_agent_id": None,
+        "active_invocation_id": None,
+        "active_invocations": [
+            {
+                "task_id": "forecast-task",
+                "member_agent_id": "forecast",
+                "invocation_id": "invocation-forecast-7",
+                "checkpoint_status": "running",
+            },
+            {
+                "task_id": "review-task",
+                "member_agent_id": "review",
+                "invocation_id": "invocation-review-11",
+                "checkpoint_status": "running",
+            },
+        ],
+    })
+    client, session, _, _ = _gateway_client(
+        snapshot=snapshot,
+        checkpoint_state=checkpoint,
+    )
+    forecast_capability = _register_artifact_capability(
+        client,
+        member_agent_id="forecast",
+        task_id="forecast-task",
+        invocation_id="invocation-forecast-7",
+    )
+    _register_artifact_capability(
+        client,
+        member_agent_id="review",
+        task_id="review-task",
+        invocation_id="invocation-review-11",
+    )
+    mismatched_registration = client.post(
+        "/internal/runner/runs/run-1/artifact-capabilities",
+        headers=_headers(),
+        json={
+            "team_version_id": "team-version-1",
+            "member_agent_id": "review",
+            "task_id": "review-task",
+            "invocation_id": "invocation-forecast-7",
+        },
+    )
+    forecast_provenance = {
+        "member_agent_id": "forecast",
+        "task_id": "forecast-task",
+        "invocation_id": "invocation-forecast-7",
+    }
+    review_provenance = {
+        "member_agent_id": "review",
+        "task_id": "review-task",
+        "invocation_id": "invocation-review-11",
+    }
+
+    accepted = client.post(
+        "/internal/runner/runs/run-1/artifacts",
+        headers=_headers(key="artifact-capability-forecast"),
+        json=_artifact_request(
+            provenance=forecast_provenance,
+            capability=forecast_capability,
+            path="/artifacts/forecast.txt",
+        ),
+    )
+    cross_member = client.post(
+        "/internal/runner/runs/run-1/artifacts",
+        headers=_headers(key="artifact-capability-cross-member"),
+        json=_artifact_request(
+            provenance=review_provenance,
+            capability=forecast_capability,
+            path="/artifacts/review.txt",
+        ),
+    )
+    forged = client.post(
+        "/internal/runner/runs/run-1/artifacts",
+        headers=_headers(key="artifact-capability-forged"),
+        json=_artifact_request(
+            provenance=forecast_provenance,
+            capability="f" * 43,
+            path="/artifacts/forged.txt",
+        ),
+    )
+    latest = client.get(
+        "/internal/runner/runs/run-1/checkpoints/latest",
+        headers=_headers(),
+    )
+
+    assert accepted.status_code == 201
+    assert mismatched_registration.status_code == 403
+    assert mismatched_registration.json()["code"] == "artifact_capability_invalid"
+    assert cross_member.status_code == 403
+    assert forged.status_code == 403
+    assert latest.status_code == 200
+    assert latest.json()["checkpoint_key"] == "team-scheduler"
+
+    from app.artifacts.models import ArtifactRecord
+    from app.runtime.checkpoint_store import RuntimeCheckpoint
+
+    stored_states = [row.state for row in session.query(RuntimeCheckpoint).all()]
+    artifact = session.query(ArtifactRecord).one()
+    assert forecast_capability not in repr(stored_states)
+    assert all("capability" not in state for state in stored_states)
+    assert "capability" not in artifact.provenance
 
 
 @pytest.mark.parametrize(
@@ -554,14 +682,21 @@ def test_team_artifact_gateway_derives_version_and_persists_validated_provenance
         checkpoint_state=_team_scheduler_checkpoint(snapshot),
     )
 
+    invocation_id = "team:team-version-1:forecast-task"
+    capability = _register_artifact_capability(
+        client,
+        member_agent_id="forecast",
+        task_id="forecast-task",
+        invocation_id=invocation_id,
+    )
     response = client.post(
         "/internal/runner/runs/run-1/artifacts",
         headers=_headers(key="artifact-team-valid"),
         json=_artifact_request(provenance={
             "member_agent_id": "forecast",
             "task_id": "forecast-task",
-            "invocation_id": "team:team-version-1:forecast-task",
-        }),
+            "invocation_id": invocation_id,
+        }, capability=capability),
     )
 
     from app.artifacts.models import ArtifactRecord

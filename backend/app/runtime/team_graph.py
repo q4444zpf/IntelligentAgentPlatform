@@ -197,13 +197,6 @@ def validate_team_plan(
     positions = [task.position for task in plan.tasks]
     if len(positions) != len(set(positions)):
         raise TeamPlanError("team_plan_invalid: duplicate position")
-    width = parallel_width(plan)
-    if width > snapshot.max_parallel_members:
-        raise TeamLimitError("team_limit_exceeded: max_parallel_members")
-    if runner_max_subagents is not None and width > runner_max_subagents:
-        raise TeamLimitError("team_limit_exceeded: max_subagents")
-
-
 def parse_supervisor_plan(
     value: str | dict[str, Any],
     snapshot: PublishedTeamSnapshot,

@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 from datetime import UTC, datetime
 from time import perf_counter
 
@@ -33,7 +34,12 @@ from app.tools.schemas import (
     ToolRuntimeError,
 )
 
-from .checkpoint_store import CheckpointStore, RunnerRequestStore
+from .checkpoint_store import (
+    RUNNER_GATEWAY_RESERVED_CHECKPOINT_PREFIX,
+    CheckpointStore,
+    RunnerRequestStore,
+    is_runner_gateway_reserved_checkpoint,
+)
 from .execution_snapshot import (
     ExecutionSnapshotService,
     PublishedTeamSnapshot,
@@ -46,6 +52,8 @@ from .model_gateway import ModelGateway, ModelRuntimeError, ModelSelection
 from .run_tokens import RunTokenClaims
 from .runner_gateway_auth import RunnerGatewayError
 from .runner_gateway_schemas import (
+    ArtifactCapabilityRegistrationRequest,
+    ArtifactCapabilityResponse,
     ArtifactProvenance,
     ArtifactContentResponse,
     ArtifactCreateRequest,
@@ -182,6 +190,12 @@ class RunnerGatewayService:
         claims: RunTokenClaims,
         idempotency_key: str,
     ) -> CheckpointResponse:
+        if is_runner_gateway_reserved_checkpoint(checkpoint_key):
+            raise RunnerGatewayError(
+                403,
+                "checkpoint_namespace_reserved",
+                "检查点命名空间未获授权",
+            )
         store = self._require_checkpoint_store()
         repository = self._require_conversation_repository()
         self._lock_run(repository, run_id)
@@ -691,6 +705,49 @@ class RunnerGatewayService:
             raise RunnerGatewayError(403, error_code, "Team 成员未获授权")
         return member
 
+    def register_artifact_capability(
+        self,
+        run_id: str,
+        request: ArtifactCapabilityRegistrationRequest,
+        claims: RunTokenClaims,
+    ) -> ArtifactCapabilityResponse:
+        repository = self._require_conversation_repository()
+        store = self._require_checkpoint_store()
+        snapshot = self._verified_snapshot(run_id, claims)
+        self._lock_run(repository, run_id)
+        provenance = self._validated_team_invocation(
+            run_id,
+            snapshot,
+            team_version_id=request.team_version_id,
+            member_agent_id=request.member_agent_id,
+            task_id=request.task_id,
+            invocation_id=request.invocation_id,
+            error_code="artifact_capability_invalid",
+        )
+        binding = {
+            "run_id": run_id,
+            "team_version_id": provenance["team_version_id"],
+            "member_agent_id": provenance["member_agent_id"],
+            "task_id": provenance["task_id"],
+            "invocation_id": request.invocation_id,
+        }
+        capability = secrets.token_urlsafe(32)
+        store.save_reserved(
+            run_id,
+            self._artifact_capability_checkpoint_key(binding),
+            {
+                "kind": "artifact_capability",
+                "binding": binding,
+                "capability_sha256": hashlib.sha256(
+                    capability.encode("utf-8")
+                ).hexdigest(),
+            },
+            snapshot.digest,
+            commit=False,
+        )
+        repository.session.commit()
+        return ArtifactCapabilityResponse(capability=capability)
+
     def create_artifact(
         self,
         run_id: str,
@@ -701,19 +758,23 @@ class RunnerGatewayService:
         repository = self._require_conversation_repository()
         artifacts = self._require_artifact_service()
         snapshot = self._verified_snapshot(run_id, claims)
+        self._lock_run(repository, run_id)
         provenance = self._validated_artifact_provenance(
             run_id,
             snapshot,
             request.provenance,
+            request.capability,
         )
-        self._lock_run(repository, run_id)
         requests = RunnerRequestStore(repository.session)
         action = "artifact.create"
         request_digest = _canonical_digest(
             {
                 "snapshot_digest": claims.snapshot_digest,
                 "request": {
-                    **request.model_dump(mode="json", exclude={"provenance"}),
+                    **request.model_dump(
+                        mode="json",
+                        exclude={"provenance", "capability"},
+                    ),
                     "provenance": provenance,
                 },
             }
@@ -794,35 +855,98 @@ class RunnerGatewayService:
         run_id: str,
         snapshot: StoredExecutionSnapshot,
         requested: ArtifactProvenance | None,
+        capability: str | None,
     ) -> dict[str, str] | None:
         actor = snapshot.payload.actor
         if not isinstance(actor, PublishedTeamSnapshot):
-            if requested is not None:
+            if requested is not None or capability is not None:
                 raise RunnerGatewayError(
                     403,
                     "artifact_provenance_invalid",
                     "成果来源无效",
                 )
             return None
-        if requested is None or (
-            requested.team_version_id is not None
-            and requested.team_version_id != actor.version_id
-        ):
+        if requested is None:
             raise RunnerGatewayError(
                 403,
                 "artifact_provenance_invalid",
                 "成果来源无效",
             )
 
+        provenance = self._validated_team_invocation(
+            run_id,
+            snapshot,
+            team_version_id=requested.team_version_id,
+            member_agent_id=requested.member_agent_id,
+            task_id=requested.task_id,
+            invocation_id=requested.invocation_id,
+            error_code="artifact_provenance_invalid",
+        )
+        if capability is None:
+            raise RunnerGatewayError(
+                403,
+                "artifact_provenance_invalid",
+                "成果来源无效",
+            )
+        binding = {
+            "run_id": run_id,
+            **provenance,
+            "invocation_id": requested.invocation_id,
+        }
+        record = self._require_checkpoint_store().load_reserved(
+            run_id,
+            self._artifact_capability_checkpoint_key(binding),
+        )
+        expected_state = {
+            "kind": "artifact_capability",
+            "binding": binding,
+            "capability_sha256": hashlib.sha256(
+                capability.encode("utf-8")
+            ).hexdigest(),
+        }
+        if (
+            record is None
+            or record.snapshot_digest != snapshot.digest
+            or record.state.get("kind") != expected_state["kind"]
+            or record.state.get("binding") != binding
+            or not secrets.compare_digest(
+                str(record.state.get("capability_sha256", "")),
+                expected_state["capability_sha256"],
+            )
+        ):
+            raise RunnerGatewayError(
+                403,
+                "artifact_provenance_invalid",
+                "成果来源无效",
+            )
+        return provenance
+
+    def _validated_team_invocation(
+        self,
+        run_id: str,
+        snapshot: StoredExecutionSnapshot,
+        *,
+        team_version_id: str | None,
+        member_agent_id: str,
+        task_id: str,
+        invocation_id: str,
+        error_code: str,
+    ) -> dict[str, str]:
+        actor = snapshot.payload.actor
+        if not isinstance(actor, PublishedTeamSnapshot) or (
+            team_version_id is not None and team_version_id != actor.version_id
+        ):
+            raise RunnerGatewayError(403, error_code, "成果来源无效")
         checkpoint = self._require_checkpoint_store().load_latest_record(run_id)
         if (
             checkpoint is None
+            or checkpoint.checkpoint_key != "team-scheduler"
             or checkpoint.snapshot_digest != snapshot.digest
             or not isinstance(checkpoint.state, dict)
         ):
             raise RunnerGatewayError(
                 403,
-                "artifact_provenance_invalid",
+                error_code,
                 "成果来源无效",
             )
         try:
@@ -835,7 +959,7 @@ class RunnerGatewayService:
         except (ValidationError, TeamPlanError) as error:
             raise RunnerGatewayError(
                 403,
-                "artifact_provenance_invalid",
+                error_code,
                 "成果来源无效",
             ) from error
         if (
@@ -844,7 +968,7 @@ class RunnerGatewayService:
         ):
             raise RunnerGatewayError(
                 403,
-                "artifact_provenance_invalid",
+                error_code,
                 "成果来源无效",
             )
 
@@ -867,15 +991,15 @@ class RunnerGatewayService:
             (
                 item
                 for item in active_invocations
-                if item.task_id == requested.task_id
-                and item.member_agent_id == requested.member_agent_id
-                and item.invocation_id == requested.invocation_id
+                if item.task_id == task_id
+                and item.member_agent_id == member_agent_id
+                and item.invocation_id == invocation_id
             ),
             None,
         )
-        if requested.task_id == "synthesis":
+        if task_id == "synthesis":
             valid = (
-                requested.member_agent_id == actor.supervisor.agent_id
+                member_agent_id == actor.supervisor.agent_id
                 and state.stage == "synthesizing"
                 and active is not None
             )
@@ -884,26 +1008,33 @@ class RunnerGatewayService:
                 (
                     candidate
                     for candidate in state.plan.tasks
-                    if candidate.id == requested.task_id
+                    if candidate.id == task_id
                 ),
                 None,
             )
             valid = (
                 task is not None
-                and task.member_id == requested.member_agent_id
+                and task.member_id == member_agent_id
                 and active is not None
             )
         if not valid:
             raise RunnerGatewayError(
                 403,
-                "artifact_provenance_invalid",
+                error_code,
                 "成果来源无效",
             )
         return {
             "team_version_id": actor.version_id,
-            "member_agent_id": requested.member_agent_id,
-            "task_id": requested.task_id,
+            "member_agent_id": member_agent_id,
+            "task_id": task_id,
         }
+
+    @staticmethod
+    def _artifact_capability_checkpoint_key(binding: dict[str, str]) -> str:
+        return (
+            f"{RUNNER_GATEWAY_RESERVED_CHECKPOINT_PREFIX}artifact-capability:"
+            f"{_canonical_digest(binding)}"
+        )
 
     def complete(
         self,

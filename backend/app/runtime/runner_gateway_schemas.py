@@ -119,6 +119,21 @@ class ArtifactProvenance(BaseModel):
     invocation_id: str = Field(min_length=1, max_length=256)
 
 
+class ArtifactCapabilityRegistrationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    team_version_id: str = Field(min_length=1, max_length=128)
+    member_agent_id: str = Field(min_length=1, max_length=128)
+    task_id: str = Field(min_length=1, max_length=128)
+    invocation_id: str = Field(min_length=1, max_length=256)
+
+
+class ArtifactCapabilityResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    capability: str = Field(min_length=32, max_length=256)
+
+
 class ArtifactCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -128,6 +143,7 @@ class ArtifactCreateRequest(BaseModel):
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     data_base64: str
     provenance: ArtifactProvenance | None = None
+    capability: str | None = Field(default=None, min_length=32, max_length=256)
 
 
 class ArtifactFileResponse(BaseModel):

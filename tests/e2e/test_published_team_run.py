@@ -201,6 +201,7 @@ class RuntimeGateway:
     def get_snapshot(self): return self.snapshot
     def get_latest_checkpoint(self): return None
     def save_checkpoint(self, checkpoint_key, state, idempotency_key): return {"checkpoint_key": checkpoint_key, "state": state}
+    def register_artifact_capability(self, **request): return f"capability:{request['invocation_id']}"
     def append_event(self, **request): self.events.append(request); return request
     def complete(self, request, idempotency_key): self.completions.append(request); return request
     def list_artifacts(self): return []
@@ -243,12 +244,23 @@ def test_team_member_artifacts_send_version_member_and_task_provenance():
             return {"path": request["path"], "artifact_id": "artifact-1", "size_bytes": len(request["data"]), "sha256": request["sha256"], "content_type": request["content_type"]}
 
     gateway = ArtifactGateway()
-    backend = ArtifactBackend(gateway, provenance={
-        "team_version_id": "version-2", "member_agent_id": "forecast", "task_id": "member-1",
-    })
+    backend = ArtifactBackend(
+        gateway,
+        provenance={
+            "team_version_id": "version-2",
+            "member_agent_id": "forecast",
+            "task_id": "member-1",
+            "invocation_id": "invocation-1",
+        },
+        capability="c" * 43,
+    )
     result = backend.write("/artifacts/forecast.txt", "完成")
 
     assert result.error is None
     assert gateway.request["provenance"] == {
-        "team_version_id": "version-2", "member_agent_id": "forecast", "task_id": "member-1",
+        "team_version_id": "version-2",
+        "member_agent_id": "forecast",
+        "task_id": "member-1",
+        "invocation_id": "invocation-1",
     }
+    assert gateway.request["capability"] == "c" * 43

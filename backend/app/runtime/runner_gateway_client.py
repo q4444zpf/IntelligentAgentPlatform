@@ -11,6 +11,8 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from .execution_contract import RunExecutionRequest
 from .runner_gateway_schemas import (
+    ArtifactCapabilityRegistrationRequest,
+    ArtifactCapabilityResponse,
     ArtifactContentResponse,
     ArtifactCreateRequest,
     ArtifactFileResponse,
@@ -172,6 +174,7 @@ class RunnerGatewayClient:
         content_type: str,
         sha256: str,
         provenance: dict[str, str] | None = None,
+        capability: str | None = None,
         idempotency_key: str,
     ) -> dict[str, Any]:
         request = ArtifactCreateRequest(
@@ -181,6 +184,7 @@ class RunnerGatewayClient:
             sha256=sha256,
             data_base64=base64.b64encode(data).decode("ascii"),
             provenance=provenance,
+            capability=capability,
         )
         return self._request(
             "POST",
@@ -189,6 +193,27 @@ class RunnerGatewayClient:
             json=request.model_dump(mode="json", exclude_none=True),
             idempotency_key=idempotency_key,
         ).model_dump(mode="json")
+
+    def register_artifact_capability(
+        self,
+        *,
+        team_version_id: str,
+        member_agent_id: str,
+        task_id: str,
+        invocation_id: str,
+    ) -> str:
+        request = ArtifactCapabilityRegistrationRequest(
+            team_version_id=team_version_id,
+            member_agent_id=member_agent_id,
+            task_id=task_id,
+            invocation_id=invocation_id,
+        )
+        return self._request(
+            "POST",
+            "artifact-capabilities",
+            ArtifactCapabilityResponse,
+            json=request.model_dump(mode="json"),
+        ).capability
 
     def list_artifacts(self) -> list[dict[str, Any]]:
         values = self._request_adapter(

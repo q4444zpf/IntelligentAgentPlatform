@@ -182,6 +182,34 @@ def test_team_tool_invocation_forwards_member_agent_identity():
     assert captured["payload"]["member_agent_id"] == "forecast-member"
 
 
+def test_team_artifact_capability_registration_forwards_exact_invocation_tuple():
+    captured = {}
+    capability = "c" * 43
+
+    def handler(request):
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(201, json={"capability": capability})
+
+    client = RunnerGatewayClient.from_execution_request(
+        _request(), transport=httpx.MockTransport(handler)
+    )
+
+    result = client.register_artifact_capability(
+        team_version_id="team-version-1",
+        member_agent_id="forecast-member",
+        task_id="forecast-task",
+        invocation_id="persisted-invocation-7",
+    )
+
+    assert result == capability
+    assert captured["payload"] == {
+        "team_version_id": "team-version-1",
+        "member_agent_id": "forecast-member",
+        "task_id": "forecast-task",
+        "invocation_id": "persisted-invocation-7",
+    }
+
+
 def test_client_rejects_oversized_or_invalid_responses():
     oversized = RunnerGatewayClient.from_execution_request(
         _request(),

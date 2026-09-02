@@ -205,6 +205,20 @@ def test_checkpoint_round_trip_is_bound_to_token_snapshot_digest():
     }
 
 
+def test_generic_checkpoint_api_rejects_gateway_reserved_namespace():
+    client, _repository, store, _token_service = build_client()
+
+    response = client.put(
+        "/internal/runner/runs/run-1/checkpoints/__runner_gateway__:artifact-capability",
+        headers=idempotent("checkpoint-reserved-spoof"),
+        json={"state": {"capability": "attacker-controlled"}},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "checkpoint_namespace_reserved"
+    assert store.load_latest("run-1") is None
+
+
 def test_duplicate_checkpoint_idempotency_key_returns_stored_response():
     client, _repository, store, _token_service = build_client()
     request = {"state": {"status": "running"}}
