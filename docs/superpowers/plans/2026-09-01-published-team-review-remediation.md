@@ -70,14 +70,37 @@ git commit -m "fix: enforce scoped team permissions"
 
 ### Task 2: Trusted Publication And Immutable Team Snapshots
 
+**Confirmed strict-scope decisions (2026-09-02):**
+
+- Persist Agent availability as either project-scoped (`unit_id` + `project_id`) or explicitly common with an allowlist/wildcard. New Agents derive project scope from the authenticated request; existing historically global Agents migrate explicitly to common wildcard availability.
+- Do not introduce an independent Agent publication table. In accordance with the original plan constraint, an enabled scoped Agent's canonical embedded definition and SHA-256 digest are its concrete published version inside a Team version.
+- Add `knowledge_source_ids` to the Agent definition. Resolve knowledge sources through the existing Tool registry entries whose `source == "knowledge"`; they must be published, enabled, and source-available.
+- Validate the captured Provider and model through `ProviderService`: provider must exist, be configured/enabled, and the selected model must exist and be enabled.
+- Capture complete immutable Skill definitions (name, version, content, enabled state and required metadata), not names alone.
+- Write new Team snapshots as schema version `5`; keep an exact frozen schema-v4 canonical projection so stored v4 digest vectors remain readable.
+- Build Team execution state from the signed canonical definition. Any mirrored normalized rows must match exact count, order, responsibilities, whitelists, limits, and policies before use.
+- Enforce configured Runner ceilings during publication, including member count, `max_subagents`, maximum steps, and maximum parallel members.
+- Lock and refresh the Team/draft before capture, and use an atomic revision predicate so concurrent draft commits cannot be overwritten or published stale.
+- Member execution must receive only its own captured model/prompts and the Team ∩ Agent ∩ member Tool/Skill/knowledge boundaries. This Task may touch the minimal runtime factory seam needed to close that critical trust gap; Task 3 still owns scheduling and resume behavior.
+
 **Files:**
 - Modify: `backend/app/collaboration/schemas.py`
 - Modify: `backend/app/collaboration/service.py`
 - Modify: `backend/app/collaboration/repository.py`
+- Modify: `backend/app/agents/schemas.py`
+- Modify: `backend/app/agents/service.py`
+- Modify: `backend/app/agents/store.py`
+- Modify: `backend/app/db/platform_models.py`
+- Create: `backend/alembic/versions/20260902_25_agent_availability.py`
+- Modify: `backend/app/model_providers/service.py` only if a focused read-only availability helper is required
 - Modify: `backend/app/runtime/execution_snapshot.py`
+- Modify: `backend/app/runtime/team_graph.py`
+- Modify: `backend/app/runtime/sandbox_runtime.py` only for immutable member model/prompt/capability construction
 - Modify: `backend/alembic/versions/20260816_21_published_teams.py`
 - Test: `backend/tests/collaboration/test_service.py`
 - Test: `backend/tests/runtime/test_execution_snapshot.py`
+- Test: `backend/tests/runtime/test_sandbox_runtime.py`
+- Test: `backend/tests/test_agents.py`
 - Test: `backend/tests/integration/test_postgres_migrations.py`
 
 **Interfaces:**
@@ -86,11 +109,15 @@ git commit -m "fix: enforce scoped team permissions"
 
 - [ ] **Step 1: Write failing forged-definition and unavailable-resource tests**
 
-Assert draft requests cannot submit `agent_definition` or `agent_definition_digest`; publication rejects missing, disabled, or cross-project Agents and whitelist values outside Team/Agent/current availability intersections.
+Assert draft requests cannot submit `agent_definition` or `agent_definition_digest`; publication rejects missing, disabled, cross-project/unavailable-common Agents, unavailable Provider/models, incomplete Skills/knowledge sources, Runner-ceiling violations, and whitelist values outside Team/Agent/current availability intersections.
 
 - [ ] **Step 2: Write failing reproducibility and scope tests**
 
-Publish a Team, edit/disable the live Agent, then assert snapshot creation still returns the original embedded prompt/model/tools. Assert an `actor_version_id` belonging to another Team/project is rejected.
+Publish a Team, edit/disable the live Agent, then assert snapshot creation and member runtime construction still return the original embedded prompt/model/tools. Assert an `actor_version_id` belonging to another Team/project is rejected, tampered mirrored rows fail digest validation, and a frozen schema-v4 payload still verifies after schema-v5 introduction.
+
+- [ ] **Step 2a: Write failing Agent availability and concurrent publication tests**
+
+Assert new Agents derive project availability from authenticated context, explicitly common Agents require allowed projects/wildcard, migrated legacy Agents remain explicit common resources, and two sessions cannot publish a stale draft revision.
 
 - [ ] **Step 3: Write failing PostgreSQL immutability tests**
 
@@ -102,15 +129,19 @@ Run: `python -m pytest backend/tests/collaboration/test_service.py backend/tests
 
 - [ ] **Step 5: Capture canonical Agent definitions on publish**
 
-Remove snapshot fields from write schemas. Resolve every member server-side, validate enabled/scoped resources and whitelist subsets, serialize the complete executable Agent definition with sorted-key UTF-8 JSON, and compute SHA-256 digests in the publish transaction.
+Remove snapshot fields from write schemas. Resolve every member server-side using persistent availability, validate enabled scoped/common access, Provider/model, Tool/Skill/knowledge definitions, Runner ceilings and whitelist subsets, serialize the complete executable Agent definition with sorted-key UTF-8 JSON, and compute SHA-256 digests in the publish transaction.
 
 - [ ] **Step 6: Build snapshots only from selected published rows**
 
-Load the version through a scoped Team/version join, verify `team_id == run.actor_id`, verify Team/member digests, and populate each member's immutable model, prompts, bindings, and policies without calling the live Agent service.
+Load the version through a scoped Team/version join, verify `team_id == run.actor_id`, verify schema-specific Team/member digests and exact mirrored-row equality, and populate each member's immutable model, prompts, Tool/Skill/knowledge bindings and policies without calling live Agent/provider/resource services. Write schema v5 while preserving the frozen v4 canonical projection.
 
 - [ ] **Step 7: Harden PostgreSQL immutability triggers**
 
 Cover `INSERT OR UPDATE OR DELETE`; check `NEW.team_version_id` and `OLD.team_version_id` as applicable. Order repository publication so draft members are copied before the target version becomes published.
+
+- [ ] **Step 7a: Enforce immutable member runtime boundaries**
+
+Build each member/supervisor from its own captured model, prompts and capability intersection. Never pass the Team-wide supervisor model or Tool collection to every member.
 
 - [ ] **Step 8: Run focused and migration regressions**
 
@@ -147,7 +178,7 @@ Cover unknown members, cycles, duplicate task IDs/positions, `max_steps`, parall
 
 - [ ] **Step 2: Write failing resume/idempotency tests**
 
-Interrupt a member Tool call for approval, recreate the Sandbox runtime, resume, and assert completed tasks/events are not replayed, event sequence continues, and the exact member/task invocation resumes once.
+Interrupt a member Tool call for approval, recreate the Sandbox runtime, resume, and assert completed tasks/events are not replayed, event sequence continues, and the exact member/task invocation resumes once. Persist and restore the shared `GatewayModelBudget` sequence plus iteration, Tool-call, and subagent counters so a worker restart cannot reset run ceilings or collide with earlier member invocation identities.
 
 - [ ] **Step 3: Write failing provenance boundary tests**
 
@@ -163,7 +194,7 @@ Generate/parse the supervisor plan through the platform-owned schema; execute de
 
 - [ ] **Step 6: Persist and restore complete Team scheduler state**
 
-Checkpoint event sequence, pending queue, completed/failed results, active member/task, invocation identity, Team version, and snapshot digest. Resume at the interrupted node; never rerun completed tasks or automatically replay uncertain side effects.
+Checkpoint event sequence, pending queue, completed/failed results, active member/task, invocation identity, Team version, snapshot digest, and shared model iteration/Tool/subagent budget state. Resume at the interrupted node; never rerun completed tasks, reset run-wide ceilings, reuse an earlier invocation key, or automatically replay uncertain side effects.
 
 - [ ] **Step 7: Enforce partial response and Artifact provenance**
 
