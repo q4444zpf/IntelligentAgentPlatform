@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+
+from pydantic import ValidationError
 
 from .artifact_backend import ArtifactBackend
 from .deepagents_factory import (
@@ -15,16 +18,33 @@ from .deepagents_factory import (
 from .execution_contract import RunExecutionRequest, RunExecutionResult
 from .execution_snapshot import verify_snapshot_digest
 from .execution_snapshot import PublishedTeamSnapshot
-from .team_graph import TeamLimitError, TeamPlan, TeamTask, member_agent_snapshot, validate_team_plan
+from .team_graph import (
+    TeamBudgetState,
+    TeamLimitError,
+    TeamPlan,
+    TeamPlanError,
+    TeamSchedulerState,
+    TeamTask,
+    TeamTaskFailure,
+    TeamTaskResult,
+    member_agent_snapshot,
+    parse_supervisor_plan,
+    schedule_ready_tasks,
+    validate_team_plan,
+)
 from .gateway_model import GatewayChatModel, GatewayModelBudget, RunnerGatewayModelError
 from .gateway_tools import RunnerApprovalInterruption, build_gateway_tools
-from .langgraph_runtime import LangGraphRuntimeAdapter, RuntimeState
+from .langgraph_runtime import LangGraphRuntimeAdapter, RuntimeResult, RuntimeState
 from .runner_gateway_client import (
     RunnerGatewayBusinessError,
     RunnerGatewayClientError,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _TeamCancelled(RuntimeError):
+    pass
 
 
 @dataclass
@@ -39,6 +59,8 @@ class _GatewayCheckpointStore:
             if error.code in {"checkpoint_not_found", "runner_gateway_not_found"}:
                 return None
             raise
+        if not isinstance(checkpoint, dict):
+            return None
         if checkpoint.get("snapshot_digest") != self.snapshot_digest:
             raise ValueError("checkpoint snapshot digest mismatch")
         state = checkpoint.get("state")
@@ -78,26 +100,14 @@ class SandboxRuntime:
             ):
                 return RunExecutionResult(status="failed", error_code="snapshot_invalid")
 
-            self._append_event("runner.started", {})
+            self._event_sequence = 0
+            self._approval_checkpoint_key = None
             checkpoint_store = _GatewayCheckpointStore(
                 self.gateway, request.snapshot_digest
             )
             limits = snapshot.payload.limits
-            model_budget = GatewayModelBudget(
-                max_iterations=limits.max_iterations,
-                max_tool_calls=limits.max_tool_calls,
-                max_subagents=limits.max_subagents,
-            )
             backend = ArtifactBackend(self.gateway)
             actor = snapshot.payload.actor
-            skill_context = ", ".join(skill.name for skill in snapshot.payload.skills)
-            context_prompt = actor.context_prompt
-            if skill_context:
-                context_prompt = (
-                    f"{context_prompt}\n\nSkills: {skill_context}"
-                    if context_prompt
-                    else f"Skills: {skill_context}"
-                )
             messages = [
                 {"role": message.role, "content": message.content}
                 for message in snapshot.payload.messages
@@ -108,150 +118,31 @@ class SandboxRuntime:
                 "project_id": snapshot.payload.project_id,
             }
             if isinstance(actor, PublishedTeamSnapshot):
-                if len(actor.members) > limits.max_subagents:
-                    raise TeamLimitError("team_limit_exceeded: max_subagents")
-                legacy_model = None
-                legacy_tools = None
-                if snapshot.payload.schema_version != "5":
-                    legacy_model = GatewayChatModel(
-                        self.gateway,
-                        max_iterations=limits.max_iterations,
-                        max_tool_calls=limits.max_tool_calls,
-                        max_subagents=limits.max_subagents,
-                        max_output_bytes=limits.max_output_bytes,
-                        budget_state=model_budget,
-                    )
-                    legacy_tools = build_gateway_tools(
-                        snapshot.payload, self.gateway
-                    )
-                plan = TeamPlan(tasks=tuple(
-                    TeamTask(
-                        id=f"member-{position + 1}", member_id=member.agent_id,
-                        objective=member.responsibility, position=position,
-                    )
-                    for position, member in enumerate(actor.members)
-                ))
-                validate_team_plan(plan, actor)
-                team_fields = {"team_id": actor.id, "version_id": actor.version_id}
-                self._append_event("team.plan.created", {
-                    **team_fields, "member_ids": [member.agent_id for member in actor.members],
-                    "task_ids": [task.id for task in plan.tasks],
-                })
-                member_results: list[str] = []
-                failed_members: list[str] = []
-                for task in plan.tasks:
-                    self._append_event("team.task.started", {
-                        **team_fields, "agent_id": task.member_id,
-                        "task_id": task.id, "position": task.position,
-                    })
-                    try:
-                        member = next(
-                            item
-                            for item in actor.members
-                            if item.agent_id == task.member_id
-                        )
-                        if snapshot.payload.schema_version == "5":
-                            member_model = GatewayChatModel(
-                                self.gateway,
-                                max_iterations=limits.max_iterations,
-                                max_tool_calls=limits.max_tool_calls,
-                                max_subagents=limits.max_subagents,
-                                max_output_bytes=limits.max_output_bytes,
-                                provider_id=member.model.provider_id,
-                                model_id=member.model.model,
-                                member_agent_id=member.agent_id,
-                                budget_state=model_budget,
-                            )
-                            member_tools = build_gateway_tools(
-                                snapshot.payload,
-                                self.gateway,
-                                allowed_tool_ids=(
-                                    set(member.tool_ids)
-                                    | set(member.knowledge_source_ids)
-                                ),
-                                member_agent_id=member.agent_id,
-                            )
-                        else:
-                            member_model = legacy_model
-                            member_tools = legacy_tools
-                        graph = self.agent_factory.build(
-                            member_agent_snapshot(actor, task.member_id),
-                            model=member_model, tools=member_tools,
-                            backend=ArtifactBackend(self.gateway, provenance={
-                                "team_version_id": actor.version_id,
-                                "member_agent_id": task.member_id,
-                                "task_id": task.id,
-                            }),
-                        )
-                        member_result = self.runtime_adapter_type(graph).invoke(
-                            RuntimeState(run_id=request.run_id, messages=messages, status="running"),
-                            metadata=metadata,
-                        )
-                    except RunnerApprovalInterruption:
-                        raise
-                    except Exception:
-                        failed_members.append(task.member_id)
-                        self._append_event("team.task.failed", {
-                            **team_fields, "agent_id": task.member_id,
-                            "task_id": task.id, "position": task.position,
-                        })
-                        if actor.failure_strategy == "fail_fast":
-                            raise
-                    else:
-                        member_results.append(f"{task.member_id}: {member_result.content}")
-                        self._append_event("team.task.completed", {
-                            **team_fields, "agent_id": task.member_id,
-                            "task_id": task.id, "position": task.position,
-                        })
-                self._append_event("team.synthesis.started", {
-                    **team_fields, "completed_members": len(member_results),
-                    "failed_members": len(failed_members),
-                })
-                synthesis_messages = [*messages, {
-                    "role": "user",
-                    "content": "Synthesize these bounded member results:\n" + "\n".join(member_results),
-                }]
-                if snapshot.payload.schema_version == "5":
-                    supervisor_model = GatewayChatModel(
-                        self.gateway,
-                        max_iterations=limits.max_iterations,
-                        max_tool_calls=limits.max_tool_calls,
-                        max_subagents=limits.max_subagents,
-                        max_output_bytes=limits.max_output_bytes,
-                        provider_id=actor.supervisor.model.provider_id,
-                        model_id=actor.supervisor.model.model,
-                        member_agent_id=actor.supervisor.agent_id,
-                        budget_state=model_budget,
-                    )
-                    supervisor_tools = build_gateway_tools(
-                        snapshot.payload,
-                        self.gateway,
-                        allowed_tool_ids=(
-                            set(actor.supervisor.tool_ids)
-                            | set(actor.supervisor.knowledge_source_ids)
-                        ),
-                        member_agent_id=actor.supervisor.agent_id,
-                    )
-                else:
-                    supervisor_model = legacy_model
-                    supervisor_tools = legacy_tools
-                graph = self.agent_factory.build(
-                    member_agent_snapshot(actor, actor.supervisor.agent_id),
-                    model=supervisor_model, tools=supervisor_tools,
-                    backend=ArtifactBackend(self.gateway, provenance={
-                        "team_version_id": actor.version_id,
-                        "member_agent_id": actor.supervisor.agent_id,
-                        "task_id": "synthesis",
-                    }),
-                )
-                result = self.runtime_adapter_type(graph, checkpoint_store=checkpoint_store).invoke(
-                    RuntimeState(run_id=request.run_id, messages=synthesis_messages, status="running"),
+                result = self._execute_team(
+                    request=request,
+                    snapshot=snapshot,
+                    actor=actor,
+                    messages=messages,
                     metadata=metadata,
+                    checkpoint_store=checkpoint_store,
                 )
-                self._append_event("team.synthesis.completed", {
-                    **team_fields, "partial": bool(failed_members),
-                })
             else:
+                self._append_event("runner.started", {})
+                model_budget = GatewayModelBudget(
+                    max_iterations=limits.max_iterations,
+                    max_tool_calls=limits.max_tool_calls,
+                    max_subagents=limits.max_subagents,
+                )
+                skill_context = ", ".join(
+                    skill.name for skill in snapshot.payload.skills
+                )
+                context_prompt = actor.context_prompt
+                if skill_context:
+                    context_prompt = (
+                        f"{context_prompt}\n\nSkills: {skill_context}"
+                        if context_prompt
+                        else f"Skills: {skill_context}"
+                    )
                 model = GatewayChatModel(
                     self.gateway,
                     max_iterations=limits.max_iterations,
@@ -273,11 +164,17 @@ class SandboxRuntime:
                     RuntimeState(run_id=request.run_id, messages=messages, status="running"),
                     metadata=metadata,
                 )
-            self._append_event("runner.completed", {"status": result.status})
+            if not isinstance(actor, PublishedTeamSnapshot):
+                self._append_event("runner.completed", {"status": result.status})
+            final_checkpoint_key = (
+                "team-scheduler"
+                if isinstance(actor, PublishedTeamSnapshot)
+                else "langgraph"
+            )
             completion = {
                 "status": "completed",
                 "final_assistant_content": result.content,
-                "checkpoint_key": "langgraph",
+                "checkpoint_key": final_checkpoint_key,
                 "artifact_refs": [
                     item.artifact_id for item in backend.list("/artifacts")
                 ],
@@ -286,20 +183,25 @@ class SandboxRuntime:
             return RunExecutionResult(
                 status="completed",
                 artifact_refs=tuple(completion["artifact_refs"]),
-                checkpoint_key="langgraph",
+                checkpoint_key=final_checkpoint_key,
             )
         except RunnerApprovalInterruption as interruption:
-            checkpoint_key = f"approval-{interruption.approval_id}"
-            state = {"status": "waiting_approval", "approval_id": interruption.approval_id}
-            self.gateway.save_checkpoint(
-                checkpoint_key,
-                state,
-                f"checkpoint:{checkpoint_key}",
-            )
-            self._append_event(
-                "approval.required",
-                {"approval_id": interruption.approval_id},
-            )
+            checkpoint_key = self._approval_checkpoint_key
+            if checkpoint_key is None:
+                checkpoint_key = f"approval-{interruption.approval_id}"
+                state = {
+                    "status": "waiting_approval",
+                    "approval_id": interruption.approval_id,
+                }
+                self.gateway.save_checkpoint(
+                    checkpoint_key,
+                    state,
+                    f"checkpoint:{checkpoint_key}",
+                )
+                self._append_event(
+                    "approval.required",
+                    {"approval_id": interruption.approval_id},
+                )
             self.gateway.complete(
                 {
                     "status": "interrupted",
@@ -314,12 +216,726 @@ class SandboxRuntime:
                 error_code="approval_required",
                 checkpoint_key=checkpoint_key,
             )
+        except _TeamCancelled:
+            return RunExecutionResult(
+                status="cancelled",
+                error_code="sandbox_cancelled",
+                checkpoint_key="team-scheduler",
+            )
         except RunnerGatewayModelError as error:
             return self._fail(error.code)
         except RunnerGatewayClientError as error:
             return self._fail(error.code)
         except Exception:  # noqa: BLE001
             return self._fail("sandbox_failed")
+
+    def _execute_team(
+        self,
+        *,
+        request: RunExecutionRequest,
+        snapshot,
+        actor: PublishedTeamSnapshot,
+        messages: list[dict[str, Any]],
+        metadata: dict[str, Any],
+        checkpoint_store: _GatewayCheckpointStore,
+    ) -> RuntimeResult:
+        limits = snapshot.payload.limits
+        state = self._load_team_state(
+            request.run_id,
+            actor,
+            checkpoint_store,
+            limits.max_subagents,
+        )
+        if state is None:
+            self._append_event("runner.started", {})
+            model_budget = GatewayModelBudget(
+                max_iterations=limits.max_iterations,
+                max_tool_calls=limits.max_tool_calls,
+                max_subagents=limits.max_subagents,
+            )
+            plan = self._create_team_plan(
+                request,
+                snapshot,
+                actor,
+                messages,
+                metadata,
+                model_budget,
+            )
+            team_fields = {"team_id": actor.id, "version_id": actor.version_id}
+            self._append_event(
+                "team.plan.created",
+                {
+                    **team_fields,
+                    "member_ids": [member.agent_id for member in actor.members],
+                    "task_ids": [task.id for task in plan.tasks],
+                },
+            )
+            state = TeamSchedulerState(
+                stage="executing",
+                snapshot_digest=snapshot.digest,
+                team_version_id=actor.version_id,
+                plan=plan,
+                pending_task_ids=tuple(task.id for task in plan.tasks),
+                event_sequence=self._event_sequence,
+                budget=self._budget_snapshot(model_budget),
+            )
+            state = self._save_team_state(state, model_budget)
+        else:
+            self._event_sequence = state.event_sequence
+            model_budget = GatewayModelBudget(
+                max_iterations=limits.max_iterations,
+                max_tool_calls=limits.max_tool_calls,
+                max_subagents=limits.max_subagents,
+                next_invocation_sequence=(
+                    state.budget.next_invocation_sequence
+                ),
+                tool_call_count=state.budget.tool_call_count,
+                subagent_call_count=state.budget.subagent_call_count,
+            )
+
+        legacy_model = None
+        legacy_tools = None
+        if snapshot.payload.schema_version != "5":
+            legacy_model = GatewayChatModel(
+                self.gateway,
+                max_iterations=limits.max_iterations,
+                max_tool_calls=limits.max_tool_calls,
+                max_subagents=limits.max_subagents,
+                max_output_bytes=limits.max_output_bytes,
+                budget_state=model_budget,
+            )
+            legacy_tools = build_gateway_tools(snapshot.payload, self.gateway)
+
+        completed = {item.task_id: item for item in state.completed_results}
+        failed = {item.task_id: item for item in state.failed_results}
+        started = set(state.started_task_ids)
+        task_by_id = {task.id: task for task in state.plan.tasks}
+        team_fields = {"team_id": actor.id, "version_id": actor.version_id}
+
+        if state.stage not in {"synthesizing", "completed"}:
+            while len(completed) + len(failed) < len(state.plan.tasks):
+                blocked = self._blocked_team_tasks(state.plan, completed, failed)
+                for task in blocked:
+                    failure = TeamTaskFailure(
+                        task_id=task.id,
+                        member_agent_id=task.member_id,
+                        position=task.position,
+                        error_code="dependency_failed",
+                    )
+                    failed[task.id] = failure
+                    self._append_event(
+                        "team.task.failed",
+                        {
+                            **team_fields,
+                            "agent_id": task.member_id,
+                            "task_id": task.id,
+                            "position": task.position,
+                            "error_code": failure.error_code,
+                        },
+                    )
+                if blocked:
+                    state = self._state_with_results(
+                        state, completed, failed, started, stage="executing"
+                    )
+                    state = self._save_team_state(state, model_budget)
+                    if actor.failure_strategy == "fail_fast":
+                        raise RuntimeError("team member failed")
+                    continue
+
+                if state.active_task_id is not None:
+                    active = task_by_id.get(state.active_task_id)
+                    if active is None or active.id in completed or active.id in failed:
+                        raise TeamPlanError("team_checkpoint_invalid: active task")
+                    batch = (active,)
+                else:
+                    batch = schedule_ready_tasks(
+                        state.plan,
+                        set(completed),
+                        failed=set(failed),
+                        max_parallel_members=min(
+                            actor.max_parallel_members,
+                            limits.max_subagents,
+                        ),
+                    )
+                if not batch:
+                    raise TeamPlanError("team_plan_invalid: task queue stalled")
+
+                self._ensure_team_active(snapshot, actor)
+                for task in batch:
+                    if task.id not in started:
+                        started.add(task.id)
+                        self._append_event(
+                            "team.task.started",
+                            {
+                                **team_fields,
+                                "agent_id": task.member_id,
+                                "task_id": task.id,
+                                "position": task.position,
+                            },
+                        )
+                state = self._state_with_results(
+                    state,
+                    completed,
+                    failed,
+                    started,
+                    stage="executing",
+                    active_task_id=None,
+                    active_member_agent_id=None,
+                    active_invocation_id=None,
+                )
+                state = self._save_team_state(state, model_budget)
+
+                def invoke(task: TeamTask):
+                    return self._invoke_team_member(
+                        request=request,
+                        snapshot=snapshot,
+                        actor=actor,
+                        task=task,
+                        messages=messages,
+                        metadata=metadata,
+                        model_budget=model_budget,
+                        completed=completed,
+                        legacy_model=legacy_model,
+                        legacy_tools=legacy_tools,
+                    )
+
+                with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                    futures = [(task, executor.submit(invoke, task)) for task in batch]
+                    outcomes = []
+                    for task, future in futures:
+                        try:
+                            outcomes.append((task, future.result(), None))
+                        except Exception as error:  # noqa: BLE001
+                            outcomes.append((task, None, error))
+
+                interruption = None
+                first_failure = None
+                for task, member_result, error in sorted(
+                    outcomes, key=lambda item: (item[0].position, item[0].id)
+                ):
+                    if isinstance(error, RunnerApprovalInterruption):
+                        interruption = interruption or (task, error)
+                        continue
+                    if error is not None:
+                        first_failure = first_failure or error
+                        failure = TeamTaskFailure(
+                            task_id=task.id,
+                            member_agent_id=task.member_id,
+                            position=task.position,
+                            error_code=self._member_error_code(error),
+                        )
+                        failed[task.id] = failure
+                        self._append_event(
+                            "team.task.failed",
+                            {
+                                **team_fields,
+                                "agent_id": task.member_id,
+                                "task_id": task.id,
+                                "position": task.position,
+                                "error_code": failure.error_code,
+                            },
+                        )
+                    else:
+                        completed[task.id] = TeamTaskResult(
+                            task_id=task.id,
+                            member_agent_id=task.member_id,
+                            position=task.position,
+                            content=member_result.content,
+                        )
+                        self._append_event(
+                            "team.task.completed",
+                            {
+                                **team_fields,
+                                "agent_id": task.member_id,
+                                "task_id": task.id,
+                                "position": task.position,
+                            },
+                        )
+
+                if interruption is not None:
+                    task, approval = interruption
+                    invocation_id = self._task_invocation_id(actor, task.id)
+                    state = self._state_with_results(
+                        state,
+                        completed,
+                        failed,
+                        started,
+                        stage="waiting_approval",
+                        active_task_id=task.id,
+                        active_member_agent_id=task.member_id,
+                        active_invocation_id=invocation_id,
+                    )
+                    self._append_event(
+                        "approval.required",
+                        {
+                            **team_fields,
+                            "approval_id": approval.approval_id,
+                            "agent_id": task.member_id,
+                            "task_id": task.id,
+                            "invocation_id": invocation_id,
+                        },
+                    )
+                    state = state.model_copy(
+                        update={"event_sequence": self._event_sequence}
+                    )
+                    self._save_team_state(state, model_budget)
+                    self._approval_checkpoint_key = "team-scheduler"
+                    raise approval
+
+                state = self._state_with_results(
+                    state, completed, failed, started, stage="executing"
+                )
+                state = self._save_team_state(state, model_budget)
+                if first_failure is not None and actor.failure_strategy == "fail_fast":
+                    raise first_failure
+
+        if state.stage == "completed":
+            if state.final_assistant_content is None:
+                raise TeamPlanError("team_checkpoint_invalid: completed without result")
+            return RuntimeResult(
+                status="completed",
+                content=state.final_assistant_content,
+                state={},
+            )
+
+        self._ensure_team_active(snapshot, actor)
+        if state.stage != "synthesizing":
+            self._append_event(
+                "team.synthesis.started",
+                {
+                    **team_fields,
+                    "completed_members": len(completed),
+                    "failed_members": len(failed),
+                },
+            )
+            state = self._state_with_results(
+                state,
+                completed,
+                failed,
+                started,
+                stage="synthesizing",
+                active_task_id="synthesis",
+                active_member_agent_id=actor.supervisor.agent_id,
+                active_invocation_id=self._task_invocation_id(actor, "synthesis"),
+            )
+            state = self._save_team_state(state, model_budget)
+
+        synthesis_lines = [
+            f"{item.task_id}: {item.content}"
+            for item in sorted(completed.values(), key=lambda item: item.position)
+        ]
+        synthesis_lines.extend(
+            f"{item.task_id} [{item.member_agent_id}] failed: {item.error_code}"
+            for item in sorted(failed.values(), key=lambda item: item.position)
+        )
+        synthesis_messages = [
+            *messages,
+            {
+                "role": "user",
+                "content": (
+                    "Synthesize these bounded Team task outcomes. Preserve failed "
+                    "task details and do not claim full completion:\n"
+                    + "\n".join(synthesis_lines)
+                ),
+            },
+        ]
+        supervisor_model, supervisor_tools = self._member_runtime_dependencies(
+            snapshot,
+            actor,
+            actor.supervisor.agent_id,
+            model_budget,
+            legacy_model,
+            legacy_tools,
+        )
+        graph = self.agent_factory.build(
+            member_agent_snapshot(actor, actor.supervisor.agent_id),
+            model=supervisor_model,
+            tools=supervisor_tools,
+            backend=ArtifactBackend(
+                self.gateway,
+                provenance={
+                    "team_version_id": actor.version_id,
+                    "member_agent_id": actor.supervisor.agent_id,
+                    "task_id": "synthesis",
+                },
+            ),
+        )
+        result = self.runtime_adapter_type(graph).invoke(
+            RuntimeState(
+                run_id=request.run_id,
+                messages=synthesis_messages,
+                status="running",
+                values={
+                    "team_version_id": actor.version_id,
+                    "team_task_id": "synthesis",
+                    "team_member_agent_id": actor.supervisor.agent_id,
+                    "team_task_invocation_id": self._task_invocation_id(
+                        actor, "synthesis"
+                    ),
+                },
+            ),
+            metadata=metadata,
+        )
+        content = result.content
+        if failed:
+            failed_ids = ", ".join(
+                item.task_id
+                for item in sorted(failed.values(), key=lambda item: item.position)
+            )
+            content = (
+                f"Partial completion: failed Team tasks: {failed_ids}.\n\n"
+                f"{content}"
+            )
+        self._append_event(
+            "team.synthesis.completed",
+            {
+                **team_fields,
+                "partial": bool(failed),
+                "failed_task_ids": [
+                    item.task_id
+                    for item in sorted(failed.values(), key=lambda item: item.position)
+                ],
+            },
+        )
+        self._append_event("runner.completed", {"status": result.status})
+        state = self._state_with_results(
+            state,
+            completed,
+            failed,
+            started,
+            stage="completed",
+            active_task_id=None,
+            active_member_agent_id=None,
+            active_invocation_id=None,
+        )
+        state = state.model_copy(update={"final_assistant_content": content})
+        self._save_team_state(state, model_budget)
+        return RuntimeResult(status=result.status, content=content, state=result.state)
+
+    def _create_team_plan(
+        self,
+        request,
+        snapshot,
+        actor,
+        messages,
+        metadata,
+        model_budget,
+    ) -> TeamPlan:
+        limits = snapshot.payload.limits
+        if snapshot.payload.schema_version != "5":
+            plan = TeamPlan(
+                tasks=tuple(
+                    TeamTask(
+                        id=f"member-{position + 1}",
+                        member_id=member.agent_id,
+                        objective=member.responsibility,
+                        position=position,
+                    )
+                    for position, member in enumerate(actor.members)
+                )
+            )
+            validate_team_plan(
+                plan,
+                actor,
+                runner_max_subagents=limits.max_subagents,
+            )
+            return plan
+
+        supervisor_model, _ = self._member_runtime_dependencies(
+            snapshot,
+            actor,
+            actor.supervisor.agent_id,
+            model_budget,
+            None,
+            None,
+        )
+        graph = self.agent_factory.build(
+            member_agent_snapshot(actor, actor.supervisor.agent_id),
+            model=supervisor_model,
+            tools=[],
+            backend=None,
+        )
+        member_lines = "\n".join(
+            f"- {member.agent_id}: {member.responsibility}"
+            for member in actor.members
+        )
+        planning_messages = [
+            *messages,
+            {
+                "role": "user",
+                "content": (
+                    "Create the bounded Team execution plan. Return only one JSON "
+                    "object matching {\"tasks\":[{\"id\":string,"
+                    "\"member_id\":string,\"objective\":string,"
+                    "\"depends_on\":[string],\"position\":integer}]}. "
+                    f"Use at most {actor.max_steps} tasks and only these members:\n"
+                    f"{member_lines}"
+                ),
+            },
+        ]
+        result = self.runtime_adapter_type(graph).invoke(
+            RuntimeState(
+                run_id=request.run_id,
+                messages=planning_messages,
+                status="running",
+                values={
+                    "team_version_id": actor.version_id,
+                    "team_stage": "planning",
+                },
+            ),
+            metadata=metadata,
+        )
+        return parse_supervisor_plan(
+            result.content,
+            actor,
+            runner_max_subagents=limits.max_subagents,
+        )
+
+    def _invoke_team_member(
+        self,
+        *,
+        request,
+        snapshot,
+        actor,
+        task,
+        messages,
+        metadata,
+        model_budget,
+        completed,
+        legacy_model,
+        legacy_tools,
+    ):
+        model, tools = self._member_runtime_dependencies(
+            snapshot,
+            actor,
+            task.member_id,
+            model_budget,
+            legacy_model,
+            legacy_tools,
+        )
+        graph = self.agent_factory.build(
+            member_agent_snapshot(actor, task.member_id),
+            model=model,
+            tools=tools,
+            backend=ArtifactBackend(
+                self.gateway,
+                provenance={
+                    "team_version_id": actor.version_id,
+                    "member_agent_id": task.member_id,
+                    "task_id": task.id,
+                },
+            ),
+        )
+        dependency_content = "\n".join(
+            f"{dependency}: {completed[dependency].content}"
+            for dependency in task.depends_on
+            if dependency in completed
+        )
+        task_messages = [
+            *messages,
+            {
+                "role": "user",
+                "content": (
+                    f"Team task {task.id}: {task.objective}"
+                    + (
+                        f"\nCompleted dependencies:\n{dependency_content}"
+                        if dependency_content
+                        else ""
+                    )
+                ),
+            },
+        ]
+        return self.runtime_adapter_type(graph).invoke(
+            RuntimeState(
+                run_id=request.run_id,
+                messages=task_messages,
+                status="running",
+                values={
+                    "team_version_id": actor.version_id,
+                    "team_task_id": task.id,
+                    "team_member_agent_id": task.member_id,
+                    "team_task_invocation_id": self._task_invocation_id(
+                        actor, task.id
+                    ),
+                },
+            ),
+            metadata=metadata,
+        )
+
+    def _member_runtime_dependencies(
+        self,
+        snapshot,
+        actor,
+        member_id,
+        model_budget,
+        legacy_model,
+        legacy_tools,
+    ):
+        if snapshot.payload.schema_version != "5":
+            return legacy_model, legacy_tools
+        member = next(
+            item
+            for item in (actor.supervisor, *actor.members)
+            if item.agent_id == member_id
+        )
+        limits = snapshot.payload.limits
+        model = GatewayChatModel(
+            self.gateway,
+            max_iterations=limits.max_iterations,
+            max_tool_calls=limits.max_tool_calls,
+            max_subagents=limits.max_subagents,
+            max_output_bytes=limits.max_output_bytes,
+            provider_id=member.model.provider_id,
+            model_id=member.model.model,
+            member_agent_id=member.agent_id,
+            budget_state=model_budget,
+        )
+        tools = build_gateway_tools(
+            snapshot.payload,
+            self.gateway,
+            allowed_tool_ids=(
+                set(member.tool_ids) | set(member.knowledge_source_ids)
+            ),
+            member_agent_id=member.agent_id,
+        )
+        return model, tools
+
+    def _load_team_state(
+        self,
+        run_id,
+        actor,
+        checkpoint_store,
+        runner_max_subagents,
+    ) -> TeamSchedulerState | None:
+        raw = checkpoint_store.load_latest(run_id)
+        if not isinstance(raw, dict) or raw.get("kind") != "team_scheduler":
+            return None
+        try:
+            state = TeamSchedulerState.model_validate(raw)
+        except ValidationError as error:
+            raise TeamPlanError("team_checkpoint_invalid: invalid schema") from error
+        if (
+            state.snapshot_digest != checkpoint_store.snapshot_digest
+            or state.team_version_id != actor.version_id
+        ):
+            raise TeamPlanError("team_checkpoint_invalid: immutable identity")
+        validate_team_plan(
+            state.plan,
+            actor,
+            runner_max_subagents=runner_max_subagents,
+        )
+        task_ids = {task.id for task in state.plan.tasks}
+        settled_ids = {
+            *(item.task_id for item in state.completed_results),
+            *(item.task_id for item in state.failed_results),
+        }
+        if (
+            not set(state.pending_task_ids) <= task_ids
+            or not set(state.started_task_ids) <= task_ids
+            or not settled_ids <= task_ids
+            or len(settled_ids)
+            != len(state.completed_results) + len(state.failed_results)
+        ):
+            raise TeamPlanError("team_checkpoint_invalid: task state")
+        return state
+
+    def _save_team_state(
+        self,
+        state: TeamSchedulerState,
+        budget: GatewayModelBudget,
+    ) -> TeamSchedulerState:
+        settled = {
+            *(item.task_id for item in state.completed_results),
+            *(item.task_id for item in state.failed_results),
+        }
+        pending = tuple(
+            task.id for task in state.plan.tasks if task.id not in settled
+        )
+        updated = state.model_copy(
+            update={
+                "pending_task_ids": pending,
+                "event_sequence": self._event_sequence,
+                "checkpoint_revision": state.checkpoint_revision + 1,
+                "budget": self._budget_snapshot(budget),
+            }
+        )
+        self.gateway.save_checkpoint(
+            "team-scheduler",
+            updated.model_dump(mode="json"),
+            f"checkpoint:team-scheduler:{updated.checkpoint_revision}",
+        )
+        return updated
+
+    @staticmethod
+    def _budget_snapshot(budget: GatewayModelBudget) -> TeamBudgetState:
+        return TeamBudgetState(
+            next_invocation_sequence=budget.next_invocation_sequence,
+            tool_call_count=budget.tool_call_count,
+            subagent_call_count=budget.subagent_call_count,
+        )
+
+    @staticmethod
+    def _state_with_results(
+        state,
+        completed,
+        failed,
+        started,
+        *,
+        stage,
+        active_task_id=None,
+        active_member_agent_id=None,
+        active_invocation_id=None,
+    ):
+        return state.model_copy(
+            update={
+                "stage": stage,
+                "started_task_ids": tuple(sorted(started)),
+                "completed_results": tuple(
+                    sorted(completed.values(), key=lambda item: item.position)
+                ),
+                "failed_results": tuple(
+                    sorted(failed.values(), key=lambda item: item.position)
+                ),
+                "active_task_id": active_task_id,
+                "active_member_agent_id": active_member_agent_id,
+                "active_invocation_id": active_invocation_id,
+            }
+        )
+
+    @staticmethod
+    def _blocked_team_tasks(plan, completed, failed):
+        settled = set(completed) | set(failed)
+        return tuple(
+            task
+            for task in sorted(plan.tasks, key=lambda item: item.position)
+            if task.id not in settled
+            and any(dependency in failed for dependency in task.depends_on)
+        )
+
+    @staticmethod
+    def _task_invocation_id(actor, task_id):
+        return f"team:{actor.version_id}:{task_id}"
+
+    @staticmethod
+    def _member_error_code(error):
+        if isinstance(error, (RunnerGatewayModelError, RunnerGatewayClientError)):
+            return error.code
+        return "member_execution_failed"
+
+    def _ensure_team_active(self, snapshot, actor) -> None:
+        try:
+            current = self.gateway.get_snapshot()
+        except RunnerGatewayBusinessError as error:
+            if error.code == "run_token_invalid":
+                raise _TeamCancelled() from error
+            raise
+        if (
+            current.snapshot_id != snapshot.snapshot_id
+            or current.digest != snapshot.digest
+            or not isinstance(current.payload.actor, PublishedTeamSnapshot)
+            or current.payload.actor.version_id != actor.version_id
+        ):
+            raise TeamPlanError("team_checkpoint_invalid: immutable identity")
 
     def _append_event(self, event_type: str, payload: dict[str, Any]) -> None:
         self._event_sequence += 1

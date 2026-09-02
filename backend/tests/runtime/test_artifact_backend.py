@@ -199,32 +199,74 @@ class GatewaySnapshotService:
         return self.snapshot if snapshot_id == self.snapshot.snapshot_id else None
 
 
-def _gateway_snapshot():
+def _gateway_snapshot(*, team=False):
     from app.runtime.execution_snapshot import (
         ExecutionSnapshotPayload,
         PublishedAgentSnapshot,
+        PublishedTeamSnapshot,
         SnapshotModelSelection,
         SnapshotRuntimeLimits,
+        SnapshotTeamMember,
         StoredExecutionSnapshot,
         canonical_snapshot_bytes,
     )
 
-    payload = ExecutionSnapshotPayload(
-        snapshot_id="snapshot-1",
-        run_id="run-1",
-        unit_id="unit-1",
-        project_id="project-1",
-        user_id="user-1",
-        actor=PublishedAgentSnapshot(
-            id="agent-1",
-            name="Agent",
+    agent = PublishedAgentSnapshot(
+        id="agent-1",
+        name="Agent",
+        description="",
+        runtime_form="common",
+        language="zh-CN",
+        system_prompt="",
+        context_prompt="",
+        approval_policy="never",
+    )
+    actor = agent
+    schema_version = "1"
+    if team:
+        def member(agent_id, role):
+            return SnapshotTeamMember(
+                agent_id=agent_id,
+                role=role,
+                responsibility=role,
+                agent_definition_digest=hashlib.sha256(
+                    agent_id.encode()
+                ).hexdigest(),
+                agent=agent.model_copy(update={"id": agent_id, "name": agent_id}),
+                model=SnapshotModelSelection(
+                    provider_id="provider-1",
+                    model="model-1",
+                ),
+            )
+
+        actor = PublishedTeamSnapshot(
+            id="team-1",
+            version_id="team-version-1",
+            version=1,
+            definition_digest="d" * 64,
+            supervisor=member("supervisor", "supervisor"),
+            members=(member("forecast", "member"), member("review", "member")),
+            max_steps=4,
+            max_parallel_members=2,
+            timeout_seconds=60,
+            failure_strategy="fail_fast",
+            name="Team",
             description="",
             runtime_form="common",
             language="zh-CN",
             system_prompt="",
             context_prompt="",
             approval_policy="never",
-        ),
+        )
+        schema_version = "5"
+    payload = ExecutionSnapshotPayload(
+        schema_version=schema_version,
+        snapshot_id="snapshot-1",
+        run_id="run-1",
+        unit_id="unit-1",
+        project_id="project-1",
+        user_id="user-1",
+        actor=actor,
         model=SnapshotModelSelection(provider_id="provider-1", model="model-1"),
         messages=(),
         limits=SnapshotRuntimeLimits(snapshot_max_bytes=1048576),
@@ -240,7 +282,15 @@ def _gateway_snapshot():
     )
 
 
-def _add_run(session, run_id, project_id="project-1"):
+def _add_run(
+    session,
+    run_id,
+    project_id="project-1",
+    *,
+    actor_type="agent",
+    actor_id="agent-1",
+    actor_version_id=None,
+):
     from app.conversations.models import AgentRun, Conversation, Message, RunEvent
 
     conversation = Conversation(
@@ -264,21 +314,23 @@ def _add_run(session, run_id, project_id="project-1"):
             id=run_id,
             conversation_id=conversation.id,
             trigger_message_id=message.id,
-            actor_type="agent",
-            actor_id="agent-1",
+            actor_type=actor_type,
+            actor_id=actor_id,
+            actor_version_id=actor_version_id,
             status="running",
         )
     )
     session.commit()
 
 
-def _gateway_client(repository_type=None):
+def _gateway_client(repository_type=None, *, snapshot=None, checkpoint_state=None):
     from app.artifacts.models import ArtifactRecord
     from app.artifacts.service import ArtifactService
     from app.conversations.models import AgentRun, Conversation, Message, RunEvent
     from app.conversations.repository import ConversationRepository
     from app.db.base import Base
     from app.runtime.run_tokens import RunTokenClaims
+    from app.runtime.checkpoint_store import CheckpointStore
     from app.runtime.runner_gateway_auth import (
         RunnerGatewayError,
         runner_gateway_error_handler,
@@ -298,18 +350,35 @@ def _gateway_client(repository_type=None):
     )
     Base.metadata.create_all(engine)
     session = Session(engine)
-    _add_run(session, "run-1")
+    snapshot = snapshot or _gateway_snapshot()
+    actor = snapshot.payload.actor
+    _add_run(
+        session,
+        "run-1",
+        actor_type=actor.kind,
+        actor_id=actor.id,
+        actor_version_id=getattr(actor, "version_id", None),
+    )
     _add_run(session, "run-2")
-    snapshot = _gateway_snapshot()
     storage = GatewayStorage()
     artifacts = ArtifactService(session, storage)
     repository = repository_type(session)
+    checkpoints = CheckpointStore(session)
+    if checkpoint_state is not None:
+        checkpoints.save(
+            "run-1",
+            "team-scheduler",
+            checkpoint_state,
+            snapshot.digest,
+            "checkpoint:test",
+        )
     app = FastAPI()
     app.add_exception_handler(RunnerGatewayError, runner_gateway_error_handler)
     app.include_router(
         create_router(
             token_service_dependency=lambda: GatewayTokenService(snapshot),
             snapshot_service_dependency=lambda: GatewaySnapshotService(snapshot),
+            checkpoint_store_dependency=lambda: checkpoints,
             conversation_repository_dependency=lambda: repository,
             artifact_service_dependency=lambda: artifacts,
         ),
@@ -374,6 +443,151 @@ def test_runner_artifact_gateway_is_scoped_idempotent_and_emits_ready_event():
     )
     assert listed.json() == [first.json()]
     assert base64.b64decode(read.json()["data_base64"]) == data
+
+
+def _artifact_request(*, provenance=None):
+    data = b"result"
+    request = {
+        "path": "/artifacts/result.txt",
+        "content_type": "text/plain",
+        "size_bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "data_base64": base64.b64encode(data).decode("ascii"),
+    }
+    if provenance is not None:
+        request["provenance"] = provenance
+    return request
+
+
+def _team_scheduler_checkpoint(snapshot):
+    return {
+        "kind": "team_scheduler",
+        "stage": "executing",
+        "snapshot_digest": snapshot.digest,
+        "team_version_id": "team-version-1",
+        "plan": {
+            "tasks": [
+                {
+                    "id": "forecast-task",
+                    "member_id": "forecast",
+                    "objective": "forecast",
+                    "depends_on": [],
+                    "position": 0,
+                },
+                {
+                    "id": "review-task",
+                    "member_id": "review",
+                    "objective": "review",
+                    "depends_on": ["forecast-task"],
+                    "position": 1,
+                },
+            ],
+        },
+        "pending_task_ids": ["forecast-task", "review-task"],
+        "started_task_ids": ["forecast-task"],
+        "completed_results": [],
+        "failed_results": [],
+        "event_sequence": 1,
+        "checkpoint_revision": 1,
+        "budget": {
+            "next_invocation_sequence": 0,
+            "tool_call_count": 0,
+            "subagent_call_count": 0,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        None,
+        {
+            "team_version_id": "spoofed-version",
+            "member_agent_id": "forecast",
+            "task_id": "forecast-task",
+        },
+        {
+            "team_version_id": "team-version-1",
+            "member_agent_id": "outside",
+            "task_id": "forecast-task",
+        },
+        {
+            "team_version_id": "team-version-1",
+            "member_agent_id": "review",
+            "task_id": "forecast-task",
+        },
+        {
+            "team_version_id": "team-version-1",
+            "member_agent_id": "review",
+            "task_id": "review-task",
+        },
+    ],
+)
+def test_team_artifact_gateway_rejects_missing_or_spoofed_provenance(provenance):
+    snapshot = _gateway_snapshot(team=True)
+    client, _, _, _ = _gateway_client(
+        snapshot=snapshot,
+        checkpoint_state=_team_scheduler_checkpoint(snapshot),
+    )
+
+    response = client.post(
+        "/internal/runner/runs/run-1/artifacts",
+        headers=_headers(key="artifact-team-invalid"),
+        json=_artifact_request(provenance=provenance),
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "artifact_provenance_invalid"
+
+
+def test_team_artifact_gateway_derives_version_and_persists_validated_provenance():
+    snapshot = _gateway_snapshot(team=True)
+    client, session, _, _ = _gateway_client(
+        snapshot=snapshot,
+        checkpoint_state=_team_scheduler_checkpoint(snapshot),
+    )
+
+    response = client.post(
+        "/internal/runner/runs/run-1/artifacts",
+        headers=_headers(key="artifact-team-valid"),
+        json=_artifact_request(provenance={
+            "member_agent_id": "forecast",
+            "task_id": "forecast-task",
+        }),
+    )
+
+    from app.artifacts.models import ArtifactRecord
+
+    assert response.status_code == 201
+    artifact = session.query(ArtifactRecord).one()
+    assert artifact.provenance == {
+        "team_version_id": "team-version-1",
+        "member_agent_id": "forecast",
+        "task_id": "forecast-task",
+    }
+
+
+def test_agent_artifact_gateway_rejects_team_provenance_but_keeps_legacy_upload():
+    client, _, _, _ = _gateway_client()
+
+    rejected = client.post(
+        "/internal/runner/runs/run-1/artifacts",
+        headers=_headers(key="artifact-agent-spoofed"),
+        json=_artifact_request(provenance={
+            "team_version_id": "team-version-1",
+            "member_agent_id": "forecast",
+            "task_id": "forecast-task",
+        }),
+    )
+    accepted = client.post(
+        "/internal/runner/runs/run-1/artifacts",
+        headers=_headers(key="artifact-agent-compatible"),
+        json={**_artifact_request(), "path": "/artifacts/legacy.txt"},
+    )
+
+    assert rejected.status_code == 403
+    assert rejected.json()["code"] == "artifact_provenance_invalid"
+    assert accepted.status_code == 201
 
 
 def test_runner_cannot_read_other_run_artifact():

@@ -1,7 +1,9 @@
 import pytest
+from pydantic import ValidationError
 
 from app.runtime.execution_snapshot import PublishedTeamSnapshot, SnapshotTeamMember
-from app.runtime.team_graph import TeamPlan, TeamPlanError, TeamTask, member_agent_snapshot, schedule_ready_tasks, validate_team_plan
+from app.runtime import team_graph
+from app.runtime.team_graph import TeamPlan, TeamLimitError, TeamPlanError, TeamTask, member_agent_snapshot, schedule_ready_tasks, validate_team_plan
 
 
 @pytest.fixture
@@ -29,6 +31,65 @@ def test_team_plan_rejects_dependency_cycle(snapshot):
         )), snapshot)
 
 
+def test_team_plan_schema_rejects_extra_fields_and_duplicate_ids_or_positions(snapshot):
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        TeamPlan.model_validate({
+            "tasks": [{
+                "id": "a",
+                "member_id": "member",
+                "objective": "review",
+                "position": 0,
+                "untrusted": True,
+            }],
+        })
+    with pytest.raises(TeamPlanError, match="duplicate task"):
+        validate_team_plan(TeamPlan(tasks=(
+            TeamTask(id="a", member_id="member", objective="one", position=0),
+            TeamTask(id="a", member_id="member", objective="two", position=1),
+        )), snapshot)
+    with pytest.raises(TeamPlanError, match="duplicate position"):
+        validate_team_plan(TeamPlan(tasks=(
+            TeamTask(id="a", member_id="member", objective="one", position=0),
+            TeamTask(id="b", member_id="member", objective="two", position=0),
+        )), snapshot)
+
+
+def test_team_plan_rejects_max_steps_and_runner_subagent_ceiling(snapshot):
+    tasks = tuple(
+        TeamTask(
+            id=f"task-{position}",
+            member_id="member",
+            objective="review",
+            position=position,
+        )
+        for position in range(5)
+    )
+    with pytest.raises(TeamLimitError, match="max_steps"):
+        validate_team_plan(TeamPlan(tasks=tasks), snapshot)
+    with pytest.raises(TeamLimitError, match="max_subagents"):
+        validate_team_plan(
+            TeamPlan(tasks=(tasks[0],)),
+            snapshot,
+            runner_max_subagents=0,
+        )
+
+
+def test_platform_plan_parser_accepts_only_typed_validated_json(snapshot):
+    parser = getattr(team_graph, "parse_supervisor_plan", None)
+    assert callable(parser), "platform supervisor plan parser is missing"
+
+    plan = parser(
+        '{"tasks":[{"id":"review","member_id":"member",'
+        '"objective":"Review flood forecast","depends_on":[],"position":0}]}',
+        snapshot,
+        runner_max_subagents=1,
+    )
+
+    assert plan.tasks[0].id == "review"
+    with pytest.raises(TeamPlanError, match="team_plan_invalid"):
+        parser("not-json", snapshot, runner_max_subagents=1)
+
+
 def test_schedule_ready_tasks_is_deterministic_and_bounded(snapshot):
     plan = TeamPlan(tasks=(
         TeamTask(id="b", member_id="member", objective="b", position=1),
@@ -39,6 +100,26 @@ def test_schedule_ready_tasks_is_deterministic_and_bounded(snapshot):
     batch = schedule_ready_tasks(plan, set(), max_parallel_members=2)
     assert [task.id for task in batch] == ["a", "b"]
     assert [task.id for task in schedule_ready_tasks(plan, {"a", "b"}, max_parallel_members=2)] == ["c"]
+
+
+def test_schedule_ready_tasks_does_not_dequeue_failed_dependencies(snapshot):
+    plan = TeamPlan(tasks=(
+        TeamTask(id="a", member_id="supervisor", objective="a", position=0),
+        TeamTask(
+            id="b",
+            member_id="member",
+            objective="b",
+            depends_on=("a",),
+            position=1,
+        ),
+    ))
+
+    assert schedule_ready_tasks(
+        plan,
+        set(),
+        failed={"a"},
+        max_parallel_members=2,
+    ) == ()
 
 
 def test_schedule_ready_tasks_rejects_zero_parallelism(snapshot):

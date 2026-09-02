@@ -9,6 +9,7 @@ import os
 from datetime import UTC, datetime
 from time import perf_counter
 
+from pydantic import ValidationError
 from sqlalchemy import func, select
 
 from app.approvals.models import Approval
@@ -45,6 +46,7 @@ from .model_gateway import ModelGateway, ModelRuntimeError, ModelSelection
 from .run_tokens import RunTokenClaims
 from .runner_gateway_auth import RunnerGatewayError
 from .runner_gateway_schemas import (
+    ArtifactProvenance,
     ArtifactContentResponse,
     ArtifactCreateRequest,
     ArtifactFileResponse,
@@ -61,6 +63,7 @@ from .runner_gateway_schemas import (
     ToolInvocationRequest,
     ToolInvocationResponse,
 )
+from .team_graph import TeamPlanError, TeamSchedulerState, validate_team_plan
 
 logger = logging.getLogger(__name__)
 
@@ -692,14 +695,22 @@ class RunnerGatewayService:
     ) -> ArtifactFileResponse:
         repository = self._require_conversation_repository()
         artifacts = self._require_artifact_service()
-        self._verified_snapshot(run_id, claims)
+        snapshot = self._verified_snapshot(run_id, claims)
+        provenance = self._validated_artifact_provenance(
+            run_id,
+            snapshot,
+            request.provenance,
+        )
         self._lock_run(repository, run_id)
         requests = RunnerRequestStore(repository.session)
         action = "artifact.create"
         request_digest = _canonical_digest(
             {
                 "snapshot_digest": claims.snapshot_digest,
-                "request": request.model_dump(mode="json"),
+                "request": {
+                    **request.model_dump(mode="json", exclude={"provenance"}),
+                    "provenance": provenance,
+                },
             }
         )
         replay = self._replay_or_conflict(
@@ -724,7 +735,7 @@ class RunnerGatewayService:
                 content_type=request.content_type,
                 data=data,
                 sha256=request.sha256,
-                provenance=request.provenance.model_dump() if request.provenance else None,
+                provenance=provenance,
                 commit=False,
             )
             response = self._artifact_response(created)
@@ -737,6 +748,7 @@ class RunnerGatewayService:
                     "size_bytes": created.size_bytes,
                     "sha256": created.sha256,
                     "content_type": created.content_type,
+                    **({"provenance": provenance} if provenance else {}),
                 },
             )
             requests.add(
@@ -771,6 +783,96 @@ class RunnerGatewayService:
             raise RunnerGatewayError(
                 502, "artifact_upload_failed", "成果文件保存失败"
             ) from error
+
+    def _validated_artifact_provenance(
+        self,
+        run_id: str,
+        snapshot: StoredExecutionSnapshot,
+        requested: ArtifactProvenance | None,
+    ) -> dict[str, str] | None:
+        actor = snapshot.payload.actor
+        if not isinstance(actor, PublishedTeamSnapshot):
+            if requested is not None:
+                raise RunnerGatewayError(
+                    403,
+                    "artifact_provenance_invalid",
+                    "成果来源无效",
+                )
+            return None
+        if requested is None or (
+            requested.team_version_id is not None
+            and requested.team_version_id != actor.version_id
+        ):
+            raise RunnerGatewayError(
+                403,
+                "artifact_provenance_invalid",
+                "成果来源无效",
+            )
+
+        checkpoint = self._require_checkpoint_store().load_latest_record(run_id)
+        if (
+            checkpoint is None
+            or checkpoint.snapshot_digest != snapshot.digest
+            or not isinstance(checkpoint.state, dict)
+        ):
+            raise RunnerGatewayError(
+                403,
+                "artifact_provenance_invalid",
+                "成果来源无效",
+            )
+        try:
+            state = TeamSchedulerState.model_validate(checkpoint.state)
+            validate_team_plan(
+                state.plan,
+                actor,
+                runner_max_subagents=snapshot.payload.limits.max_subagents,
+            )
+        except (ValidationError, TeamPlanError) as error:
+            raise RunnerGatewayError(
+                403,
+                "artifact_provenance_invalid",
+                "成果来源无效",
+            ) from error
+        if (
+            state.snapshot_digest != snapshot.digest
+            or state.team_version_id != actor.version_id
+        ):
+            raise RunnerGatewayError(
+                403,
+                "artifact_provenance_invalid",
+                "成果来源无效",
+            )
+
+        if requested.task_id == "synthesis":
+            valid = (
+                requested.member_agent_id == actor.supervisor.agent_id
+                and state.stage in {"synthesizing", "completed"}
+            )
+        else:
+            task = next(
+                (
+                    candidate
+                    for candidate in state.plan.tasks
+                    if candidate.id == requested.task_id
+                ),
+                None,
+            )
+            valid = (
+                task is not None
+                and task.member_id == requested.member_agent_id
+                and requested.task_id in state.started_task_ids
+            )
+        if not valid:
+            raise RunnerGatewayError(
+                403,
+                "artifact_provenance_invalid",
+                "成果来源无效",
+            )
+        return {
+            "team_version_id": actor.version_id,
+            "member_agent_id": requested.member_agent_id,
+            "task_id": requested.task_id,
+        }
 
     def complete(
         self,

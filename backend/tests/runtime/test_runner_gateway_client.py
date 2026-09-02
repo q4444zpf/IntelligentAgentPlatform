@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -151,6 +152,34 @@ def test_client_maps_business_error_without_returning_server_message():
     assert captured.value.code == "tool_approval_required"
     assert captured.value.details == {"approval_id": "approval-1"}
     assert "C:/secret" not in str(captured.value)
+
+
+def test_team_tool_invocation_forwards_member_agent_identity():
+    captured = {}
+
+    def handler(request):
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"invocation_id": "invocation-1", "value": {"ok": True}},
+        )
+
+    client = RunnerGatewayClient.from_execution_request(
+        _request(), transport=httpx.MockTransport(handler)
+    )
+
+    response = client.invoke_tool(
+        tool_id="water.query",
+        version="1",
+        tool_call_id="call-1",
+        member_agent_id="forecast-member",
+        arguments={"station": "A"},
+        invocation_sequence=0,
+        idempotency_key="tool-call-1",
+    )
+
+    assert response["value"] == {"ok": True}
+    assert captured["payload"]["member_agent_id"] == "forecast-member"
 
 
 def test_client_rejects_oversized_or_invalid_responses():

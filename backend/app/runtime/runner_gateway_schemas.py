@@ -113,7 +113,7 @@ class ToolInvocationResponse(BaseModel):
 class ArtifactProvenance(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    team_version_id: str = Field(min_length=1, max_length=128)
+    team_version_id: str | None = Field(default=None, min_length=1, max_length=128)
     member_agent_id: str = Field(min_length=1, max_length=128)
     task_id: str = Field(min_length=1, max_length=128)
 

@@ -36,6 +36,59 @@ class NoopDispatcher:
         self.run_ids.append(run_id)
 
 
+class LocalTeamAgentService:
+    def __init__(self):
+        self.agents = {
+            agent_id: SimpleNamespace(
+                id=agent_id,
+                name=agent_id,
+                description="",
+                runtime_form="common",
+                language="zh-CN",
+                provider_id="provider-1",
+                model="model-1",
+                system_prompt="",
+                context_prompt="",
+                approval_policy="never",
+                skill_names=[],
+                tool_ids=[],
+                knowledge_source_ids=[],
+                enabled=True,
+                availability_scope="project",
+                unit_id="unit-1",
+                project_id="project-1",
+                allowed_project_ids=[],
+            )
+            for agent_id in ("supervisor", "forecast", "review")
+        }
+        self.tool_service = SimpleNamespace(
+            resolve_bindable=lambda tool_ids: [],
+            resolve_knowledge_sources=lambda tool_ids: [],
+        )
+        self.skill_service = SimpleNamespace()
+
+    def get(self, agent_id):
+        return self.agents[agent_id]
+
+    def get_available(self, agent_id, *, unit_id, project_id):
+        agent = self.get(agent_id)
+        if agent.unit_id != unit_id or agent.project_id != project_id:
+            raise KeyError(agent_id)
+        return agent
+
+
+class LocalTeamProviderService:
+    def get(self, provider_id):
+        if provider_id != "provider-1":
+            raise KeyError(provider_id)
+        return SimpleNamespace(
+            id=provider_id,
+            configured=True,
+            enabled=True,
+            models=[SimpleNamespace(id="model-1", enabled=True)],
+        )
+
+
 def context(*, project="project-1", roles=frozenset({"project_admin"})):
     role_codes = tuple(sorted(roles))
     grants = tuple(
@@ -62,13 +115,12 @@ def context(*, project="project-1", roles=frozenset({"project_admin"})):
 
 
 def team_draft():
-    member = lambda agent_id, responsibility, digest: TeamMemberDraft(  # noqa: E731
+    member = lambda agent_id, responsibility: TeamMemberDraft(  # noqa: E731
         agent_id=agent_id, responsibility=responsibility,
-        agent_definition_digest=digest * 64,
     )
     return TeamDraft(
-        supervisor=member("supervisor", "统筹与汇总", "a"),
-        members=[member("forecast", "洪水预报", "b"), member("review", "成果复核", "c")],
+        supervisor=member("supervisor", "统筹与汇总"),
+        members=[member("forecast", "洪水预报"), member("review", "成果复核")],
         max_steps=6, max_parallel_members=2, timeout_seconds=600,
     )
 
@@ -77,7 +129,12 @@ def test_published_team_run_records_exact_version_and_rejects_missing_run_permis
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
-        team_service = TeamService(session)
+        agent_service = LocalTeamAgentService()
+        team_service = TeamService(
+            session,
+            agent_service=agent_service,
+            provider_service=LocalTeamProviderService(),
+        )
         admin = context()
         team = team_service.create(admin, TeamCreateRequest(name="北江联合研判"))
         team_service.save_draft(admin, team.id, TeamDraftUpdate(revision=1, draft=team_draft()))
@@ -87,7 +144,10 @@ def test_published_team_run_records_exact_version_and_rejects_missing_run_permis
             team_service.get(context(project="project-2"), team.id)
         dispatcher = NoopDispatcher()
         conversation_service = ConversationService(
-            ConversationRepository(session), dispatcher, team_service=team_service,
+            ConversationRepository(session),
+            dispatcher,
+            agent_service=agent_service,
+            team_service=team_service,
         )
         conversation = conversation_service.create_conversation(admin, ConversationCreate(title="联合研判"))
 
@@ -153,7 +213,7 @@ class MemberFactory:
 
 class MemberAdapter:
     def __init__(self, graph, checkpoint_store=None): self.graph = graph
-    def invoke(self, state, metadata): return SimpleNamespace(status="completed", content=f"{self.graph} 完成")
+    def invoke(self, state, metadata): return SimpleNamespace(status="completed", content=f"{self.graph} 完成", state={})
 
 
 def test_published_team_runtime_completes_two_member_tasks_and_one_synthesis():

@@ -142,21 +142,25 @@ class RunnerGatewayClient:
         tool_id: str,
         version: str,
         tool_call_id: str,
+        member_agent_id: str | None = None,
         arguments: dict[str, Any],
         invocation_sequence: int,
         idempotency_key: str,
     ) -> dict[str, Any]:
+        request = {
+            "tool_id": tool_id,
+            "version": version,
+            "tool_call_id": tool_call_id,
+            "arguments": arguments,
+            "invocation_sequence": invocation_sequence,
+        }
+        if member_agent_id is not None:
+            request["member_agent_id"] = member_agent_id
         return self._request(
             "POST",
             "tool-invocations",
             ToolInvocationResponse,
-            json={
-                "tool_id": tool_id,
-                "version": version,
-                "tool_call_id": tool_call_id,
-                "arguments": arguments,
-                "invocation_sequence": invocation_sequence,
-            },
+            json=request,
             idempotency_key=idempotency_key,
         ).model_dump(mode="json")
 

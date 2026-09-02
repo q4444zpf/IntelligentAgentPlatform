@@ -328,6 +328,10 @@ def create_router(
             ConversationRepository,
             Depends(conversation_repository_dependency),
         ],
+        checkpoint_store: Annotated[
+            CheckpointStore,
+            Depends(checkpoint_store_dependency),
+        ],
         artifacts: Annotated[
             ArtifactService,
             Depends(artifact_service_dependency),
@@ -335,6 +339,7 @@ def create_router(
     ) -> ArtifactFileResponse:
         return RunnerGatewayService(
             snapshot_service,
+            checkpoint_store=checkpoint_store,
             conversation_repository=repository,
             artifact_service=artifacts,
         ).create_artifact(run_id, request, claims, idempotency_key)
