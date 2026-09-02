@@ -44,6 +44,11 @@
             <label>主管智能体<a-select v-model:value="draft.supervisor.agent_id" :options="agentOptions" /></label>
             <label>主管职责<a-input v-model:value="draft.supervisor.responsibility" maxlength="500" /></label>
           </div>
+          <div class="member-capability-grid">
+            <label>主管工具白名单<a-select v-model:value="draft.supervisor.tool_ids" mode="multiple" :options="memberToolOptions(draft.supervisor.agent_id)" data-testid="supervisor-tool-whitelist" /></label>
+            <label>主管 Skill 白名单<a-select v-model:value="draft.supervisor.skill_names" mode="multiple" :options="memberSkillOptions(draft.supervisor.agent_id)" data-testid="supervisor-skill-whitelist" /></label>
+            <label>主管知识库白名单<a-select v-model:value="draft.supervisor.knowledge_source_ids" mode="multiple" :options="memberKnowledgeOptions(draft.supervisor.agent_id)" data-testid="supervisor-knowledge-whitelist" /></label>
+          </div>
           <div class="available-agents">可用智能体：<span v-for="agent in availableAgents" :key="agent.id">{{ agent.name }}</span></div>
           <div v-for="(member, index) in draft.members" :key="index" class="member-row">
             <a-select v-model:value="member.agent_id" :options="memberAgentOptions" aria-label="成员智能体" />

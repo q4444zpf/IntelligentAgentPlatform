@@ -25,7 +25,7 @@ const published = { ...draft, id: 'version-1', version: 1, status: 'published', 
 const stubs = {
   'a-button': { props: ['disabled'], emits: ['click'], template: '<button v-bind="$attrs" :disabled="disabled" @click="$emit(\'click\')"><slot name="icon"/><slot/></button>' },
   'a-input': { template: '<input v-bind="$attrs" />' }, 'a-input-number': { template: '<input type="number" v-bind="$attrs" />' },
-  'a-select': { props: ['options', 'value'], template: '<select><slot/></select>' }, 'a-tag': { template: '<span><slot/></span>' },
+  'a-select': { props: ['mode', 'options', 'value'], emits: ['update:value'], template: '<select v-bind="$attrs" :value="value" @change="$emit(\'update:value\', mode === \'multiple\' ? [$event.target.value] : $event.target.value)"><option v-for="option in options" :key="option.value" :value="option.value">{{ option.label }}</option><slot/></select>' }, 'a-tag': { template: '<span><slot/></span>' },
   'a-switch': { emits: ['change'], template: '<button class="switch" @click="$emit(\'change\', true)" />' },
   'a-drawer': { props: ['open'], template: '<aside v-if="open"><slot/><slot name="footer"/></aside>' },
   'a-modal': { props: ['open'], template: '<div v-if="open"><slot/></div>' }, 'a-empty': { template: '<div><slot/></div>' },
@@ -96,5 +96,28 @@ describe('TeamManageView', () => {
     await wrapper.get('[data-testid="team-publish"]').trigger('click');
     expect(wrapper.text()).toContain('团队工具白名单包含不可用或未绑定工具');
     expect(mocks.saveDraft).not.toHaveBeenCalled();
+  });
+
+  it('assigns supervisor capabilities and saves them with the draft', async () => {
+    mocks.agents.mockResolvedValue([
+      { id: 'forecast', name: '洪水预报智能体', enabled: true, startup_status: 'ready', tool_ids: ['forecast.read'], skill_names: ['forecast'], knowledge_source_ids: ['knowledge.rainfall'] },
+      { id: 'review', name: '成果复核智能体', enabled: true, startup_status: 'ready', tool_ids: [], skill_names: [], knowledge_source_ids: [] },
+    ]);
+    mocks.tools.mockResolvedValue([
+      { tool_id: 'forecast.read', name: '预报查询', published: true, enabled: true, source_available: true, source: 'builtin' },
+      { tool_id: 'knowledge.rainfall', name: '降雨知识库', published: true, enabled: true, source_available: true, source: 'knowledge' },
+    ]);
+    mocks.getVersion.mockResolvedValue({ ...draft, definition: {
+      ...draft.definition,
+      tool_ids: ['forecast.read'], skill_names: ['forecast'], knowledge_source_ids: ['knowledge.rainfall'],
+    } });
+
+    const wrapper = render(); await flushPromises(); await wrapper.get('[data-testid="team-edit"]').trigger('click'); await flushPromises();
+    await wrapper.get('[data-testid="supervisor-tool-whitelist"]').setValue('forecast.read');
+    await wrapper.get('[data-testid="team-publish"]').trigger('click'); await flushPromises();
+
+    expect(mocks.saveDraft).toHaveBeenCalledWith('team-1', 2, expect.objectContaining({
+      supervisor: expect.objectContaining({ tool_ids: ['forecast.read'] }),
+    }));
   });
 });

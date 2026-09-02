@@ -42,6 +42,8 @@ class TeamMetadataUpdate(BaseModel):
 
 
 class TeamDraftUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     revision: int = Field(ge=1)
     draft: TeamDraft
 

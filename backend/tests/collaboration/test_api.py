@@ -131,3 +131,49 @@ def test_team_create_rejects_a_client_supplied_identifier():
 
     assert response.status_code == 422
     assert session.scalar(select(func.count()).select_from(Team)) == 0
+
+
+def test_team_draft_rejects_non_editable_outer_fields():
+    class DraftService:
+        calls = []
+
+        def save_draft(self, context, team_id, request):
+            self.calls.append((context, team_id, request))
+            return {"id": team_id}
+
+    service = DraftService()
+    app = FastAPI()
+    app.include_router(router, prefix="/api/collaboration")
+    app.dependency_overrides[require_request_context] = lambda: _context("collaboration.manage")
+    app.dependency_overrides[_service] = lambda: service
+    draft = {
+        "supervisor": {
+            "agent_id": "forecast",
+            "responsibility": "统筹",
+            "tool_ids": [],
+            "skill_names": [],
+            "knowledge_source_ids": [],
+        },
+        "members": [{
+            "agent_id": "review",
+            "responsibility": "复核",
+            "tool_ids": [],
+            "skill_names": [],
+            "knowledge_source_ids": [],
+        }],
+        "tool_ids": [],
+        "skill_names": [],
+        "knowledge_source_ids": [],
+        "max_steps": 8,
+        "max_parallel_members": 1,
+        "timeout_seconds": 600,
+    }
+
+    for field, value in (("id", "forged-team"), ("agent_definition", {"name": "forged"})):
+        response = TestClient(app).put(
+            "/api/collaboration/teams/team-1/draft",
+            json={"revision": 1, "draft": draft, field: value},
+        )
+
+        assert response.status_code == 422
+        assert service.calls == []
