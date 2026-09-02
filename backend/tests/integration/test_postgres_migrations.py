@@ -31,7 +31,7 @@ def test_migration_graph_has_single_integration_head():
     config = Config(Path(__file__).resolve().parents[3] / "backend" / "alembic.ini")
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["20260901_24"]
+    assert script.get_heads() == ["20260902_25"]
 
 
 @pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="requires PostgreSQL")
@@ -41,7 +41,7 @@ def test_upgrade_head_creates_conversation_tables():
     engine = create_engine(env["DATABASE_URL"])
     inspector = inspect(engine)
     with engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260901_24"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260902_25"
     tables = set(inspector.get_table_names())
     assert {
         "conversations",
@@ -114,6 +114,14 @@ def test_upgrade_head_creates_conversation_tables():
         column["name"]: column for column in inspector.get_columns("messages")
     }
     assert message_columns["run_id"]["nullable"] is True
+    agent_columns = {
+        column["name"]: column
+        for column in inspector.get_columns("managed_agents")
+    }
+    assert agent_columns["availability_scope"]["nullable"] is False
+    assert agent_columns["unit_id"]["nullable"] is True
+    assert agent_columns["project_id"]["nullable"] is True
+    assert agent_columns["allowed_project_ids"]["nullable"] is False
     audit_constraints = inspector.get_unique_constraints("audit_events")
     idempotency_constraint = next(
         constraint for constraint in audit_constraints
@@ -160,6 +168,69 @@ def test_upgrade_head_creates_conversation_tables():
         name: audit_indexes[name] for name in expected_audit_indexes
     } == expected_audit_indexes
     engine.dispose()
+
+
+@pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="requires PostgreSQL")
+def test_agent_availability_migration_marks_legacy_agents_common_wildcard():
+    database_url = os.environ["TEST_DATABASE_URL"]
+    env = os.environ | {"DATABASE_URL": database_url}
+    downgrade = (*ALEMBIC_UPGRADE_COMMAND[:-2], "downgrade", "20260901_24")
+    upgrade = (*ALEMBIC_UPGRADE_COMMAND[:-1], "20260902_25")
+    engine = create_engine(database_url)
+    legacy_agent_id = "migration-legacy-agent"
+    try:
+        subprocess.run(downgrade, check=True, env=env)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO managed_agents (
+                        agent_id, config, workspace_dir, pinned
+                    ) VALUES (
+                        :agent_id, '{}'::json, '/migration/legacy-agent', false
+                    )
+                    """
+                ),
+                {"agent_id": legacy_agent_id},
+            )
+
+        subprocess.run(upgrade, check=True, env=env)
+
+        with engine.connect() as connection:
+            migrated = connection.execute(
+                text(
+                    """
+                    SELECT availability_scope, unit_id, project_id,
+                           allowed_project_ids
+                    FROM managed_agents
+                    WHERE agent_id = :agent_id
+                    """
+                ),
+                {"agent_id": legacy_agent_id},
+            ).one()
+        assert migrated.availability_scope == "common"
+        assert migrated.unit_id is None
+        assert migrated.project_id is None
+        assert migrated.allowed_project_ids == ["*"]
+
+        constraints = {
+            constraint["name"]
+            for constraint in inspect(engine).get_check_constraints(
+                "managed_agents"
+            )
+        }
+        assert {
+            "ck_managed_agents_availability_scope",
+            "ck_managed_agents_availability_shape",
+        } <= constraints
+    finally:
+        subprocess.run(ALEMBIC_UPGRADE_COMMAND, check=True, env=env)
+        with engine.begin() as connection:
+            connection.execute(
+                text("DELETE FROM managed_agents WHERE agent_id = :agent_id"),
+                {"agent_id": legacy_agent_id},
+            )
+        engine.dispose()
 
 
 @pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="requires PostgreSQL")

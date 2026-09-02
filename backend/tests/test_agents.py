@@ -10,7 +10,7 @@ from app.agents.schemas import AgentConfig, AgentCreateRequest, AgentDefaultRequ
 from app.agents.service import AgentConflictError, BUILTIN_AGENT_ID, AgentService
 from app.agents.store import AgentConcurrentUpdateError, DEFAULT_SETTING_KEY, AgentStore
 from app.db.base import Base
-from app.db.platform_models import PlatformSettingRecord, RegisteredToolRecord
+from app.db.platform_models import ManagedAgentRecord, PlatformSettingRecord, RegisteredToolRecord
 from app.skills.schemas import SkillCreateRequest
 from app.skills.service import SkillService
 
@@ -406,6 +406,10 @@ def test_creates_and_lists_runtime_specific_agent(client):
     assert body["skill_names"] == ["flood-forecast"]
     assert body["startup_status"] == "ready"
     assert body["workspace_dir"].endswith("reservoir-dispatch")
+    assert body["availability_scope"] == "project"
+    assert body["unit_id"] == "unit-1"
+    assert body["project_id"] == "p1"
+    assert body["allowed_project_ids"] == []
 
     listed = client.get("/api/agents")
     assert listed.status_code == 200
@@ -413,6 +417,76 @@ def test_creates_and_lists_runtime_specific_agent(client):
         BUILTIN_AGENT_ID,
         body["id"],
     }
+
+
+def test_agent_knowledge_sources_are_persisted_and_must_be_available_knowledge_tools(client):
+    service = client.app.state.agent_service
+    with service.tool_service.store.session_factory.begin() as session:
+        session.add_all(
+            [
+                RegisteredToolRecord(
+                    tool_id="knowledge.reservoir.manual",
+                    version="7",
+                    name="水库规程",
+                    description="水库调度规程知识源",
+                    source="knowledge",
+                    risk_level="low",
+                    input_schema={"type": "object"},
+                    output_schema={"type": "object"},
+                    source_resource_id="reservoir-manual",
+                    source_available=True,
+                    requires_approval=False,
+                    published=True,
+                    enabled=True,
+                ),
+                RegisteredToolRecord(
+                    tool_id="mcp.not_knowledge",
+                    version="1",
+                    name="普通工具",
+                    description="不是知识源",
+                    source="mcp",
+                    risk_level="low",
+                    input_schema={"type": "object"},
+                    output_schema={"type": "object"},
+                    source_available=True,
+                    requires_approval=False,
+                    published=True,
+                    enabled=True,
+                ),
+            ]
+        )
+
+    created = client.post(
+        "/api/agents",
+        json=agent_payload(
+            knowledge_source_ids=["knowledge.reservoir.manual"]
+        ),
+    )
+    assert created.status_code == 201
+    assert created.json()["knowledge_source_ids"] == [
+        "knowledge.reservoir.manual"
+    ]
+
+    rejected = client.post(
+        "/api/agents",
+        json=agent_payload(
+            id="invalid-knowledge-agent",
+            knowledge_source_ids=["mcp.not_knowledge"],
+        ),
+    )
+    assert rejected.status_code == 422
+    assert "mcp.not_knowledge" in rejected.json()["detail"]
+
+
+def test_historical_agents_are_explicit_common_wildcard_records(client):
+    service = client.app.state.agent_service
+    with service.store.session_factory() as session:
+        builtin = session.get(ManagedAgentRecord, BUILTIN_AGENT_ID)
+        assert builtin is not None
+        assert builtin.availability_scope == "common"
+        assert builtin.unit_id is None
+        assert builtin.project_id is None
+        assert builtin.allowed_project_ids == ["*"]
 
 
 def test_create_rejects_preexisting_workspace_without_deleting_contents(client):

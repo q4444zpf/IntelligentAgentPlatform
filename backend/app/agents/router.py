@@ -93,8 +93,8 @@ def create_router(service: AgentService | None = None) -> APIRouter:
 
 
     @router.get("", response_model=list[AgentInfo])
-    def list_agents():
-        return manager.list()
+    def list_agents(context: RequestContext = Depends(require_request_context)):
+        return manager.list(context=context)
 
     @router.post("", response_model=AgentInfo, status_code=201)
     def create_agent(
