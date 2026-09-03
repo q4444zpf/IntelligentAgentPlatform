@@ -1,9 +1,14 @@
 import hashlib
 import json
+import subprocess
+import sys
 import threading
 import time
+import textwrap
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -29,9 +34,13 @@ from app.runtime.gateway_tools import (
     RunnerApprovalInterruption,
     RunnerGatewayToolError,
 )
-from app.runtime.runner_gateway_client import RunnerGatewayBusinessError
+from app.runtime.runner_gateway_client import (
+    RunnerGatewayBusinessError,
+    RunnerGatewayClient,
+    RunnerGatewayUnavailable,
+)
 from app.runtime.runner_gateway_schemas import SnapshotResponse
-from app.runtime.sandbox_runtime import SandboxRuntime
+from app.runtime.sandbox_runtime import SandboxRuntime, _TeamTimedOut
 from app.runtime.langgraph_runtime import LangGraphRuntimeAdapter, RuntimeState
 from app.runtime.team_graph import (
     TeamBudgetState,
@@ -93,11 +102,13 @@ def _snapshot():
 
 
 def _request(snapshot):
+    deadline = datetime.now(UTC) + timedelta(minutes=5)
     return RunExecutionRequest(
         run_id="run-1",
         agent_version="agent-v1",
         checkpoint_key="checkpoint-1",
-        deadline_at=datetime.now(UTC) + timedelta(minutes=5),
+        deadline_at=deadline,
+        execution_deadline_at=deadline,
         snapshot_id="snapshot-1",
         snapshot_digest=snapshot.digest,
         gateway_url="http://api:8000/internal/runner",
@@ -441,6 +452,181 @@ def test_runtime_builds_agent_on_fresh_run_streams_events_and_completes():
     assert gateway.completions[0][0]["final_assistant_content"] == "completed"
     assert factory.calls[0][1]["backend"].list("/artifacts") == []
     assert isinstance(factory.calls[0][1]["checkpointer"], InMemorySaver)
+
+
+def test_expired_execution_deadline_reports_timeout_before_snapshot_transport():
+    snapshot = _snapshot()
+    gateway = FakeGateway(snapshot)
+    request = _request(snapshot).model_copy(
+        update={
+            "execution_deadline_at": datetime.now(UTC) - timedelta(seconds=1)
+        }
+    )
+
+    result = SandboxRuntime(gateway).execute(request)
+
+    assert result.status == "failed"
+    assert result.error_code == "sandbox_timeout"
+    assert gateway.snapshot_reads == 0
+    assert gateway.completions == [
+        (
+            {"status": "failed", "error_code": "sandbox_timeout"},
+            "completion:failed",
+        )
+    ]
+
+
+def test_gateway_failure_observed_after_execution_deadline_reports_timeout():
+    snapshot = _snapshot()
+
+    class ExpiringGateway(FakeGateway):
+        def get_snapshot(self):
+            self.snapshot_reads += 1
+            raise RunnerGatewayUnavailable()
+
+    gateway = ExpiringGateway(snapshot)
+    request = _request(snapshot).model_copy(
+        update={
+            "execution_deadline_at": datetime.now(UTC)
+            + timedelta(seconds=0.1)
+        }
+    )
+    ticks = iter([0.0, 0.2])
+
+    result = SandboxRuntime(
+        gateway,
+        monotonic=ticks.__next__,
+    ).execute(request)
+
+    assert result.status == "failed"
+    assert result.error_code == "sandbox_timeout"
+    assert gateway.completions == [
+        (
+            {"status": "failed", "error_code": "sandbox_timeout"},
+            "completion:failed",
+        )
+    ]
+
+
+def test_real_gateway_slow_drip_expiry_completes_as_sandbox_timeout():
+    snapshot = _snapshot()
+    snapshot_body = snapshot.model_dump_json().encode()
+    completions = []
+
+    class SlowSnapshotHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(snapshot_body)))
+            self.end_headers()
+            chunk_size = max(1, len(snapshot_body) // 12)
+            try:
+                for offset in range(0, len(snapshot_body), chunk_size):
+                    self.wfile.write(
+                        snapshot_body[offset : offset + chunk_size]
+                    )
+                    self.wfile.flush()
+                    time.sleep(0.05)
+            except OSError:
+                return
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            completions.append(json.loads(self.rfile.read(length)))
+            body = b"{}"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *_args):
+            return
+
+    class TestServer(ThreadingHTTPServer):
+        daemon_threads = True
+
+    server = TestServer(("127.0.0.1", 0), SlowSnapshotHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    request = _request(snapshot).model_copy(
+        update={
+            "deadline_at": datetime.now(UTC) + timedelta(seconds=5),
+            "execution_deadline_at": datetime.now(UTC)
+            + timedelta(seconds=0.25),
+            "gateway_url": f"http://127.0.0.1:{server.server_port}",
+        }
+    )
+    gateway = RunnerGatewayClient.from_execution_request(request)
+    started_at = time.monotonic()
+    operation_elapsed = None
+    try:
+        result = SandboxRuntime(gateway).execute(request)
+        operation_elapsed = time.monotonic() - started_at
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert result.status == "failed"
+    assert result.error_code == "sandbox_timeout"
+    assert completions == [
+        {"status": "failed", "error_code": "sandbox_timeout"}
+    ]
+    assert operation_elapsed is not None and operation_elapsed < 0.6
+
+
+def test_model_gateway_error_observed_after_execution_deadline_reports_timeout():
+    snapshot = _snapshot()
+
+    class ExpiringModelGateway(FakeGateway):
+        def invoke_model(self, request, idempotency_key):
+            self.model_calls.append((request, idempotency_key))
+            raise RunnerGatewayUnavailable()
+
+    gateway = ExpiringModelGateway(snapshot)
+    request = _request(snapshot).model_copy(
+        update={
+            "execution_deadline_at": datetime.now(UTC)
+            + timedelta(seconds=0.1)
+        }
+    )
+    ticks = iter([0.0, 0.2])
+
+    result = SandboxRuntime(
+        gateway,
+        agent_factory=ModelInvokingFactory(),
+        monotonic=ticks.__next__,
+    ).execute(request)
+
+    assert result.status == "failed"
+    assert result.error_code == "sandbox_timeout"
+    assert len(gateway.model_calls) == 1
+    assert gateway.completions[-1] == (
+        {"status": "failed", "error_code": "sandbox_timeout"},
+        "completion:failed",
+    )
+
+
+def test_team_execution_receives_float_monotonic_deadline_keyword():
+    snapshot = _schema_v5_team_snapshot()
+    gateway = FakeGateway(snapshot)
+
+    class DeadlineContractRuntime(SandboxRuntime):
+        received_deadline = None
+
+        def _execute_team(self, *, monotonic_deadline: float, **_kwargs):
+            self.received_deadline = monotonic_deadline
+            return SimpleNamespace(status="completed", content="done")
+
+    runtime = DeadlineContractRuntime(gateway, monotonic=lambda: 10.0)
+
+    result = runtime.execute(_request(snapshot))
+
+    assert result.status == "completed"
+    assert type(runtime.received_deadline) is float
 
 
 def test_agent_checkpoint_gateway_not_found_fails_closed_without_starting_fresh():
@@ -1389,7 +1575,7 @@ def test_team_runtime_fails_recovery_when_a_found_checkpoint_is_not_valid_team_s
     assert factory.build_calls == 0
 
 
-def test_team_timeout_applies_during_execution_before_member_dequeue(monkeypatch):
+def test_team_timeout_applies_during_execution_before_member_dequeue():
     base = _schema_v5_team_snapshot()
     actor = base.payload.actor.model_copy(update={"timeout_seconds": 1})
     payload = base.payload.model_copy(update={"actor": actor})
@@ -1410,18 +1596,6 @@ def test_team_timeout_applies_during_execution_before_member_dequeue(monkeypatch
             }
         ]
     }
-    started_at = datetime(2026, 9, 3, 9, 0, tzinfo=UTC)
-
-    class AdvancingDateTime:
-        calls = 0
-
-        @classmethod
-        def now(cls, _timezone):
-            cls.calls += 1
-            if cls.calls <= 2:
-                return started_at
-            return started_at + timedelta(seconds=2)
-
     class Factory:
         def __init__(self):
             self.supervisor_calls = 0
@@ -1435,20 +1609,287 @@ def test_team_timeout_applies_during_execution_before_member_dequeue(monkeypatch
             return TextGraph("too late")
 
     request = _request(snapshot).model_copy(
-        update={"deadline_at": started_at + timedelta(minutes=5)}
-    )
-    monkeypatch.setattr(
-        "app.runtime.sandbox_runtime.datetime",
-        AdvancingDateTime,
+        update={
+            "deadline_at": datetime.now(UTC) + timedelta(minutes=5),
+            "execution_deadline_at": datetime.now(UTC) + timedelta(minutes=5),
+        }
     )
     gateway = FakeGateway(snapshot)
     factory = Factory()
-    result = SandboxRuntime(gateway, agent_factory=factory).execute(request)
+    ticks = iter([0.0, 0.0, 0.0, 2.0])
+    result = SandboxRuntime(
+        gateway,
+        agent_factory=factory,
+        monotonic=lambda: next(ticks),
+    ).execute(request)
 
     assert result.status == "failed"
     assert result.error_code == "sandbox_timeout"
     assert factory.supervisor_calls == 1
     assert factory.member_calls == 0
+
+
+def test_team_timeout_interrupts_slow_planning_before_wider_run_deadline():
+    base = _schema_v5_team_snapshot()
+    actor = base.payload.actor.model_copy(update={"timeout_seconds": 1})
+    payload = base.payload.model_copy(update={"actor": actor})
+    snapshot = base.model_copy(
+        update={
+            "payload": payload,
+            "digest": hashlib.sha256(canonical_snapshot_bytes(payload)).hexdigest(),
+        }
+    )
+    plan = {
+        "tasks": [
+            {
+                "id": "planned-task",
+                "member_id": "member-1",
+                "objective": "inspect",
+                "depends_on": [],
+                "position": 0,
+            }
+        ]
+    }
+
+    class SlowPlanGraph(TeamPlanGraph):
+        def invoke(self, state, *, config=None):
+            time.sleep(2)
+            return super().invoke(state, config=config)
+
+    class Factory:
+        def build(self, member, **_kwargs):
+            assert member.agent_id == "supervisor"
+            return SlowPlanGraph(plan)
+
+    gateway = FakeGateway(snapshot)
+    request = _request(snapshot).model_copy(
+        update={"deadline_at": datetime.now(UTC) + timedelta(minutes=5)}
+    )
+    started_at = time.monotonic()
+
+    result = SandboxRuntime(gateway, agent_factory=Factory()).execute(request)
+
+    assert result.status == "failed"
+    assert result.error_code == "sandbox_timeout"
+    assert time.monotonic() - started_at < 1.5
+    assert gateway.completions[-1][0] == {
+        "status": "failed",
+        "error_code": "sandbox_timeout",
+    }
+
+
+def test_team_timeout_interrupts_slow_member_before_wider_run_deadline():
+    base = _schema_v5_team_snapshot()
+    actor = base.payload.actor.model_copy(update={"timeout_seconds": 1})
+    payload = base.payload.model_copy(
+        update={
+            "actor": actor,
+            "limits": base.payload.limits.model_copy(update={"max_iterations": 8}),
+        }
+    )
+    snapshot = base.model_copy(
+        update={
+            "payload": payload,
+            "digest": hashlib.sha256(canonical_snapshot_bytes(payload)).hexdigest(),
+        }
+    )
+    plan = {
+        "tasks": [
+            {
+                "id": "slow-task",
+                "member_id": "member-1",
+                "objective": "inspect",
+                "depends_on": [],
+                "position": 0,
+            }
+        ]
+    }
+
+    class Factory:
+        def __init__(self):
+            self.supervisor_calls = 0
+
+        def build(self, member, **_kwargs):
+            if member.agent_id == "supervisor":
+                self.supervisor_calls += 1
+                return TeamPlanGraph(plan)
+            return TextGraph("late member result", delay=2)
+
+    gateway = FakeGateway(snapshot)
+    request = _request(snapshot).model_copy(
+        update={"deadline_at": datetime.now(UTC) + timedelta(minutes=5)}
+    )
+    started_at = time.monotonic()
+
+    result = SandboxRuntime(gateway, agent_factory=Factory()).execute(request)
+
+    elapsed = time.monotonic() - started_at
+    assert result.status == "failed"
+    assert result.error_code == "sandbox_timeout"
+    assert elapsed < 1.5
+    assert gateway.completions[-1][0] == {
+        "status": "failed",
+        "error_code": "sandbox_timeout",
+    }
+    checkpoint_count = len(gateway.saved_checkpoints)
+    event_count = len(gateway.events)
+    time.sleep(1.2)
+    assert len(gateway.saved_checkpoints) == checkpoint_count
+    assert len(gateway.events) == event_count
+
+
+def test_team_timeout_interrupts_slow_synthesis_before_wider_run_deadline():
+    base = _schema_v5_team_snapshot()
+    actor = base.payload.actor.model_copy(update={"timeout_seconds": 1})
+    payload = base.payload.model_copy(
+        update={
+            "actor": actor,
+            "limits": base.payload.limits.model_copy(update={"max_iterations": 8}),
+        }
+    )
+    snapshot = base.model_copy(
+        update={
+            "payload": payload,
+            "digest": hashlib.sha256(canonical_snapshot_bytes(payload)).hexdigest(),
+        }
+    )
+    plan = {
+        "tasks": [
+            {
+                "id": "fast-task",
+                "member_id": "member-1",
+                "objective": "inspect",
+                "depends_on": [],
+                "position": 0,
+            }
+        ]
+    }
+
+    class Factory:
+        def __init__(self):
+            self.supervisor_calls = 0
+
+        def build(self, member, **_kwargs):
+            if member.agent_id == "supervisor":
+                self.supervisor_calls += 1
+                if self.supervisor_calls == 1:
+                    return TeamPlanGraph(plan)
+                return TextGraph("late synthesis", delay=2)
+            return TextGraph("member result")
+
+    gateway = FakeGateway(snapshot)
+    request = _request(snapshot).model_copy(
+        update={"deadline_at": datetime.now(UTC) + timedelta(minutes=5)}
+    )
+    started_at = time.monotonic()
+
+    result = SandboxRuntime(gateway, agent_factory=Factory()).execute(request)
+
+    elapsed = time.monotonic() - started_at
+    assert result.status == "failed"
+    assert result.error_code == "sandbox_timeout"
+    assert elapsed < 1.5
+    assert not any(
+        event["event_type"] == "team.synthesis.completed"
+        for event in gateway.events
+    )
+    checkpoint_count = len(gateway.saved_checkpoints)
+    event_count = len(gateway.events)
+    time.sleep(1.2)
+    assert len(gateway.saved_checkpoints) == checkpoint_count
+    assert len(gateway.events) == event_count
+
+
+@pytest.mark.parametrize(
+    ("slow_stage", "expiry_call"),
+    [("member", 2), ("synthesis", 3)],
+)
+def test_team_deadline_expiry_before_wait_sets_late_checkpoint_fence(
+    slow_stage,
+    expiry_call,
+):
+    snapshot = _schema_v5_team_snapshot(
+        limits=_snapshot().payload.limits.model_copy(update={"max_iterations": 8})
+    )
+    plan = {
+        "tasks": [
+            {
+                "id": "fenced-task",
+                "member_id": "member-1",
+                "objective": "inspect",
+                "depends_on": [],
+                "position": 0,
+            }
+        ]
+    }
+    stage_entered = threading.Event()
+    release_stage = threading.Event()
+    stage_finished = threading.Event()
+
+    class Graph:
+        def __init__(self, stage):
+            self.stage = stage
+
+    class Factory:
+        def __init__(self):
+            self.supervisor_calls = 0
+
+        def build(self, member, **_kwargs):
+            if member.agent_id == "supervisor":
+                self.supervisor_calls += 1
+                return Graph(
+                    "planning" if self.supervisor_calls == 1 else "synthesis"
+                )
+            return Graph("member")
+
+    class CheckpointingAdapter:
+        def __init__(self, graph, *, checkpoint_store=None):
+            self.graph = graph
+            self.checkpoint_store = checkpoint_store
+
+        def invoke(self, _state, *, metadata=None):
+            del metadata
+            if self.graph.stage == "planning":
+                return SimpleNamespace(content=json.dumps(plan))
+            if self.graph.stage == slow_stage:
+                stage_entered.set()
+                assert release_stage.wait(5), "timed-out stage was not released"
+                assert self.checkpoint_store is not None
+                self.checkpoint_store.save(
+                    "run-1",
+                    "late-checkpoint",
+                    {"stage": self.graph.stage},
+                )
+                stage_finished.set()
+            return SimpleNamespace(content=f"{self.graph.stage} result")
+
+    class ExpiringBeforeWaitRuntime(SandboxRuntime):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.remaining_calls = 0
+
+        def _remaining_team_seconds(self, deadline_at):
+            self.remaining_calls += 1
+            if self.remaining_calls == expiry_call:
+                raise _TeamTimedOut()
+            return super()._remaining_team_seconds(deadline_at)
+
+    gateway = FakeGateway(snapshot)
+    runtime = ExpiringBeforeWaitRuntime(
+        gateway,
+        agent_factory=Factory(),
+        runtime_adapter_type=CheckpointingAdapter,
+    )
+
+    result = runtime.execute(_request(snapshot))
+
+    assert result.status == "failed"
+    assert result.error_code == "sandbox_timeout"
+    assert stage_entered.wait(2), "deadline stage did not enter"
+    checkpoint_count = len(gateway.saved_checkpoints)
+    release_stage.set()
+    assert stage_finished.wait(2), "deadline stage did not finish"
+    assert len(gateway.saved_checkpoints) == checkpoint_count
 
 
 @pytest.mark.parametrize(
@@ -2087,15 +2528,18 @@ def test_team_synthesis_approval_restart_preserves_exact_graph_frontier():
 
 
 @pytest.mark.parametrize(
-    ("status", "expected"),
+    ("status", "error_code", "expected"),
     [
-        ("completed", 0),
-        ("interrupted", 0),
-        ("failed", 1),
-        ("cancelled", 3),
+        ("completed", None, 0),
+        ("interrupted", "approval_required", 0),
+        ("failed", "sandbox_failed", 1),
+        ("failed", "sandbox_timeout", 4),
+        ("cancelled", "sandbox_cancelled", 3),
     ],
 )
-def test_worker_returns_fixed_exit_codes(monkeypatch, status, expected):
+def test_worker_returns_fixed_exit_codes(
+    monkeypatch, status, error_code, expected
+):
     request = _request(_snapshot())
 
     class ClientFactory:
@@ -2110,7 +2554,7 @@ def test_worker_returns_fixed_exit_codes(monkeypatch, status, expected):
 
         def execute(self, value):
             assert value is request
-            return SimpleNamespace(status=status)
+            return SimpleNamespace(status=status, error_code=error_code)
 
     monkeypatch.setattr(run_worker.sys, "argv", ["run_worker"])
     monkeypatch.setattr(run_worker, "load_execution_request", lambda: request)
@@ -2118,6 +2562,159 @@ def test_worker_returns_fixed_exit_codes(monkeypatch, status, expected):
     monkeypatch.setattr(run_worker, "SandboxRuntime", Runtime)
 
     assert run_worker.main() == expected
+
+
+def test_worker_timeout_exit_survives_failed_completion_report(monkeypatch):
+    snapshot = _snapshot()
+    request = _request(snapshot).model_copy(
+        update={
+            "execution_deadline_at": datetime.now(UTC) - timedelta(seconds=1)
+        }
+    )
+
+    class CompletionFailingGateway(FakeGateway):
+        def __init__(self, current_snapshot):
+            super().__init__(current_snapshot)
+            self.completion_attempts = 0
+
+        def complete(self, request, idempotency_key):
+            self.completion_attempts += 1
+            raise RunnerGatewayBusinessError("runner_gateway_unavailable")
+
+    gateway = CompletionFailingGateway(snapshot)
+
+    class ClientFactory:
+        @staticmethod
+        def from_execution_request(_request):
+            return gateway
+
+    monkeypatch.setattr(run_worker.sys, "argv", ["run_worker"])
+    monkeypatch.setattr(run_worker, "load_execution_request", lambda: request)
+    monkeypatch.setattr(run_worker, "RunnerGatewayClient", ClientFactory)
+
+    assert run_worker.main() == 4
+    assert gateway.snapshot_reads == 0
+    assert gateway.completion_attempts == 1
+    assert gateway.completions == []
+
+
+@pytest.mark.parametrize("slow_stage", ["planning", "member", "synthesis"])
+def test_real_worker_process_does_not_join_abandoned_team_deadline_work(
+    slow_stage,
+    tmp_path,
+):
+    probe = textwrap.dedent(
+        """
+        import json
+        import runpy
+        import sys
+        import time
+        from datetime import UTC, datetime, timedelta
+        from pathlib import Path
+
+        from app.runtime import run_worker
+        from app.runtime.sandbox_runtime import SandboxRuntime
+
+        stage = sys.argv[1]
+        helpers = runpy.run_path(sys.argv[2])
+        ready_path = Path(sys.argv[3])
+        snapshot = helpers["_schema_v5_team_snapshot"]()
+        gateway = helpers["FakeGateway"](snapshot)
+        request = helpers["_request"](snapshot).model_copy(
+            update={
+                "deadline_at": datetime.now(UTC) + timedelta(seconds=5),
+                    "execution_deadline_at": datetime.now(UTC)
+                    + timedelta(seconds=0.75),
+            }
+        )
+        plan = {
+            "tasks": [
+                {
+                    "id": "probe-task",
+                    "member_id": "member-1",
+                    "objective": "probe",
+                    "depends_on": [],
+                    "position": 0,
+                }
+            ]
+        }
+
+        class Factory:
+            def __init__(self):
+                self.supervisor_calls = 0
+
+            def build(self, member, **_kwargs):
+                def slow(inner):
+                    class SlowGraph:
+                        def invoke(self, state, *, config=None):
+                            ready_path.write_text(stage, encoding="utf-8")
+                            time.sleep(5)
+                            return inner.invoke(state, config=config)
+
+                    return SlowGraph()
+
+                if member.agent_id == "supervisor":
+                    self.supervisor_calls += 1
+                    if stage == "planning" and self.supervisor_calls == 1:
+                        return slow(helpers["TextGraph"](json.dumps(plan)))
+                    if self.supervisor_calls == 1:
+                        return helpers["TeamPlanGraph"](plan)
+                    if stage == "synthesis":
+                        return slow(helpers["TextGraph"]("late synthesis"))
+                    return helpers["TextGraph"]("synthesis")
+                graph = helpers["TextGraph"]("member")
+                return (
+                    slow(graph)
+                    if stage == "member"
+                    else graph
+                )
+
+        class ClientFactory:
+            @staticmethod
+            def from_execution_request(_request):
+                return gateway
+
+        run_worker.load_execution_request = lambda: request
+        run_worker.RunnerGatewayClient = ClientFactory
+        run_worker.SandboxRuntime = lambda current_gateway: SandboxRuntime(
+            current_gateway, agent_factory=Factory()
+        )
+        run_worker.sys.argv = ["run_worker"]
+        raise SystemExit(run_worker.main())
+        """
+    )
+    test_file = Path(__file__).resolve()
+    ready_path = tmp_path / f"{slow_stage}.ready"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            probe,
+            slow_stage,
+            str(test_file),
+            str(ready_path),
+        ],
+        cwd=test_file.parents[2],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        ready_deadline = time.monotonic() + 10
+        while not ready_path.exists() and process.poll() is None:
+            if time.monotonic() >= ready_deadline:
+                pytest.fail("worker did not enter the selected slow stage")
+            time.sleep(0.01)
+        assert ready_path.read_text(encoding="utf-8") == slow_stage
+        entered_at = time.monotonic()
+        stdout, stderr = process.communicate(timeout=2.5)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+    assert process.returncode == 4, (stdout, stderr)
+    assert time.monotonic() - entered_at < 2.5
 
 
 def test_worker_rejects_invalid_execution_envelope(monkeypatch):

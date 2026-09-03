@@ -160,6 +160,36 @@ class ArtifactService:
         provenance: dict[str, str] | None = None,
         commit: bool = True,
     ) -> ArtifactRecord:
+        record = self.prepare_for_run(
+            run_id=run_id,
+            path=path,
+            content_type=content_type,
+            data=data,
+            sha256=sha256,
+            provenance=provenance,
+        )
+        uploaded = False
+        try:
+            self.upload_prepared(record, data)
+            uploaded = True
+            self.persist_prepared(record, commit=commit)
+        except Exception:
+            self.session.rollback()
+            if uploaded:
+                self.storage.delete_object(record.object_key)
+            raise
+        return record
+
+    def prepare_for_run(
+        self,
+        *,
+        run_id: str,
+        path: str,
+        content_type: str,
+        data: bytes,
+        sha256: str,
+        provenance: dict[str, str] | None = None,
+    ) -> ArtifactRecord:
         run_context = self._run_context(run_id)
         normalized_path = self._validate_runner_path(path)
         if len(data) > self.runner_max_bytes:
@@ -200,22 +230,32 @@ class ArtifactService:
             provenance=dict(provenance or {}),
             status="active",
         )
-        uploaded = False
-        try:
-            self.storage.put_bytes(object_key, data, content_type)
-            uploaded = True
-            self.session.add(record)
-            if commit:
-                self.session.commit()
-                self.session.refresh(record)
-            else:
-                self.session.flush()
-        except Exception:
-            self.session.rollback()
-            if uploaded:
-                self.storage.delete_object(object_key)
-            raise
         return record
+
+    def upload_prepared(self, record: ArtifactRecord, data: bytes) -> None:
+        self.storage.put_bytes(record.object_key, data, record.content_type)
+
+    def persist_prepared(
+        self,
+        record: ArtifactRecord,
+        *,
+        commit: bool = True,
+    ) -> None:
+        existing = self.session.scalar(
+            select(ArtifactRecord).where(
+                ArtifactRecord.run_id == record.run_id,
+                ArtifactRecord.filename == record.filename,
+                ArtifactRecord.status == "active",
+            )
+        )
+        if existing is not None:
+            raise ArtifactAlreadyExistsError(record.filename)
+        self.session.add(record)
+        if commit:
+            self.session.commit()
+            self.session.refresh(record)
+        else:
+            self.session.flush()
 
     def get_for_run(self, run_id: str, artifact_id: str) -> ArtifactRecord:
         row = self.session.scalar(

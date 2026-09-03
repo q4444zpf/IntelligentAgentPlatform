@@ -4,14 +4,14 @@ from datetime import UTC, datetime
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from langchain_core.messages import ToolMessage
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from app.conversations.models import AgentRun, Conversation, Message
 from app.conversations.repository import ConversationRepository
 from app.db.base import Base
-from app.runtime.checkpoint_store import CheckpointStore
+from app.runtime.checkpoint_store import CheckpointStore, RuntimeRunnerRequest
 from app.runtime.execution_snapshot import (
     ExecutionSnapshotPayload,
     PublishedAgentSnapshot,
@@ -171,7 +171,7 @@ def build_client(tool_gateway):
         poolclass=StaticPool,
     )
     Base.metadata.create_all(engine)
-    session = Session(engine)
+    session = Session(engine, expire_on_commit=False)
     conversation = Conversation(
         id="conversation-1",
         unit_id="unit-1",
@@ -281,6 +281,55 @@ def test_tool_execution_context_comes_from_run_repository_and_is_idempotent():
     assert context.user_id == "user-1"
     assert context.actor_roles == ("operator",)
     assert authorized == {"water.query_level", "reservoir.release"}
+
+
+def test_terminal_run_preserves_tool_replay_but_rejects_new_execution():
+    gateway = FakeToolGateway()
+    client, repository = build_client(gateway)
+    first = invoke_tool(client, "water.query_level", key="tool-before-timeout")
+    repository.get_run_by_id("run-1").status = "failed"
+    repository.session.commit()
+
+    replay = invoke_tool(client, "water.query_level", key="tool-before-timeout")
+    rejected = invoke_tool(client, "water.query_level", key="tool-after-timeout")
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    assert rejected.status_code == 409
+    assert rejected.json()["code"] == "run_not_active"
+    assert len(gateway.calls) == 1
+
+
+def test_tool_finishing_after_terminal_run_adds_no_outer_runner_request():
+    class TerminalAfterToolGateway(FakeToolGateway):
+        repository = None
+        in_transaction_during_execute = None
+
+        def execute(self, call, context, authorized_tool_ids):
+            self.in_transaction_during_execute = (
+                self.repository.session.in_transaction()
+            )
+            result = super().execute(call, context, authorized_tool_ids)
+            with Session(self.repository.session.bind) as terminal_session:
+                terminal_session.get(AgentRun, "run-1").status = "failed"
+                terminal_session.commit()
+            return result
+
+    gateway = TerminalAfterToolGateway()
+    client, repository = build_client(gateway)
+    gateway.repository = repository
+
+    response = invoke_tool(client, "water.query_level", key="tool-terminal-race")
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "run_not_active"
+    assert gateway.in_transaction_during_execute is False
+    assert repository.session.scalar(
+        select(RuntimeRunnerRequest).where(
+            RuntimeRunnerRequest.idempotency_key == "tool-terminal-race"
+        )
+    ) is None
 
 
 def test_approval_required_is_returned_as_interruption():

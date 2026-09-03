@@ -8,6 +8,7 @@ from app.runtime.artifact_backend import (
 )
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
 
 
 class FakeArtifactClient:
@@ -155,8 +156,11 @@ def test_artifact_backend_is_create_only():
 class GatewayStorage:
     def __init__(self):
         self.objects = {}
+        self.on_put = None
 
     def put_bytes(self, object_key, data, content_type):
+        if self.on_put is not None:
+            self.on_put()
         self.objects[object_key] = (data, content_type)
 
     def get_bytes(self, object_key):
@@ -349,7 +353,7 @@ def _gateway_client(repository_type=None, *, snapshot=None, checkpoint_state=Non
         poolclass=StaticPool,
     )
     Base.metadata.create_all(engine)
-    session = Session(engine)
+    session = Session(engine, expire_on_commit=False)
     snapshot = snapshot or _gateway_snapshot()
     actor = snapshot.payload.actor
     _add_run(
@@ -710,6 +714,35 @@ def test_team_artifact_gateway_derives_version_and_persists_validated_provenance
     }
 
 
+def test_terminal_team_run_rejects_new_artifact_capability_checkpoint():
+    from app.conversations.models import AgentRun
+    from app.runtime.checkpoint_store import RuntimeCheckpoint
+
+    snapshot = _gateway_snapshot(team=True)
+    client, session, _, _ = _gateway_client(
+        snapshot=snapshot,
+        checkpoint_state=_team_scheduler_checkpoint(snapshot),
+    )
+    session.get(AgentRun, "run-1").status = "failed"
+    session.commit()
+    checkpoint_count = session.query(RuntimeCheckpoint).count()
+
+    response = client.post(
+        "/internal/runner/runs/run-1/artifact-capabilities",
+        headers=_headers(),
+        json={
+            "team_version_id": "team-version-1",
+            "member_agent_id": "forecast",
+            "task_id": "forecast-task",
+            "invocation_id": "team:team-version-1:forecast-task",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "run_not_active"
+    assert session.query(RuntimeCheckpoint).count() == checkpoint_count
+
+
 def test_team_artifact_gateway_rejects_another_started_task_than_active_invocation():
     snapshot = _gateway_snapshot(team=True)
     checkpoint = _team_scheduler_checkpoint(snapshot) | {
@@ -817,4 +850,35 @@ def test_runner_artifact_upload_removes_object_when_event_persistence_fails():
     assert response.status_code == 502
     assert response.json()["code"] == "artifact_upload_failed"
     assert session.query(ArtifactRecord).count() == 0
+    assert storage.objects == {}
+
+
+def test_artifact_upload_finishing_after_terminal_run_commits_no_platform_state():
+    from app.artifacts.models import ArtifactRecord
+    from app.conversations.models import AgentRun, RunEvent
+    from app.runtime.checkpoint_store import RuntimeRunnerRequest
+
+    client, session, _, storage = _gateway_client()
+    transaction_states = []
+
+    def timeout_during_upload():
+        transaction_states.append(session.in_transaction())
+        with Session(session.bind) as terminal_session:
+            terminal_session.get(AgentRun, "run-1").status = "failed"
+            terminal_session.commit()
+
+    storage.on_put = timeout_during_upload
+
+    response = client.post(
+        "/internal/runner/runs/run-1/artifacts",
+        headers=_headers(key="artifact-terminal-race"),
+        json=_artifact_request(),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "run_not_active"
+    assert transaction_states == [False]
+    assert session.query(ArtifactRecord).count() == 0
+    assert session.query(RunEvent).count() == 0
+    assert session.query(RuntimeRunnerRequest).count() == 0
     assert storage.objects == {}

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from threading import Lock
+from datetime import datetime, timezone
+from threading import Event, Lock, Thread
 from typing import Any
 
 from pydantic import ValidationError
@@ -60,6 +60,33 @@ class _TeamTimedOut(RuntimeError):
 
 class _AgentRecoveryRequired(RuntimeError):
     pass
+
+
+@dataclass
+class _DeadlineOperation:
+    completed: Event = field(default_factory=Event)
+    result: Any = None
+    error: BaseException | None = None
+
+    @classmethod
+    def start(cls, operation) -> _DeadlineOperation:
+        outcome = cls()
+
+        def run() -> None:
+            try:
+                outcome.result = operation()
+            except BaseException as error:  # noqa: BLE001
+                outcome.error = error
+            finally:
+                outcome.completed.set()
+
+        Thread(target=run, daemon=True).start()
+        return outcome
+
+    def unwrap(self):
+        if self.error is not None:
+            raise self.error
+        return self.result
 
 
 @dataclass
@@ -131,16 +158,26 @@ class SandboxRuntime:
         *,
         agent_factory: DeepAgentFactory | None = None,
         runtime_adapter_type=LangGraphRuntimeAdapter,
+        monotonic=time.monotonic,
     ) -> None:
         self.gateway = gateway
         self.agent_factory = agent_factory or DeepAgentFactory()
         self.runtime_adapter_type = runtime_adapter_type
+        self.monotonic = monotonic
         self._event_sequence = 0
 
     def execute(self, request: RunExecutionRequest) -> RunExecutionResult:
         started_at = datetime.now(timezone.utc)
-        if request.deadline_at <= started_at:
-            return RunExecutionResult(status="failed", error_code="sandbox_timeout")
+        started_monotonic = self.monotonic()
+        monotonic_execution_deadline = started_monotonic + max(
+            0.0,
+            (request.execution_deadline_at - started_at).total_seconds(),
+        )
+        if (
+            request.deadline_at <= started_at
+            or monotonic_execution_deadline <= started_monotonic
+        ):
+            return self._fail("sandbox_timeout")
         checkpoint_store = None
         model_budget = None
         try:
@@ -171,9 +208,9 @@ class SandboxRuntime:
                 "project_id": snapshot.payload.project_id,
             }
             if isinstance(actor, PublishedTeamSnapshot):
-                team_deadline = min(
-                    request.deadline_at,
-                    started_at + timedelta(seconds=actor.timeout_seconds),
+                monotonic_deadline = min(
+                    monotonic_execution_deadline,
+                    started_monotonic + actor.timeout_seconds,
                 )
                 result = self._execute_team(
                     request=request,
@@ -182,7 +219,7 @@ class SandboxRuntime:
                     messages=messages,
                     metadata=metadata,
                     checkpoint_store=checkpoint_store,
-                    deadline_at=team_deadline,
+                    monotonic_deadline=monotonic_deadline,
                 )
             else:
                 restored_state = checkpoint_store.load_latest(request.run_id)
@@ -323,7 +360,12 @@ class SandboxRuntime:
                         {"approval_id": interruption.approval_id},
                     )
                 except RunnerGatewayClientError as error:
-                    return self._fail(error.code)
+                    return self._fail(
+                        self._gateway_error_code(
+                            error,
+                            monotonic_execution_deadline,
+                        )
+                    )
                 except Exception:  # noqa: BLE001
                     return self._fail("sandbox_failed")
             self.gateway.complete(
@@ -353,10 +395,22 @@ class SandboxRuntime:
         except _AgentRecoveryRequired:
             return self._fail("agent_recovery_required")
         except RunnerGatewayModelError as error:
-            return self._fail(error.code)
+            return self._fail(
+                self._gateway_error_code(
+                    error,
+                    monotonic_execution_deadline,
+                )
+            )
         except RunnerGatewayClientError as error:
-            return self._fail(error.code)
+            return self._fail(
+                self._gateway_error_code(
+                    error,
+                    monotonic_execution_deadline,
+                )
+            )
         except Exception:  # noqa: BLE001
+            if self.monotonic() >= monotonic_execution_deadline:
+                return self._fail("sandbox_timeout")
             return self._fail("sandbox_failed")
 
     def _execute_team(
@@ -368,7 +422,7 @@ class SandboxRuntime:
         messages: list[dict[str, Any]],
         metadata: dict[str, Any],
         checkpoint_store: _GatewayCheckpointStore,
-        deadline_at: datetime,
+        monotonic_deadline: float,
     ) -> RuntimeResult:
         limits = snapshot.payload.limits
         state = self._load_team_state(
@@ -384,7 +438,7 @@ class SandboxRuntime:
                 max_tool_calls=limits.max_tool_calls,
                 max_subagents=limits.max_subagents,
             )
-            self._ensure_team_deadline(deadline_at)
+            self._ensure_team_deadline(monotonic_deadline)
             plan = self._create_team_plan(
                 request,
                 snapshot,
@@ -392,8 +446,9 @@ class SandboxRuntime:
                 messages,
                 metadata,
                 model_budget,
+                monotonic_deadline,
             )
-            self._ensure_team_deadline(deadline_at)
+            self._ensure_team_deadline(monotonic_deadline)
             team_fields = {"team_id": actor.id, "version_id": actor.version_id}
             self._append_event(
                 "team.plan.created",
@@ -529,7 +584,7 @@ class SandboxRuntime:
                 if not batch:
                     raise TeamPlanError("team_plan_invalid: task queue stalled")
 
-                self._ensure_team_deadline(deadline_at)
+                self._ensure_team_deadline(monotonic_deadline)
                 self._ensure_team_active(snapshot, actor)
                 for task in batch:
                     if task.id not in started:
@@ -582,15 +637,20 @@ class SandboxRuntime:
                     for invocation in active_invocations
                 }
                 state_lock = Lock()
+                batch_timed_out = Event()
 
                 def save_member_runtime_state(task, checkpoint_key, runtime_state):
                     nonlocal state
+                    if batch_timed_out.is_set():
+                        return
                     checkpoint_status = (
                         "interrupted"
                         if checkpoint_key == "interrupted"
                         else "completed"
                     )
                     with state_lock:
+                        if batch_timed_out.is_set():
+                            return
                         active = tuple(
                             item.model_copy(
                                 update={
@@ -637,15 +697,23 @@ class SandboxRuntime:
                         ),
                     )
 
-                with ThreadPoolExecutor(max_workers=len(batch)) as executor:
-                    futures = [(task, executor.submit(invoke, task)) for task in batch]
-                    outcomes = []
-                    for task, future in futures:
-                        try:
-                            outcomes.append((task, future.result(), None))
-                        except Exception as error:  # noqa: BLE001
-                            outcomes.append((task, None, error))
-                self._ensure_team_deadline(deadline_at)
+                operations = [
+                    (task, _DeadlineOperation.start(lambda task=task: invoke(task)))
+                    for task in batch
+                ]
+                for _task, operation in operations:
+                    self._wait_before_team_deadline(
+                        operation,
+                        monotonic_deadline,
+                        timeout_event=batch_timed_out,
+                    )
+                outcomes = []
+                for task, operation in operations:
+                    try:
+                        outcomes.append((task, operation.unwrap(), None))
+                    except Exception as error:  # noqa: BLE001
+                        outcomes.append((task, None, error))
+                self._ensure_team_deadline(monotonic_deadline)
 
                 interruptions = []
                 first_failure = None
@@ -783,7 +851,7 @@ class SandboxRuntime:
                 state={},
             )
 
-        self._ensure_team_deadline(deadline_at)
+        self._ensure_team_deadline(monotonic_deadline)
         self._ensure_team_active(snapshot, actor)
         if state.stage != "synthesizing":
             self._append_event(
@@ -874,13 +942,19 @@ class SandboxRuntime:
             ),
         )
 
+        synthesis_timed_out = Event()
+
         def save_synthesis_runtime_state(checkpoint_key, runtime_state):
             nonlocal state
+            if synthesis_timed_out.is_set():
+                return
             checkpoint_status = (
                 "interrupted"
                 if checkpoint_key == "interrupted"
                 else "completed"
             )
+            if synthesis_timed_out.is_set():
+                return
             active = tuple(
                 item.model_copy(
                     update={
@@ -907,24 +981,28 @@ class SandboxRuntime:
             save_synthesis_runtime_state,
         )
         try:
-            result = self.runtime_adapter_type(
-                graph,
-                checkpoint_store=synthesis_checkpoint_store,
-            ).invoke(
-                RuntimeState(
-                    run_id=request.run_id,
-                    messages=synthesis_messages,
-                    status="running",
-                    values={
-                        "team_version_id": actor.version_id,
-                        "team_task_id": "synthesis",
-                        "team_member_agent_id": actor.supervisor.agent_id,
-                        "team_task_invocation_id": (
-                            synthesis_invocation.invocation_id
-                        ),
-                    },
+            result = self._invoke_before_team_deadline(
+                lambda: self.runtime_adapter_type(
+                    graph,
+                    checkpoint_store=synthesis_checkpoint_store,
+                ).invoke(
+                    RuntimeState(
+                        run_id=request.run_id,
+                        messages=synthesis_messages,
+                        status="running",
+                        values={
+                            "team_version_id": actor.version_id,
+                            "team_task_id": "synthesis",
+                            "team_member_agent_id": actor.supervisor.agent_id,
+                            "team_task_invocation_id": (
+                                synthesis_invocation.invocation_id
+                            ),
+                        },
+                    ),
+                    metadata=metadata,
                 ),
-                metadata=metadata,
+                monotonic_deadline,
+                timeout_event=synthesis_timed_out,
             )
         except RunnerApprovalInterruption as interruption:
             active = tuple(
@@ -959,7 +1037,7 @@ class SandboxRuntime:
             state = self._save_team_state(state, model_budget)
             self._approval_checkpoint_key = "team-scheduler"
             raise
-        self._ensure_team_deadline(deadline_at)
+        self._ensure_team_deadline(monotonic_deadline)
         content = result.content
         if failed:
             failed_ids = ", ".join(
@@ -1006,6 +1084,7 @@ class SandboxRuntime:
         messages,
         metadata,
         model_budget,
+        deadline_at,
     ) -> TeamPlan:
         limits = snapshot.payload.limits
         if snapshot.payload.schema_version != "5":
@@ -1061,17 +1140,20 @@ class SandboxRuntime:
                 ),
             },
         ]
-        result = self.runtime_adapter_type(graph).invoke(
-            RuntimeState(
-                run_id=request.run_id,
-                messages=planning_messages,
-                status="running",
-                values={
-                    "team_version_id": actor.version_id,
-                    "team_stage": "planning",
-                },
+        result = self._invoke_before_team_deadline(
+            lambda: self.runtime_adapter_type(graph).invoke(
+                RuntimeState(
+                    run_id=request.run_id,
+                    messages=planning_messages,
+                    status="running",
+                    values={
+                        "team_version_id": actor.version_id,
+                        "team_stage": "planning",
+                    },
+                ),
+                metadata=metadata,
             ),
-            metadata=metadata,
+            deadline_at,
         )
         return parse_supervisor_plan(
             result.content,
@@ -1428,16 +1510,67 @@ class SandboxRuntime:
     def _task_invocation_id(actor, task_id):
         return f"team:{actor.version_id}:{task_id}"
 
-    @staticmethod
-    def _ensure_team_deadline(deadline_at: datetime) -> None:
-        if datetime.now(timezone.utc) >= deadline_at:
+    def _ensure_team_deadline(self, deadline_at: float) -> None:
+        if self.monotonic() >= deadline_at:
             raise _TeamTimedOut()
+
+    def _remaining_team_seconds(self, deadline_at: float) -> float:
+        remaining = deadline_at - self.monotonic()
+        if remaining <= 0:
+            raise _TeamTimedOut()
+        return remaining
+
+    def _invoke_before_team_deadline(
+        self,
+        operation,
+        deadline_at: float,
+        *,
+        timeout_event: Event | None = None,
+    ):
+        outcome = _DeadlineOperation.start(operation)
+        self._wait_before_team_deadline(
+            outcome,
+            deadline_at,
+            timeout_event=timeout_event,
+        )
+        return outcome.unwrap()
+
+    def _wait_before_team_deadline(
+        self,
+        operation: _DeadlineOperation,
+        deadline_at: float,
+        *,
+        timeout_event: Event | None = None,
+    ) -> None:
+        try:
+            remaining = self._remaining_team_seconds(deadline_at)
+        except _TeamTimedOut:
+            if timeout_event is not None:
+                timeout_event.set()
+            raise
+        if operation.completed.wait(timeout=remaining):
+            return
+        if timeout_event is not None:
+            timeout_event.set()
+        raise _TeamTimedOut()
 
     @staticmethod
     def _member_error_code(error):
         if isinstance(error, (RunnerGatewayModelError, RunnerGatewayClientError)):
             return error.code
         return "member_execution_failed"
+
+    def _gateway_error_code(
+        self,
+        error: Any,
+        monotonic_execution_deadline: float,
+    ) -> str:
+        if (
+            error.code == "sandbox_timeout"
+            or self.monotonic() >= monotonic_execution_deadline
+        ):
+            return "sandbox_timeout"
+        return error.code
 
     def _ensure_team_active(self, snapshot, actor) -> None:
         try:

@@ -1,6 +1,7 @@
 from collections.abc import Callable
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.core.database import get_session
@@ -42,9 +43,16 @@ def create_router(service_factory: Callable[[Session], ApprovalService] | None =
     def approve_approval(approval_id: str, body: ApprovalDecisionRequest | None = None, context: RequestContext = Depends(require_request_context), manager: ApprovalService = Depends(service)):
         try:
             approval = manager.approve(approval_id, context, body.reason if body else None)
-            run = manager.session.get(AgentRun, approval.run_id)
-            if run is not None:
-                run.status = "queued"
+            transition = manager.session.execute(
+                update(AgentRun)
+                .where(
+                    AgentRun.id == approval.run_id,
+                    AgentRun.status == "waiting_approval",
+                )
+                .values(status="queued")
+            )
+            if transition.rowcount != 1:
+                raise ApprovalConflictError("run is not waiting for approval")
             manager.session.flush()
             from app.conversations.repository import ConversationRepository
             ConversationRepository(manager.session).append_event(approval.run_id, "approval.resolved", {"approval_id": approval.id, "status": "approved"})

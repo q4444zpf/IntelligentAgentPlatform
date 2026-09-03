@@ -35,6 +35,7 @@ _RUNNER_ACTIONS = {
     "artifact.create",
     "result.complete",
 }
+_TIMEOUT_CONTROL_ALLOWANCE_SECONDS = 1.0
 
 
 class SandboxRunCoordinator:
@@ -70,9 +71,17 @@ class SandboxRunCoordinator:
         if not self._start(run_id):
             return
         started_at = self.monotonic()
-        deadline_at = self.clock() + timedelta(seconds=self.timeout_seconds)
+        started_wall_clock = self.clock()
+        deadline_at = started_wall_clock + timedelta(seconds=self.timeout_seconds)
+        watchdog_deadline = None
+        timeout_control_deadline = None
         try:
             snapshot, token = self._prepare_execution(run_id, deadline_at)
+            execution_deadline_at = self._execution_deadline(snapshot, deadline_at)
+            watchdog_deadline = started_at + max(
+                0.0,
+                (execution_deadline_at - started_wall_clock).total_seconds(),
+            )
             self.runner.submit(
                 run_id,
                 self._agent_version(run_id),
@@ -82,26 +91,54 @@ class SandboxRunCoordinator:
                 gateway_url=self.gateway_url,
                 run_token=token.value,
                 deadline_at=deadline_at.isoformat(),
+                execution_deadline_at=execution_deadline_at.isoformat(),
+                monotonic_deadline=watchdog_deadline,
             )
             while True:
-                if self.monotonic() - started_at >= self.timeout_seconds:
-                    self._finish(run_id, "failed", "sandbox_timeout")
-                    self._revoke_for_terminal_run(run_id)
-                    self._terminate_safely(run_id)
+                if self.monotonic() >= watchdog_deadline:
+                    timeout_control_deadline = self._timeout_run(
+                        run_id,
+                        watchdog_deadline,
+                    )
                     return
-                status = self.runner.status(run_id)
+                status = self.runner.status(
+                    run_id,
+                    monotonic_deadline=watchdog_deadline,
+                )
+                if self.monotonic() >= watchdog_deadline:
+                    timeout_control_deadline = self._timeout_run(
+                        run_id,
+                        watchdog_deadline,
+                    )
+                    return
                 container_status = status.get("status")
                 if container_status in {"running", "created", "accepted"}:
                     if self.poll_interval:
-                        self.sleeper(self.poll_interval)
+                        remaining = max(
+                            0.0,
+                            watchdog_deadline - self.monotonic(),
+                        )
+                        self.sleeper(min(self.poll_interval, remaining))
                     continue
                 self._apply_container_status(run_id, status)
                 return
         except RunnerUnavailableError:
-            self._finish(run_id, "failed", "launcher_unavailable")
+            if (
+                watchdog_deadline is not None
+                and self.monotonic() >= watchdog_deadline
+            ):
+                timeout_control_deadline = self._timeout_run(
+                    run_id,
+                    watchdog_deadline,
+                )
+            else:
+                self._finish(run_id, "failed", "launcher_unavailable")
         finally:
             self._revoke_for_terminal_run(run_id)
-            self._cleanup(run_id)
+            self._cleanup(
+                run_id,
+                monotonic_deadline=timeout_control_deadline,
+            )
 
     def cancel(self, run_id: str) -> None:
         if self._is_terminal(run_id):
@@ -120,25 +157,58 @@ class SandboxRunCoordinator:
         if self._is_terminal(run_id):
             return
         started_at = self.monotonic()
+        started_wall_clock = self.clock()
+        execution_deadline_at = self._recovery_execution_deadline(
+            run_id,
+            started_wall_clock + timedelta(seconds=self.timeout_seconds),
+        )
+        watchdog_deadline = started_at + max(
+            0.0,
+            (execution_deadline_at - started_wall_clock).total_seconds(),
+        )
+        timeout_control_deadline = None
         try:
             while True:
-                if self.monotonic() - started_at >= self.timeout_seconds:
-                    self._finish(run_id, "failed", "sandbox_timeout")
-                    self._revoke_for_terminal_run(run_id)
-                    self._terminate_safely(run_id)
+                if self.monotonic() >= watchdog_deadline:
+                    timeout_control_deadline = self._timeout_run(
+                        run_id,
+                        watchdog_deadline,
+                    )
                     return
-                status = self.runner.status(run_id)
+                status = self.runner.status(
+                    run_id,
+                    monotonic_deadline=watchdog_deadline,
+                )
+                if self.monotonic() >= watchdog_deadline:
+                    timeout_control_deadline = self._timeout_run(
+                        run_id,
+                        watchdog_deadline,
+                    )
+                    return
                 if status.get("status") in {"running", "created", "accepted"}:
                     if self.poll_interval:
-                        self.sleeper(self.poll_interval)
+                        remaining = max(
+                            0.0,
+                            watchdog_deadline - self.monotonic(),
+                        )
+                        self.sleeper(min(self.poll_interval, remaining))
                     continue
                 self._apply_container_status(run_id, status)
                 return
         except RunnerUnavailableError:
-            self._finish(run_id, "failed", "launcher_unavailable")
+            if self.monotonic() >= watchdog_deadline:
+                timeout_control_deadline = self._timeout_run(
+                    run_id,
+                    watchdog_deadline,
+                )
+            else:
+                self._finish(run_id, "failed", "launcher_unavailable")
         finally:
             self._revoke_for_terminal_run(run_id)
-            self._cleanup(run_id)
+            self._cleanup(
+                run_id,
+                monotonic_deadline=timeout_control_deadline,
+            )
 
     def _prepare_execution(self, run_id: str, deadline_at: datetime):
         if (
@@ -156,6 +226,35 @@ class SandboxRunCoordinator:
             )
             session.commit()
             return snapshot, token
+
+    @staticmethod
+    def _execution_deadline(snapshot, request_deadline: datetime) -> datetime:
+        actor = snapshot.payload.actor
+        if getattr(actor, "kind", "agent") != "team":
+            return request_deadline
+        created_at = snapshot.created_at
+        if created_at.tzinfo is None or created_at.utcoffset() is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        return min(
+            request_deadline,
+            created_at.astimezone(UTC)
+            + timedelta(seconds=actor.timeout_seconds),
+        )
+
+    def _recovery_execution_deadline(
+        self,
+        run_id: str,
+        request_deadline: datetime,
+    ) -> datetime:
+        if self.snapshot_service_factory is None:
+            return request_deadline
+        with self.session_factory() as session:
+            service = self.snapshot_service_factory(session)
+            getter = getattr(service, "get_for_run", None)
+            snapshot = getter(run_id) if getter is not None else None
+            if snapshot is None:
+                return request_deadline
+            return self._execution_deadline(snapshot, request_deadline)
 
     def _revoke_for_terminal_run(self, run_id: str) -> None:
         if self.token_service_factory is None:
@@ -273,6 +372,8 @@ class SandboxRunCoordinator:
             self._finish(run_id, "failed", "sandbox_oom")
         elif container_status == "exited" and status.get("exit_code") == 0:
             self._finish(run_id, "completed")
+        elif container_status == "exited" and status.get("exit_code") == 4:
+            self._finish(run_id, "failed", "sandbox_timeout")
         else:
             self._finish(run_id, "failed", "sandbox_failed")
 
@@ -297,7 +398,7 @@ class SandboxRunCoordinator:
                 AgentRun.id == run_id,
                 AgentRun.status.not_in(_TERMINAL_STATUSES),
             ]
-            if not allow_waiting_approval:
+            if status == "completed" and not allow_waiting_approval:
                 eligibility.append(AgentRun.status != "waiting_approval")
             transition = session.execute(
                 update(AgentRun).where(*eligibility).values(status=status)
@@ -336,7 +437,12 @@ class SandboxRunCoordinator:
             )
             session.commit()
 
-    def _cleanup(self, run_id: str) -> None:
+    def _cleanup(
+        self,
+        run_id: str,
+        *,
+        monotonic_deadline: float | None = None,
+    ) -> None:
         lock = self._cleanup_locks.setdefault(run_id, Lock())
         with lock:
             with self.session_factory() as session:
@@ -370,7 +476,13 @@ class SandboxRunCoordinator:
 
             payload = {"status": "cleaned"}
             try:
-                self.runner.cleanup(run_id)
+                if monotonic_deadline is None:
+                    self.runner.cleanup(run_id)
+                else:
+                    self.runner.cleanup(
+                        run_id,
+                        monotonic_deadline=monotonic_deadline,
+                    )
             except RunnerUnavailableError:
                 payload = {"status": "failed", "code": "launcher_unavailable"}
             with self.session_factory() as session:
@@ -379,11 +491,34 @@ class SandboxRunCoordinator:
                     repository.append_event(run_id, "sandbox.cleanup", payload)
                     session.commit()
 
-    def _terminate_safely(self, run_id: str) -> None:
+    def _terminate_safely(
+        self,
+        run_id: str,
+        *,
+        monotonic_deadline: float | None = None,
+    ) -> None:
         try:
-            self.runner.terminate(run_id)
+            if monotonic_deadline is None:
+                self.runner.terminate(run_id)
+            else:
+                self.runner.terminate(
+                    run_id,
+                    monotonic_deadline=monotonic_deadline,
+                )
         except RunnerUnavailableError:
             return
+
+    def _timeout_run(self, run_id: str, watchdog_deadline: float) -> float:
+        self._finish(run_id, "failed", "sandbox_timeout")
+        self._revoke_for_terminal_run(run_id)
+        control_deadline = (
+            watchdog_deadline + _TIMEOUT_CONTROL_ALLOWANCE_SECONDS
+        )
+        self._terminate_safely(
+            run_id,
+            monotonic_deadline=control_deadline,
+        )
+        return control_deadline
 
     def _record_audit(
         self,

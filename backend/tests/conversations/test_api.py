@@ -10,13 +10,14 @@ from sqlalchemy.pool import StaticPool
 
 from app.agents.schemas import AgentConfig
 from app.agents.service import BUILTIN_AGENT_ID, AgentNotFoundError, AgentService
-from app.agents.store import AgentStore
+from app.agents.store import AgentStore, DEFAULT_SETTING_KEY
 from app.conversations.dispatcher import UnavailableRunDispatcher
 from app.conversations.models import AgentRun, Message, ToolInvocation
 from app.conversations.repository import ConversationRepository
 from app.conversations.router import create_router
 from app.conversations.service import ConversationService
 from app.db.base import Base
+from app.db.platform_models import PlatformSettingRecord
 
 
 class StubAgentService:
@@ -510,8 +511,12 @@ def test_message_agent_selection_uses_persisted_scope_and_common_wildcard(tmp_pa
         project_id="p1",
         allowed_project_ids=[],
     )
-    pointer = store.get_default_id()
-    store.set_default_id("other-project-agent", expected_version=pointer.version)
+    with factory.begin() as pointer_session:
+        pointer = pointer_session.get(PlatformSettingRecord, DEFAULT_SETTING_KEY)
+        pointer.value = {
+            "agent_id": "other-project-agent",
+            "scope": "platform",
+        }
     session = Session(engine)
     service = ConversationService(
         ConversationRepository(session),
@@ -547,7 +552,7 @@ def test_message_agent_selection_uses_persisted_scope_and_common_wildcard(tmp_pa
         },
         headers=HEADERS,
     )
-    inaccessible_default = scoped_client.post(
+    repaired_default = scoped_client.post(
         endpoint,
         json={"content": "inspect", "actor_type": "agent"},
         headers=HEADERS,
@@ -565,12 +570,13 @@ def test_message_agent_selection_uses_persisted_scope_and_common_wildcard(tmp_pa
     assert [
         cross_project.status_code,
         cross_unit.status_code,
-        inaccessible_default.status_code,
-    ] == [422, 422, 422]
+        repaired_default.status_code,
+    ] == [422, 422, 202]
+    assert repaired_default.json()["run"]["actor_id"] == BUILTIN_AGENT_ID
     assert common.status_code == 202
     assert common.json()["run"]["actor_id"] == BUILTIN_AGENT_ID
-    assert session.scalar(select(func.count()).select_from(Message)) == 1
-    assert session.scalar(select(func.count()).select_from(AgentRun)) == 1
+    assert session.scalar(select(func.count()).select_from(Message)) == 2
+    assert session.scalar(select(func.count()).select_from(AgentRun)) == 2
 
 
 def test_sse_honors_last_event_id():

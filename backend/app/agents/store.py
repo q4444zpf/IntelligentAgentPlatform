@@ -125,38 +125,37 @@ class AgentStore:
                 version=row.version,
             )
 
+    @staticmethod
+    def is_platform_default_eligible(record: dict[str, Any] | None) -> bool:
+        return bool(
+            record
+            and record.get("enabled") is True
+            and record.get("availability_scope") == "common"
+            and record.get("unit_id") is None
+            and record.get("project_id") is None
+            and record.get("allowed_project_ids") == ["*"]
+        )
+
+    def _validate_platform_default_target(
+        self,
+        target: ManagedAgentRecord,
+        agent_id: str,
+    ) -> None:
+        if not target.config.get("enabled", False):
+            raise AgentStoreValidationError(
+                f"Disabled agent '{agent_id}' cannot be the default"
+            )
+        if not self.is_platform_default_eligible(self._decode(target)):
+            raise AgentStoreValidationError(
+                f"Default agent '{agent_id}' must be available to every project"
+            )
+
     def set_default_id(
         self,
         agent_id: str,
         expected_version: int,
     ) -> DefaultAgentPointer:
-        value = {"agent_id": agent_id, "scope": "platform"}
-        try:
-            with self.session_factory.begin() as session:
-                if expected_version:
-                    result = session.execute(
-                        update(PlatformSettingRecord)
-                        .where(
-                            PlatformSettingRecord.setting_key == DEFAULT_SETTING_KEY,
-                            PlatformSettingRecord.version == expected_version,
-                        )
-                        .values(value=value, version=expected_version + 1)
-                    )
-                    if result.rowcount != 1:
-                        raise AgentConcurrentUpdateError(
-                            "Default agent changed concurrently; retry the request"
-                        )
-                else:
-                    session.add(
-                        PlatformSettingRecord(
-                            setting_key=DEFAULT_SETTING_KEY,
-                            value=value,
-                        )
-                    )
-        except IntegrityError as error:
-            raise AgentConcurrentUpdateError(
-                "Default agent changed concurrently; retry the request"
-            ) from error
+        self.set_default_agent(agent_id, expected_version)
         return DefaultAgentPointer(
             agent_id=agent_id,
             version=expected_version + 1,
@@ -179,10 +178,7 @@ class AgentStore:
                 target = self._lock_agent(session, agent_id)
                 if target is None:
                     raise AgentStoreNotFoundError(agent_id)
-                if not target.config.get("enabled", False):
-                    raise AgentStoreValidationError(
-                        f"Disabled agent '{agent_id}' cannot be the default"
-                    )
+                self._validate_platform_default_target(target, agent_id)
 
                 value = {"agent_id": agent_id, "scope": "platform"}
                 if pointer is None:
@@ -285,8 +281,7 @@ class AgentStore:
         target = self._lock_agent(session, agent_id)
         if target is None:
             raise AgentStoreNotFoundError(agent_id)
-        if not target.config.get("enabled", False):
-            raise AgentStoreValidationError(f"Disabled agent '{agent_id}' cannot be the default")
+        self._validate_platform_default_target(target, agent_id)
         value = {"agent_id": agent_id, "scope": "platform"}
         if pointer is None:
             session.add(PlatformSettingRecord(setting_key=DEFAULT_SETTING_KEY, value=value))

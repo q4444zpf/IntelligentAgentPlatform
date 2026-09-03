@@ -1,6 +1,8 @@
+import time
 from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier, local
+from datetime import UTC, datetime, timedelta
+from threading import Barrier, Event, Thread, local
 from unittest.mock import ANY
 
 import pytest
@@ -24,13 +26,21 @@ class SequenceRunner:
         self.status_callback = status_callback
         self.calls = []
 
-    def submit(self, run_id, agent_version, checkpoint_key, **execution):
+    def submit(
+        self,
+        run_id,
+        agent_version,
+        checkpoint_key,
+        *,
+        monotonic_deadline=None,
+        **execution,
+    ):
         self.calls.append(("submit", run_id, agent_version, checkpoint_key, execution))
         if self.submit_error:
             raise self.submit_error
         return {"run_id": run_id, "status": "accepted"}
 
-    def status(self, run_id):
+    def status(self, run_id, *, monotonic_deadline=None):
         self.calls.append(("status", run_id))
         if self.status_error:
             raise self.status_error
@@ -38,11 +48,11 @@ class SequenceRunner:
             self.status_callback(run_id)
         return self.statuses.pop(0)
 
-    def terminate(self, run_id):
+    def terminate(self, run_id, *, monotonic_deadline=None):
         self.calls.append(("terminate", run_id))
         return {"run_id": run_id, "status": "terminated"}
 
-    def cleanup(self, run_id):
+    def cleanup(self, run_id, *, monotonic_deadline=None):
         self.calls.append(("cleanup", run_id))
         if self.cleanup_error:
             raise self.cleanup_error
@@ -50,19 +60,32 @@ class SequenceRunner:
 
 
 class FakeSnapshots:
-    def __init__(self):
+    def __init__(self, *, actor=None, created_at=None):
         self.created = []
+        self.actor = actor or SimpleNamespace(kind="agent")
+        self.created_at = created_at or datetime.now(UTC)
 
-    def create(self, run_id):
-        snapshot = SimpleNamespace(
+    def _snapshot(self, run_id):
+        return SimpleNamespace(
             snapshot_id="snapshot-1",
             run_id=run_id,
             digest="a" * 64,
             expires_at=None,
-            payload=SimpleNamespace(unit_id="unit-1", project_id="project-1"),
+            payload=SimpleNamespace(
+                unit_id="unit-1",
+                project_id="project-1",
+                actor=self.actor,
+            ),
+            created_at=self.created_at,
         )
+
+    def create(self, run_id):
+        snapshot = self._snapshot(run_id)
         self.created.append(snapshot)
         return snapshot
+
+    def get_for_run(self, run_id):
+        return self._snapshot(run_id)
 
 
 class FakeTokens:
@@ -192,12 +215,15 @@ def test_timeout_state_is_persisted_before_container_termination(run_factory):
     factory, run_id = run_factory
 
     class RacingRunner(SequenceRunner):
-        def terminate(self, current_run_id):
+        def terminate(self, current_run_id, *, monotonic_deadline=None):
             with factory.begin() as session:
                 run = session.get(AgentRun, current_run_id)
                 if run.status == "running":
                     run.status = "completed"
-            return super().terminate(current_run_id)
+            return super().terminate(
+                current_run_id,
+                monotonic_deadline=monotonic_deadline,
+            )
 
     runner = RacingRunner([{"status": "running"}] * 3)
     ticks = iter([0.0, 0.5, 1.1])
@@ -209,6 +235,413 @@ def test_timeout_state_is_persisted_before_container_termination(run_factory):
         timeout_seconds=1,
         monotonic=lambda: next(ticks),
     ).execute(run_id)
+
+    state = snapshot(factory, run_id)
+    assert state.run.status == "failed"
+    assert next(
+        event for event in state.events if event.event_type == "run.error"
+    ).payload["code"] == "sandbox_timeout"
+
+
+def test_team_watchdog_uses_snapshot_deadline_before_worker_snapshot_discovery(
+    run_factory,
+):
+    factory, run_id = run_factory
+    base = datetime(2026, 9, 4, 8, 0, tzinfo=UTC)
+    snapshots = FakeSnapshots(
+        actor=SimpleNamespace(kind="team", timeout_seconds=1),
+        created_at=base,
+    )
+    tokens = FakeTokens()
+    runner = SequenceRunner([{"status": "running"}] * 3)
+    ticks = iter([0.0, 0.5, 1.1])
+
+    make_coordinator(
+        factory,
+        runner,
+        snapshots=snapshots,
+        tokens=tokens,
+        poll_interval=0,
+        timeout_seconds=5,
+        monotonic=lambda: next(ticks),
+        clock=lambda: base,
+    ).execute(run_id)
+
+    submission = next(call for call in runner.calls if call[0] == "submit")[4]
+    assert datetime.fromisoformat(submission["execution_deadline_at"]) == (
+        base + timedelta(seconds=1)
+    )
+    assert tokens.issued[0].deadline_at == base + timedelta(seconds=5)
+    assert snapshot(factory, run_id).run.status == "failed"
+    assert ("terminate", run_id) in runner.calls
+
+
+def test_team_watchdog_terminates_worker_blocked_on_initial_snapshot(run_factory):
+    from app.runtime.execution_contract import RunExecutionRequest
+    from app.runtime.runner_gateway_client import RunnerGatewayBusinessError
+    from app.runtime.sandbox_runtime import SandboxRuntime
+
+    factory, run_id = run_factory
+    snapshots = FakeSnapshots(
+        actor=SimpleNamespace(kind="team", timeout_seconds=1),
+    )
+    snapshot_entered = Event()
+    snapshot_returned = Event()
+    release_snapshot = Event()
+
+    class BlockingGateway:
+        def get_snapshot(self):
+            snapshot_entered.set()
+            assert release_snapshot.wait(timeout=5)
+            snapshot_returned.set()
+            raise RunnerGatewayBusinessError("runner_gateway_unavailable")
+
+        def complete(self, _request, _idempotency_key):
+            return {}
+
+    class BlockingSnapshotRunner:
+        def __init__(self):
+            self.calls = []
+            self.worker = None
+
+        def submit(
+            self,
+            current_run_id,
+            agent_version,
+            checkpoint_key,
+            *,
+            monotonic_deadline=None,
+            **execution,
+        ):
+            self.calls.append(
+                (
+                    "submit",
+                    current_run_id,
+                    agent_version,
+                    checkpoint_key,
+                    execution,
+                )
+            )
+            request = RunExecutionRequest(
+                run_id=current_run_id,
+                agent_version=agent_version,
+                checkpoint_key=checkpoint_key,
+                **execution,
+            )
+            self.worker = Thread(
+                target=lambda: SandboxRuntime(BlockingGateway()).execute(request),
+                daemon=True,
+            )
+            self.worker.start()
+            assert snapshot_entered.wait(timeout=2)
+            return {"run_id": current_run_id, "status": "accepted"}
+
+        def status(self, current_run_id, *, monotonic_deadline=None):
+            self.calls.append(("status", current_run_id))
+            return {"run_id": current_run_id, "status": "running"}
+
+        def terminate(self, current_run_id, *, monotonic_deadline=None):
+            self.calls.append(("terminate", current_run_id))
+            assert not snapshot_returned.is_set()
+            release_snapshot.set()
+            return {"run_id": current_run_id, "status": "terminated"}
+
+        def cleanup(self, current_run_id, *, monotonic_deadline=None):
+            self.calls.append(("cleanup", current_run_id))
+            release_snapshot.set()
+            if self.worker is not None:
+                self.worker.join(timeout=2)
+            return {"run_id": current_run_id, "status": "cleaned"}
+
+    runner = BlockingSnapshotRunner()
+
+    make_coordinator(
+        factory,
+        runner,
+        snapshots=snapshots,
+        poll_interval=0.01,
+        timeout_seconds=5,
+    ).execute(run_id)
+
+    state = snapshot(factory, run_id)
+    assert state.run.status == "failed"
+    assert next(
+        event for event in state.events if event.event_type == "run.error"
+    ).payload["code"] == "sandbox_timeout"
+    assert ("terminate", run_id) in runner.calls
+
+
+def test_team_watchdog_expires_while_runner_submit_is_blocked(run_factory):
+    factory, run_id = run_factory
+
+    class BlockingSubmitRunner(SequenceRunner):
+        def submit(
+            self,
+            current_run_id,
+            agent_version,
+            checkpoint_key,
+            *,
+            monotonic_deadline=None,
+            **execution,
+        ):
+            self.calls.append(
+                (
+                    "submit",
+                    current_run_id,
+                    agent_version,
+                    checkpoint_key,
+                    execution,
+                )
+            )
+            timeout = (
+                0.6
+                if monotonic_deadline is None
+                else max(0, monotonic_deadline - time.monotonic())
+            )
+            Event().wait(timeout=timeout)
+            if monotonic_deadline is not None:
+                raise RunnerUnavailableError("runner deadline expired")
+            return {"run_id": current_run_id, "status": "accepted"}
+
+    runner = BlockingSubmitRunner([{"status": "running"}])
+    started_at = time.monotonic()
+
+    make_coordinator(
+        factory,
+        runner,
+        poll_interval=0,
+        timeout_seconds=0.15,
+    ).execute(run_id)
+
+    assert time.monotonic() - started_at < 0.45
+    state = snapshot(factory, run_id)
+    assert state.run.status == "failed"
+    assert next(
+        event for event in state.events if event.event_type == "run.error"
+    ).payload["code"] == "sandbox_timeout"
+
+
+def test_team_watchdog_expires_while_runner_status_is_blocked(run_factory):
+    factory, run_id = run_factory
+
+    class BlockingStatusRunner(SequenceRunner):
+        def status(self, current_run_id, *, monotonic_deadline=None):
+            self.calls.append(("status", current_run_id))
+            timeout = (
+                0.6
+                if monotonic_deadline is None
+                else max(0, monotonic_deadline - time.monotonic())
+            )
+            Event().wait(timeout=timeout)
+            if monotonic_deadline is not None:
+                raise RunnerUnavailableError("runner deadline expired")
+            return {"run_id": current_run_id, "status": "running"}
+
+    runner = BlockingStatusRunner([])
+    started_at = time.monotonic()
+
+    make_coordinator(
+        factory,
+        runner,
+        poll_interval=0,
+        timeout_seconds=0.15,
+    ).execute(run_id)
+
+    assert time.monotonic() - started_at < 0.45
+    assert snapshot(factory, run_id).run.status == "failed"
+
+
+def test_team_watchdog_expires_while_recovery_status_is_blocked(run_factory):
+    factory, run_id = run_factory
+    with factory.begin() as session:
+        session.get(AgentRun, run_id).status = "running"
+
+    class BlockingStatusRunner(SequenceRunner):
+        def status(self, current_run_id, *, monotonic_deadline=None):
+            self.calls.append(("status", current_run_id))
+            timeout = (
+                0.6
+                if monotonic_deadline is None
+                else max(0, monotonic_deadline - time.monotonic())
+            )
+            Event().wait(timeout=timeout)
+            if monotonic_deadline is not None:
+                raise RunnerUnavailableError("runner deadline expired")
+            return {"run_id": current_run_id, "status": "running"}
+
+    runner = BlockingStatusRunner([])
+    started_at = time.monotonic()
+
+    make_coordinator(
+        factory,
+        runner,
+        poll_interval=0,
+        timeout_seconds=0.15,
+    ).recover(run_id)
+
+    assert time.monotonic() - started_at < 0.45
+    assert snapshot(factory, run_id).run.status == "failed"
+
+
+def test_runner_failure_after_team_deadline_remains_sandbox_timeout(run_factory):
+    factory, run_id = run_factory
+
+    class LateFailingStatusRunner(SequenceRunner):
+        def status(self, current_run_id, *, monotonic_deadline=None):
+            self.calls.append(("status", current_run_id))
+            timeout = 0.6
+            if monotonic_deadline is not None:
+                timeout = max(
+                    0,
+                    monotonic_deadline - time.monotonic() + 0.05,
+                )
+            Event().wait(timeout=timeout)
+            raise RunnerUnavailableError("late runner failure")
+
+    runner = LateFailingStatusRunner([])
+
+    make_coordinator(
+        factory,
+        runner,
+        poll_interval=0,
+        timeout_seconds=0.15,
+    ).execute(run_id)
+
+    state = snapshot(factory, run_id)
+    assert state.run.status == "failed"
+    assert next(
+        event for event in state.events if event.event_type == "run.error"
+    ).payload["code"] == "sandbox_timeout"
+
+
+def test_terminal_success_returned_after_team_deadline_remains_timeout(
+    run_factory,
+):
+    factory, run_id = run_factory
+
+    class LateTerminalRunner(SequenceRunner):
+        def status(self, current_run_id, *, monotonic_deadline=None):
+            self.calls.append(("status", current_run_id))
+            timeout = 0.6
+            if monotonic_deadline is not None:
+                timeout = max(
+                    0,
+                    monotonic_deadline - time.monotonic() + 0.05,
+                )
+            Event().wait(timeout=timeout)
+            return {
+                "run_id": current_run_id,
+                "status": "exited",
+                "exit_code": 0,
+                "oom_killed": False,
+            }
+
+    make_coordinator(
+        factory,
+        LateTerminalRunner([]),
+        poll_interval=0,
+        timeout_seconds=0.15,
+    ).execute(run_id)
+
+    state = snapshot(factory, run_id)
+    assert state.run.status == "failed"
+    finished = [
+        event for event in state.events if event.event_type == "sandbox.finished"
+    ]
+    assert [event.payload for event in finished] == [
+        {"status": "failed", "code": "sandbox_timeout"}
+    ]
+
+
+def test_team_watchdog_clamps_poll_sleep_to_remaining_deadline(run_factory):
+    factory, run_id = run_factory
+    sleep_calls = []
+
+    def recording_sleep(seconds):
+        sleep_calls.append(seconds)
+        time.sleep(seconds)
+
+    class RunningRunner(SequenceRunner):
+        def status(self, current_run_id, *, monotonic_deadline=None):
+            self.calls.append(("status", current_run_id))
+            return {"run_id": current_run_id, "status": "running"}
+
+    started_at = time.monotonic()
+    make_coordinator(
+        factory,
+        RunningRunner([]),
+        poll_interval=0.6,
+        timeout_seconds=0.15,
+        sleeper=recording_sleep,
+    ).execute(run_id)
+
+    assert sleep_calls
+    assert max(sleep_calls) <= 0.15
+    assert time.monotonic() - started_at < 0.45
+
+
+def test_timeout_terminate_and_cleanup_share_one_control_allowance(run_factory):
+    factory, run_id = run_factory
+
+    class BlockingControlRunner(SequenceRunner):
+        def status(self, current_run_id, *, monotonic_deadline=None):
+            self.calls.append(("status", current_run_id))
+            return {"run_id": current_run_id, "status": "running"}
+
+        def terminate(self, current_run_id, *, monotonic_deadline=None):
+            self.calls.append(("terminate", current_run_id))
+            timeout = (
+                0.9
+                if monotonic_deadline is None
+                else min(0.9, max(0, monotonic_deadline - time.monotonic()))
+            )
+            Event().wait(timeout=timeout)
+            if (
+                monotonic_deadline is not None
+                and time.monotonic() >= monotonic_deadline
+            ):
+                raise RunnerUnavailableError("runner deadline expired")
+            return {"run_id": current_run_id, "status": "terminated"}
+
+        def cleanup(self, current_run_id, *, monotonic_deadline=None):
+            self.calls.append(("cleanup", current_run_id))
+            timeout = (
+                0.9
+                if monotonic_deadline is None
+                else min(0.9, max(0, monotonic_deadline - time.monotonic()))
+            )
+            Event().wait(timeout=timeout)
+            if (
+                monotonic_deadline is not None
+                and time.monotonic() >= monotonic_deadline
+            ):
+                raise RunnerUnavailableError("runner deadline expired")
+            return {"run_id": current_run_id, "status": "cleaned"}
+
+    runner = BlockingControlRunner([])
+    started_at = time.monotonic()
+
+    make_coordinator(
+        factory,
+        runner,
+        poll_interval=0.01,
+        timeout_seconds=0.05,
+    ).execute(run_id)
+
+    assert time.monotonic() - started_at < 1.4
+    assert ("terminate", run_id) in runner.calls
+    assert ("cleanup", run_id) in runner.calls
+
+
+def test_timeout_worker_exit_remains_authoritative_when_completion_report_fails(
+    run_factory,
+):
+    factory, run_id = run_factory
+    runner = SequenceRunner(
+        [{"status": "exited", "exit_code": 4, "oom_killed": False}]
+    )
+
+    make_coordinator(factory, runner, poll_interval=0).execute(run_id)
 
     state = snapshot(factory, run_id)
     assert state.run.status == "failed"
@@ -265,6 +698,7 @@ def test_coordinator_is_idempotent_after_run_reaches_terminal_state(run_factory)
             "gateway_url": "http://api:8000/internal/runner",
             "run_token": "run-secret-token",
             "deadline_at": ANY,
+            "execution_deadline_at": ANY,
         }),
     ]
 
@@ -353,6 +787,33 @@ def test_coordinator_waits_for_recovered_running_container_to_exit(run_factory):
         ("status", run_id),
     ]
     assert runner.calls[-1] == ("cleanup", run_id)
+
+
+def test_recovered_team_run_keeps_original_snapshot_deadline(run_factory):
+    factory, run_id = run_factory
+    base = datetime(2026, 9, 4, 8, 0, tzinfo=UTC)
+    snapshots = FakeSnapshots(
+        actor=SimpleNamespace(kind="team", timeout_seconds=1),
+        created_at=base,
+    )
+    with factory.begin() as session:
+        session.get(AgentRun, run_id).status = "running"
+    runner = SequenceRunner([{"status": "running"}])
+
+    make_coordinator(
+        factory,
+        runner,
+        snapshots=snapshots,
+        poll_interval=0,
+        timeout_seconds=10,
+        monotonic=iter([0.0, 0.0]).__next__,
+        clock=lambda: base + timedelta(seconds=2),
+    ).recover(run_id)
+
+    state = snapshot(factory, run_id)
+    assert state.run.status == "failed"
+    assert not [call for call in runner.calls if call[0] == "status"]
+    assert ("terminate", run_id) in runner.calls
 
 
 def test_coordinator_lists_only_running_runs_for_startup_recovery(run_factory):
@@ -588,6 +1049,34 @@ def test_interrupted_gateway_completion_survives_container_exit_and_revokes_toke
     assert state.run.status == "waiting_approval"
     assert "sandbox.finished" not in [event.event_type for event in state.events]
     assert tokens.revoked == [(run_id, "approval_required")]
+
+
+def test_failed_container_exit_supersedes_waiting_approval(run_factory):
+    factory, run_id = run_factory
+
+    def wait_for_approval(current_run_id):
+        with factory.begin() as session:
+            repository = ConversationRepository(session)
+            run = repository.get_run_by_id(current_run_id)
+            run.status = "waiting_approval"
+            repository.append_event(
+                current_run_id,
+                "run.status",
+                {"status": "waiting_approval"},
+            )
+
+    runner = SequenceRunner(
+        [{"status": "exited", "exit_code": 1, "oom_killed": False}],
+        status_callback=wait_for_approval,
+    )
+
+    make_coordinator(factory, runner, poll_interval=0).execute(run_id)
+
+    state = snapshot(factory, run_id)
+    assert state.run.status == "failed"
+    assert next(
+        event for event in state.events if event.event_type == "run.error"
+    ).payload["code"] == "sandbox_failed"
 
 
 def test_waiting_approval_run_can_be_cancelled(run_factory):

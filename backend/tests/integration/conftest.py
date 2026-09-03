@@ -215,7 +215,7 @@ def runner_gateway_env():
             actor_type="agent",
             actor_id="agent-1",
             actor_roles_json=["user"],
-            status="pending",
+            status="running",
         )
         session.add_all(
             [

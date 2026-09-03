@@ -1,3 +1,5 @@
+from datetime import UTC, datetime, timedelta
+
 from fastapi.testclient import TestClient
 
 from app.runtime.sandbox_readiness import SandboxReadiness
@@ -91,9 +93,9 @@ def test_runner_prepares_container_before_accepting_run():
     class FakeLauncherClient:
         def __init__(self): self.runs = []
         def prepare(self, run_id, **execution): self.runs.append((run_id, execution)); return {"run_id": run_id, "status": "running"}
-        def inspect(self, run_id): return {"run_id": run_id, "status": "exited", "exit_code": 0, "oom_killed": False}
-        def terminate(self, run_id): return {"run_id": run_id, "status": "terminated"}
-        def cleanup(self, run_id): return {"run_id": run_id, "status": "cleaned"}
+        def inspect(self, run_id, **_kwargs): return {"run_id": run_id, "status": "exited", "exit_code": 0, "oom_killed": False}
+        def terminate(self, run_id, **_kwargs): return {"run_id": run_id, "status": "terminated"}
+        def cleanup(self, run_id, **_kwargs): return {"run_id": run_id, "status": "cleaned"}
 
     launcher = FakeLauncherClient()
     client = TestClient(create_runner_app(
@@ -109,15 +111,79 @@ def test_runner_prepares_container_before_accepting_run():
         "agent_version": "a1",
         "checkpoint_key": "c1",
         "deadline_at": "2099-01-01T00:00:00Z",
+        "execution_deadline_at": "2098-12-31T23:59:00Z",
         "snapshot_id": "snapshot-1",
         "snapshot_digest": "a" * 64,
         "gateway_url": "http://api:8000/internal/runner",
         "run_token": "secret-token",
+        "request_deadline_at": "2098-12-31T23:59:00+00:00",
     })]
 
     assert client.get("/runs/r1").json()["status"] == "exited"
     assert client.post("/runs/r1/terminate").json()["status"] == "terminated"
     assert client.delete("/runs/r1").json()["status"] == "cleaned"
+
+
+def test_runner_rejects_expired_downstream_deadline_before_launcher_prepare():
+    class FakeLauncherClient:
+        def __init__(self):
+            self.runs = []
+
+        def prepare(self, run_id, **execution):
+            self.runs.append((run_id, execution))
+            return {"run_id": run_id, "status": "running"}
+
+    launcher = FakeLauncherClient()
+    client = TestClient(
+        create_runner_app(
+            sandbox_enabled=True,
+            readiness=SandboxReadiness(True, True, True, True, True, True),
+            launcher_client=launcher,
+        )
+    )
+    expired = datetime.now(UTC) - timedelta(seconds=1)
+
+    response = client.post(
+        "/runs",
+        headers={"X-Request-Deadline-At": expired.isoformat()},
+        json=_submission(),
+    )
+
+    assert response.status_code == 503
+    assert launcher.runs == []
+
+
+def test_runner_rejects_expired_execution_with_later_hop_deadline():
+    class FakeLauncherClient:
+        def __init__(self):
+            self.runs = []
+
+        def prepare(self, run_id, **execution):
+            self.runs.append((run_id, execution))
+            return {"run_id": run_id, "status": "running"}
+
+    launcher = FakeLauncherClient()
+    client = TestClient(
+        create_runner_app(
+            sandbox_enabled=True,
+            readiness=SandboxReadiness(True, True, True, True, True, True),
+            launcher_client=launcher,
+        )
+    )
+    request = _submission()
+    request["execution_deadline_at"] = (
+        datetime.now(UTC) - timedelta(seconds=1)
+    ).isoformat()
+    later_hop_deadline = datetime.now(UTC) + timedelta(seconds=5)
+
+    response = client.post(
+        "/runs",
+        headers={"X-Request-Deadline-At": later_hop_deadline.isoformat()},
+        json=request,
+    )
+
+    assert response.status_code == 503
+    assert launcher.runs == []
 
 
 def test_runner_builds_launcher_client_only_when_url_and_token_are_configured(monkeypatch):
@@ -137,6 +203,7 @@ def _submission():
         "agent_version": "a1",
         "checkpoint_key": "c1",
         "deadline_at": "2099-01-01T00:00:00Z",
+        "execution_deadline_at": "2098-12-31T23:59:00Z",
         "snapshot_id": "snapshot-1",
         "snapshot_digest": "a" * 64,
         "gateway_url": "http://api:8000/internal/runner",

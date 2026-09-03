@@ -10,7 +10,11 @@ from app.artifacts.service import ArtifactNotFoundError
 from app.conversations.models import AgentRun, Conversation, Message
 from app.conversations.repository import ConversationRepository
 from app.db.base import Base
-from app.runtime.checkpoint_store import CheckpointStore
+from app.runtime.checkpoint_store import (
+    CheckpointStore,
+    RuntimeCheckpoint,
+    RuntimeRunnerRequest,
+)
 from app.runtime.execution_snapshot import (
     ExecutionSnapshotPayload,
     PublishedAgentSnapshot,
@@ -282,6 +286,88 @@ def test_duplicate_event_idempotency_key_creates_one_event():
     assert second.status_code == 200
     assert second.json() == first.json()
     assert len(repository.list_events("run-1", 0)) == 1
+
+
+def test_terminal_run_rejects_new_checkpoint_but_preserves_exact_replay():
+    client, repository, _store, _token_service = build_client()
+    checkpoint_request = {"state": {"status": "running"}}
+    first = client.put(
+        "/internal/runner/runs/run-1/checkpoints/step-1",
+        headers=idempotent("checkpoint-1"),
+        json=checkpoint_request,
+    )
+    completion = client.post(
+        "/internal/runner/runs/run-1/completion",
+        headers=idempotent("completion:timeout"),
+        json={"status": "failed", "error_code": "sandbox_timeout"},
+    )
+    checkpoint_count = repository.session.query(RuntimeCheckpoint).count()
+    request_count = repository.session.query(RuntimeRunnerRequest).count()
+
+    replay = client.put(
+        "/internal/runner/runs/run-1/checkpoints/step-1",
+        headers=idempotent("checkpoint-1"),
+        json=checkpoint_request,
+    )
+    rejected = client.put(
+        "/internal/runner/runs/run-1/checkpoints/step-2",
+        headers=idempotent("checkpoint-2"),
+        json={"state": {"status": "late"}},
+    )
+
+    assert first.status_code == 200
+    assert completion.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    assert rejected.status_code == 409
+    assert rejected.json()["code"] == "run_not_active"
+    assert repository.session.query(RuntimeCheckpoint).count() == checkpoint_count
+    assert repository.session.query(RuntimeRunnerRequest).count() == request_count
+
+
+def test_terminal_run_rejects_new_event_but_preserves_exact_replay():
+    client, repository, _store, _token_service = build_client()
+    event_request = {
+        "sequence": 1,
+        "event_type": "runner.started",
+        "payload": {"status": "running"},
+    }
+    first = client.post(
+        "/internal/runner/runs/run-1/events",
+        headers=idempotent("event-1"),
+        json=event_request,
+    )
+    completion = client.post(
+        "/internal/runner/runs/run-1/completion",
+        headers=idempotent("completion:timeout"),
+        json={"status": "failed", "error_code": "sandbox_timeout"},
+    )
+    event_count = len(repository.list_events("run-1", 0))
+    request_count = repository.session.query(RuntimeRunnerRequest).count()
+
+    replay = client.post(
+        "/internal/runner/runs/run-1/events",
+        headers=idempotent("event-1"),
+        json=event_request,
+    )
+    rejected = client.post(
+        "/internal/runner/runs/run-1/events",
+        headers=idempotent("event-2"),
+        json={
+            "sequence": 2,
+            "event_type": "model.delta",
+            "payload": {"text": "late"},
+        },
+    )
+
+    assert first.status_code == 200
+    assert completion.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    assert rejected.status_code == 409
+    assert rejected.json()["code"] == "run_not_active"
+    assert len(repository.list_events("run-1", 0)) == event_count
+    assert repository.session.query(RuntimeRunnerRequest).count() == request_count
 
 
 def test_reused_idempotency_key_with_different_event_is_conflict():

@@ -92,6 +92,44 @@ def test_records_tool_failure_without_arguments_or_raw_error(runtime, monkeypatc
     assert "secret raw failure" not in str(events)
 
 
+def test_tool_finishing_after_terminal_run_commits_no_terminal_state(
+    runtime, monkeypatch
+):
+    session, gateway = make_gateway(runtime)
+    original = BUILTIN_EXECUTORS["system.get_current_time"]
+    external_transaction_state = []
+
+    def finish_after_timeout(arguments, execution_context, clock):
+        external_transaction_state.append(session.in_transaction())
+        with Session(session.bind) as terminal_session:
+            terminal_session.get(AgentRun, "run-1").status = "failed"
+            terminal_session.commit()
+        return original(arguments, execution_context, clock)
+
+    monkeypatch.setitem(
+        BUILTIN_EXECUTORS,
+        "system.get_current_time",
+        finish_after_timeout,
+    )
+
+    with pytest.raises(ToolRuntimeError) as captured:
+        execute(gateway)
+
+    session.expire_all()
+    invocation = session.scalar(select(ToolInvocation))
+    run_events = list(
+        session.scalars(select(RunEvent).where(RunEvent.run_id == "run-1"))
+    )
+    audits = list(
+        session.scalars(select(AuditEvent).where(AuditEvent.run_id == "run-1"))
+    )
+    assert captured.value.code == "run_not_active"
+    assert external_transaction_state == [False]
+    assert invocation.status == "started"
+    assert [event.event_type for event in run_events] == ["tool.started"]
+    assert [audit.action for audit in audits] == ["tool.invoke.started"]
+
+
 def test_current_time_uses_frozen_clock_and_chinese_weekday(runtime):
     session, gateway = make_gateway(runtime)
     try:
@@ -280,7 +318,8 @@ def test_required_approval_pauses_run_without_executing_tool(runtime, monkeypatc
         session.close()
 
 
-def test_approved_tool_invocation_executes_after_digest_check(runtime):
+@pytest.mark.parametrize("run_status", ["waiting_approval", "queued"])
+def test_approved_tool_invocation_executes_after_digest_check(runtime, run_status):
     factory, _ = runtime
     with factory.begin() as db:
         tool = db.get(RegisteredToolRecord, "system.get_current_time")
@@ -294,12 +333,91 @@ def test_approved_tool_invocation_executes_after_digest_check(runtime):
         approval = session.scalar(select(Approval))
         from app.approvals.service import ApprovalService
         ApprovalService(session, clock=lambda: datetime(2026, 8, 2, 4, 30, tzinfo=timezone.utc)).approve(approval.id, __import__("app.core.request_context", fromlist=["RequestContext"]).RequestContext(user_id="reviewer", unit_id="unit-1", project_id="project-1", roles=frozenset({"project_admin"})))
+        session.get(AgentRun, "run-1").status = run_status
+        session.commit()
         result = gateway.execute_approved(approval.id, context())
         invocation = session.scalar(select(ToolInvocation))
         assert result.value["date"] == "2026-08-02"
         assert invocation.status == "completed"
+        assert session.get(AgentRun, "run-1").status == run_status
     finally:
         session.close()
+
+
+def test_approved_tool_finishing_after_terminal_run_commits_no_terminal_state(
+    runtime, monkeypatch
+):
+    factory, _ = runtime
+    with factory.begin() as db:
+        tool = db.get(RegisteredToolRecord, "system.get_current_time")
+        tool.requires_approval = True
+        tool.risk_level = "high"
+    session, gateway = make_gateway(runtime)
+    with pytest.raises(ToolRuntimeError) as approval_required:
+        execute(gateway)
+    assert approval_required.value.code == "approval_required"
+    approval = session.scalar(select(Approval))
+    from app.approvals.service import ApprovalService
+    from app.core.request_context import RequestContext
+
+    ApprovalService(
+        session,
+        clock=lambda: datetime(2026, 8, 2, 4, 30, tzinfo=timezone.utc),
+    ).approve(
+        approval.id,
+        RequestContext(
+            user_id="reviewer",
+            unit_id="unit-1",
+            project_id="project-1",
+            roles=frozenset({"project_admin"}),
+        ),
+    )
+    session.get(AgentRun, "run-1").status = "queued"
+    session.commit()
+    original = BUILTIN_EXECUTORS["system.get_current_time"]
+    external_transaction_state = []
+
+    def finish_after_timeout(arguments, execution_context, clock):
+        external_transaction_state.append(session.in_transaction())
+        with factory.begin() as terminal_session:
+            terminal_session.get(AgentRun, "run-1").status = "failed"
+        return original(arguments, execution_context, clock)
+
+    monkeypatch.setitem(
+        BUILTIN_EXECUTORS,
+        "system.get_current_time",
+        finish_after_timeout,
+    )
+
+    with pytest.raises(ToolRuntimeError) as caught:
+        gateway.execute_approved(approval.id, context())
+
+    session.expire_all()
+    invocation = session.scalar(select(ToolInvocation))
+    events = list(
+        session.scalars(
+            select(RunEvent)
+            .where(RunEvent.run_id == "run-1")
+            .order_by(RunEvent.sequence)
+        )
+    )
+    tool_audits = list(
+        session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.run_id == "run-1",
+                AuditEvent.action.like("tool.invoke.%"),
+            )
+        )
+    )
+    assert caught.value.code == "run_not_active"
+    assert external_transaction_state == [False]
+    assert invocation.status == "started"
+    assert [event.event_type for event in events] == [
+        "approval.requested",
+        "run.status",
+        "tool.started",
+    ]
+    assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
 
 
 def test_mcp_tool_executes_remote_capability_and_records_result(runtime):
@@ -419,6 +537,60 @@ def test_success_terminal_audit_failure_retries_true_outcome_without_duplicates(
     ]
     assert audits[1].parent_event_id == audits[0].id
     assert [event.event_type for event in events] == ["tool.started", "tool.completed"]
+
+
+def test_terminal_run_during_completion_compensation_bypasses_retry(
+    runtime, monkeypatch
+):
+    factory, store = runtime
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        audit_recorder=OneShotTerminalFailingRecorder(),
+    )
+    original_rollback = gateway._rollback_safely
+    original_persist_terminal = gateway._persist_terminal
+    rollback_count = 0
+    terminal_attempts = []
+
+    def rollback_then_finish_run():
+        nonlocal rollback_count
+        original_rollback()
+        rollback_count += 1
+        if rollback_count == 1:
+            with factory.begin() as terminal_session:
+                terminal_session.get(AgentRun, "run-1").status = "failed"
+
+    def capture_terminal_attempt(*args, **kwargs):
+        terminal_attempts.append(kwargs.get("include_audit", True))
+        return original_persist_terminal(*args, **kwargs)
+
+    monkeypatch.setattr(gateway, "_rollback_safely", rollback_then_finish_run)
+    monkeypatch.setattr(gateway, "_persist_terminal", capture_terminal_attempt)
+
+    with pytest.raises(ToolRuntimeError) as caught:
+        execute(gateway)
+
+    session.expire_all()
+    invocation = session.scalar(select(ToolInvocation))
+    events = list(
+        session.scalars(
+            select(RunEvent)
+            .where(RunEvent.run_id == "run-1")
+            .order_by(RunEvent.sequence)
+        )
+    )
+    audits = list(
+        session.scalars(
+            select(AuditEvent).where(AuditEvent.run_id == "run-1")
+        )
+    )
+    assert caught.value.code == "run_not_active"
+    assert terminal_attempts == [True, True]
+    assert invocation.status == "started"
+    assert [event.event_type for event in events] == ["tool.started"]
+    assert [audit.action for audit in audits] == ["tool.invoke.started"]
 
 
 class PersistentTerminalFailingRecorder(AuditRecorder):

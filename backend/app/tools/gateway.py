@@ -10,13 +10,14 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from app.audit.models import AuditEvent
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.approvals.service import ApprovalService
 from app.core.request_context import RequestContext
-from app.conversations.models import ToolInvocation
+from app.conversations.models import AgentRun, ToolInvocation
 from app.conversations.repository import ConversationRepository
 from app.mcp.protocol import McpProtocolClient, McpProtocolError
 from app.mcp.store import McpStore
@@ -29,6 +30,7 @@ from .store import ToolStore
 _SENSITIVE_KEY = re.compile(r"authorization|api_?key|token|secret|password|credential", re.IGNORECASE)
 _REDACTED = "[REDACTED]"
 _TRUNCATED = "[TRUNCATED]"
+_APPROVED_TOOL_RUN_STATUSES = frozenset({"queued", "waiting_approval"})
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +54,22 @@ class ToolGateway:
         self.mcp_store = mcp_store
         self.mcp_protocol_client = mcp_protocol_client
         self.mcp_credential_resolver = mcp_credential_resolver
+
+    def _lock_active_run(
+        self,
+        run_id: str,
+        *,
+        allowed_statuses: Collection[str] = ("running",),
+    ) -> AgentRun:
+        run = self.repository.session.scalar(
+            select(AgentRun)
+            .where(AgentRun.id == run_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        if run is None or run.status not in allowed_statuses:
+            raise ToolRuntimeError("run_not_active", "Run 已结束。")
+        return run
 
     @staticmethod
     def _validate(schema: dict[str, Any], value: Any, code: str, message: str) -> None:
@@ -112,6 +130,7 @@ class ToolGateway:
     def _commit_started(
         self, invocation: ToolInvocation, display_name: str, context: ToolExecutionContext,
     ) -> AuditEvent:
+        self._lock_active_run(invocation.run_id)
         self.repository.add_tool_invocation(invocation)
         self.repository.append_event(
             invocation.run_id,
@@ -158,7 +177,12 @@ class ToolGateway:
         result: dict[str, Any] | None,
         error: ToolRuntimeError | None,
         include_audit: bool = True,
+        allowed_run_statuses: Collection[str] = ("running",),
     ) -> None:
+        self._lock_active_run(
+            invocation.run_id,
+            allowed_statuses=allowed_run_statuses,
+        )
         invocation.status = status
         invocation.duration_ms = duration_ms
         invocation.completed_at = datetime.now(timezone.utc)
@@ -217,6 +241,7 @@ class ToolGateway:
         result: dict[str, Any] | None,
         context: ToolExecutionContext,
         parent_event_id: str,
+        allowed_run_statuses: Collection[str] = ("running",),
     ) -> bool:
         try:
             invocation = self.repository.session.get(ToolInvocation, invocation_id)
@@ -226,8 +251,13 @@ class ToolGateway:
                 invocation, display_name, status=status, duration_ms=duration_ms,
                 context=context, parent_event_id=parent_event_id,
                 result=result, error=error,
+                allowed_run_statuses=allowed_run_statuses,
             )
             return True
+        except ToolRuntimeError as persistence_error:
+            self._rollback_safely()
+            if persistence_error.code == "run_not_active":
+                raise
         except Exception:
             self._rollback_safely()
 
@@ -239,7 +269,12 @@ class ToolGateway:
                 invocation, display_name, status=status, duration_ms=duration_ms,
                 context=context, parent_event_id=parent_event_id,
                 result=result, error=error, include_audit=False,
+                allowed_run_statuses=allowed_run_statuses,
             )
+        except ToolRuntimeError as persistence_error:
+            self._rollback_safely()
+            if persistence_error.code == "run_not_active":
+                raise
         except Exception:
             self._rollback_safely()
         return False
@@ -255,6 +290,7 @@ class ToolGateway:
         parent_event_id: str,
         result: dict[str, Any] | None = None,
         error: ToolRuntimeError | None = None,
+        allowed_run_statuses: Collection[str] = ("running",),
     ) -> None:
         invocation_id = str(invocation.id)
         tool_id = str(invocation.tool_id)
@@ -263,14 +299,21 @@ class ToolGateway:
                 invocation, display_name, status=status, duration_ms=duration_ms,
                 context=context, parent_event_id=parent_event_id,
                 result=result, error=error,
+                allowed_run_statuses=allowed_run_statuses,
             )
             return
         except Exception as database_error:
             self._rollback_safely()
+            if (
+                isinstance(database_error, ToolRuntimeError)
+                and database_error.code == "run_not_active"
+            ):
+                raise
             if self._compensate_failed_completion(
                 invocation_id, display_name, duration_ms, error,
                 status=status, result=result, context=context,
                 parent_event_id=parent_event_id,
+                allowed_run_statuses=allowed_run_statuses,
             ):
                 return
             logger.error(
@@ -320,6 +363,11 @@ class ToolGateway:
             started_audit = self._commit_started(invocation, tool["name"], context)
         except Exception as database_error:
             self._rollback_safely()
+            if (
+                isinstance(database_error, ToolRuntimeError)
+                and database_error.code == "run_not_active"
+            ):
+                raise
             if isinstance(database_error, IntegrityError):
                 try:
                     duplicate = self.repository.get_tool_invocation(
@@ -375,6 +423,7 @@ class ToolGateway:
         tool: dict[str, Any],
         context: ToolExecutionContext,
     ) -> ToolExecutionResult:
+        self._lock_active_run(context.run_id)
         invocation = ToolInvocation(
             run_id=context.run_id,
             tool_call_id=call.id,
@@ -429,6 +478,10 @@ class ToolGateway:
         executor = BUILTIN_EXECUTORS.get(invocation.tool_id)
         if executor is None and tool["source"] != "mcp":
             raise ToolRuntimeError("tool_execution_failed", "工具执行失败。")
+        self._lock_active_run(
+            invocation.run_id,
+            allowed_statuses=_APPROVED_TOOL_RUN_STATUSES,
+        )
         invocation.status = "started"
         self.repository.append_event(
             invocation.run_id,
@@ -458,15 +511,15 @@ class ToolGateway:
             self._validate(tool["output_schema"], value, "tool_execution_failed", "工具执行失败。")
         except ToolRuntimeError as error:
             duration_ms = max(0, round((time.perf_counter() - started_at) * 1000))
-            self._commit_finished(invocation, tool["name"], status="failed", duration_ms=duration_ms, error=error, context=context, parent_event_id=started_audit.id)
+            self._commit_finished(invocation, tool["name"], status="failed", duration_ms=duration_ms, error=error, context=context, parent_event_id=started_audit.id, allowed_run_statuses=_APPROVED_TOOL_RUN_STATUSES)
             raise
         except Exception as error:
             safe_error = ToolRuntimeError("tool_execution_failed", "工具执行失败。")
             duration_ms = max(0, round((time.perf_counter() - started_at) * 1000))
-            self._commit_finished(invocation, tool["name"], status="failed", duration_ms=duration_ms, error=safe_error, context=context, parent_event_id=started_audit.id)
+            self._commit_finished(invocation, tool["name"], status="failed", duration_ms=duration_ms, error=safe_error, context=context, parent_event_id=started_audit.id, allowed_run_statuses=_APPROVED_TOOL_RUN_STATUSES)
             raise safe_error from error
         duration_ms = max(0, round((time.perf_counter() - started_at) * 1000))
-        self._commit_finished(invocation, tool["name"], status="completed", duration_ms=duration_ms, result=value, context=context, parent_event_id=started_audit.id)
+        self._commit_finished(invocation, tool["name"], status="completed", duration_ms=duration_ms, result=value, context=context, parent_event_id=started_audit.id, allowed_run_statuses=_APPROVED_TOOL_RUN_STATUSES)
         return ToolExecutionResult(invocation_id=str(invocation.id), value=value)
 
     def _execute_mcp(

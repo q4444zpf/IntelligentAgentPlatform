@@ -220,9 +220,10 @@ class MemberAdapter:
 
 def test_published_team_runtime_completes_two_member_tasks_and_one_synthesis():
     snapshot = team_snapshot(); gateway = RuntimeGateway(snapshot); factory = MemberFactory()
+    deadline_at = datetime.now(UTC) + timedelta(minutes=5)
     request = RunExecutionRequest(
         run_id="run-1", agent_version="version-2", checkpoint_key="initial",
-        deadline_at=datetime.now(UTC) + timedelta(minutes=5), snapshot_id="snapshot-1",
+        deadline_at=deadline_at, execution_deadline_at=deadline_at, snapshot_id="snapshot-1",
         snapshot_digest=snapshot.digest, gateway_url="http://runner-gateway/internal", run_token="token",
     )
 

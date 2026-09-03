@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
-import urllib.request
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
+
+import httpx
+
+
+_DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
 
 
 class RunnerUnavailableError(RuntimeError):
@@ -12,52 +20,176 @@ class RunnerUnavailableError(RuntimeError):
 
 
 class RunnerTransport(Protocol):
-    def health_check(self) -> dict[str, Any]: ...
-    def submit(self, payload: dict[str, str]) -> dict[str, Any]: ...
-    def status(self, run_id: str) -> dict[str, Any]: ...
-    def terminate(self, run_id: str) -> dict[str, Any]: ...
-    def cleanup(self, run_id: str) -> dict[str, Any]: ...
-
-
-def _urlopen_request(method: str, url: str, *, headers: dict[str, str], body: bytes | None = None) -> dict[str, Any]:
-    request = urllib.request.Request(url, data=body, headers=headers, method=method)
-    with urllib.request.urlopen(request, timeout=10) as response:
-        return json.loads(response.read().decode("utf-8"))
+    def health_check(
+        self, *, monotonic_deadline: float | None = None
+    ) -> dict[str, Any]: ...
+    def submit(
+        self,
+        payload: dict[str, str],
+        *,
+        monotonic_deadline: float | None = None,
+    ) -> dict[str, Any]: ...
+    def status(
+        self, run_id: str, *, monotonic_deadline: float | None = None
+    ) -> dict[str, Any]: ...
+    def terminate(
+        self, run_id: str, *, monotonic_deadline: float | None = None
+    ) -> dict[str, Any]: ...
+    def cleanup(
+        self, run_id: str, *, monotonic_deadline: float | None = None
+    ) -> dict[str, Any]: ...
 
 
 @dataclass
 class WorkflowRunnerHttpTransport:
     base_url: str
-    request: Any = _urlopen_request
+    request: Any | None = None
+    monotonic: Callable[[], float] = time.monotonic
 
-    def health_check(self) -> dict[str, Any]:
-        return self.request("GET", f"{self.base_url.rstrip('/')}/health", headers={})
+    def health_check(
+        self, *, monotonic_deadline: float | None = None
+    ) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"{self.base_url.rstrip('/')}/health",
+            headers={},
+            monotonic_deadline=monotonic_deadline,
+        )
 
-    def submit(self, payload: dict[str, str]) -> dict[str, Any]:
-        return self.request(
+    def submit(
+        self,
+        payload: dict[str, str],
+        *,
+        monotonic_deadline: float | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
             "POST",
             f"{self.base_url.rstrip('/')}/runs",
             headers={"Content-Type": "application/json"},
             body=json.dumps(payload).encode("utf-8"),
+            monotonic_deadline=monotonic_deadline,
         )
 
-    def status(self, run_id: str) -> dict[str, Any]:
-        return self.request("GET", f"{self.base_url.rstrip('/')}/runs/{run_id}", headers={})
+    def status(
+        self, run_id: str, *, monotonic_deadline: float | None = None
+    ) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"{self.base_url.rstrip('/')}/runs/{run_id}",
+            headers={},
+            monotonic_deadline=monotonic_deadline,
+        )
 
-    def terminate(self, run_id: str) -> dict[str, Any]:
-        return self.request("POST", f"{self.base_url.rstrip('/')}/runs/{run_id}/terminate", headers={})
+    def terminate(
+        self, run_id: str, *, monotonic_deadline: float | None = None
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"{self.base_url.rstrip('/')}/runs/{run_id}/terminate",
+            headers={},
+            monotonic_deadline=monotonic_deadline,
+        )
 
-    def cleanup(self, run_id: str) -> dict[str, Any]:
-        return self.request("DELETE", f"{self.base_url.rstrip('/')}/runs/{run_id}", headers={})
+    def cleanup(
+        self, run_id: str, *, monotonic_deadline: float | None = None
+    ) -> dict[str, Any]:
+        return self._request(
+            "DELETE",
+            f"{self.base_url.rstrip('/')}/runs/{run_id}",
+            headers={},
+            monotonic_deadline=monotonic_deadline,
+        )
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str],
+        body: bytes | None = None,
+        monotonic_deadline: float | None = None,
+    ) -> dict[str, Any]:
+        deadline = (
+            monotonic_deadline
+            if monotonic_deadline is not None
+            else self.monotonic() + _DEFAULT_REQUEST_TIMEOUT_SECONDS
+        )
+        remaining = deadline - self.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Workflow Runner deadline expired")
+        request_headers = dict(headers)
+        if monotonic_deadline is not None:
+            request_headers["X-Request-Deadline-At"] = (
+                datetime.now(UTC) + timedelta(seconds=remaining)
+            ).isoformat()
+        if self.request is not None:
+            result = self.request(
+                method,
+                url,
+                headers=request_headers,
+                body=body,
+            )
+        else:
+            result = asyncio.run(
+                self._async_request(
+                    method,
+                    url,
+                    headers=request_headers,
+                    body=body,
+                    monotonic_deadline=deadline,
+                    monotonic=self.monotonic,
+                )
+            )
+        if self.monotonic() >= deadline:
+            raise TimeoutError("Workflow Runner deadline expired")
+        return result
+
+    @staticmethod
+    async def _async_request(
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str],
+        body: bytes | None,
+        monotonic_deadline: float,
+        monotonic: Callable[[], float],
+    ) -> dict[str, Any]:
+        remaining = monotonic_deadline - monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Workflow Runner deadline expired")
+        phase_timeout = httpx.Timeout(
+            connect=min(3.0, remaining),
+            pool=min(3.0, remaining),
+            read=remaining,
+            write=remaining,
+        )
+        async with asyncio.timeout(remaining):
+            async with httpx.AsyncClient(
+                timeout=phase_timeout,
+                trust_env=False,
+            ) as client:
+                response = await client.request(
+                    method,
+                    url,
+                    headers=headers,
+                    content=body,
+                )
+                response.raise_for_status()
+                payload = response.json()
+        if monotonic() >= monotonic_deadline:
+            raise TimeoutError("Workflow Runner deadline expired")
+        return payload
 
 
 @dataclass
 class WorkflowRunnerClient:
     transport: RunnerTransport
 
-    def is_healthy(self) -> bool:
+    def is_healthy(self, *, monotonic_deadline: float | None = None) -> bool:
         try:
-            health = self.transport.health_check()
+            health = self.transport.health_check(
+                monotonic_deadline=monotonic_deadline
+            )
         except Exception:  # noqa: BLE001
             return False
         return health.get("status") == "healthy" and health.get("sandbox") is True
@@ -73,33 +205,66 @@ class WorkflowRunnerClient:
         gateway_url: str,
         run_token: str,
         deadline_at: str,
+        execution_deadline_at: str,
+        monotonic_deadline: float | None = None,
     ) -> dict[str, Any]:
-        if not self.is_healthy():
+        if not self.is_healthy(monotonic_deadline=monotonic_deadline):
             raise RunnerUnavailableError("Workflow Runner is unavailable")
-        return self.transport.submit({
-            "run_id": run_id,
-            "agent_version": agent_version,
-            "checkpoint_key": checkpoint_key,
-            "snapshot_id": snapshot_id,
-            "snapshot_digest": snapshot_digest,
-            "gateway_url": gateway_url,
-            "run_token": run_token,
-            "deadline_at": deadline_at,
-        })
+        return self._transport_call(
+            self.transport.submit,
+            {
+                "run_id": run_id,
+                "agent_version": agent_version,
+                "checkpoint_key": checkpoint_key,
+                "snapshot_id": snapshot_id,
+                "snapshot_digest": snapshot_digest,
+                "gateway_url": gateway_url,
+                "run_token": run_token,
+                "deadline_at": deadline_at,
+                "execution_deadline_at": execution_deadline_at,
+            },
+            monotonic_deadline=monotonic_deadline,
+        )
 
-    def status(self, run_id: str) -> dict[str, Any]:
-        return self._lifecycle_call(self.transport.status, run_id)
+    def status(
+        self, run_id: str, *, monotonic_deadline: float | None = None
+    ) -> dict[str, Any]:
+        return self._transport_call(
+            self.transport.status,
+            run_id,
+            monotonic_deadline=monotonic_deadline,
+        )
 
-    def terminate(self, run_id: str) -> dict[str, Any]:
-        return self._lifecycle_call(self.transport.terminate, run_id)
+    def terminate(
+        self, run_id: str, *, monotonic_deadline: float | None = None
+    ) -> dict[str, Any]:
+        return self._transport_call(
+            self.transport.terminate,
+            run_id,
+            monotonic_deadline=monotonic_deadline,
+        )
 
-    def cleanup(self, run_id: str) -> dict[str, Any]:
-        return self._lifecycle_call(self.transport.cleanup, run_id)
+    def cleanup(
+        self, run_id: str, *, monotonic_deadline: float | None = None
+    ) -> dict[str, Any]:
+        return self._transport_call(
+            self.transport.cleanup,
+            run_id,
+            monotonic_deadline=monotonic_deadline,
+        )
 
     @staticmethod
-    def _lifecycle_call(operation, run_id: str) -> dict[str, Any]:
+    def _transport_call(
+        operation,
+        argument,
+        *,
+        monotonic_deadline: float | None,
+    ) -> dict[str, Any]:
         try:
-            result = operation(run_id)
+            result = operation(
+                argument,
+                monotonic_deadline=monotonic_deadline,
+            )
         except Exception as exc:
             raise RunnerUnavailableError("Workflow Runner is unavailable") from exc
         if not isinstance(result, dict):

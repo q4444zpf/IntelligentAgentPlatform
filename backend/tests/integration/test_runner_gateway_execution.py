@@ -207,12 +207,6 @@ def test_runner_gateway_normal_path_persists_complete_trace(runner_gateway_env):
     env = runner_gateway_env
     token = env.issue_token()
     headers = env.headers(token)
-    run = env.repository.get_run_by_id("run-1")
-    assert run.status == "pending"
-
-    run.status = "running"
-    env.repository.append_event("run-1", "run.status", {"status": "running"})
-    env.session.commit()
 
     snapshot = env.client.get(
         "/internal/runner/runs/run-1/snapshot",

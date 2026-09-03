@@ -134,7 +134,7 @@ def build_model_client(
         poolclass=StaticPool,
     )
     Base.metadata.create_all(engine)
-    session = Session(engine)
+    session = Session(engine, expire_on_commit=False)
     conversation = Conversation(
         id="conversation-1",
         unit_id="unit-1",
@@ -277,6 +277,50 @@ def test_model_provider_call_runs_outside_gateway_database_transaction():
 
     assert response.status_code == 200
     assert model.in_transaction_during_generate is False
+
+
+@pytest.mark.parametrize("provider_fails", [False, True])
+def test_model_provider_finishing_after_terminal_run_commits_no_result_or_audit(
+    provider_fails,
+):
+    class TerminalDuringGenerateGateway(FakeModelGateway):
+        session = None
+        in_transaction_during_generate = None
+
+        def generate(self, messages, selection=None, tools=None):
+            self.in_transaction_during_generate = self.session.in_transaction()
+            with Session(self.session.bind) as terminal_session:
+                terminal_session.get(AgentRun, "run-1").status = "failed"
+                terminal_session.commit()
+            if provider_fails:
+                raise ModelUpstreamError("late provider failure")
+            return super().generate(messages, selection, tools)
+
+    model = TerminalDuringGenerateGateway()
+    client, session = build_model_client(model)
+    model.session = session
+
+    response = client.post(
+        "/internal/runner/runs/run-1/model-invocations",
+        headers=headers("model-terminal-race"),
+        json=model_request(),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "run_not_active"
+    assert model.in_transaction_during_generate is False
+    reservation = session.scalar(
+        select(RuntimeRunnerRequest).where(
+            RuntimeRunnerRequest.idempotency_key == "model-terminal-race"
+        )
+    )
+    assert reservation is not None
+    assert reservation.response_json == {"__runner_gateway_state__": "pending"}
+    assert session.scalar(
+        select(AuditEvent).where(
+            AuditEvent.action.in_({"llm.invoke.succeeded", "llm.invoke.failed"})
+        )
+    ) is None
 
 
 def test_pending_model_request_returns_stable_idempotency_conflict():

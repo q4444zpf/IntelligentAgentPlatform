@@ -335,6 +335,14 @@ class ExecutionSnapshotService:
         row = self.session.get(RuntimeExecutionSnapshot, snapshot_id)
         return self._stored(row) if row is not None else None
 
+    def get_for_run(self, run_id: str) -> StoredExecutionSnapshot | None:
+        row = self.session.scalar(
+            select(RuntimeExecutionSnapshot).where(
+                RuntimeExecutionSnapshot.run_id == run_id
+            )
+        )
+        return self._stored(row) if row is not None else None
+
     @staticmethod
     def _definition_digest(definition: dict) -> str:
         serialized = json.dumps(
