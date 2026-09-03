@@ -13,7 +13,7 @@ from app.audit.recorder import AuditRecorder
 from app.conversations.models import AgentRun, Conversation, Message
 from app.conversations.repository import ConversationRepository
 from app.db.base import Base
-from app.runtime.checkpoint_store import CheckpointStore
+from app.runtime.checkpoint_store import CheckpointStore, RuntimeRunnerRequest
 from app.runtime.execution_snapshot import (
     ExecutionSnapshotPayload,
     PublishedAgentSnapshot,
@@ -34,6 +34,8 @@ from app.runtime.runner_gateway_auth import (
     runner_gateway_error_handler,
 )
 from app.runtime.runner_gateway_router import create_router
+from app.runtime.runner_gateway_schemas import ModelInvocationRequest
+from app.runtime.runner_gateway_service import _canonical_digest
 
 
 def build_snapshot():
@@ -119,7 +121,12 @@ class FakeModelGateway:
         return self.result
 
 
-def build_model_client(model_gateway, audit_recorder_dependency=AuditRecorder):
+def build_model_client(
+    model_gateway,
+    audit_recorder_dependency=AuditRecorder,
+    *,
+    raise_server_exceptions=True,
+):
     snapshot = build_snapshot()
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
@@ -169,7 +176,9 @@ def build_model_client(model_gateway, audit_recorder_dependency=AuditRecorder):
         ),
         prefix="/internal/runner",
     )
-    return TestClient(app), session
+    return TestClient(
+        app, raise_server_exceptions=raise_server_exceptions
+    ), session
 
 
 def model_request():
@@ -245,6 +254,96 @@ def test_duplicate_model_request_returns_stored_response_without_second_call():
     assert second.status_code == 200
     assert second.json() == first.json()
     assert len(model.selections) == 1
+
+
+def test_model_provider_call_runs_outside_gateway_database_transaction():
+    class TransactionInspectingGateway(FakeModelGateway):
+        session = None
+        in_transaction_during_generate = None
+
+        def generate(self, messages, selection=None, tools=None):
+            self.in_transaction_during_generate = self.session.in_transaction()
+            return super().generate(messages, selection, tools)
+
+    model = TransactionInspectingGateway()
+    client, session = build_model_client(model)
+    model.session = session
+
+    response = client.post(
+        "/internal/runner/runs/run-1/model-invocations",
+        headers=headers(),
+        json=model_request(),
+    )
+
+    assert response.status_code == 200
+    assert model.in_transaction_during_generate is False
+
+
+def test_pending_model_request_returns_stable_idempotency_conflict():
+    model = FakeModelGateway()
+    client, session = build_model_client(
+        model, raise_server_exceptions=False
+    )
+    session.add(
+        RuntimeRunnerRequest(
+            run_id="run-1",
+            action="model.invoke",
+            idempotency_key="model-1",
+            request_digest=_canonical_digest(
+                {
+                    "snapshot_digest": build_snapshot().digest,
+                    "request": ModelInvocationRequest.model_validate(
+                        model_request()
+                    ).model_dump(mode="json"),
+                }
+            ),
+            response_json={"__runner_gateway_state__": "pending"},
+        )
+    )
+    session.commit()
+
+    response = client.post(
+        "/internal/runner/runs/run-1/model-invocations",
+        headers=headers(),
+        json=model_request(),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "idempotency_conflict"
+    assert model.selections == []
+
+
+def test_model_failure_removes_committed_pending_reservation():
+    class ReservationInspectingGateway(FakeModelGateway):
+        session = None
+        saw_pending_reservation = False
+
+        def generate(self, messages, selection=None, tools=None):
+            reservation = self.session.scalar(
+                select(RuntimeRunnerRequest).where(
+                    RuntimeRunnerRequest.run_id == "run-1",
+                    RuntimeRunnerRequest.action == "model.invoke",
+                    RuntimeRunnerRequest.idempotency_key == "model-1",
+                )
+            )
+            self.saw_pending_reservation = reservation is not None
+            return super().generate(messages, selection, tools)
+
+    model = ReservationInspectingGateway(
+        error=ModelUpstreamError("provider-secret")
+    )
+    client, session = build_model_client(model)
+    model.session = session
+
+    response = client.post(
+        "/internal/runner/runs/run-1/model-invocations",
+        headers=headers(),
+        json=model_request(),
+    )
+
+    assert response.status_code == 502
+    assert model.saw_pending_reservation is True
+    assert session.scalar(select(RuntimeRunnerRequest)) is None
 
 
 def test_model_failure_returns_safe_code_and_records_failed_audit():

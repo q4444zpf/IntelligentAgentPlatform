@@ -69,6 +69,13 @@ class AgentStore:
         with self.session_factory() as session:
             return self._decode(session.get(ManagedAgentRecord, agent_id))
 
+    def get_for_update(
+        self,
+        session: Session,
+        agent_id: str,
+    ) -> dict[str, Any] | None:
+        return self._decode(self._lock_agent(session, agent_id))
+
     @staticmethod
     def _decode_default_agent_id(
         row: PlatformSettingRecord | None,

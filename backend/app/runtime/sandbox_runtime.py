@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Any
 
@@ -51,6 +51,10 @@ class _TeamCancelled(RuntimeError):
 
 
 class _TeamRecoveryRequired(RuntimeError):
+    pass
+
+
+class _TeamTimedOut(RuntimeError):
     pass
 
 
@@ -134,7 +138,8 @@ class SandboxRuntime:
         self._event_sequence = 0
 
     def execute(self, request: RunExecutionRequest) -> RunExecutionResult:
-        if request.deadline_at <= datetime.now(timezone.utc):
+        started_at = datetime.now(timezone.utc)
+        if request.deadline_at <= started_at:
             return RunExecutionResult(status="failed", error_code="sandbox_timeout")
         checkpoint_store = None
         model_budget = None
@@ -166,6 +171,10 @@ class SandboxRuntime:
                 "project_id": snapshot.payload.project_id,
             }
             if isinstance(actor, PublishedTeamSnapshot):
+                team_deadline = min(
+                    request.deadline_at,
+                    started_at + timedelta(seconds=actor.timeout_seconds),
+                )
                 result = self._execute_team(
                     request=request,
                     snapshot=snapshot,
@@ -173,6 +182,7 @@ class SandboxRuntime:
                     messages=messages,
                     metadata=metadata,
                     checkpoint_store=checkpoint_store,
+                    deadline_at=team_deadline,
                 )
             else:
                 restored_state = checkpoint_store.load_latest(request.run_id)
@@ -336,6 +346,8 @@ class SandboxRuntime:
                 error_code="sandbox_cancelled",
                 checkpoint_key="team-scheduler",
             )
+        except _TeamTimedOut:
+            return self._fail("sandbox_timeout")
         except _TeamRecoveryRequired:
             return self._fail("team_recovery_required")
         except _AgentRecoveryRequired:
@@ -356,6 +368,7 @@ class SandboxRuntime:
         messages: list[dict[str, Any]],
         metadata: dict[str, Any],
         checkpoint_store: _GatewayCheckpointStore,
+        deadline_at: datetime,
     ) -> RuntimeResult:
         limits = snapshot.payload.limits
         state = self._load_team_state(
@@ -371,6 +384,7 @@ class SandboxRuntime:
                 max_tool_calls=limits.max_tool_calls,
                 max_subagents=limits.max_subagents,
             )
+            self._ensure_team_deadline(deadline_at)
             plan = self._create_team_plan(
                 request,
                 snapshot,
@@ -379,6 +393,7 @@ class SandboxRuntime:
                 metadata,
                 model_budget,
             )
+            self._ensure_team_deadline(deadline_at)
             team_fields = {"team_id": actor.id, "version_id": actor.version_id}
             self._append_event(
                 "team.plan.created",
@@ -427,6 +442,8 @@ class SandboxRuntime:
         completed = {item.task_id: item for item in state.completed_results}
         failed = {item.task_id: item for item in state.failed_results}
         started = set(state.started_task_ids)
+        if failed and actor.failure_strategy == "fail_fast":
+            raise RuntimeError("team member failed")
         task_by_id = {task.id: task for task in state.plan.tasks}
         team_fields = {"team_id": actor.id, "version_id": actor.version_id}
         state = self._normalize_active_invocations(state)
@@ -512,6 +529,7 @@ class SandboxRuntime:
                 if not batch:
                     raise TeamPlanError("team_plan_invalid: task queue stalled")
 
+                self._ensure_team_deadline(deadline_at)
                 self._ensure_team_active(snapshot, actor)
                 for task in batch:
                     if task.id not in started:
@@ -627,6 +645,7 @@ class SandboxRuntime:
                             outcomes.append((task, future.result(), None))
                         except Exception as error:  # noqa: BLE001
                             outcomes.append((task, None, error))
+                self._ensure_team_deadline(deadline_at)
 
                 interruptions = []
                 first_failure = None
@@ -708,6 +727,18 @@ class SandboxRuntime:
                         )
                         active_by_task.pop(task.id, None)
 
+                if first_failure is not None and actor.failure_strategy == "fail_fast":
+                    state = self._state_with_results(
+                        state,
+                        completed,
+                        failed,
+                        started,
+                        stage="executing",
+                        active_invocations=(),
+                    )
+                    self._save_team_state(state, model_budget)
+                    raise first_failure
+
                 if interruptions:
                     state = self._state_with_results(
                         state,
@@ -742,8 +773,6 @@ class SandboxRuntime:
                     state, completed, failed, started, stage="executing"
                 )
                 state = self._save_team_state(state, model_budget)
-                if first_failure is not None and actor.failure_strategy == "fail_fast":
-                    raise first_failure
 
         if state.stage == "completed":
             if state.final_assistant_content is None:
@@ -754,6 +783,7 @@ class SandboxRuntime:
                 state={},
             )
 
+        self._ensure_team_deadline(deadline_at)
         self._ensure_team_active(snapshot, actor)
         if state.stage != "synthesizing":
             self._append_event(
@@ -825,6 +855,7 @@ class SandboxRuntime:
             model_budget,
             legacy_model,
             legacy_tools,
+            invocation_namespace=synthesis_invocation.invocation_id,
         )
         graph = self.agent_factory.build(
             member_agent_snapshot(actor, actor.supervisor.agent_id),
@@ -928,6 +959,7 @@ class SandboxRuntime:
             state = self._save_team_state(state, model_budget)
             self._approval_checkpoint_key = "team-scheduler"
             raise
+        self._ensure_team_deadline(deadline_at)
         content = result.content
         if failed:
             failed_ids = ", ".join(
@@ -1072,6 +1104,7 @@ class SandboxRuntime:
             model_budget,
             legacy_model,
             legacy_tools,
+            invocation_namespace=invocation.invocation_id,
         )
         graph = self.agent_factory.build(
             member_agent_snapshot(actor, task.member_id),
@@ -1135,6 +1168,8 @@ class SandboxRuntime:
         model_budget,
         legacy_model,
         legacy_tools,
+        *,
+        invocation_namespace=None,
     ):
         if snapshot.payload.schema_version != "5":
             return legacy_model, legacy_tools
@@ -1162,6 +1197,7 @@ class SandboxRuntime:
                 set(member.tool_ids) | set(member.knowledge_source_ids)
             ),
             member_agent_id=member.agent_id,
+            invocation_namespace=invocation_namespace,
         )
         return model, tools
 
@@ -1173,22 +1209,27 @@ class SandboxRuntime:
         runner_max_subagents,
     ) -> TeamSchedulerState | None:
         raw = checkpoint_store.load_latest(run_id)
-        if not isinstance(raw, dict) or raw.get("kind") != "team_scheduler":
+        if raw is None and not checkpoint_store.checkpoint_found:
             return None
+        if not isinstance(raw, dict) or raw.get("kind") != "team_scheduler":
+            raise _TeamRecoveryRequired()
         try:
             state = TeamSchedulerState.model_validate(raw)
         except ValidationError as error:
-            raise TeamPlanError("team_checkpoint_invalid: invalid schema") from error
+            raise _TeamRecoveryRequired() from error
         if (
             state.snapshot_digest != checkpoint_store.snapshot_digest
             or state.team_version_id != actor.version_id
         ):
-            raise TeamPlanError("team_checkpoint_invalid: immutable identity")
-        validate_team_plan(
-            state.plan,
-            actor,
-            runner_max_subagents=runner_max_subagents,
-        )
+            raise _TeamRecoveryRequired()
+        try:
+            validate_team_plan(
+                state.plan,
+                actor,
+                runner_max_subagents=runner_max_subagents,
+            )
+        except TeamPlanError as error:
+            raise _TeamRecoveryRequired() from error
         task_ids = {task.id for task in state.plan.tasks}
         settled_ids = {
             *(item.task_id for item in state.completed_results),
@@ -1201,10 +1242,10 @@ class SandboxRuntime:
             or len(settled_ids)
             != len(state.completed_results) + len(state.failed_results)
         ):
-            raise TeamPlanError("team_checkpoint_invalid: task state")
+            raise _TeamRecoveryRequired()
         active_task_ids = [item.task_id for item in state.active_invocations]
         if len(active_task_ids) != len(set(active_task_ids)):
-            raise TeamPlanError("team_checkpoint_invalid: active task")
+            raise _TeamRecoveryRequired()
         synthesis_invocations = tuple(
             item
             for item in state.active_invocations
@@ -1219,13 +1260,13 @@ class SandboxRuntime:
                 or synthesis.invocation_id
                 != self._task_invocation_id(actor, "synthesis")
             ):
-                raise TeamPlanError("team_checkpoint_invalid: active task")
+                raise _TeamRecoveryRequired()
         elif (
             not set(active_task_ids) <= task_ids
             or not set(active_task_ids) <= set(state.started_task_ids)
             or set(active_task_ids) & settled_ids
         ):
-            raise TeamPlanError("team_checkpoint_invalid: active task")
+            raise _TeamRecoveryRequired()
         return state
 
     def _save_team_state(
@@ -1386,6 +1427,11 @@ class SandboxRuntime:
     @staticmethod
     def _task_invocation_id(actor, task_id):
         return f"team:{actor.version_id}:{task_id}"
+
+    @staticmethod
+    def _ensure_team_deadline(deadline_at: datetime) -> None:
+        if datetime.now(timezone.utc) >= deadline_at:
+            raise _TeamTimedOut()
 
     @staticmethod
     def _member_error_code(error):

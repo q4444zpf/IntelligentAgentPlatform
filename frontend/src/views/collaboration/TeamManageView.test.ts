@@ -57,6 +57,21 @@ describe('TeamManageView', () => {
     expect(mocks.publish).toHaveBeenCalledWith('team-1');
   });
 
+  it('opens a newly created empty server draft as a valid editable form', async () => {
+    mocks.getVersion.mockResolvedValue({ ...draft, definition: {} });
+    const wrapper = render(); await flushPromises();
+
+    await wrapper.get('[data-testid="team-edit"]').trigger('click');
+    await flushPromises();
+
+    expect(wrapper.text()).toContain('成员与职责');
+    expect(wrapper.text()).toContain('运行边界');
+    await wrapper.get('[data-testid="team-publish"]').trigger('click');
+    expect(wrapper.text()).toContain('请选择主管智能体');
+    expect(wrapper.text()).toContain('至少选择一个成员智能体');
+    expect(mocks.saveDraft).not.toHaveBeenCalled();
+  });
+
   it('shows field-specific draft validation and does not publish an invalid definition', async () => {
     mocks.getVersion.mockResolvedValue({ ...draft, definition: { ...draft.definition, supervisor: { ...draft.definition.supervisor, agent_id: '' }, members: [] } });
     const wrapper = render(); await flushPromises(); await wrapper.get('[data-testid="team-edit"]').trigger('click'); await flushPromises();

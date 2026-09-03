@@ -882,6 +882,82 @@ def test_team_runtime_allocates_unique_model_requests_across_members_and_supervi
     assert calls[3] == ("supervisor", 3, "model-supervisor-3")
 
 
+def test_team_runtime_namespaces_shared_model_tool_call_id_by_task_invocation():
+    snapshot = _schema_v5_team_snapshot()
+    plan = {
+        "tasks": [
+            {
+                "id": "member-1-task",
+                "member_id": "member-1",
+                "objective": "inspect",
+                "depends_on": [],
+                "position": 0,
+            },
+            {
+                "id": "member-2-task",
+                "member_id": "member-2",
+                "objective": "review",
+                "depends_on": [],
+                "position": 1,
+            },
+        ]
+    }
+
+    class DuplicateRejectingGateway(FakeGateway):
+        def __init__(self):
+            super().__init__(snapshot)
+            self.tool_call_ids = set()
+
+        def invoke_tool(self, **request):
+            if request["tool_call_id"] in self.tool_call_ids:
+                raise RunnerGatewayToolError("tool_duplicate_call")
+            self.tool_call_ids.add(request["tool_call_id"])
+            self.tool_calls.append(deepcopy(request))
+            return {"ok": True}
+
+    class ToolCallingGraph:
+        def __init__(self, tool):
+            self.tool = tool
+
+        def invoke(self, state, *, config=None):
+            self.tool.run({}, tool_call_id="shared-model-call")
+            return {
+                **state,
+                "messages": [
+                    *state["messages"],
+                    {"role": "assistant", "content": "done"},
+                ],
+                "status": "completed",
+            }
+
+    class Factory:
+        def __init__(self):
+            self.supervisor_calls = 0
+
+        def build(self, member, **kwargs):
+            if member.agent_id == "supervisor":
+                self.supervisor_calls += 1
+                if self.supervisor_calls == 1:
+                    return TeamPlanGraph(plan)
+                return TextGraph("synthesized")
+            return ToolCallingGraph(kwargs["tools"][0])
+
+    gateway = DuplicateRejectingGateway()
+    result = SandboxRuntime(gateway, agent_factory=Factory()).execute(
+        _request(snapshot)
+    )
+
+    assert result.status == "completed"
+    assert {request["tool_call_id"] for request in gateway.tool_calls} == {
+        "team:version-1:member-1-task:shared-model-call",
+        "team:version-1:member-2-task:shared-model-call",
+    }
+    assert {request["idempotency_key"] for request in gateway.tool_calls} == {
+        "tool:team:version-1:member-1-task:shared-model-call:0",
+        "tool:team:version-1:member-2-task:shared-model-call:0",
+    }
+
+
 @pytest.mark.parametrize(
     ("limit_updates", "tool_name", "expected_error"),
     [
@@ -1128,6 +1204,251 @@ def test_team_runtime_applies_failure_strategy_and_labels_partial_content(
         assert final_content.startswith("Partial completion:")
         assert "secret failure detail" not in final_content
         assert synthesis_events[0]["payload"]["partial"] is True
+
+
+def test_team_fail_fast_failure_wins_over_parallel_approval_interruption():
+    base = _schema_v5_team_snapshot()
+    actor = base.payload.actor.model_copy(
+        update={"failure_strategy": "fail_fast", "max_parallel_members": 2}
+    )
+    payload = base.payload.model_copy(
+        update={
+            "actor": actor,
+            "limits": base.payload.limits.model_copy(update={"max_iterations": 8}),
+        }
+    )
+    snapshot = base.model_copy(
+        update={
+            "payload": payload,
+            "digest": hashlib.sha256(canonical_snapshot_bytes(payload)).hexdigest(),
+        }
+    )
+    plan = {
+        "tasks": [
+            {
+                "id": "failed-task",
+                "member_id": "member-1",
+                "objective": "inspect",
+                "depends_on": [],
+                "position": 0,
+            },
+            {
+                "id": "approval-task",
+                "member_id": "member-2",
+                "objective": "operate",
+                "depends_on": [],
+                "position": 1,
+            },
+        ]
+    }
+
+    class Factory:
+        def __init__(self):
+            self.supervisor_calls = 0
+
+        def build(self, member, **_kwargs):
+            if member.agent_id == "supervisor":
+                self.supervisor_calls += 1
+                return TeamPlanGraph(plan)
+            if member.agent_id == "member-1":
+                return TextGraph("", error=RuntimeError("member failed"))
+            return TextGraph(
+                "",
+                error=RunnerApprovalInterruption("approval-member-2"),
+            )
+
+    gateway = DurableApprovalGateway(snapshot)
+    result = SandboxRuntime(gateway, agent_factory=Factory()).execute(
+        _request(snapshot)
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "sandbox_failed"
+    assert gateway.latest_checkpoint["state"]["failed_results"] == [
+        {
+            "task_id": "failed-task",
+            "member_agent_id": "member-1",
+            "position": 0,
+            "error_code": "member_execution_failed",
+        }
+    ]
+    assert not any(
+        completion[0].get("status") == "interrupted"
+        for completion in gateway.completions
+    )
+
+
+def test_team_fail_fast_resume_stops_before_replaying_after_persisted_failure():
+    snapshot = _schema_v5_team_snapshot(
+        limits=_snapshot().payload.limits.model_copy(update={"max_iterations": 8})
+    )
+    plan = TeamPlan(
+        tasks=(
+            TeamTask(
+                id="failed-task",
+                member_id="member-1",
+                objective="inspect",
+                position=0,
+            ),
+            TeamTask(
+                id="pending-task",
+                member_id="member-2",
+                objective="operate",
+                position=1,
+            ),
+        )
+    )
+    checkpoint = TeamSchedulerState(
+        stage="executing",
+        snapshot_digest=snapshot.digest,
+        team_version_id="version-1",
+        plan=plan,
+        pending_task_ids=("pending-task",),
+        started_task_ids=("failed-task",),
+        failed_results=(
+            {
+                "task_id": "failed-task",
+                "member_agent_id": "member-1",
+                "position": 0,
+                "error_code": "member_execution_failed",
+            },
+        ),
+        budget=TeamBudgetState(
+            next_invocation_sequence=0,
+            tool_call_count=0,
+            subagent_call_count=0,
+        ),
+    ).model_dump(mode="json")
+
+    class CheckpointGateway(DurableApprovalGateway):
+        def __init__(self, value):
+            super().__init__(value)
+            self.latest_checkpoint = {
+                "checkpoint_key": "team-scheduler",
+                "snapshot_digest": value.digest,
+                "state": checkpoint,
+            }
+
+    class RejectingFactory:
+        def __init__(self):
+            self.build_calls = 0
+
+        def build(self, *_args, **_kwargs):
+            self.build_calls += 1
+            raise AssertionError("fail-fast checkpoint replayed pending work")
+
+    gateway = CheckpointGateway(snapshot)
+    factory = RejectingFactory()
+    result = SandboxRuntime(gateway, agent_factory=factory).execute(
+        _request(snapshot)
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "sandbox_failed"
+    assert factory.build_calls == 0
+
+
+@pytest.mark.parametrize(
+    "checkpoint_state",
+    [
+        {"kind": "unrelated_checkpoint"},
+        {"kind": "team_scheduler"},
+        None,
+    ],
+)
+def test_team_runtime_fails_recovery_when_a_found_checkpoint_is_not_valid_team_state(
+    checkpoint_state,
+):
+    snapshot = _schema_v5_team_snapshot()
+
+    class InvalidCheckpointGateway(FakeGateway):
+        def get_latest_checkpoint(self):
+            self.checkpoint_reads += 1
+            return {
+                "checkpoint_key": "legacy-or-corrupt",
+                "snapshot_digest": snapshot.digest,
+                "state": checkpoint_state,
+            }
+
+    class RejectingFactory:
+        def __init__(self):
+            self.build_calls = 0
+
+        def build(self, *_args, **_kwargs):
+            self.build_calls += 1
+            raise AssertionError("invalid checkpoint entered fresh execution")
+
+    gateway = InvalidCheckpointGateway(snapshot)
+    factory = RejectingFactory()
+    result = SandboxRuntime(gateway, agent_factory=factory).execute(
+        _request(snapshot)
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == "team_recovery_required"
+    assert factory.build_calls == 0
+
+
+def test_team_timeout_applies_during_execution_before_member_dequeue(monkeypatch):
+    base = _schema_v5_team_snapshot()
+    actor = base.payload.actor.model_copy(update={"timeout_seconds": 1})
+    payload = base.payload.model_copy(update={"actor": actor})
+    snapshot = base.model_copy(
+        update={
+            "payload": payload,
+            "digest": hashlib.sha256(canonical_snapshot_bytes(payload)).hexdigest(),
+        }
+    )
+    plan = {
+        "tasks": [
+            {
+                "id": "late-task",
+                "member_id": "member-1",
+                "objective": "inspect",
+                "depends_on": [],
+                "position": 0,
+            }
+        ]
+    }
+    started_at = datetime(2026, 9, 3, 9, 0, tzinfo=UTC)
+
+    class AdvancingDateTime:
+        calls = 0
+
+        @classmethod
+        def now(cls, _timezone):
+            cls.calls += 1
+            if cls.calls <= 2:
+                return started_at
+            return started_at + timedelta(seconds=2)
+
+    class Factory:
+        def __init__(self):
+            self.supervisor_calls = 0
+            self.member_calls = 0
+
+        def build(self, member, **_kwargs):
+            if member.agent_id == "supervisor":
+                self.supervisor_calls += 1
+                return TeamPlanGraph(plan)
+            self.member_calls += 1
+            return TextGraph("too late")
+
+    request = _request(snapshot).model_copy(
+        update={"deadline_at": started_at + timedelta(minutes=5)}
+    )
+    monkeypatch.setattr(
+        "app.runtime.sandbox_runtime.datetime",
+        AdvancingDateTime,
+    )
+    gateway = FakeGateway(snapshot)
+    factory = Factory()
+    result = SandboxRuntime(gateway, agent_factory=factory).execute(request)
+
+    assert result.status == "failed"
+    assert result.error_code == "sandbox_timeout"
+    assert factory.supervisor_calls == 1
+    assert factory.member_calls == 0
 
 
 @pytest.mark.parametrize(
@@ -1394,7 +1715,12 @@ def test_team_approval_restart_restores_exact_task_events_and_shared_budget_stat
         for request, _ in gateway.model_calls
     ) == 1
     assert len(gateway.tool_calls) == 2
-    assert gateway.tool_calls[0] == gateway.tool_calls[1]
+    assert gateway.tool_calls[0]["tool_call_id"] == (
+        "team:version-1:approval-task:approval-tool-call"
+    )
+    assert gateway.tool_calls[1]["tool_call_id"] == (
+        "persisted-approval-invocation:approval-tool-call"
+    )
     assert gateway.tool_calls[0]["member_agent_id"] == "member-2"
     assert resumed_states[0]["team_task_invocation_id"] == persisted_invocation_id
     approval_registrations = [
@@ -1742,9 +2068,12 @@ def test_team_synthesis_approval_restart_preserves_exact_graph_frontier():
     synthesis_tool_calls = [
         request
         for request in gateway.tool_calls
-        if request["tool_call_id"] == "synthesis-approval-tool-call"
+        if request["tool_call_id"].endswith(":synthesis-approval-tool-call")
     ]
     assert len(synthesis_tool_calls) == 2
+    assert {
+        request["tool_call_id"] for request in synthesis_tool_calls
+    } == {"team:version-1:synthesis:synthesis-approval-tool-call"}
     assert synthesis_tool_calls[0] == synthesis_tool_calls[1]
     assert [event["sequence"] for event in gateway.events] == list(
         range(1, len(gateway.events) + 1)

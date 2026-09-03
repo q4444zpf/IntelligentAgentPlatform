@@ -447,6 +447,90 @@ def test_agent_list_detail_and_default_fail_closed_outside_persisted_scope(clien
     assert common.json()["allowed_project_ids"] == ["*"]
 
 
+@pytest.mark.parametrize(
+    "operation",
+    ["set_default", "update", "toggle", "pin", "copy", "delete"],
+)
+def test_project_admin_mutations_fail_closed_outside_exact_agent_scope(
+    client,
+    operation,
+):
+    created = client.post("/api/agents", json=agent_payload())
+    assert created.status_code == 201
+    service = client.app.state.agent_service
+    with service.store.session_factory.begin() as session:
+        scoped = session.get(ManagedAgentRecord, "reservoir-dispatch")
+        scoped.project_id = "other-project"
+
+    if operation == "set_default":
+        response = client.put(
+            "/api/agents/default",
+            json={"agent_id": "reservoir-dispatch"},
+        )
+    elif operation == "update":
+        response = client.put(
+            "/api/agents/reservoir-dispatch",
+            json={
+                key: value
+                for key, value in agent_payload(name="越权修改").items()
+                if key != "id"
+            },
+        )
+    elif operation == "toggle":
+        response = client.patch(
+            "/api/agents/reservoir-dispatch/toggle",
+            json={"enabled": False},
+        )
+    elif operation == "pin":
+        response = client.patch(
+            "/api/agents/reservoir-dispatch/pin",
+            json={"pinned": True},
+        )
+    elif operation == "copy":
+        response = client.post(
+            "/api/agents/reservoir-dispatch/copy",
+            json={
+                "id": "unauthorized-copy",
+                "name": "越权副本",
+                "copy_skills": False,
+            },
+        )
+    else:
+        response = client.delete("/api/agents/reservoir-dispatch")
+
+    assert response.status_code == 404
+
+
+def test_only_unit_admin_can_mutate_common_agent(client):
+    service = client.app.state.agent_service
+    workspace = service.workspace_root / "common-agent"
+    workspace.mkdir()
+    (workspace / "AGENTS.md").write_text("# Common\n", encoding="utf-8")
+    service.store.create(
+        "common-agent",
+        AgentConfig(name="公共智能体").model_dump(),
+        str(workspace),
+        availability_scope="common",
+        unit_id=None,
+        project_id=None,
+        allowed_project_ids=["*"],
+    )
+
+    denied = client.patch(
+        "/api/agents/common-agent/pin",
+        json={"pinned": True},
+    )
+    allowed = client.patch(
+        "/api/agents/common-agent/pin",
+        json={"pinned": True},
+        headers={"X-User-Roles": "unit_admin"},
+    )
+
+    assert denied.status_code == 404
+    assert allowed.status_code == 200
+    assert allowed.json()["pinned"] is True
+
+
 def test_agent_knowledge_sources_are_persisted_and_must_be_available_knowledge_tools(client):
     service = client.app.state.agent_service
     with service.tool_service.store.session_factory.begin() as session:
@@ -916,15 +1000,23 @@ def test_rejects_disabled_or_missing_default_target(client):
 
 
 def test_rejects_deleting_or_disabling_active_default(client):
-    assert client.delete(f"/api/agents/{BUILTIN_AGENT_ID}").status_code == 409
+    unit_admin = {"X-User-Roles": "unit_admin"}
+    assert (
+        client.delete(
+            f"/api/agents/{BUILTIN_AGENT_ID}", headers=unit_admin
+        ).status_code
+        == 409
+    )
     disabled = client.patch(
         f"/api/agents/{BUILTIN_AGENT_ID}/toggle",
         json={"enabled": False},
+        headers=unit_admin,
     )
     assert disabled.status_code == 409
     enabled = client.patch(
         f"/api/agents/{BUILTIN_AGENT_ID}/toggle",
         json={"enabled": True},
+        headers=unit_admin,
     )
     assert enabled.status_code == 200
     assert enabled.json()["is_default"] is True
@@ -951,6 +1043,7 @@ def test_old_ordinary_default_can_be_disabled_and_deleted_after_switch(client):
         client.put(
         "/api/agents/default",
         json={"agent_id": BUILTIN_AGENT_ID},
+        headers={"X-User-Roles": "unit_admin"},
         ).status_code
         == 200
     )
@@ -974,7 +1067,10 @@ def test_builtin_agent_cannot_be_deleted_after_default_switch(client):
         == 200
     )
 
-    deleted = client.delete(f"/api/agents/{BUILTIN_AGENT_ID}")
+    deleted = client.delete(
+        f"/api/agents/{BUILTIN_AGENT_ID}",
+        headers={"X-User-Roles": "unit_admin"},
+    )
 
     assert deleted.status_code == 409
     assert client.get(f"/api/agents/{BUILTIN_AGENT_ID}").status_code == 200
@@ -1110,11 +1206,16 @@ def test_delete_restores_quarantined_workspace_when_audit_fails(tmp_path):
     store = AgentStore(factory)
     root = tmp_path / "workspaces"
     service = AgentService(store, workspace_root=root)
-    service.create(AgentCreateRequest(**agent_payload(skill_names=[])))
+    context = RequestContext(unit_id="unit-1", project_id="p1", user_id="u1")
+    with factory() as session:
+        service.create(
+            AgentCreateRequest(**agent_payload(skill_names=[])),
+            context=context,
+            session=session,
+        )
     workspace = root / "reservoir-dispatch"
     assert workspace.is_dir()
     failing = AgentService(store, workspace_root=root, audit_recorder=FailingRecorder())
-    context = RequestContext(unit_id="unit-1", project_id="p1", user_id="u1")
     with factory() as session, pytest.raises(RuntimeError, match="audit unavailable"):
         failing.delete(
             "reservoir-dispatch",
@@ -1152,7 +1253,11 @@ def test_protected_agent_delete_records_failed_audit_in_fresh_transaction(client
 
     response = client.delete(
         f"/api/agents/{BUILTIN_AGENT_ID}",
-        headers={**AUTH_HEADERS, "X-Request-ID": "protected-delete-1"},
+        headers={
+            **AUTH_HEADERS,
+            "X-User-Roles": "unit_admin",
+            "X-Request-ID": "protected-delete-1",
+        },
     )
     assert response.status_code == 409
     factory = client.app.state.agent_service.store.session_factory
@@ -1241,7 +1346,13 @@ def test_update_restores_workspace_after_partial_write_failure(tmp_path, monkeyp
     factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
     store = AgentStore(factory)
     service = AgentService(store, workspace_root=tmp_path / "workspaces")
-    service.create(AgentCreateRequest(**agent_payload(skill_names=[])))
+    context = RequestContext(unit_id="unit-1", project_id="p1", user_id="u1")
+    with factory() as session:
+        service.create(
+            AgentCreateRequest(**agent_payload(skill_names=[])),
+            context=context,
+            session=session,
+        )
     agents_file = tmp_path / "workspaces" / "reservoir-dispatch" / "AGENTS.md"
     previous = agents_file.read_bytes()
     original_write_bytes = Path.write_bytes
@@ -1256,7 +1367,6 @@ def test_update_restores_workspace_after_partial_write_failure(tmp_path, monkeyp
 
     monkeypatch.setattr(Path, "write_bytes", partial_write_then_fail)
     updated = AgentConfig(**agent_payload(name="Changed", skill_names=[]))
-    context = RequestContext(unit_id="unit-1", project_id="p1", user_id="u1")
     with factory() as session, pytest.raises(OSError, match="disk write failed"):
         service.update(
             "reservoir-dispatch",

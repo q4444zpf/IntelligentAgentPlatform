@@ -1,27 +1,8 @@
 import { request } from './client';
+import type { TeamDraft, TeamFailureStrategy, TeamMemberDraft } from './teamDraft';
 
-export type TeamFailureStrategy = 'fail_fast' | 'continue_then_synthesize';
-
-export interface TeamMemberDraft {
-  agent_id: string;
-  responsibility: string;
-  tool_ids: string[];
-  skill_names: string[];
-  knowledge_source_ids: string[];
-}
-
-export interface TeamDraft {
-  supervisor: TeamMemberDraft;
-  members: TeamMemberDraft[];
-  tool_ids: string[];
-  skill_names: string[];
-  knowledge_source_ids: string[];
-  max_steps: number;
-  max_parallel_members: number;
-  timeout_seconds: number;
-  failure_strategy: TeamFailureStrategy;
-  approval_policy_id: string | null;
-}
+export { normalizeTeamDraft } from './teamDraft';
+export type { TeamDraft, TeamFailureStrategy, TeamMemberDraft } from './teamDraft';
 
 export interface TeamMemberInfo {
   agent_id: string;

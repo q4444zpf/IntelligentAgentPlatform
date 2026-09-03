@@ -24,6 +24,7 @@ from app.runtime.execution_snapshot import (
     SnapshotModelSelection, SnapshotRuntimeLimits, SnapshotTeamMember,
     canonical_snapshot_bytes,
 )
+from app.runtime.runner_gateway_client import RunnerGatewayBusinessError
 from app.runtime.runner_gateway_schemas import SnapshotResponse
 from app.runtime.sandbox_runtime import SandboxRuntime
 
@@ -199,7 +200,7 @@ class RuntimeGateway:
         self.snapshot = snapshot; self.events = []; self.completions = []
 
     def get_snapshot(self): return self.snapshot
-    def get_latest_checkpoint(self): return None
+    def get_latest_checkpoint(self): raise RunnerGatewayBusinessError("checkpoint_not_found")
     def save_checkpoint(self, checkpoint_key, state, idempotency_key): return {"checkpoint_key": checkpoint_key, "state": state}
     def register_artifact_capability(self, **request): return f"capability:{request['invocation_id']}"
     def append_event(self, **request): self.events.append(request); return request

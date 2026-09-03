@@ -1,12 +1,29 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { request } from './client';
-import { teamsApi } from './teams';
+import { normalizeTeamDraft, teamsApi } from './teams';
 
 vi.mock('./client', () => ({ request: vi.fn() }));
 
 describe('teamsApi', () => {
   beforeEach(() => vi.clearAllMocks());
+
+  it('normalizes an empty persisted draft into an editable Team definition', () => {
+    expect(normalizeTeamDraft({})).toEqual({
+      supervisor: {
+        agent_id: '', responsibility: '', tool_ids: [], skill_names: [], knowledge_source_ids: [],
+      },
+      members: [],
+      tool_ids: [],
+      skill_names: [],
+      knowledge_source_ids: [],
+      max_steps: 8,
+      max_parallel_members: 1,
+      timeout_seconds: 600,
+      failure_strategy: 'fail_fast',
+      approval_policy_id: null,
+    });
+  });
 
   it('uses the scoped Team catalogue and encodes resource ids', async () => {
     vi.mocked(request).mockResolvedValue([]);

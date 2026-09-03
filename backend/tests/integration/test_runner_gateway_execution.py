@@ -1,10 +1,22 @@
 import base64
 import hashlib
 
+import pytest
 from sqlalchemy import select
 
 from app.audit.models import AuditEvent
 from app.conversations.models import Message, ToolInvocation
+from app.identity.models import (
+    Permission,
+    Project,
+    ProjectMembership,
+    ProjectMembershipRole,
+    Role,
+    RolePermission,
+    Unit,
+    UnitMembership,
+    User,
+)
 from app.runtime.execution_snapshot import (
     PublishedAgentSnapshot,
     PublishedTeamSnapshot,
@@ -16,7 +28,81 @@ from app.runtime.execution_snapshot import (
 from app.runtime.model_gateway import ModelResult
 
 
+def _install_team_tool_identity(env):
+    env.session.add_all(
+        [
+            User(
+                id="user-1",
+                display_name="Current operator",
+                email=None,
+                status="active",
+                authorization_version=1,
+            ),
+            Unit(id="unit-1", code="unit-1", name="Unit 1", status="active"),
+            Project(
+                id="project-1",
+                unit_id="unit-1",
+                code="project-1",
+                name="Project 1",
+                status="active",
+            ),
+            UnitMembership(
+                id="unit-membership-1",
+                user_id="user-1",
+                unit_id="unit-1",
+                status="active",
+            ),
+            ProjectMembership(
+                id="project-membership-1",
+                user_id="user-1",
+                unit_id="unit-1",
+                project_id="project-1",
+                status="active",
+            ),
+            Permission(
+                id="permission-tool-invoke",
+                code="tool.invoke",
+                resource="tool",
+                action="invoke",
+                risk_level="medium",
+                status="active",
+            ),
+            Role(
+                id="role-current-operator",
+                code="current_operator",
+                name="Current operator",
+                scope_type="project",
+                unit_id="unit-1",
+                built_in=False,
+                status="active",
+            ),
+        ]
+    )
+    env.session.flush()
+    env.session.add_all(
+        [
+            RolePermission(
+                id="role-permission-tool-invoke",
+                role_id="role-current-operator",
+                permission_code="tool.invoke",
+                unit_id="unit-1",
+                data_scope="project",
+            ),
+            ProjectMembershipRole(
+                id="project-membership-role-1",
+                user_id="user-1",
+                unit_id="unit-1",
+                project_id="project-1",
+                role_id="role-current-operator",
+                scope_type="project",
+            ),
+        ]
+    )
+    env.session.commit()
+
+
 def _install_team_snapshot(env, *, include_second_member=False):
+    _install_team_tool_identity(env)
     stored = env.snapshots["run-1"]
     tools = {tool.tool_id: tool for tool in stored.payload.tools}
     supervisor_tool = tools["system.get_runtime_context"]
@@ -421,3 +507,75 @@ def test_team_tool_invocation_is_restricted_to_the_captured_member(
     assert sibling_tool.status_code == 403
     assert accepted.status_code == 200
     assert supervisor_tool.tool_id != member_tool.tool_id
+
+
+def test_team_tool_invocation_uses_current_roles_not_accepted_run_roles(
+    runner_gateway_env,
+    monkeypatch,
+):
+    env = runner_gateway_env
+    _, _, member_tool = _install_team_snapshot(env)
+    token = env.issue_token()
+    contexts = []
+    execute = env.tool_gateway.execute
+
+    def capture_context(call, context, authorized_tool_ids):
+        contexts.append(context)
+        return execute(call, context, authorized_tool_ids)
+
+    monkeypatch.setattr(env.tool_gateway, "execute", capture_context)
+    response = env.client.post(
+        "/internal/runner/runs/run-1/tool-invocations",
+        headers=env.headers(token, "tool:current-role"),
+        json={
+            "tool_call_id": "call-current-role",
+            "tool_id": member_tool.tool_id,
+            "version": member_tool.version,
+            "arguments": {"timezone": "Asia/Shanghai"},
+            "invocation_sequence": 0,
+            "member_agent_id": "member-1",
+        },
+    )
+
+    assert response.status_code == 200
+    assert contexts[0].actor_roles == ("current_operator",)
+
+
+@pytest.mark.parametrize(
+    "revoked_resource",
+    ["user", "unit_membership", "project", "project_membership", "permission"],
+)
+def test_team_tool_invocation_rejects_revoked_current_authorization(
+    runner_gateway_env,
+    revoked_resource,
+):
+    env = runner_gateway_env
+    _, _, member_tool = _install_team_snapshot(env)
+    if revoked_resource == "user":
+        env.session.get(User, "user-1").status = "inactive"
+    elif revoked_resource == "unit_membership":
+        env.session.get(UnitMembership, "unit-membership-1").status = "inactive"
+    elif revoked_resource == "project":
+        env.session.get(Project, "project-1").status = "inactive"
+    elif revoked_resource == "project_membership":
+        env.session.get(ProjectMembership, "project-membership-1").status = "inactive"
+    else:
+        env.session.get(Permission, "permission-tool-invoke").status = "inactive"
+    env.session.commit()
+    token = env.issue_token()
+
+    response = env.client.post(
+        "/internal/runner/runs/run-1/tool-invocations",
+        headers=env.headers(token, f"tool:revoked:{revoked_resource}"),
+        json={
+            "tool_call_id": f"call-revoked-{revoked_resource}",
+            "tool_id": member_tool.tool_id,
+            "version": member_tool.version,
+            "arguments": {"timezone": "Asia/Shanghai"},
+            "invocation_sequence": 0,
+            "member_agent_id": "member-1",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "tool_not_authorized"

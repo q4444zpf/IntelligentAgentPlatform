@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from itertools import count
 from typing import Any, Protocol
 
@@ -47,9 +48,15 @@ def build_gateway_tools(
     *,
     allowed_tool_ids: set[str] | None = None,
     member_agent_id: str | None = None,
+    invocation_namespace: str | None = None,
 ) -> list[StructuredTool]:
     return [
-        _build_tool(tool, client, member_agent_id=member_agent_id)
+        _build_tool(
+            tool,
+            client,
+            member_agent_id=member_agent_id,
+            invocation_namespace=invocation_namespace,
+        )
         for tool in snapshot.tools
         if tool.published
         and tool.enabled
@@ -63,6 +70,7 @@ def _build_tool(
     client: RunnerToolClient,
     *,
     member_agent_id: str | None = None,
+    invocation_namespace: str | None = None,
 ) -> StructuredTool:
     sequences = count()
 
@@ -70,14 +78,22 @@ def _build_tool(
         if not _tool_call_id:
             raise RunnerGatewayToolError("tool_execution_failed")
         sequence = next(sequences)
+        tool_call_id = _tool_call_id
+        if invocation_namespace is not None:
+            candidate = f"{invocation_namespace}:{_tool_call_id}"
+            tool_call_id = (
+                candidate
+                if len(candidate) <= 128
+                else f"team-tool:{hashlib.sha256(candidate.encode('utf-8')).hexdigest()}"
+            )
         try:
             request = {
                 "tool_id": tool.tool_id,
                 "version": tool.version,
-                "tool_call_id": _tool_call_id,
+                "tool_call_id": tool_call_id,
                 "arguments": arguments,
                 "invocation_sequence": sequence,
-                "idempotency_key": f"tool:{_tool_call_id}:{sequence}",
+                "idempotency_key": f"tool:{tool_call_id}:{sequence}",
             }
             if member_agent_id is not None:
                 request["member_agent_id"] = member_agent_id

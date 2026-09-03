@@ -329,6 +329,60 @@ def test_build_gateway_tools_uses_snapshot_schema_and_model_tool_call_id():
     assert tool.args_schema == build_snapshot().payload.tools[0].input_schema
 
 
+def test_team_gateway_tools_namespace_model_call_ids_by_persisted_invocation():
+    first_client = FakeRunnerGatewayClient()
+    second_client = FakeRunnerGatewayClient()
+    first_tool = build_gateway_tools(
+        build_snapshot().payload,
+        first_client,
+        invocation_namespace="team:version-1:task-a",
+    )[0]
+    second_tool = build_gateway_tools(
+        build_snapshot().payload,
+        second_client,
+        invocation_namespace="team:version-1:task-b",
+    )[0]
+
+    first_tool.run({"station": "A"}, tool_call_id="model-call-1")
+    second_tool.run({"station": "A"}, tool_call_id="model-call-1")
+
+    first_request = first_client.calls[0]
+    second_request = second_client.calls[0]
+    assert first_request["tool_call_id"] == (
+        "team:version-1:task-a:model-call-1"
+    )
+    assert second_request["tool_call_id"] == (
+        "team:version-1:task-b:model-call-1"
+    )
+    assert first_request["tool_call_id"] != second_request["tool_call_id"]
+    assert first_request["idempotency_key"] == (
+        "tool:team:version-1:task-a:model-call-1:0"
+    )
+    assert second_request["idempotency_key"] == (
+        "tool:team:version-1:task-b:model-call-1:0"
+    )
+
+
+def test_team_gateway_tool_namespace_is_stable_and_bounded():
+    namespace = "team:" + "v" * 128 + ":" + "task" * 32
+    calls = []
+    for _ in range(2):
+        client = FakeRunnerGatewayClient()
+        tool = build_gateway_tools(
+            build_snapshot().payload,
+            client,
+            invocation_namespace=namespace,
+        )[0]
+        tool.run({"station": "A"}, tool_call_id="m" * 128)
+        calls.append(client.calls[0])
+
+    assert calls[0] == calls[1]
+    assert len(calls[0]["tool_call_id"]) <= 128
+    assert calls[0]["idempotency_key"] == (
+        f"tool:{calls[0]['tool_call_id']}:0"
+    )
+
+
 def test_gateway_tool_maps_approval_to_typed_interruption():
     client = FakeRunnerGatewayClient(
         RunnerGatewayToolError(

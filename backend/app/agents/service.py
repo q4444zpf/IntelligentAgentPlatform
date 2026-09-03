@@ -292,6 +292,32 @@ class AgentService:
         except ToolValidationError as error:
             raise AgentValidationError(str(error)) from error
 
+    def _require_mutation_scope(
+        self,
+        agent_id: str,
+        context: RequestContext | None,
+        session: Session | None,
+    ) -> dict | None:
+        if context is None:
+            return None
+        record = (
+            self.store.get_for_update(session, agent_id)
+            if session is not None
+            else self.store.get(agent_id)
+        )
+        if record is None:
+            raise AgentNotFoundError(agent_id)
+        is_unit_admin = "unit_admin" in context.roles
+        if record["availability_scope"] == "common":
+            allowed = is_unit_admin
+        else:
+            allowed = record["unit_id"] == context.unit_id and (
+                is_unit_admin or record["project_id"] == context.project_id
+            )
+        if not allowed:
+            raise AgentNotFoundError(agent_id)
+        return record
+
     def list(self, *, context: RequestContext | None = None) -> list[AgentInfo]:
         self._ensure_default_agent()
         default_id = self.store.get_default_id().agent_id
@@ -344,6 +370,7 @@ class AgentService:
         request_id: str | None = None,
     ) -> AgentInfo:
         self._ensure_default_agent()
+        self._require_mutation_scope(agent_id, context, session)
         pointer = self.store.get_default_id()
         if context is None or session is None:
             record = self._call_store_mutation(
@@ -480,6 +507,7 @@ class AgentService:
         request_id: str | None = None,
     ) -> AgentInfo:
         self._ensure_default_agent()
+        self._require_mutation_scope(agent_id, context, session)
         self._validate_skills(request.skill_names)
         self._validate_tools(request.tool_ids)
         self._validate_knowledge_sources(request.knowledge_source_ids)
@@ -538,6 +566,7 @@ class AgentService:
         request_id: str | None = None,
     ) -> AgentInfo:
         self._ensure_default_agent()
+        self._require_mutation_scope(agent_id, context, session)
         if context is None or session is None:
             record = self._call_store_mutation(
                 lambda: self.store.set_enabled_agent(agent_id, enabled)
@@ -569,6 +598,7 @@ class AgentService:
         request_id: str | None = None,
     ) -> AgentInfo:
         self._ensure_default_agent()
+        self._require_mutation_scope(agent_id, context, session)
         record = (
             self.store.set_pinned(agent_id, pinned)
             if context is None or session is None
@@ -598,7 +628,9 @@ class AgentService:
         request_id: str | None = None,
     ) -> AgentInfo:
         self._ensure_default_agent()
-        source = self.store.get(source_id)
+        source = self._require_mutation_scope(source_id, context, session)
+        if source is None:
+            source = self.store.get(source_id)
         if not source:
             raise AgentNotFoundError(source_id)
         config = {
@@ -625,7 +657,9 @@ class AgentService:
         request_id: str | None = None,
     ) -> None:
         self._ensure_default_agent()
-        existing = self.store.get(agent_id)
+        existing = self._require_mutation_scope(agent_id, context, session)
+        if existing is None:
+            existing = self.store.get(agent_id)
         if existing is None:
             raise AgentNotFoundError(agent_id)
         workspace, _ = self._validated_workspace(existing["workspace_dir"])

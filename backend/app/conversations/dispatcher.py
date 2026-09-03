@@ -13,6 +13,9 @@ from app.approvals.models import Approval
 from app.artifacts.storage import S3ObjectStorage
 from app.core.config import RunnerTokenSettings
 from app.core.database import SessionFactory
+from app.identity.authorization import AuthorizationService
+from app.identity.repository import AuthorizationRepository
+from app.identity.schemas import ResourceScope
 from app.mcp.protocol import McpProtocolClient
 from app.mcp.store import McpStore
 from app.model_providers.store import ProviderStore
@@ -58,14 +61,6 @@ def _execute_approved_tool(
         context_data = repository.get_run_execution_context(run_id)
         if context_data is None:
             return None
-        context = ToolExecutionContext(
-            unit_id=context_data["unit_id"],
-            run_id=run_id,
-            conversation_id=context_data["conversation_id"],
-            project_id=context_data["project_id"],
-            user_id=context_data["user_id"],
-            actor_roles=context_data["actor_roles"],
-        )
         gateway = ToolGateway(
             tool_store=ToolStore(session_factory),
             repository=repository,
@@ -73,6 +68,41 @@ def _execute_approved_tool(
             mcp_protocol_client=McpProtocolClient(),
         )
         try:
+            actor_roles = tuple(context_data["actor_roles"])
+            if run.actor_type == "team":
+                try:
+                    authorization = AuthorizationRepository(
+                        session
+                    ).load_current_context(
+                        str(context_data["user_id"]),
+                        str(context_data["unit_id"]),
+                        str(context_data["project_id"]),
+                    )
+                except LookupError as error:
+                    raise ToolRuntimeError(
+                        "tool_not_authorized", "该工具当前不可用。"
+                    ) from error
+                if not AuthorizationService().allows(
+                    authorization,
+                    "tool.invoke",
+                    ResourceScope(
+                        str(context_data["unit_id"]),
+                        str(context_data["project_id"]),
+                        str(context_data["user_id"]),
+                    ),
+                ):
+                    raise ToolRuntimeError(
+                        "tool_not_authorized", "该工具当前不可用。"
+                    )
+                actor_roles = authorization.role_codes
+            context = ToolExecutionContext(
+                unit_id=context_data["unit_id"],
+                run_id=run_id,
+                conversation_id=context_data["conversation_id"],
+                project_id=context_data["project_id"],
+                user_id=context_data["user_id"],
+                actor_roles=actor_roles,
+            )
             gateway.execute_approved(approval_id, context)
         except ToolRuntimeError as error:
             transition = session.execute(

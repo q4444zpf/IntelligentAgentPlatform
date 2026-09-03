@@ -96,7 +96,8 @@ import { computed, onMounted, reactive, ref } from 'vue';
 import { message } from 'ant-design-vue';
 import { agentsApi, type AgentInfo } from '@/api/agents';
 import { skillsApi, type SkillInfo } from '@/api/skills';
-import { teamsApi, type TeamDraft, type TeamSummary, type TeamVersionInfo } from '@/api/teams';
+import { normalizeTeamDraft, type TeamDraft } from '@/api/teamDraft';
+import { teamsApi, type TeamSummary, type TeamVersionInfo } from '@/api/teams';
 import { toolsApi, type ToolInfo } from '@/api/tools';
 import { usePermissionStore } from '@/stores/permission';
 
@@ -133,7 +134,7 @@ function agentName(id?: string | null) { return availableAgents.value.find((agen
 function formatTime(value?: string | null) { return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '-'; }
 function openCreate() { createForm.name = ''; createForm.description = ''; createOpen.value = true; }
 async function createTeam() { if (!createForm.name.trim()) { message.error('请输入团队名称'); return; } const created = await teamsApi.create({ name: createForm.name.trim(), description: createForm.description.trim() }); teams.value.push(created); createOpen.value = false; await openEdit(created); }
-async function openEdit(team: TeamSummary) { selectedTeam.value = team; historyOnly.value = false; validationErrors.value = []; drawerOpen.value = true; const [savedDraft, history] = await Promise.all([teamsApi.getVersion(team.id, 0), teamsApi.listVersions(team.id)]); draft.value = structuredClone(savedDraft.definition); versions.value = history; }
+async function openEdit(team: TeamSummary) { selectedTeam.value = team; historyOnly.value = false; validationErrors.value = []; drawerOpen.value = true; const [savedDraft, history] = await Promise.all([teamsApi.getVersion(team.id, 0), teamsApi.listVersions(team.id)]); draft.value = normalizeTeamDraft(savedDraft.definition); versions.value = history; }
 async function openHistory(team: TeamSummary) { selectedTeam.value = team; historyOnly.value = true; draft.value = null; drawerOpen.value = true; versions.value = await teamsApi.listVersions(team.id); }
 function addMember() { draft.value?.members.push({ agent_id: '', responsibility: '', tool_ids: [], skill_names: [], knowledge_source_ids: [] }); }
 function agentById(agentId: string) { return availableAgents.value.find((agent) => agent.id === agentId); }

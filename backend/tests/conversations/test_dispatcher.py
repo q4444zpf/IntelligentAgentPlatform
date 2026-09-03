@@ -9,6 +9,7 @@ from app.approvals.service import arguments_digest
 from app.conversations.dispatcher import (
     SandboxRunDispatcher,
     ThreadRunDispatcher,
+    _execute_approved_tool,
     build_default_run_dispatcher,
 )
 from app.conversations.models import (
@@ -20,10 +21,17 @@ from app.conversations.models import (
 )
 from app.db.base import Base
 from app.db.platform_models import RegisteredToolRecord
+from app.identity.models import (
+    Project,
+    ProjectMembership,
+    Unit,
+    UnitMembership,
+    User,
+)
 from app.runtime.checkpoint_store import RuntimeCheckpoint
 from app.runtime.model_gateway import ModelResult, ModelSelection
 from app.tools.builtins import BUILTIN_TOOL_DEFINITIONS
-from app.tools.schemas import ToolCall, ToolRuntimeError
+from app.tools.schemas import ToolCall, ToolExecutionResult, ToolRuntimeError
 from app.tools.store import ToolStore
 
 
@@ -382,6 +390,130 @@ def test_sandbox_dispatcher_executes_approved_tool_before_resuming_run(tmp_path)
         assert session.get(ToolInvocation, invocation.id).status == "completed"
         assert session.get(AgentRun, run_id).status == "queued"
     assert coordinator.executed == [run_id]
+
+
+def test_team_approval_resume_rechecks_current_membership_before_side_effect(
+    tmp_path,
+    monkeypatch,
+):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'team-approval-auth.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+
+    with factory.begin() as session:
+        conversation = Conversation(
+            unit_id="unit-1",
+            project_id="p-tool",
+            owner_id="u-tool",
+            title="团队审批授权",
+        )
+        session.add(conversation)
+        session.flush()
+        message = Message(
+            conversation_id=conversation.id,
+            role="user",
+            content="执行控制操作",
+        )
+        session.add(message)
+        session.flush()
+        run = AgentRun(
+            conversation_id=conversation.id,
+            trigger_message_id=message.id,
+            actor_type="team",
+            actor_id="team-1",
+            actor_version_id="team-version-1",
+            actor_roles_json=["stale_operator"],
+            status="queued",
+        )
+        session.add(run)
+        session.flush()
+        invocation = ToolInvocation(
+            run_id=run.id,
+            tool_call_id="team-approval-call",
+            tool_id="system.get_current_time",
+            tool_version="1.0.0",
+            status="waiting_approval",
+            arguments_summary={},
+        )
+        session.add(invocation)
+        session.flush()
+        approval = Approval(
+            id="team-approval-1",
+            run_id=run.id,
+            invocation_id=invocation.id,
+            tool_id=invocation.tool_id,
+            tool_version=invocation.tool_version,
+            unit_id="unit-1",
+            project_id="p-tool",
+            requester_id="u-tool",
+            requester_roles=["stale_operator"],
+            assignee_role="project_admin",
+            risk_level="high",
+            arguments_summary={},
+            arguments_digest=arguments_digest({}),
+            status="approved",
+            expires_at=datetime(2026, 9, 4, tzinfo=timezone.utc),
+        )
+        session.add_all(
+            [
+                approval,
+                User(
+                    id="u-tool",
+                    display_name="Former operator",
+                    email=None,
+                    status="active",
+                    authorization_version=1,
+                ),
+                Unit(id="unit-1", code="unit-1", name="Unit", status="active"),
+                Project(
+                    id="p-tool",
+                    unit_id="unit-1",
+                    code="p-tool",
+                    name="Project",
+                    status="active",
+                ),
+                UnitMembership(
+                    id="unit-membership-tool",
+                    user_id="u-tool",
+                    unit_id="unit-1",
+                    status="inactive",
+                ),
+                ProjectMembership(
+                    id="project-membership-tool",
+                    user_id="u-tool",
+                    unit_id="unit-1",
+                    project_id="p-tool",
+                    status="active",
+                ),
+            ]
+        )
+        approval_id = approval.id
+        run_id = run.id
+        invocation_id = invocation.id
+
+    executed = []
+
+    def record_approved_tool(self, current_approval_id, context):
+        executed.append((current_approval_id, context))
+        return ToolExecutionResult(invocation_id, {"executed": True})
+
+    monkeypatch.setattr(
+        "app.conversations.dispatcher.ToolGateway.execute_approved",
+        record_approved_tool,
+    )
+
+    assert _execute_approved_tool(factory, approval_id) is None
+    with factory() as session:
+        assert session.get(AgentRun, run_id).status == "failed"
+        assert session.get(ToolInvocation, invocation_id).status == "waiting_approval"
+        error = session.scalar(
+            select(RunEvent).where(
+                RunEvent.run_id == run_id,
+                RunEvent.event_type == "run.error",
+            )
+        )
+        assert error.payload["code"] == "tool_not_authorized"
+    assert executed == []
 
 
 def test_sandbox_dispatcher_does_not_resume_a_run_cancelled_before_worker_claim(tmp_path):

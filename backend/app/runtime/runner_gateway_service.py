@@ -26,6 +26,9 @@ from app.artifacts.service import (
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.conversations.models import AgentRun, RunEvent
 from app.conversations.repository import ConversationRepository
+from app.identity.authorization import AuthorizationService
+from app.identity.repository import AuthorizationRepository
+from app.identity.schemas import ResourceScope
 from app.tools.gateway import ToolGateway
 from app.tools.schemas import (
     ToolCall,
@@ -79,6 +82,8 @@ from .team_graph import (
 )
 
 logger = logging.getLogger(__name__)
+
+_PENDING_MODEL_RESPONSE = {"__runner_gateway_state__": "pending"}
 
 
 def _canonical_digest(value: dict[str, object]) -> str:
@@ -346,6 +351,14 @@ class RunnerGatewayService:
             requests, run_id, action, idempotency_key, request_digest
         )
         if replay is not None:
+            if replay == _PENDING_MODEL_RESPONSE:
+                repository.session.rollback()
+                raise RunnerGatewayError(
+                    409,
+                    "idempotency_conflict",
+                    "模型调用正在处理中",
+                )
+            repository.session.commit()
             return ModelInvocationResponse.model_validate(replay)
 
         if team_member is None:
@@ -399,11 +412,36 @@ class RunnerGatewayService:
             message.model_dump(mode="json", exclude_none=True)
             for message in request.messages
         ]
+        requests.add(
+            run_id=run_id,
+            action=action,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+            response_json=dict(_PENDING_MODEL_RESPONSE),
+        )
+        repository.session.commit()
         started = perf_counter()
         try:
             result = model_gateway.generate(messages, selection, tools=tools)
         except ModelRuntimeError as error:
             repository.session.rollback()
+            try:
+                self._lock_run(repository, run_id)
+                reservation = requests.get(run_id, action, idempotency_key)
+                if (
+                    reservation is not None
+                    and reservation.request_digest == request_digest
+                    and reservation.response_json == _PENDING_MODEL_RESPONSE
+                ):
+                    repository.session.delete(reservation)
+                repository.session.commit()
+            except Exception as persistence_error:
+                repository.session.rollback()
+                raise RunnerGatewayError(
+                    500,
+                    "audit_persistence_failed",
+                    "模型调用记录保存失败",
+                ) from persistence_error
             try:
                 self._record_model_audit(
                     repository,
@@ -444,6 +482,14 @@ class RunnerGatewayService:
         )
         duration_ms = max(0, round((perf_counter() - started) * 1000))
         try:
+            self._lock_run(repository, run_id)
+            reservation = requests.get(run_id, action, idempotency_key)
+            if (
+                reservation is None
+                or reservation.request_digest != request_digest
+                or reservation.response_json != _PENDING_MODEL_RESPONSE
+            ):
+                raise RuntimeError("model invocation reservation was lost")
             self._record_model_audit(
                 repository,
                 snapshot,
@@ -453,13 +499,7 @@ class RunnerGatewayService:
                 duration_ms=duration_ms,
                 response=response,
             )
-            requests.add(
-                run_id=run_id,
-                action=action,
-                idempotency_key=idempotency_key,
-                request_digest=request_digest,
-                response_json=response.model_dump(mode="json"),
-            )
+            reservation.response_json = response.model_dump(mode="json")
             repository.session.commit()
         except Exception as error:
             repository.session.rollback()
@@ -573,6 +613,36 @@ class RunnerGatewayService:
             )
 
         self._lock_run(repository, run_id)
+        context_data = repository.get_run_execution_context(run_id)
+        if context_data is None:
+            raise RunnerGatewayError(404, "run_not_found", "Run 不存在")
+        actor_roles = tuple(context_data["actor_roles"])
+        if isinstance(snapshot.payload.actor, PublishedTeamSnapshot):
+            try:
+                authorization = AuthorizationRepository(
+                    repository.session
+                ).load_current_context(
+                    str(context_data["user_id"]),
+                    str(context_data["unit_id"]),
+                    str(context_data["project_id"]),
+                )
+            except LookupError as error:
+                raise RunnerGatewayError(
+                    403, "tool_not_authorized", "该工具当前不可用"
+                ) from error
+            if not AuthorizationService().allows(
+                authorization,
+                "tool.invoke",
+                ResourceScope(
+                    str(context_data["unit_id"]),
+                    str(context_data["project_id"]),
+                    str(context_data["user_id"]),
+                ),
+            ):
+                raise RunnerGatewayError(
+                    403, "tool_not_authorized", "该工具当前不可用"
+                )
+            actor_roles = authorization.role_codes
         requests = RunnerRequestStore(repository.session)
         action = "tool.invoke"
         request_digest = _canonical_digest(
@@ -619,16 +689,13 @@ class RunnerGatewayService:
                 repository.session.commit()
                 return response
 
-        context_data = repository.get_run_execution_context(run_id)
-        if context_data is None:
-            raise RunnerGatewayError(404, "run_not_found", "Run 不存在")
         context = ToolExecutionContext(
             unit_id=str(context_data["unit_id"]),
             run_id=run_id,
             conversation_id=str(context_data["conversation_id"]),
             project_id=str(context_data["project_id"]),
             user_id=str(context_data["user_id"]),
-            actor_roles=tuple(context_data["actor_roles"]),
+            actor_roles=actor_roles,
         )
         call = ToolCall(
             id=request.tool_call_id,
