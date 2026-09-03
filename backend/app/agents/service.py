@@ -249,7 +249,7 @@ class AgentService:
         for _ in range(3):
             pointer = self.store.get_default_id()
             selected = self.store.get(pointer.agent_id) if pointer.agent_id else None
-            if selected is not None and selected["enabled"]:
+            if self.store.is_platform_default_eligible(selected):
                 return
             try:
                 self.store.set_default_id(
@@ -261,7 +261,7 @@ class AgentService:
                 continue
         pointer = self.store.get_default_id()
         selected = self.store.get(pointer.agent_id) if pointer.agent_id else None
-        if selected is None or not selected["enabled"]:
+        if not self.store.is_platform_default_eligible(selected):
             raise AgentConcurrentUpdateError(
                 "Default agent changed concurrently; retry the request"
             )

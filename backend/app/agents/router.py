@@ -91,6 +91,17 @@ def create_router(service: AgentService | None = None) -> APIRouter:
         record_failed_management(manager.store.session_factory, manager.audit_recorder, context, source="agent", action=action, resource_type="agent", resource_id=resource_id, error_code="PERMISSION_DENIED", request_id=management_request_id(request))
         raise HTTPException(status_code=403, detail="Administrator permission is required")
 
+    def require_default_agent_admin(
+        request: Request,
+        context: RequestContext = Depends(require_request_context),
+    ) -> RequestContext:
+        if "unit_admin" in context.roles:
+            request.state.management_context = context
+            management_request_id(request)
+            return context
+        record_failed_management(manager.store.session_factory, manager.audit_recorder, context, source="agent", action="resource.updated", resource_type="agent", resource_id="agents", error_code="PERMISSION_DENIED", request_id=management_request_id(request))
+        raise HTTPException(status_code=403, detail="Unit administrator permission is required")
+
 
     @router.get("", response_model=list[AgentInfo])
     def list_agents(context: RequestContext = Depends(require_request_context)):
@@ -117,7 +128,7 @@ def create_router(service: AgentService | None = None) -> APIRouter:
         )
 
     @router.put("/default", response_model=AgentInfo)
-    def set_default_agent(request: AgentDefaultRequest, context: RequestContext = Depends(require_agent_admin), request_id: str = Depends(management_request_id)):
+    def set_default_agent(request: AgentDefaultRequest, context: RequestContext = Depends(require_default_agent_admin), request_id: str = Depends(management_request_id)):
         with manager.store.session_factory() as session:
             return call_management(lambda: manager.set_default(request.agent_id, context=context, session=session, request_id=request_id), session, context, request_id, "resource.updated", request.agent_id)
 
