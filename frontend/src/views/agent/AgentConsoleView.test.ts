@@ -10,15 +10,18 @@ const mocks = vi.hoisted(() => ({
   listArtifacts: vi.fn(),
   downloadArtifact: vi.fn(),
   previewArtifact: vi.fn(),
+  listTeams: vi.fn(),
+  getTeamVersion: vi.fn(),
 }));
 
-const store = reactive({ conversations: [] as Array<Record<string, unknown>>, activeConversationId: 'c1', messages: [] as Array<Record<string, unknown>>, activeRun: { id: 'r1', status: 'running' }, error: '', sending: false, toolActivities: [
+const store = reactive({ conversations: [] as Array<Record<string, unknown>>, activeConversationId: 'c1', messages: [] as Array<Record<string, unknown>>, activeRun: { id: 'r1', status: 'running' }, events: [] as Array<Record<string, unknown>>, error: '', sending: false, toolActivities: [
   { invocation_id: 'i1', display_name: '获取当前时间', tool_id: 'system.time', status: 'running', duration_ms: null, sequence: 1 },
   { invocation_id: 'i2', display_name: '运行上下文', tool_id: 'system.context', status: 'completed', duration_ms: 12, sequence: 2 },
   { invocation_id: 'i3', display_name: '失败工具', tool_id: 'system.fail', status: 'failed', duration_ms: 7, sequence: 3 },
 ], secret: 'SECRET_SENTINEL', loadConversations: vi.fn(), selectConversation: vi.fn(), startNewConversation: vi.fn(), sendMessage: vi.fn() });
 vi.mock('@/stores/conversations', () => ({ useConversationStore: () => store }));
 vi.mock('@/api/agents', () => ({ agentsApi: { list: vi.fn().mockResolvedValue([]) } }));
+vi.mock('@/api/teams', () => ({ teamsApi: { list: mocks.listTeams, getVersion: mocks.getTeamVersion } }));
 vi.mock('@/api/artifacts', () => ({
   artifactsApi: {
     list: mocks.listArtifacts,
@@ -65,13 +68,17 @@ beforeEach(() => {
   store.conversations = [];
   store.activeConversationId = 'c1';
   store.messages = [];
+  store.events = [];
   store.selectConversation.mockClear();
   store.startNewConversation.mockClear();
+  store.sendMessage.mockClear();
   mocks.listArtifacts.mockReset();
   mocks.downloadArtifact.mockReset();
   mocks.previewArtifact.mockReset();
   mocks.listArtifacts.mockResolvedValue([]);
   mocks.previewArtifact.mockResolvedValue({ url: 'https://objects.example/signed' });
+  mocks.listTeams.mockReset(); mocks.getTeamVersion.mockReset();
+  mocks.listTeams.mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -299,7 +306,51 @@ describe('AgentConsoleView runtime contract', () => {
     expect(source).toContain('hasExplicitAgentSelection'); expect(source).toContain('selectedAgentId.value || undefined');
     expect(source).not.toContain('arguments_summary'); expect(source).not.toContain('result_summary');
     expect(source).not.toContain('setTimeout'); expect(source).not.toContain('initialMessages'); expect(source).not.toContain('沙箱已隔离');
-    expect(source).toContain("const mode = ref<ChatMode>('single')"); expect(source).toContain('title="多智能体运行时开发中" disabled');
+    expect(source).toContain("const mode = ref<ChatMode>('single')"); expect(source).not.toContain('多智能体运行时开发中');
     expect(source).toContain("agent.enabled && (agent.runtime_form === 'web' || agent.runtime_form === 'common')");
+  });
+});
+
+describe('AgentConsoleView Team runs', () => {
+  const team = { id: 'team-1', name: '北江联合研判', description: '防洪会商', enabled: true, published_version: 2, supervisor: { agent_id: 'forecast', responsibility: '统筹研判' }, member_count: 1 };
+  const version = { version: 2, definition: { supervisor: { agent_id: 'forecast', responsibility: '统筹研判' }, members: [{ agent_id: 'review', responsibility: '复核成果' }] } };
+
+  it('selects an enabled published Team and sends its real actor id', async () => {
+    mocks.listTeams.mockResolvedValue([team, { ...team, id: 'disabled', enabled: false }, { ...team, id: 'draft', published_version: null }]);
+    mocks.getTeamVersion.mockResolvedValue(version);
+    store.sendMessage.mockResolvedValue(undefined);
+    const wrapper = mount(AgentConsoleView, { global: { stubs } }); await flushPromises();
+    expect(mocks.listTeams).toHaveBeenCalledWith({ enabled: true, published: true });
+    await wrapper.get('[data-testid="mode-team"]').trigger('click');
+    await wrapper.get('textarea').setValue('联合研判');
+    await wrapper.get('[data-testid="send-message"]').trigger('click'); await flushPromises();
+    expect(store.sendMessage).toHaveBeenCalledWith('联合研判', 'team', 'team-1');
+    expect(wrapper.text()).toContain('统筹研判'); expect(wrapper.text()).toContain('复核成果');
+    expect(wrapper.text()).toContain('防洪会商');
+    expect(wrapper.text()).not.toContain('统筹预报分析、GIS 空间研判和调度方案生成');
+    wrapper.unmount();
+  });
+
+  it('shows an explicit empty state and prevents Team submission without a catalogue', async () => {
+    const wrapper = mount(AgentConsoleView, { global: { stubs } }); await flushPromises();
+    await wrapper.get('[data-testid="mode-team"]').trigger('click');
+    expect(wrapper.text()).toContain('当前项目暂无可运行团队');
+    await wrapper.get('textarea').setValue('联合研判');
+    expect(wrapper.get('[data-testid="send-message"]').attributes('disabled')).toBeDefined();
+    wrapper.unmount();
+  });
+
+  it('renders member task and partial synthesis progress without raw prompts', async () => {
+    mocks.listTeams.mockResolvedValue([team]); mocks.getTeamVersion.mockResolvedValue(version);
+    store.events = [
+      { sequence: 2, event_type: 'team.task.completed', payload: { agent_id: 'review', task_id: 'task-1', prompt: 'SECRET_PROMPT' } },
+      { sequence: 3, event_type: 'team.synthesis.completed', payload: { partial: true, trace: 'SECRET_TRACE' } },
+    ];
+    const wrapper = mount(AgentConsoleView, { global: { stubs } }); await flushPromises();
+    await wrapper.get('[data-testid="mode-team"]').trigger('click');
+    expect(wrapper.text()).toContain('review · 任务 task-1 已完成');
+    expect(wrapper.text()).toContain('团队汇总已完成（部分完成）');
+    expect(wrapper.text()).not.toContain('SECRET_');
+    wrapper.unmount();
   });
 });

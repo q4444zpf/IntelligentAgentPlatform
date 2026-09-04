@@ -24,7 +24,7 @@ class MessageCreate(BaseModel):
     content: str = Field(min_length=1, max_length=50_000)
     actor_type: Literal["agent", "team"]
     actor_id: str | None = Field(
-        default=None, pattern=r"^[a-z][a-z0-9_-]{0,63}$"
+        default=None, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$"
     )
 
 
@@ -47,6 +47,7 @@ class AgentRunInfo(BaseModel):
     trigger_message_id: str
     actor_type: Literal["agent", "team"]
     actor_id: str
+    actor_version_id: str | None = None
     status: str
     created_at: datetime
     updated_at: datetime

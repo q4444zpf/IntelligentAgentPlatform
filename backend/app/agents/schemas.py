@@ -1,14 +1,18 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 RuntimeForm = Literal["web", "desktop", "common"]
 ApprovalPolicy = Literal["never", "control_commands", "always"]
+AvailabilityScope = Literal["project", "common"]
 
 
 class AgentConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str | None = Field(default=None, exclude=True)
     name: str = Field(min_length=1, max_length=120)
     description: str = Field(default="", max_length=500)
     runtime_form: RuntimeForm = "common"
@@ -20,9 +24,10 @@ class AgentConfig(BaseModel):
     approval_policy: ApprovalPolicy = "control_commands"
     skill_names: list[str] = Field(default_factory=list, max_length=100)
     tool_ids: list[str] = Field(default_factory=list, max_length=100)
+    knowledge_source_ids: list[str] = Field(default_factory=list, max_length=100)
     enabled: bool = True
 
-    @field_validator("skill_names", "tool_ids")
+    @field_validator("skill_names", "tool_ids", "knowledge_source_ids")
     @classmethod
     def normalize_skills(cls, value: list[str]) -> list[str]:
         return list(dict.fromkeys(name.strip() for name in value if name.strip()))
@@ -53,9 +58,20 @@ class AgentDefaultRequest(BaseModel):
 class AgentInfo(AgentConfig):
     id: str
     pinned: bool = False
+    availability_scope: AvailabilityScope = "project"
+    unit_id: str | None = "__internal__"
+    project_id: str | None = "__internal__"
+    allowed_project_ids: list[str] = Field(default_factory=list)
     is_builtin: bool
     is_default: bool
     startup_status: Literal["ready", "disabled"]
     workspace_dir: str
     created_at: datetime
     updated_at: datetime
+
+    def is_available_to(self, unit_id: str, project_id: str) -> bool:
+        if self.availability_scope == "project":
+            return self.unit_id == unit_id and self.project_id == project_id
+        return bool(self.allowed_project_ids) and (
+            "*" in self.allowed_project_ids or project_id in self.allowed_project_ids
+        )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException
@@ -17,6 +18,7 @@ class ContainerCreateRequest(BaseModel):
     agent_version: str
     checkpoint_key: str
     deadline_at: str
+    execution_deadline_at: str
     snapshot_id: str
     snapshot_digest: str
     gateway_url: str
@@ -37,6 +39,26 @@ def create_launcher_app(launcher: Any, *, runner_token: str) -> FastAPI:
 
     def auth_headers(authorization: str | None, x_run_id: str | None) -> None:
         authorize(authorization, x_run_id)
+
+    def require_active_deadline(value: str | None) -> None:
+        if value is None:
+            return
+        try:
+            deadline_at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Sandbox execution deadline is invalid",
+            ) from exc
+        if (
+            deadline_at.tzinfo is None
+            or deadline_at.utcoffset() is None
+            or datetime.now(UTC) >= deadline_at
+        ):
+            raise HTTPException(
+                status_code=504,
+                detail="Sandbox execution deadline expired",
+            )
 
     def run_operation(operation):
         try:
@@ -59,9 +81,12 @@ def create_launcher_app(launcher: Any, *, runner_token: str) -> FastAPI:
         request: ContainerCreateRequest,
         authorization: str | None = Header(default=None),
         x_run_id: str | None = Header(default=None),
+        x_request_deadline_at: str | None = Header(default=None),
     ) -> dict[str, Any]:
         auth_headers(authorization, x_run_id)
         authorize(authorization, x_run_id, run_id)
+        require_active_deadline(x_request_deadline_at)
+        require_active_deadline(request.execution_deadline_at)
         return run_operation(lambda: launcher.create(run_id, request.model_dump()))
 
     @app.get("/runs/{run_id}/container")
@@ -69,8 +94,10 @@ def create_launcher_app(launcher: Any, *, runner_token: str) -> FastAPI:
         run_id: str,
         authorization: str | None = Header(default=None),
         x_run_id: str | None = Header(default=None),
+        x_request_deadline_at: str | None = Header(default=None),
     ) -> dict[str, Any]:
         authorize(authorization, x_run_id, run_id)
+        require_active_deadline(x_request_deadline_at)
         return run_operation(lambda: launcher.inspect(run_id))
 
     @app.post("/runs/{run_id}/container/terminate")
@@ -78,8 +105,10 @@ def create_launcher_app(launcher: Any, *, runner_token: str) -> FastAPI:
         run_id: str,
         authorization: str | None = Header(default=None),
         x_run_id: str | None = Header(default=None),
+        x_request_deadline_at: str | None = Header(default=None),
     ) -> dict[str, Any]:
         authorize(authorization, x_run_id, run_id)
+        require_active_deadline(x_request_deadline_at)
         return run_operation(lambda: launcher.terminate(run_id))
 
     @app.delete("/runs/{run_id}/container")
@@ -87,8 +116,10 @@ def create_launcher_app(launcher: Any, *, runner_token: str) -> FastAPI:
         run_id: str,
         authorization: str | None = Header(default=None),
         x_run_id: str | None = Header(default=None),
+        x_request_deadline_at: str | None = Header(default=None),
     ) -> dict[str, Any]:
         authorize(authorization, x_run_id, run_id)
+        require_active_deadline(x_request_deadline_at)
         return run_operation(lambda: launcher.cleanup(run_id))
 
     return app

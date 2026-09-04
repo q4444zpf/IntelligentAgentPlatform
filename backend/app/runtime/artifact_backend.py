@@ -58,8 +58,25 @@ class RunnerArtifactClient(Protocol):
 
 
 class ArtifactBackend(BackendProtocol):
-    def __init__(self, client: RunnerArtifactClient) -> None:
+    def __init__(
+        self,
+        client: RunnerArtifactClient,
+        *,
+        provenance: dict[str, str] | None = None,
+        capability: str | None = None,
+    ) -> None:
         self.client = client
+        self.capability = capability
+        allowed = {
+            "team_version_id",
+            "member_agent_id",
+            "task_id",
+            "invocation_id",
+        }
+        self.provenance = {
+            key: value for key, value in (provenance or {}).items()
+            if key in allowed and isinstance(value, str) and value
+        }
 
     def _create(
         self,
@@ -76,6 +93,8 @@ class ArtifactBackend(BackendProtocol):
             data=data,
             content_type=content_type,
             sha256=digest,
+            provenance=self.provenance or None,
+            capability=self.capability,
             idempotency_key=f"artifact:{hashlib.sha256(normalized.encode()).hexdigest()}:{digest}",
         )
         return _artifact_file(response)

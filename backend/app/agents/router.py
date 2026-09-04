@@ -91,10 +91,20 @@ def create_router(service: AgentService | None = None) -> APIRouter:
         record_failed_management(manager.store.session_factory, manager.audit_recorder, context, source="agent", action=action, resource_type="agent", resource_id=resource_id, error_code="PERMISSION_DENIED", request_id=management_request_id(request))
         raise HTTPException(status_code=403, detail="Administrator permission is required")
 
+    def require_default_agent_admin(
+        request: Request,
+        context: RequestContext = Depends(require_request_context),
+    ) -> RequestContext:
+        record_failed_management(manager.store.session_factory, manager.audit_recorder, context, source="agent", action="resource.updated", resource_type="agent", resource_id="agents", error_code="PERMISSION_DENIED", request_id=management_request_id(request))
+        raise HTTPException(
+            status_code=403,
+            detail="Platform default mutation requires system authority",
+        )
+
 
     @router.get("", response_model=list[AgentInfo])
-    def list_agents():
-        return manager.list()
+    def list_agents(context: RequestContext = Depends(require_request_context)):
+        return manager.list(context=context)
 
     @router.post("", response_model=AgentInfo, status_code=201)
     def create_agent(
@@ -106,17 +116,33 @@ def create_router(service: AgentService | None = None) -> APIRouter:
             return call_management(lambda: manager.create(request, context=context, session=session, request_id=request_id), session, context, request_id, "resource.created", request.id)
 
     @router.get("/default", response_model=AgentInfo)
-    def get_default_agent():
-        return call(manager.get_default)
+    def get_default_agent(
+        context: RequestContext = Depends(require_request_context),
+    ):
+        return call(
+            lambda: manager.get_default_available(
+                unit_id=context.unit_id,
+                project_id=context.project_id,
+            )
+        )
 
     @router.put("/default", response_model=AgentInfo)
-    def set_default_agent(request: AgentDefaultRequest, context: RequestContext = Depends(require_agent_admin), request_id: str = Depends(management_request_id)):
+    def set_default_agent(request: AgentDefaultRequest, context: RequestContext = Depends(require_default_agent_admin), request_id: str = Depends(management_request_id)):
         with manager.store.session_factory() as session:
             return call_management(lambda: manager.set_default(request.agent_id, context=context, session=session, request_id=request_id), session, context, request_id, "resource.updated", request.agent_id)
 
     @router.get("/{agent_id}", response_model=AgentInfo)
-    def get_agent(agent_id: str):
-        return call(lambda: manager.get(agent_id))
+    def get_agent(
+        agent_id: str,
+        context: RequestContext = Depends(require_request_context),
+    ):
+        return call(
+            lambda: manager.get_available(
+                agent_id,
+                unit_id=context.unit_id,
+                project_id=context.project_id,
+            )
+        )
 
     @router.put("/{agent_id}", response_model=AgentInfo)
     def update_agent(agent_id: str, request: AgentConfig, context: RequestContext = Depends(require_agent_admin), request_id: str = Depends(management_request_id)):

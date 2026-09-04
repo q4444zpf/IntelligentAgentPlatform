@@ -223,6 +223,10 @@ class AgentService:
                     BUILTIN_AGENT_ID,
                     BUILTIN_AGENT_CONFIG.model_dump(),
                     str(workspace),
+                    availability_scope="common",
+                    unit_id=None,
+                    project_id=None,
+                    allowed_project_ids=["*"],
                 )
             except IntegrityError:
                 record = self.store.get(BUILTIN_AGENT_ID)
@@ -245,7 +249,7 @@ class AgentService:
         for _ in range(3):
             pointer = self.store.get_default_id()
             selected = self.store.get(pointer.agent_id) if pointer.agent_id else None
-            if selected is not None and selected["enabled"]:
+            if self.store.is_platform_default_eligible(selected):
                 return
             try:
                 self.store.set_default_id(
@@ -257,7 +261,7 @@ class AgentService:
                 continue
         pointer = self.store.get_default_id()
         selected = self.store.get(pointer.agent_id) if pointer.agent_id else None
-        if selected is None or not selected["enabled"]:
+        if not self.store.is_platform_default_eligible(selected):
             raise AgentConcurrentUpdateError(
                 "Default agent changed concurrently; retry the request"
             )
@@ -280,12 +284,53 @@ class AgentService:
         except ToolValidationError as error:
             raise AgentValidationError(str(error)) from error
 
-    def list(self) -> list[AgentInfo]:
+    def _validate_knowledge_sources(self, tool_ids: list[str]) -> None:
+        try:
+            self.tool_service.resolve_knowledge_sources(tool_ids)
+        except ToolNotFoundError as error:
+            raise AgentValidationError(f"Unknown knowledge source: {error}") from error
+        except ToolValidationError as error:
+            raise AgentValidationError(str(error)) from error
+
+    def _require_mutation_scope(
+        self,
+        agent_id: str,
+        context: RequestContext | None,
+        session: Session | None,
+    ) -> dict | None:
+        if context is None:
+            return None
+        record = (
+            self.store.get_for_update(session, agent_id)
+            if session is not None
+            else self.store.get(agent_id)
+        )
+        if record is None:
+            raise AgentNotFoundError(agent_id)
+        is_unit_admin = "unit_admin" in context.roles
+        if record["availability_scope"] == "common":
+            allowed = is_unit_admin
+        else:
+            allowed = record["unit_id"] == context.unit_id and (
+                is_unit_admin or record["project_id"] == context.project_id
+            )
+        if not allowed:
+            raise AgentNotFoundError(agent_id)
+        return record
+
+    def list(self, *, context: RequestContext | None = None) -> list[AgentInfo]:
         self._ensure_default_agent()
         default_id = self.store.get_default_id().agent_id
-        return [
+        agents = [
             self._info(record, default_id=default_id) for record in self.store.list()
         ]
+        if context is not None:
+            agents = [
+                agent
+                for agent in agents
+                if agent.is_available_to(context.unit_id, context.project_id)
+            ]
+        return agents
 
     def get(self, agent_id: str) -> AgentInfo:
         self._ensure_default_agent()
@@ -293,6 +338,20 @@ class AgentService:
         if not record:
             raise AgentNotFoundError(agent_id)
         return self._info(record)
+
+    def get_available(
+        self, agent_id: str, *, unit_id: str, project_id: str
+    ) -> AgentInfo:
+        agent = self.get(agent_id)
+        if not agent.is_available_to(unit_id, project_id):
+            raise AgentNotFoundError(agent_id)
+        return agent
+
+    def get_default_available(self, *, unit_id: str, project_id: str) -> AgentInfo:
+        agent = self.get_default()
+        if not agent.is_available_to(unit_id, project_id):
+            raise AgentNotFoundError(agent.id)
+        return agent
 
     def get_default(self) -> AgentInfo:
         self._ensure_default_agent()
@@ -311,6 +370,7 @@ class AgentService:
         request_id: str | None = None,
     ) -> AgentInfo:
         self._ensure_default_agent()
+        self._require_mutation_scope(agent_id, context, session)
         pointer = self.store.get_default_id()
         if context is None or session is None:
             record = self._call_store_mutation(
@@ -367,12 +427,19 @@ class AgentService:
             raise AgentConflictError(f"Agent '{request.id}' already exists")
         self._validate_skills(request.skill_names)
         self._validate_tools(request.tool_ids)
+        self._validate_knowledge_sources(request.knowledge_source_ids)
         config = AgentConfig(**request.model_dump(exclude={"id"}))
         workspace = self._initialize_workspace(request.id, config)
         if context is None or session is None:
             try:
                 record = self.store.create(
-                    request.id, config.model_dump(), str(workspace)
+                    request.id,
+                    config.model_dump(),
+                    str(workspace),
+                    availability_scope="project",
+                    unit_id="__internal__",
+                    project_id="__internal__",
+                    allowed_project_ids=[],
                 )
             except IntegrityError as error:
                 shutil.rmtree(workspace, ignore_errors=True)
@@ -382,7 +449,14 @@ class AgentService:
             return self._info(record)
         try:
             record = self.store.create_in_session(
-                session, request.id, config.model_dump(), str(workspace)
+                session,
+                request.id,
+                config.model_dump(),
+                str(workspace),
+                availability_scope="project",
+                unit_id=context.unit_id,
+                project_id=context.project_id,
+                allowed_project_ids=[],
             )
             self.audit_recorder.record(
                 session,
@@ -433,8 +507,10 @@ class AgentService:
         request_id: str | None = None,
     ) -> AgentInfo:
         self._ensure_default_agent()
+        self._require_mutation_scope(agent_id, context, session)
         self._validate_skills(request.skill_names)
         self._validate_tools(request.tool_ids)
+        self._validate_knowledge_sources(request.knowledge_source_ids)
         if context is None or session is None:
             record = self._call_store_mutation(
                 lambda: self.store.update_agent(agent_id, request.model_dump())
@@ -490,6 +566,7 @@ class AgentService:
         request_id: str | None = None,
     ) -> AgentInfo:
         self._ensure_default_agent()
+        self._require_mutation_scope(agent_id, context, session)
         if context is None or session is None:
             record = self._call_store_mutation(
                 lambda: self.store.set_enabled_agent(agent_id, enabled)
@@ -521,6 +598,7 @@ class AgentService:
         request_id: str | None = None,
     ) -> AgentInfo:
         self._ensure_default_agent()
+        self._require_mutation_scope(agent_id, context, session)
         record = (
             self.store.set_pinned(agent_id, pinned)
             if context is None or session is None
@@ -550,10 +628,16 @@ class AgentService:
         request_id: str | None = None,
     ) -> AgentInfo:
         self._ensure_default_agent()
-        source = self.store.get(source_id)
+        source = self._require_mutation_scope(source_id, context, session)
+        if source is None:
+            source = self.store.get(source_id)
         if not source:
             raise AgentNotFoundError(source_id)
-        config = {name: source[name] for name in AgentConfig.model_fields}
+        config = {
+            name: source[name]
+            for name in AgentConfig.model_fields
+            if name != "id"
+        }
         config["name"] = request.name
         config["skill_names"] = config["skill_names"] if request.copy_skills else []
         config["enabled"] = False
@@ -573,7 +657,9 @@ class AgentService:
         request_id: str | None = None,
     ) -> None:
         self._ensure_default_agent()
-        existing = self.store.get(agent_id)
+        existing = self._require_mutation_scope(agent_id, context, session)
+        if existing is None:
+            existing = self.store.get(agent_id)
         if existing is None:
             raise AgentNotFoundError(agent_id)
         workspace, _ = self._validated_workspace(existing["workspace_dir"])

@@ -30,6 +30,8 @@ def main() -> int:
         return 0
     if result.status == "cancelled":
         return 3
+    if result.error_code == "sandbox_timeout":
+        return 4
     return 1
 
 

@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -70,3 +71,24 @@ def test_approve_queues_run_and_dispatches_resume(monkeypatch):
     assert resumed == ["approval-1"]
     events = session.query(RunEvent).filter_by(run_id="run-1").order_by(RunEvent.sequence).all()
     assert [event.event_type for event in events] == ["approval.resolved", "run.status"]
+
+
+@pytest.mark.parametrize("terminal_status", ["failed", "completed", "cancelled"])
+def test_approve_cannot_resume_terminal_run(monkeypatch, terminal_status):
+    client, session = build_client()
+    session.get(AgentRun, "run-1").status = terminal_status
+    session.commit()
+    resumed: list[str] = []
+    monkeypatch.setattr(default_run_dispatcher, "resume_approval", resumed.append)
+
+    response = client.post(
+        "/api/approvals/approval-1/approve",
+        json={"reason": "too late"},
+        headers=ADMIN_HEADERS,
+    )
+
+    assert response.status_code == 409
+    assert session.get(AgentRun, "run-1").status == terminal_status
+    assert session.get(Approval, "approval-1").status == "pending"
+    assert session.query(RunEvent).filter_by(run_id="run-1").count() == 0
+    assert resumed == []

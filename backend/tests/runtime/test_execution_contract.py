@@ -9,12 +9,14 @@ from app.runtime.run_worker import load_execution_request
 
 def test_execution_request_accepts_only_run_snapshot_references_and_future_deadline():
     deadline = datetime.now(timezone.utc) + timedelta(minutes=5)
+    execution_deadline = deadline - timedelta(minutes=4)
 
     request = RunExecutionRequest(
         run_id="run-1",
         agent_version="agent-v1",
         checkpoint_key="checkpoint-1",
         deadline_at=deadline,
+        execution_deadline_at=execution_deadline,
         snapshot_id="snapshot-1",
         snapshot_digest="a" * 64,
         gateway_url="http://api:8000/internal/runner",
@@ -26,6 +28,9 @@ def test_execution_request_accepts_only_run_snapshot_references_and_future_deadl
         "agent_version": "agent-v1",
         "checkpoint_key": "checkpoint-1",
         "deadline_at": deadline.isoformat().replace("+00:00", "Z"),
+        "execution_deadline_at": execution_deadline.isoformat().replace(
+            "+00:00", "Z"
+        ),
         "snapshot_id": "snapshot-1",
         "snapshot_digest": "a" * 64,
         "gateway_url": "http://api:8000/internal/runner",
@@ -49,6 +54,7 @@ def test_execution_request_rejects_invalid_or_expired_references(field, value):
         "agent_version": "agent-v1",
         "checkpoint_key": "checkpoint-1",
         "deadline_at": datetime.now(timezone.utc) + timedelta(minutes=5),
+        "execution_deadline_at": datetime.now(timezone.utc) + timedelta(minutes=1),
         "snapshot_id": "snapshot-1",
         "snapshot_digest": "a" * 64,
         "gateway_url": "http://api:8000/internal/runner",
@@ -67,6 +73,7 @@ def test_execution_request_rejects_untrusted_runtime_fields():
             agent_version="agent-v1",
             checkpoint_key="checkpoint-1",
             deadline_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            execution_deadline_at=datetime.now(timezone.utc) + timedelta(minutes=1),
             snapshot_id="snapshot-1",
             snapshot_digest="a" * 64,
             gateway_url="http://api:8000/internal/runner",
@@ -104,6 +111,7 @@ def test_worker_loads_validated_request_from_environment(monkeypatch):
         agent_version="agent-v1",
         checkpoint_key="runtime",
         deadline_at=deadline,
+        execution_deadline_at=deadline - timedelta(minutes=4),
         snapshot_id="snapshot-1",
         snapshot_digest="a" * 64,
         gateway_url="http://api:8000/internal/runner",
@@ -129,6 +137,7 @@ def test_execution_request_rejects_invalid_gateway_identity(field, value):
         "agent_version": "agent-v1",
         "checkpoint_key": "checkpoint-1",
         "deadline_at": datetime.now(timezone.utc) + timedelta(minutes=5),
+        "execution_deadline_at": datetime.now(timezone.utc) + timedelta(minutes=1),
         "snapshot_id": "snapshot-1",
         "snapshot_digest": "a" * 64,
         "gateway_url": "http://api:8000/internal/runner",
@@ -138,3 +147,19 @@ def test_execution_request_rejects_invalid_gateway_identity(field, value):
 
     with pytest.raises(ValidationError):
         RunExecutionRequest(**data)
+
+
+def test_execution_request_accepts_expired_timezone_aware_execution_deadline():
+    request = RunExecutionRequest(
+        run_id="run-1",
+        agent_version="agent-v1",
+        checkpoint_key="runtime",
+        deadline_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        execution_deadline_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        snapshot_id="snapshot-1",
+        snapshot_digest="a" * 64,
+        gateway_url="http://api:8000/internal/runner",
+        run_token="secret-token",
+    )
+
+    assert request.execution_deadline_at < datetime.now(timezone.utc)

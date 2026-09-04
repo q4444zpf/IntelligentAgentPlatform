@@ -7,6 +7,7 @@
 - Web 管理控制台原型，包含工作台、AI 对话、资源库、智能体、Prompt、MCP、Skill / Tool、知识库、流程编排、多智能体协同、大模型配置、系统集成、用户权限、审计日志、沙箱监控和系统设置等页面。
 - FastAPI 后端服务，提供健康检查、会话与运行事件、平台运行总览和大模型供应商配置 API。
 - 项目及用户范围内的会话、消息、Agent Run 和 Run Event 使用 PostgreSQL 持久化，并支持有限、可恢复的 SSE 事件回放。
+- 支持项目内多智能体 Team 的草稿编辑、不可变版本发布、启停、聊天选择与受限成员执行；每个 Team Run 在接收消息时固定具体发布版本。
 - 提供真实的 Agent Runs 运行审计页面，支持当前项目、当前用户范围内的运行列表、条件筛选和分页，以及按运行查看事件时间线与工具调用安全摘要。
 - 会话、模型供应商、智能体和 MCP 配置统一使用 PostgreSQL 持久化。
 - 支持前后端分别启动，也可通过根目录脚本联合启动。
@@ -141,6 +142,9 @@ npm run dev
 - `GET /api/agent-runs/{run_id}`：读取 Run 状态。
 - `GET /api/agent-runs/{run_id}/events`：通过 `Last-Event-ID` 恢复读取有限 SSE 事件。
 - `GET /api/agent-runs/{run_id}/tool-invocations`：读取工具调用安全摘要。
+- `/api/collaboration/teams`：管理项目内 Team、草稿、发布版本和启停状态；版本历史通过 `/versions` 与 `/versions/{version}` 读取。
+
+Team 读取、管理和运行分别要求 `collaboration.read`、`collaboration.manage` 和 `collaboration.run`。Team 必须包含一个主管和至少一个不同成员；发布后版本不可变。停用 Team 会阻止新 Run，但不会改写已经固定到 Run 的版本快照。底层 Agent 或能力在运行期间停用时，Gateway 仍按当前授权失败关闭。
 
 模型供应商、智能体和 MCP 运行数据统一写入 `DATABASE_URL` 指定的 PostgreSQL。更新已有部署时，API 容器会在 Alembic 升级后检查 `/data/model-providers.db`、`/data/agents.db` 和 `/data/mcp.db`；仅当对应 PostgreSQL 表为空时执行一次性导入：
 
@@ -173,6 +177,13 @@ npm run build
 ```powershell
 cd backend
 python -m pytest
+```
+
+Published Team 聚焦验收：
+
+```powershell
+$env:PYTHONPATH = "backend"
+python -m pytest tests/e2e/test_published_team_run.py -q
 ```
 
 整套容器启动：

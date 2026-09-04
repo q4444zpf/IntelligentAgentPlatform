@@ -1,22 +1,213 @@
 import base64
 import hashlib
 
+import pytest
 from sqlalchemy import select
 
 from app.audit.models import AuditEvent
 from app.conversations.models import Message, ToolInvocation
+from app.identity.models import (
+    Permission,
+    Project,
+    ProjectMembership,
+    ProjectMembershipRole,
+    Role,
+    RolePermission,
+    Unit,
+    UnitMembership,
+    User,
+)
+from app.runtime.execution_snapshot import (
+    PublishedAgentSnapshot,
+    PublishedTeamSnapshot,
+    RuntimeExecutionSnapshot,
+    SnapshotModelSelection,
+    SnapshotTeamMember,
+    canonical_snapshot_bytes,
+)
+from app.runtime.model_gateway import ModelResult
+from app.tools.schemas import ToolRuntimeError
+
+
+def _install_team_tool_identity(env):
+    env.session.add_all(
+        [
+            User(
+                id="user-1",
+                display_name="Current operator",
+                email=None,
+                status="active",
+                authorization_version=1,
+            ),
+            Unit(id="unit-1", code="unit-1", name="Unit 1", status="active"),
+            Project(
+                id="project-1",
+                unit_id="unit-1",
+                code="project-1",
+                name="Project 1",
+                status="active",
+            ),
+            UnitMembership(
+                id="unit-membership-1",
+                user_id="user-1",
+                unit_id="unit-1",
+                status="active",
+            ),
+            ProjectMembership(
+                id="project-membership-1",
+                user_id="user-1",
+                unit_id="unit-1",
+                project_id="project-1",
+                status="active",
+            ),
+            Permission(
+                id="permission-tool-invoke",
+                code="tool.invoke",
+                resource="tool",
+                action="invoke",
+                risk_level="medium",
+                status="active",
+            ),
+            Role(
+                id="role-current-operator",
+                code="current_operator",
+                name="Current operator",
+                scope_type="project",
+                unit_id="unit-1",
+                built_in=False,
+                status="active",
+            ),
+        ]
+    )
+    env.session.flush()
+    env.session.add_all(
+        [
+            RolePermission(
+                id="role-permission-tool-invoke",
+                role_id="role-current-operator",
+                permission_code="tool.invoke",
+                unit_id="unit-1",
+                data_scope="project",
+            ),
+            ProjectMembershipRole(
+                id="project-membership-role-1",
+                user_id="user-1",
+                unit_id="unit-1",
+                project_id="project-1",
+                role_id="role-current-operator",
+                scope_type="project",
+            ),
+        ]
+    )
+    env.session.commit()
+
+
+def _install_team_snapshot(env, *, include_second_member=False):
+    _install_team_tool_identity(env)
+    stored = env.snapshots["run-1"]
+    tools = {tool.tool_id: tool for tool in stored.payload.tools}
+    supervisor_tool = tools["system.get_runtime_context"]
+    member_tool = tools["system.get_current_time"]
+    supervisor = SnapshotTeamMember(
+        agent_id="supervisor",
+        role="supervisor",
+        responsibility="coordinate",
+        agent_definition_digest="a" * 64,
+        agent=PublishedAgentSnapshot(
+            id="supervisor",
+            name="Supervisor",
+            description="",
+            runtime_form="common",
+            language="zh-CN",
+            system_prompt="supervise",
+            context_prompt="",
+            approval_policy="never",
+        ),
+        model=SnapshotModelSelection(
+            provider_id="supervisor-provider", model="supervisor-model"
+        ),
+        tool_ids=(supervisor_tool.tool_id,),
+        tools=(supervisor_tool,),
+    )
+    member = SnapshotTeamMember(
+        agent_id="member-1",
+        role="member",
+        responsibility="inspect",
+        agent_definition_digest="b" * 64,
+        agent=PublishedAgentSnapshot(
+            id="member-1",
+            name="Member",
+            description="",
+            runtime_form="common",
+            language="zh-CN",
+            system_prompt="inspect",
+            context_prompt="",
+            approval_policy="never",
+        ),
+        model=SnapshotModelSelection(
+            provider_id="member-provider", model="member-model"
+        ),
+        tool_ids=(member_tool.tool_id,),
+        tools=(member_tool,),
+    )
+    second_member = member.model_copy(
+        update={
+            "agent_id": "member-2",
+            "agent_definition_digest": "d" * 64,
+            "agent": member.agent.model_copy(
+                update={"id": "member-2", "name": "Member 2"}
+            ),
+            "model": SnapshotModelSelection(
+                provider_id="member-2-provider", model="member-2-model"
+            ),
+        }
+    )
+    actor = PublishedTeamSnapshot(
+        id="team-1",
+        version_id="team-version-1",
+        version=1,
+        definition_digest="c" * 64,
+        supervisor=supervisor,
+        members=(member, second_member) if include_second_member else (member,),
+        max_steps=3 if include_second_member else 2,
+        max_parallel_members=1,
+        timeout_seconds=60,
+        failure_strategy="fail_fast",
+        tool_ids=(supervisor_tool.tool_id, member_tool.tool_id),
+        name="Team",
+        description="",
+        runtime_form="common",
+        language="zh-CN",
+        system_prompt="supervise",
+        context_prompt="",
+        approval_policy="never",
+    )
+    payload = stored.payload.model_copy(
+        update={
+            "schema_version": "5",
+            "actor": actor,
+            "model": supervisor.model,
+            "tools": (supervisor_tool, member_tool),
+        }
+    )
+    digest = hashlib.sha256(canonical_snapshot_bytes(payload)).hexdigest()
+    team_snapshot = stored.model_copy(update={"payload": payload, "digest": digest})
+    env.snapshots["run-1"] = team_snapshot
+    row = env.session.get(RuntimeExecutionSnapshot, stored.snapshot_id)
+    row.digest = digest
+    row.payload = payload.model_dump(mode="json")
+    run = env.repository.get_run_by_id("run-1")
+    run.actor_type = "team"
+    run.actor_id = actor.id
+    run.actor_version_id = actor.version_id
+    env.session.commit()
+    return team_snapshot, supervisor_tool, member_tool
 
 
 def test_runner_gateway_normal_path_persists_complete_trace(runner_gateway_env):
     env = runner_gateway_env
     token = env.issue_token()
     headers = env.headers(token)
-    run = env.repository.get_run_by_id("run-1")
-    assert run.status == "pending"
-
-    run.status = "running"
-    env.repository.append_event("run-1", "run.status", {"status": "running"})
-    env.session.commit()
 
     snapshot = env.client.get(
         "/internal/runner/runs/run-1/snapshot",
@@ -135,3 +326,281 @@ def test_runner_gateway_normal_path_persists_complete_trace(runner_gateway_env):
     assert accepted["status"] == "completed"
     assert accepted["created_at"] is not None
     assert accepted["duration_ms"] >= 0
+
+
+def test_team_model_invocation_uses_only_the_captured_member_boundary(
+    runner_gateway_env, monkeypatch
+):
+    env = runner_gateway_env
+    snapshot, supervisor_tool, member_tool = _install_team_snapshot(env)
+    token = env.issue_token()
+    calls = []
+
+    def generate(messages, selection, tools=None):
+        calls.append((messages, selection, tools))
+        return ModelResult("member result", 1, 1, 2)
+
+    monkeypatch.setattr(env.model_gateway, "generate", generate)
+
+    base_request = {
+        "provider_id": "member-provider",
+        "model": "member-model",
+        "messages": [{"role": "user", "content": "inspect"}],
+        "tools": [],
+        "invocation_sequence": 0,
+    }
+    missing_member = env.client.post(
+        "/internal/runner/runs/run-1/model-invocations",
+        headers=env.headers(token, "model:missing-member"),
+        json=base_request,
+    )
+    wrong_model = env.client.post(
+        "/internal/runner/runs/run-1/model-invocations",
+        headers=env.headers(token, "model:wrong-model"),
+        json=base_request
+        | {"member_agent_id": "member-1", "model": "supervisor-model"},
+    )
+    sibling_tool = env.client.post(
+        "/internal/runner/runs/run-1/model-invocations",
+        headers=env.headers(token, "model:sibling-tool"),
+        json=base_request
+        | {
+            "member_agent_id": "member-1",
+            "tools": [
+                {
+                    "tool_id": supervisor_tool.tool_id,
+                    "description": "forged",
+                    "input_schema": {"type": "object"},
+                }
+            ],
+        },
+    )
+    accepted = env.client.post(
+        "/internal/runner/runs/run-1/model-invocations",
+        headers=env.headers(token, "model:member-1"),
+        json=base_request
+        | {
+            "member_agent_id": "member-1",
+            "tools": [
+                {
+                    "tool_id": member_tool.tool_id,
+                    "description": "forged",
+                    "input_schema": {"type": "object"},
+                }
+            ],
+        },
+    )
+
+    assert [missing_member.status_code, wrong_model.status_code] == [403, 403]
+    assert sibling_tool.status_code == 403
+    assert accepted.status_code == 200
+    assert len(calls) == 1
+    _, selection, advertised_tools = calls[0]
+    assert (selection.provider_id, selection.model) == (
+        "member-provider",
+        "member-model",
+    )
+    assert [(tool.tool_id, tool.description, tool.input_schema) for tool in advertised_tools] == [
+        (member_tool.tool_id, member_tool.description, member_tool.input_schema)
+    ]
+    assert snapshot.payload.schema_version == "5"
+
+
+def test_team_model_audits_are_attributed_without_cross_member_idempotency_conflicts(
+    runner_gateway_env,
+    monkeypatch,
+):
+    env = runner_gateway_env
+    snapshot, _, _ = _install_team_snapshot(env, include_second_member=True)
+    token = env.issue_token()
+    monkeypatch.setattr(
+        env.model_gateway,
+        "generate",
+        lambda messages, selection, tools=None: ModelResult("done", 1, 1, 2),
+    )
+
+    responses = []
+    for sequence, member in enumerate(
+        (*snapshot.payload.actor.members, snapshot.payload.actor.supervisor)
+    ):
+        responses.append(
+            env.client.post(
+                "/internal/runner/runs/run-1/model-invocations",
+                headers=env.headers(
+                    token,
+                    f"model:{member.agent_id}:{sequence}",
+                ),
+                json={
+                    "provider_id": member.model.provider_id,
+                    "model": member.model.model,
+                    "member_agent_id": member.agent_id,
+                    "messages": [{"role": "user", "content": "inspect"}],
+                    "tools": [],
+                    "invocation_sequence": sequence,
+                },
+            )
+        )
+
+    assert [response.status_code for response in responses] == [200, 200, 200]
+    audits = list(
+        env.session.scalars(
+            select(AuditEvent)
+            .where(
+                AuditEvent.run_id == "run-1",
+                AuditEvent.action == "llm.invoke.succeeded",
+            )
+            .order_by(AuditEvent.id)
+        )
+    )
+    assert {audit.metadata_json["member_agent_id"] for audit in audits} == {
+        "member-1",
+        "member-2",
+        "supervisor",
+    }
+    assert {audit.idempotency_key for audit in audits} == {
+        "llm:run-1:member-1:0:succeeded",
+        "llm:run-1:member-2:1:succeeded",
+        "llm:run-1:supervisor:2:succeeded",
+    }
+
+
+def test_team_tool_invocation_is_restricted_to_the_captured_member(
+    runner_gateway_env,
+):
+    env = runner_gateway_env
+    _, supervisor_tool, member_tool = _install_team_snapshot(env)
+    token = env.issue_token()
+    base_request = {
+        "tool_call_id": "call-member-time",
+        "tool_id": member_tool.tool_id,
+        "version": member_tool.version,
+        "arguments": {"timezone": "Asia/Shanghai"},
+        "invocation_sequence": 0,
+    }
+
+    missing_member = env.client.post(
+        "/internal/runner/runs/run-1/tool-invocations",
+        headers=env.headers(token, "tool:missing-member"),
+        json=base_request,
+    )
+    sibling_tool = env.client.post(
+        "/internal/runner/runs/run-1/tool-invocations",
+        headers=env.headers(token, "tool:sibling-tool"),
+        json=base_request
+        | {
+            "tool_call_id": "call-supervisor-time",
+            "member_agent_id": "supervisor",
+        },
+    )
+    accepted = env.client.post(
+        "/internal/runner/runs/run-1/tool-invocations",
+        headers=env.headers(token, "tool:member-1"),
+        json=base_request | {"member_agent_id": "member-1"},
+    )
+
+    assert missing_member.status_code == 403
+    assert sibling_tool.status_code == 403
+    assert accepted.status_code == 200
+    assert supervisor_tool.tool_id != member_tool.tool_id
+
+
+def test_team_tool_invocation_uses_current_roles_not_accepted_run_roles(
+    runner_gateway_env,
+    monkeypatch,
+):
+    env = runner_gateway_env
+    _, _, member_tool = _install_team_snapshot(env)
+    token = env.issue_token()
+    contexts = []
+    execute = env.tool_gateway.execute
+
+    def capture_context(call, context, authorized_tool_ids):
+        contexts.append(context)
+        return execute(call, context, authorized_tool_ids)
+
+    monkeypatch.setattr(env.tool_gateway, "execute", capture_context)
+    response = env.client.post(
+        "/internal/runner/runs/run-1/tool-invocations",
+        headers=env.headers(token, "tool:current-role"),
+        json={
+            "tool_call_id": "call-current-role",
+            "tool_id": member_tool.tool_id,
+            "version": member_tool.version,
+            "arguments": {"timezone": "Asia/Shanghai"},
+            "invocation_sequence": 0,
+            "member_agent_id": "member-1",
+        },
+    )
+
+    assert response.status_code == 200
+    assert contexts[0].actor_roles == ("current_operator",)
+
+
+def test_team_tool_deadline_error_is_returned_as_conflict(
+    runner_gateway_env,
+    monkeypatch,
+):
+    env = runner_gateway_env
+    _, _, member_tool = _install_team_snapshot(env)
+    token = env.issue_token()
+
+    def reject_after_deadline(*_args, **_kwargs):
+        raise ToolRuntimeError("sandbox_timeout", "沙箱任务执行超时")
+
+    monkeypatch.setattr(env.tool_gateway, "execute", reject_after_deadline)
+
+    response = env.client.post(
+        "/internal/runner/runs/run-1/tool-invocations",
+        headers=env.headers(token, "tool:deadline-expired"),
+        json={
+            "tool_call_id": "call-deadline-expired",
+            "tool_id": member_tool.tool_id,
+            "version": member_tool.version,
+            "arguments": {"timezone": "Asia/Shanghai"},
+            "invocation_sequence": 0,
+            "member_agent_id": "member-1",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "sandbox_timeout"
+
+
+@pytest.mark.parametrize(
+    "revoked_resource",
+    ["user", "unit_membership", "project", "project_membership", "permission"],
+)
+def test_team_tool_invocation_rejects_revoked_current_authorization(
+    runner_gateway_env,
+    revoked_resource,
+):
+    env = runner_gateway_env
+    _, _, member_tool = _install_team_snapshot(env)
+    if revoked_resource == "user":
+        env.session.get(User, "user-1").status = "inactive"
+    elif revoked_resource == "unit_membership":
+        env.session.get(UnitMembership, "unit-membership-1").status = "inactive"
+    elif revoked_resource == "project":
+        env.session.get(Project, "project-1").status = "inactive"
+    elif revoked_resource == "project_membership":
+        env.session.get(ProjectMembership, "project-membership-1").status = "inactive"
+    else:
+        env.session.get(Permission, "permission-tool-invoke").status = "inactive"
+    env.session.commit()
+    token = env.issue_token()
+
+    response = env.client.post(
+        "/internal/runner/runs/run-1/tool-invocations",
+        headers=env.headers(token, f"tool:revoked:{revoked_resource}"),
+        json={
+            "tool_call_id": f"call-revoked-{revoked_resource}",
+            "tool_id": member_tool.tool_id,
+            "version": member_tool.version,
+            "arguments": {"timezone": "Asia/Shanghai"},
+            "invocation_sequence": 0,
+            "member_agent_id": "member-1",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "tool_not_authorized"

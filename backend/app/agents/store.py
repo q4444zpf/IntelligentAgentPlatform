@@ -12,6 +12,7 @@ from app.db.platform_models import ManagedAgentRecord, PlatformSettingRecord
 
 
 DEFAULT_SETTING_KEY = "default_agent"
+INTERNAL_SCOPE_ID = "__internal__"
 
 
 class AgentConcurrentUpdateError(ValueError):
@@ -50,6 +51,10 @@ class AgentStore:
             "id": row.agent_id,
             **row.config,
             "workspace_dir": row.workspace_dir,
+            "availability_scope": row.availability_scope,
+            "unit_id": row.unit_id,
+            "project_id": row.project_id,
+            "allowed_project_ids": list(row.allowed_project_ids),
             "pinned": row.pinned,
             "created_at": row.created_at,
             "updated_at": row.updated_at,
@@ -63,6 +68,13 @@ class AgentStore:
     def get(self, agent_id: str) -> dict[str, Any] | None:
         with self.session_factory() as session:
             return self._decode(session.get(ManagedAgentRecord, agent_id))
+
+    def get_for_update(
+        self,
+        session: Session,
+        agent_id: str,
+    ) -> dict[str, Any] | None:
+        return self._decode(self._lock_agent(session, agent_id))
 
     @staticmethod
     def _decode_default_agent_id(
@@ -113,38 +125,37 @@ class AgentStore:
                 version=row.version,
             )
 
+    @staticmethod
+    def is_platform_default_eligible(record: dict[str, Any] | None) -> bool:
+        return bool(
+            record
+            and record.get("enabled") is True
+            and record.get("availability_scope") == "common"
+            and record.get("unit_id") is None
+            and record.get("project_id") is None
+            and record.get("allowed_project_ids") == ["*"]
+        )
+
+    def _validate_platform_default_target(
+        self,
+        target: ManagedAgentRecord,
+        agent_id: str,
+    ) -> None:
+        if not target.config.get("enabled", False):
+            raise AgentStoreValidationError(
+                f"Disabled agent '{agent_id}' cannot be the default"
+            )
+        if not self.is_platform_default_eligible(self._decode(target)):
+            raise AgentStoreValidationError(
+                f"Default agent '{agent_id}' must be available to every project"
+            )
+
     def set_default_id(
         self,
         agent_id: str,
         expected_version: int,
     ) -> DefaultAgentPointer:
-        value = {"agent_id": agent_id, "scope": "platform"}
-        try:
-            with self.session_factory.begin() as session:
-                if expected_version:
-                    result = session.execute(
-                        update(PlatformSettingRecord)
-                        .where(
-                            PlatformSettingRecord.setting_key == DEFAULT_SETTING_KEY,
-                            PlatformSettingRecord.version == expected_version,
-                        )
-                        .values(value=value, version=expected_version + 1)
-                    )
-                    if result.rowcount != 1:
-                        raise AgentConcurrentUpdateError(
-                            "Default agent changed concurrently; retry the request"
-                        )
-                else:
-                    session.add(
-                        PlatformSettingRecord(
-                            setting_key=DEFAULT_SETTING_KEY,
-                            value=value,
-                        )
-                    )
-        except IntegrityError as error:
-            raise AgentConcurrentUpdateError(
-                "Default agent changed concurrently; retry the request"
-            ) from error
+        self.set_default_agent(agent_id, expected_version)
         return DefaultAgentPointer(
             agent_id=agent_id,
             version=expected_version + 1,
@@ -167,10 +178,7 @@ class AgentStore:
                 target = self._lock_agent(session, agent_id)
                 if target is None:
                     raise AgentStoreNotFoundError(agent_id)
-                if not target.config.get("enabled", False):
-                    raise AgentStoreValidationError(
-                        f"Disabled agent '{agent_id}' cannot be the default"
-                    )
+                self._validate_platform_default_target(target, agent_id)
 
                 value = {"agent_id": agent_id, "scope": "platform"}
                 if pointer is None:
@@ -273,8 +281,7 @@ class AgentStore:
         target = self._lock_agent(session, agent_id)
         if target is None:
             raise AgentStoreNotFoundError(agent_id)
-        if not target.config.get("enabled", False):
-            raise AgentStoreValidationError(f"Disabled agent '{agent_id}' cannot be the default")
+        self._validate_platform_default_target(target, agent_id)
         value = {"agent_id": agent_id, "scope": "platform"}
         if pointer is None:
             session.add(PlatformSettingRecord(setting_key=DEFAULT_SETTING_KEY, value=value))
@@ -363,16 +370,55 @@ class AgentStore:
         session.flush()
         return record
 
-    def create_in_session(self, session: Session, agent_id: str, config: dict[str, Any], workspace_dir: str) -> dict[str, Any]:
-        row = ManagedAgentRecord(agent_id=agent_id, config=config, workspace_dir=workspace_dir, pinned=False)
+    def create_in_session(
+        self,
+        session: Session,
+        agent_id: str,
+        config: dict[str, Any],
+        workspace_dir: str,
+        *,
+        availability_scope: str = "project",
+        unit_id: str | None = INTERNAL_SCOPE_ID,
+        project_id: str | None = INTERNAL_SCOPE_ID,
+        allowed_project_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        allowed = list(allowed_project_ids or [])
+        if availability_scope == "project":
+            if not unit_id or not project_id or allowed:
+                raise AgentStoreValidationError("Project Agent availability is invalid")
+        elif availability_scope == "common":
+            if unit_id is not None or project_id is not None or not allowed:
+                raise AgentStoreValidationError("Common Agent availability is invalid")
+            if "*" in allowed and allowed != ["*"]:
+                raise AgentStoreValidationError("Common wildcard must be the only allowlist value")
+        else:
+            raise AgentStoreValidationError("Agent availability scope is invalid")
+        row = ManagedAgentRecord(
+            agent_id=agent_id,
+            config=config,
+            workspace_dir=workspace_dir,
+            pinned=False,
+            availability_scope=availability_scope,
+            unit_id=unit_id,
+            project_id=project_id,
+            allowed_project_ids=allowed,
+        )
         session.add(row)
         session.flush()
         session.refresh(row)
         return self._decode(row)
 
-    def create(self, agent_id: str, config: dict[str, Any], workspace_dir: str) -> dict[str, Any]:
+    def create(
+        self,
+        agent_id: str,
+        config: dict[str, Any],
+        workspace_dir: str,
+        **availability: Any,
+    ) -> dict[str, Any]:
         with self.session_factory.begin() as session:
-            return self.create_in_session(session, agent_id, config, workspace_dir)
+            return self.create_in_session(
+                session, agent_id, config, workspace_dir, **availability
+            )
 
     def update(self, agent_id: str, config: dict[str, Any]) -> dict[str, Any] | None:
         with self.session_factory.begin() as session:

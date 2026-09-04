@@ -32,3 +32,13 @@ describe('fixed authorization routes', () => {
     expect(String(forbidden?.component)).toContain('ForbiddenView');
   });
 });
+
+describe('collaboration route', () => {
+  it('uses the dedicated Team management view instead of the generic placeholder', () => {
+    const root = routes.find((route) => route.path === '/');
+    const collaboration = root?.children?.find((route) => route.path === 'collaboration');
+
+    expect(collaboration?.meta?.module).toBeUndefined();
+    expect(String(collaboration?.component)).toContain('TeamManageView');
+  });
+});

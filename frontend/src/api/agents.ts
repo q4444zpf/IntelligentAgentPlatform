@@ -2,6 +2,7 @@ import { request } from './client';
 
 export type AgentRuntimeForm = 'web' | 'desktop' | 'common';
 export type AgentApprovalPolicy = 'never' | 'control_commands' | 'always';
+export type AgentAvailabilityScope = 'project' | 'common';
 
 export interface AgentInput {
   name: string;
@@ -15,11 +16,16 @@ export interface AgentInput {
   approval_policy: AgentApprovalPolicy;
   skill_names: string[];
   tool_ids: string[];
+  knowledge_source_ids: string[];
   enabled: boolean;
 }
 
 export interface AgentInfo extends AgentInput {
   id: string;
+  availability_scope: AgentAvailabilityScope;
+  unit_id: string | null;
+  project_id: string | null;
+  allowed_project_ids: string[];
   is_builtin: boolean;
   is_default: boolean;
   pinned: boolean;

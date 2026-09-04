@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, Integer, String, Text, func
+from sqlalchemy import JSON, Boolean, CheckConstraint, DateTime, Index, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
@@ -37,10 +37,30 @@ class PlatformSettingRecord(Base):
 
 class ManagedAgentRecord(Base):
     __tablename__ = "managed_agents"
+    __table_args__ = (
+        CheckConstraint(
+            "availability_scope IN ('project', 'common')",
+            name="ck_managed_agents_availability_scope",
+        ),
+        CheckConstraint(
+            "(availability_scope = 'project' AND unit_id IS NOT NULL AND project_id IS NOT NULL) "
+            "OR (availability_scope = 'common' AND unit_id IS NULL AND project_id IS NULL)",
+            name="ck_managed_agents_availability_shape",
+        ),
+        Index("ix_managed_agents_project_scope", "unit_id", "project_id"),
+    )
 
     agent_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     workspace_dir: Mapped[str] = mapped_column(Text, nullable=False)
+    availability_scope: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="project"
+    )
+    unit_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    project_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    allowed_project_ids: Mapped[list[str]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
     pinned: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

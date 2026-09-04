@@ -1,3 +1,6 @@
+from datetime import UTC, datetime, timedelta
+from threading import Event
+
 import pytest
 
 from app.runtime.container_launcher import (
@@ -59,6 +62,7 @@ def execution_payload(run_id="run-1"):
         "agent_version": "agent-v1",
         "checkpoint_key": "runtime",
         "deadline_at": "2099-01-01T00:00:00Z",
+        "execution_deadline_at": "2098-12-31T23:59:00Z",
         "snapshot_id": "snapshot-1",
         "snapshot_digest": "a" * 64,
         "gateway_url": "http://api:8000/internal/runner",
@@ -122,6 +126,7 @@ def test_controlled_launcher_passes_only_validated_request_references():
         "agent_version": "agent-v1",
         "checkpoint_key": "runtime",
         "deadline_at": "2099-01-01T00:00:00Z",
+        "execution_deadline_at": "2098-12-31T23:59:00Z",
         "snapshot_id": "snapshot-1",
         "snapshot_digest": "a" * 64,
         "gateway_url": "http://api:8000/internal/runner",
@@ -131,9 +136,52 @@ def test_controlled_launcher_passes_only_validated_request_references():
     request = client.kwargs["environment"]["IAP_RUN_EXECUTION_REQUEST"]
     assert '"run_id":"run-1"' in request
     assert '"agent_version":"agent-v1"' in request
+    assert '"execution_deadline_at":"2098-12-31T23:59:00Z"' in request
     assert "workspace_path" not in request
     assert '"run_token":"secret-token"' in request
     assert "secret-token" not in str(launcher.inspect("run-1"))
+
+
+def test_controlled_launcher_rejects_expired_execution_before_container_create():
+    client = FakeClient()
+    launcher = ControlledContainerLauncher(
+        client,
+        ContainerPolicy("iap/workflow-runner:latest"),
+    )
+    payload = execution_payload()
+    payload["execution_deadline_at"] = (
+        datetime.now(UTC) - timedelta(seconds=1)
+    ).isoformat()
+
+    with pytest.raises(LauncherUnavailableError, match="deadline"):
+        launcher.create("run-1", payload)
+
+    assert client.kwargs is None
+
+
+def test_controlled_launcher_removes_container_created_after_execution_deadline():
+    class SlowClient(FakeClient):
+        def containers_run(self, **kwargs):
+            container = super().containers_run(**kwargs)
+            Event().wait(timeout=0.1)
+            return container
+
+    client = SlowClient()
+    launcher = ControlledContainerLauncher(
+        client,
+        ContainerPolicy("iap/workflow-runner:latest"),
+    )
+    payload = execution_payload()
+    payload["execution_deadline_at"] = (
+        datetime.now(UTC) + timedelta(seconds=0.05)
+    ).isoformat()
+
+    with pytest.raises(LauncherUnavailableError, match="deadline"):
+        launcher.create("run-1", payload)
+
+    assert client.container.removed is True
+    with pytest.raises(LauncherUnavailableError):
+        launcher.inspect("run-1")
 
 
 def test_controlled_launcher_reports_sanitized_exit_and_oom_state():

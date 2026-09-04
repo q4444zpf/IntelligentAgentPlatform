@@ -10,6 +10,7 @@ from .models import (
     Role,
     RolePermission,
     RolePermissionProject,
+    Unit,
     UnitMembership,
     UnitMembershipRole,
     User,
@@ -102,6 +103,135 @@ class AuthorizationRepository:
             authorization_version=auth.authorization_version,
             role_codes=tuple(sorted(role_codes)),
             grants=tuple(sorted(grants.values(), key=lambda item: (item.permission_code, item.data_scope))),
+        )
+
+    def load_current_context(
+        self,
+        user_id: str,
+        unit_id: str,
+        project_id: str,
+    ) -> AuthorizationContext:
+        user = self.session.scalar(
+            select(User).where(User.id == user_id, User.status == "active")
+        )
+        unit_membership = self.session.scalar(
+            select(UnitMembership)
+            .join(Unit, Unit.id == UnitMembership.unit_id)
+            .where(
+                UnitMembership.user_id == user_id,
+                UnitMembership.unit_id == unit_id,
+                UnitMembership.status == "active",
+                Unit.status == "active",
+            )
+        )
+        project_membership = self.session.scalar(
+            select(ProjectMembership)
+            .join(
+                Project,
+                (Project.id == ProjectMembership.project_id)
+                & (Project.unit_id == ProjectMembership.unit_id),
+            )
+            .where(
+                ProjectMembership.user_id == user_id,
+                ProjectMembership.unit_id == unit_id,
+                ProjectMembership.project_id == project_id,
+                ProjectMembership.status == "active",
+                Project.status == "active",
+            )
+        )
+        if user is None or unit_membership is None or project_membership is None:
+            raise LookupError("current authorization membership is inactive")
+
+        unit_roles = self.session.execute(
+            select(Role, RolePermission)
+            .join(UnitMembershipRole, UnitMembershipRole.role_id == Role.id)
+            .join(RolePermission, RolePermission.role_id == Role.id)
+            .join(Permission, Permission.code == RolePermission.permission_code)
+            .where(
+                UnitMembershipRole.user_id == user_id,
+                UnitMembershipRole.unit_id == unit_id,
+                Role.unit_id == unit_id,
+                Role.status == "active",
+                Permission.status == "active",
+            )
+        ).all()
+        project_roles = self.session.execute(
+            select(Role, RolePermission)
+            .join(ProjectMembershipRole, ProjectMembershipRole.role_id == Role.id)
+            .join(RolePermission, RolePermission.role_id == Role.id)
+            .join(Permission, Permission.code == RolePermission.permission_code)
+            .join(
+                ProjectMembership,
+                (ProjectMembership.user_id == ProjectMembershipRole.user_id)
+                & (ProjectMembership.unit_id == ProjectMembershipRole.unit_id)
+                & (
+                    ProjectMembership.project_id
+                    == ProjectMembershipRole.project_id
+                ),
+            )
+            .join(
+                Project,
+                (Project.id == ProjectMembership.project_id)
+                & (Project.unit_id == ProjectMembership.unit_id),
+            )
+            .where(
+                ProjectMembershipRole.user_id == user_id,
+                ProjectMembershipRole.unit_id == unit_id,
+                ProjectMembershipRole.project_id == project_id,
+                Role.unit_id == unit_id,
+                ProjectMembership.status == "active",
+                Project.status == "active",
+                Role.status == "active",
+                Permission.status == "active",
+            )
+        ).all()
+
+        grants: dict[tuple[str, str, frozenset[str], str | None], PermissionGrant] = {}
+        role_codes: set[str] = set()
+        for role, permission in [*unit_roles, *project_roles]:
+            role_codes.add(role.code)
+            projects = self._role_projects(role.id, user_id, unit_id)
+            custom = frozenset(
+                self.session.scalars(
+                    select(RolePermissionProject.project_id)
+                    .join(Project, Project.id == RolePermissionProject.project_id)
+                    .where(
+                        RolePermissionProject.role_permission_id == permission.id,
+                        RolePermissionProject.unit_id == unit_id,
+                        Project.status == "active",
+                    )
+                )
+            )
+            ids = custom or projects
+            owner = user_id if permission.data_scope == "own" else None
+            grant = PermissionGrant(
+                permission.permission_code,
+                permission.data_scope,
+                frozenset(ids),
+                owner,
+            )
+            grants[
+                (
+                    grant.permission_code,
+                    grant.data_scope,
+                    grant.project_ids,
+                    grant.owner_user_id,
+                )
+            ] = grant
+        return AuthorizationContext(
+            session_id=f"runtime:{user_id}:{unit_id}:{project_id}",
+            user_id=user_id,
+            unit_id=unit_id,
+            current_project_id=project_id,
+            auth_method="local",
+            authorization_version=user.authorization_version,
+            role_codes=tuple(sorted(role_codes)),
+            grants=tuple(
+                sorted(
+                    grants.values(),
+                    key=lambda item: (item.permission_code, item.data_scope),
+                )
+            ),
         )
 
     def _role_projects(self, role_id: str, user_id: str, unit_id: str) -> frozenset[str]:

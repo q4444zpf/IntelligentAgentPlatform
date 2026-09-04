@@ -1,8 +1,13 @@
 import json
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 
+import httpx
 import pytest
 
 from app.runtime.workflow_runner import (
+    RunnerDeadlineExceededError,
     RunnerUnavailableError,
     WorkflowRunnerClient,
     WorkflowRunnerHttpTransport,
@@ -15,20 +20,20 @@ class FakeTransport:
         self.health = health
         self.requests = []
 
-    def health_check(self):
+    def health_check(self, *, monotonic_deadline=None):
         return {"status": "healthy" if self.health else "unhealthy", "sandbox": self.health}
 
-    def submit(self, payload):
+    def submit(self, payload, *, monotonic_deadline=None):
         self.requests.append(payload)
         return {"run_id": payload["run_id"], "status": "accepted"}
 
-    def status(self, run_id):
+    def status(self, run_id, *, monotonic_deadline=None):
         return {"run_id": run_id, "status": "exited", "exit_code": 0, "oom_killed": False}
 
-    def terminate(self, run_id):
+    def terminate(self, run_id, *, monotonic_deadline=None):
         return {"run_id": run_id, "status": "terminated"}
 
-    def cleanup(self, run_id):
+    def cleanup(self, run_id, *, monotonic_deadline=None):
         return {"run_id": run_id, "status": "cleaned"}
 
 
@@ -46,6 +51,7 @@ def test_runner_client_requires_healthy_sandbox_before_submit():
             gateway_url="http://api:8000/internal/runner",
             run_token="secret-token",
             deadline_at="2099-01-01T00:00:00Z",
+            execution_deadline_at="2098-12-31T23:59:00Z",
         )
     assert transport.requests == []
 
@@ -63,6 +69,7 @@ def test_runner_client_submits_only_run_snapshot_references():
         gateway_url="http://api:8000/internal/runner",
         run_token="secret-token",
         deadline_at="2099-01-01T00:00:00Z",
+        execution_deadline_at="2098-12-31T23:59:00Z",
     )
 
     assert response == {"run_id": "run-1", "status": "accepted"}
@@ -75,6 +82,7 @@ def test_runner_client_submits_only_run_snapshot_references():
         "gateway_url": "http://api:8000/internal/runner",
         "run_token": "secret-token",
         "deadline_at": "2099-01-01T00:00:00Z",
+        "execution_deadline_at": "2098-12-31T23:59:00Z",
     }]
 
 
@@ -84,6 +92,77 @@ def test_runner_client_exposes_run_lifecycle_operations():
     assert client.status("run-1")["exit_code"] == 0
     assert client.terminate("run-1")["status"] == "terminated"
     assert client.cleanup("run-1")["status"] == "cleaned"
+
+
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        TimeoutError("Workflow Runner deadline expired"),
+        httpx.ReadTimeout(
+            "Workflow Runner deadline expired",
+            request=httpx.Request("GET", "http://runner/runs/run-1"),
+        ),
+        httpx.HTTPStatusError(
+            "Gateway Timeout",
+            request=httpx.Request("GET", "http://runner/runs/run-1"),
+            response=httpx.Response(
+                504,
+                request=httpx.Request("GET", "http://runner/runs/run-1"),
+            ),
+        ),
+    ],
+)
+def test_runner_client_preserves_deadline_expiry_identity(transport_error):
+    class DeadlineTransport(FakeTransport):
+        def status(self, run_id, *, monotonic_deadline=None):
+            raise transport_error
+
+    client = WorkflowRunnerClient(DeadlineTransport())
+
+    with pytest.raises(RunnerUnavailableError) as captured:
+        client.status("run-1", monotonic_deadline=time.monotonic() - 1)
+
+    assert isinstance(captured.value, RunnerDeadlineExceededError)
+
+
+def test_runner_client_keeps_far_future_connect_timeout_as_unavailable():
+    connect_timeout = httpx.ConnectTimeout(
+        "connection timed out",
+        request=httpx.Request("GET", "http://runner/runs/run-1"),
+    )
+
+    class UnavailableTransport(FakeTransport):
+        def status(self, run_id, *, monotonic_deadline=None):
+            raise connect_timeout
+
+    client = WorkflowRunnerClient(UnavailableTransport())
+
+    with pytest.raises(RunnerUnavailableError) as captured:
+        client.status("run-1", monotonic_deadline=time.monotonic() + 300)
+
+    assert type(captured.value) is RunnerUnavailableError
+
+
+def test_runner_submit_preserves_deadline_expiry_from_health_check():
+    class DeadlineTransport(FakeTransport):
+        def health_check(self, *, monotonic_deadline=None):
+            raise RunnerDeadlineExceededError("Workflow Runner deadline expired")
+
+    client = WorkflowRunnerClient(DeadlineTransport())
+
+    with pytest.raises(RunnerDeadlineExceededError):
+        client.submit(
+            "run-1",
+            "agent-v1",
+            "runtime",
+            snapshot_id="snapshot-1",
+            snapshot_digest="a" * 64,
+            gateway_url="http://api:8000/internal/runner",
+            run_token="secret-token",
+            deadline_at="2099-01-01T00:00:00Z",
+            execution_deadline_at="2098-12-31T23:59:00Z",
+            monotonic_deadline=time.monotonic() + 5,
+        )
 
 
 def test_workflow_runner_http_transport_uses_json_lifecycle_contract():
@@ -104,6 +183,7 @@ def test_workflow_runner_http_transport_uses_json_lifecycle_contract():
         "gateway_url": "http://api:8000/internal/runner",
         "run_token": "secret-token",
         "deadline_at": "2099-01-01T00:00:00Z",
+        "execution_deadline_at": "2098-12-31T23:59:00Z",
     })
     transport.status("run-1")
     transport.terminate("run-1")
@@ -119,12 +199,84 @@ def test_workflow_runner_http_transport_uses_json_lifecycle_contract():
         "gateway_url": "http://api:8000/internal/runner",
         "run_token": "secret-token",
         "deadline_at": "2099-01-01T00:00:00Z",
+        "execution_deadline_at": "2098-12-31T23:59:00Z",
     }
     assert [(item[0], item[1]) for item in observed[2:]] == [
         ("GET", "http://runner:8090/runs/run-1"),
         ("POST", "http://runner:8090/runs/run-1/terminate"),
         ("DELETE", "http://runner:8090/runs/run-1"),
     ]
+
+
+def test_workflow_runner_submit_enforces_absolute_slow_drip_deadline():
+    received_deadlines = []
+
+    class SlowDripHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def do_GET(self):
+            self._write_json(b'{"status":"healthy","sandbox":true}')
+
+        def do_POST(self):
+            received_deadlines.append(
+                self.headers.get("X-Request-Deadline-At")
+            )
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            self._write_json(b'{"status":"accepted"}', slow=True)
+
+        def _write_json(self, body, *, slow=False):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                for byte in body:
+                    self.wfile.write(bytes((byte,)))
+                    self.wfile.flush()
+                    if slow:
+                        time.sleep(0.04)
+            except OSError:
+                return
+
+        def log_message(self, _format, *_args):
+            return
+
+    class TestServer(ThreadingHTTPServer):
+        daemon_threads = True
+
+    server = TestServer(("127.0.0.1", 0), SlowDripHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = WorkflowRunnerClient(
+        WorkflowRunnerHttpTransport(
+            f"http://127.0.0.1:{server.server_port}"
+        )
+    )
+    started_at = time.monotonic()
+    operation_elapsed = None
+    try:
+        with pytest.raises(RunnerUnavailableError):
+            client.submit(
+                "run-1",
+                "agent-v1",
+                "runtime",
+                snapshot_id="snapshot-1",
+                snapshot_digest="a" * 64,
+                gateway_url="http://api:8000/internal/runner",
+                run_token="secret-token",
+                deadline_at="2099-01-01T00:00:00Z",
+                execution_deadline_at="2098-12-31T23:59:00Z",
+                monotonic_deadline=started_at + 0.2,
+            )
+        operation_elapsed = time.monotonic() - started_at
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert operation_elapsed is not None and operation_elapsed < 0.5
+    assert received_deadlines and received_deadlines[0] is not None
 
 
 def test_workflow_runner_client_factory_requires_explicit_enablement(monkeypatch):

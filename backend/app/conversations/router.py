@@ -8,6 +8,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.agents.service import AgentService
+from app.collaboration.service import TeamService
 from app.core.database import get_session
 from app.core.request_context import RequestContext, require_request_context
 
@@ -41,6 +42,7 @@ def default_service_factory(session: Session) -> ConversationService:
         ConversationRepository(session),
         default_run_dispatcher,
         agent_service=AgentService(),
+        team_service=TeamService(session),
     )
 
 
@@ -144,7 +146,7 @@ def create_router(
             str | None,
             Query(
                 max_length=64,
-                pattern=r"^[a-z][a-z0-9_-]{0,63}$",
+                pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$",
             ),
         ] = None,
         query: Annotated[str | None, Query(max_length=200)] = None,

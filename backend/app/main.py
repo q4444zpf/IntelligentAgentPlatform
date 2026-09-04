@@ -27,6 +27,7 @@ from .runtime.runner_gateway_auth import (
     validate_runner_gateway_startup,
 )
 from .runtime.runner_gateway_router import router as runner_gateway_router
+from .collaboration.router import router as collaboration_router
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -88,6 +89,7 @@ app.include_router(approvals_router, prefix="/api/approvals", tags=["approvals"]
 app.include_router(identity_admin_router, prefix="/api/identity", tags=["identity"])
 app.include_router(identity_auth_router, prefix="/api/auth", tags=["auth"])
 app.include_router(artifacts_router, prefix="/api", tags=["artifacts"])
+app.include_router(collaboration_router, prefix="/api/collaboration", tags=["collaboration"])
 app.include_router(
     runner_gateway_router,
     prefix="/internal/runner",

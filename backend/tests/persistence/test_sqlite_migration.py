@@ -5,7 +5,9 @@ from datetime import datetime
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.agents.service import AgentService
 from app.agents.store import AgentStore
+from app.core.request_context import RequestContext
 from app.db.base import Base
 from app.mcp.store import McpStore
 from app.migrations.sqlite_to_postgres import migrate_sqlite_databases
@@ -16,6 +18,27 @@ def build_factory(tmp_path) -> sessionmaker[Session]:
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'target.db'}")
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+
+
+def create_legacy_agents_database(tmp_path):
+    agents = tmp_path / "agents.db"
+    with sqlite3.connect(agents) as connection:
+        connection.execute(
+            "CREATE TABLE agents (agent_id TEXT PRIMARY KEY, config_json TEXT "
+            "NOT NULL, workspace_dir TEXT NOT NULL, pinned INTEGER, created_at "
+            "TEXT, updated_at TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO agents VALUES (?, ?, ?, 1, ?, ?)",
+            (
+                "flood",
+                json.dumps({"name": "洪水智能体", "enabled": True}),
+                "D:/work/flood",
+                "2025-01-02 03:04:05",
+                "2025-02-03 04:05:06",
+            ),
+        )
+    return agents
 
 
 def test_imports_all_legacy_sqlite_domains_once(tmp_path):
@@ -29,10 +52,7 @@ def test_imports_all_legacy_sqlite_domains_once(tmp_path):
         connection.execute("INSERT INTO provider_configs VALUES (?, ?, CURRENT_TIMESTAMP)", ("deepseek", json.dumps({"api_key": "legacy"})))
         connection.execute("INSERT INTO platform_settings VALUES (?, ?, CURRENT_TIMESTAMP)", ("active_model", json.dumps({"provider_id": "deepseek", "model": "deepseek-chat"})))
 
-    agents = tmp_path / "agents.db"
-    with sqlite3.connect(agents) as connection:
-        connection.execute("CREATE TABLE agents (agent_id TEXT PRIMARY KEY, config_json TEXT NOT NULL, workspace_dir TEXT NOT NULL, pinned INTEGER, created_at TEXT, updated_at TEXT)")
-        connection.execute("INSERT INTO agents VALUES (?, ?, ?, 1, ?, ?)", ("flood", json.dumps({"name": "洪水智能体", "enabled": True}), "D:/work/flood", "2025-01-02 03:04:05", "2025-02-03 04:05:06"))
+    agents = create_legacy_agents_database(tmp_path)
 
     mcp = tmp_path / "mcp.db"
     with sqlite3.connect(mcp) as connection:
@@ -53,6 +73,10 @@ def test_imports_all_legacy_sqlite_domains_once(tmp_path):
     assert ProviderStore(factory).load()["providers"]["deepseek"]["api_key"] == "legacy"
     assert ProviderStore(factory).load()["providers"]["existing"]["api_key"] == "postgres"
     migrated_agent = AgentStore(factory).get("flood")
+    assert migrated_agent["availability_scope"] == "common"
+    assert migrated_agent["unit_id"] is None
+    assert migrated_agent["project_id"] is None
+    assert migrated_agent["allowed_project_ids"] == ["*"]
     assert migrated_agent["pinned"] is True
     assert migrated_agent["created_at"] == datetime(2025, 1, 2, 3, 4, 5)
     assert migrated_agent["updated_at"] == datetime(2025, 2, 3, 4, 5, 6)
@@ -65,3 +89,29 @@ def test_imports_all_legacy_sqlite_domains_once(tmp_path):
 
     second = migrate_sqlite_databases(factory, providers, agents, mcp)
     assert second == {"model_providers": 0, "agents": 0, "mcp_clients": 0}
+
+
+def test_migrated_wildcard_agent_is_selected_for_each_project(tmp_path):
+    agents = create_legacy_agents_database(tmp_path)
+    factory = build_factory(tmp_path)
+    migrate_sqlite_databases(
+        factory,
+        tmp_path / "missing-providers.db",
+        agents,
+        tmp_path / "missing-mcp.db",
+    )
+    service = AgentService(
+        AgentStore(factory), workspace_root=tmp_path / "agent-workspaces"
+    )
+
+    for unit_id, project_id in (
+        ("unit-north", "project-north"),
+        ("unit-south", "project-south"),
+    ):
+        context = RequestContext(
+            unit_id=unit_id, project_id=project_id, user_id="operator"
+        )
+        assert "flood" in {agent.id for agent in service.list(context=context)}
+        assert service.get_available(
+            "flood", unit_id=unit_id, project_id=project_id
+        ).id == "flood"

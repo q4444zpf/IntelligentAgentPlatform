@@ -8,6 +8,7 @@ from app.runtime.artifact_backend import (
 )
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
 
 
 class FakeArtifactClient:
@@ -155,8 +156,11 @@ def test_artifact_backend_is_create_only():
 class GatewayStorage:
     def __init__(self):
         self.objects = {}
+        self.on_put = None
 
     def put_bytes(self, object_key, data, content_type):
+        if self.on_put is not None:
+            self.on_put()
         self.objects[object_key] = (data, content_type)
 
     def get_bytes(self, object_key):
@@ -184,7 +188,7 @@ class GatewayTokenService:
             project_id="project-1",
             snapshot_id=self.snapshot.snapshot_id,
             snapshot_digest=self.snapshot.digest,
-            actions=("artifact.create",),
+            actions=(action,),
             iat=1,
             nbf=1,
             exp=9999999999,
@@ -199,32 +203,74 @@ class GatewaySnapshotService:
         return self.snapshot if snapshot_id == self.snapshot.snapshot_id else None
 
 
-def _gateway_snapshot():
+def _gateway_snapshot(*, team=False):
     from app.runtime.execution_snapshot import (
         ExecutionSnapshotPayload,
         PublishedAgentSnapshot,
+        PublishedTeamSnapshot,
         SnapshotModelSelection,
         SnapshotRuntimeLimits,
+        SnapshotTeamMember,
         StoredExecutionSnapshot,
         canonical_snapshot_bytes,
     )
 
-    payload = ExecutionSnapshotPayload(
-        snapshot_id="snapshot-1",
-        run_id="run-1",
-        unit_id="unit-1",
-        project_id="project-1",
-        user_id="user-1",
-        actor=PublishedAgentSnapshot(
-            id="agent-1",
-            name="Agent",
+    agent = PublishedAgentSnapshot(
+        id="agent-1",
+        name="Agent",
+        description="",
+        runtime_form="common",
+        language="zh-CN",
+        system_prompt="",
+        context_prompt="",
+        approval_policy="never",
+    )
+    actor = agent
+    schema_version = "1"
+    if team:
+        def member(agent_id, role):
+            return SnapshotTeamMember(
+                agent_id=agent_id,
+                role=role,
+                responsibility=role,
+                agent_definition_digest=hashlib.sha256(
+                    agent_id.encode()
+                ).hexdigest(),
+                agent=agent.model_copy(update={"id": agent_id, "name": agent_id}),
+                model=SnapshotModelSelection(
+                    provider_id="provider-1",
+                    model="model-1",
+                ),
+            )
+
+        actor = PublishedTeamSnapshot(
+            id="team-1",
+            version_id="team-version-1",
+            version=1,
+            definition_digest="d" * 64,
+            supervisor=member("supervisor", "supervisor"),
+            members=(member("forecast", "member"), member("review", "member")),
+            max_steps=4,
+            max_parallel_members=2,
+            timeout_seconds=60,
+            failure_strategy="fail_fast",
+            name="Team",
             description="",
             runtime_form="common",
             language="zh-CN",
             system_prompt="",
             context_prompt="",
             approval_policy="never",
-        ),
+        )
+        schema_version = "5"
+    payload = ExecutionSnapshotPayload(
+        schema_version=schema_version,
+        snapshot_id="snapshot-1",
+        run_id="run-1",
+        unit_id="unit-1",
+        project_id="project-1",
+        user_id="user-1",
+        actor=actor,
         model=SnapshotModelSelection(provider_id="provider-1", model="model-1"),
         messages=(),
         limits=SnapshotRuntimeLimits(snapshot_max_bytes=1048576),
@@ -240,7 +286,15 @@ def _gateway_snapshot():
     )
 
 
-def _add_run(session, run_id, project_id="project-1"):
+def _add_run(
+    session,
+    run_id,
+    project_id="project-1",
+    *,
+    actor_type="agent",
+    actor_id="agent-1",
+    actor_version_id=None,
+):
     from app.conversations.models import AgentRun, Conversation, Message, RunEvent
 
     conversation = Conversation(
@@ -264,21 +318,23 @@ def _add_run(session, run_id, project_id="project-1"):
             id=run_id,
             conversation_id=conversation.id,
             trigger_message_id=message.id,
-            actor_type="agent",
-            actor_id="agent-1",
+            actor_type=actor_type,
+            actor_id=actor_id,
+            actor_version_id=actor_version_id,
             status="running",
         )
     )
     session.commit()
 
 
-def _gateway_client(repository_type=None):
+def _gateway_client(repository_type=None, *, snapshot=None, checkpoint_state=None):
     from app.artifacts.models import ArtifactRecord
     from app.artifacts.service import ArtifactService
     from app.conversations.models import AgentRun, Conversation, Message, RunEvent
     from app.conversations.repository import ConversationRepository
     from app.db.base import Base
     from app.runtime.run_tokens import RunTokenClaims
+    from app.runtime.checkpoint_store import CheckpointStore
     from app.runtime.runner_gateway_auth import (
         RunnerGatewayError,
         runner_gateway_error_handler,
@@ -297,19 +353,36 @@ def _gateway_client(repository_type=None):
         poolclass=StaticPool,
     )
     Base.metadata.create_all(engine)
-    session = Session(engine)
-    _add_run(session, "run-1")
+    session = Session(engine, expire_on_commit=False)
+    snapshot = snapshot or _gateway_snapshot()
+    actor = snapshot.payload.actor
+    _add_run(
+        session,
+        "run-1",
+        actor_type=actor.kind,
+        actor_id=actor.id,
+        actor_version_id=getattr(actor, "version_id", None),
+    )
     _add_run(session, "run-2")
-    snapshot = _gateway_snapshot()
     storage = GatewayStorage()
     artifacts = ArtifactService(session, storage)
     repository = repository_type(session)
+    checkpoints = CheckpointStore(session)
+    if checkpoint_state is not None:
+        checkpoints.save(
+            "run-1",
+            "team-scheduler",
+            checkpoint_state,
+            snapshot.digest,
+            "checkpoint:test",
+        )
     app = FastAPI()
     app.add_exception_handler(RunnerGatewayError, runner_gateway_error_handler)
     app.include_router(
         create_router(
             token_service_dependency=lambda: GatewayTokenService(snapshot),
             snapshot_service_dependency=lambda: GatewaySnapshotService(snapshot),
+            checkpoint_store_dependency=lambda: checkpoints,
             conversation_repository_dependency=lambda: repository,
             artifact_service_dependency=lambda: artifacts,
         ),
@@ -376,6 +449,351 @@ def test_runner_artifact_gateway_is_scoped_idempotent_and_emits_ready_event():
     assert base64.b64decode(read.json()["data_base64"]) == data
 
 
+def _artifact_request(*, provenance=None, capability=None, path="/artifacts/result.txt"):
+    data = b"result"
+    request = {
+        "path": path,
+        "content_type": "text/plain",
+        "size_bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "data_base64": base64.b64encode(data).decode("ascii"),
+    }
+    if provenance is not None:
+        request["provenance"] = provenance
+    if capability is not None:
+        request["capability"] = capability
+    return request
+
+
+def _team_scheduler_checkpoint(snapshot):
+    return {
+        "kind": "team_scheduler",
+        "stage": "executing",
+        "snapshot_digest": snapshot.digest,
+        "team_version_id": "team-version-1",
+        "plan": {
+            "tasks": [
+                {
+                    "id": "forecast-task",
+                    "member_id": "forecast",
+                    "objective": "forecast",
+                    "depends_on": [],
+                    "position": 0,
+                },
+                {
+                    "id": "review-task",
+                    "member_id": "review",
+                    "objective": "review",
+                    "depends_on": ["forecast-task"],
+                    "position": 1,
+                },
+            ],
+        },
+        "pending_task_ids": ["forecast-task", "review-task"],
+        "started_task_ids": ["forecast-task"],
+        "active_task_id": "forecast-task",
+        "active_member_agent_id": "forecast",
+        "active_invocation_id": "team:team-version-1:forecast-task",
+        "completed_results": [],
+        "failed_results": [],
+        "event_sequence": 1,
+        "checkpoint_revision": 1,
+        "budget": {
+            "next_invocation_sequence": 0,
+            "tool_call_count": 0,
+            "subagent_call_count": 0,
+        },
+    }
+
+
+def _register_artifact_capability(client, *, member_agent_id, task_id, invocation_id):
+    response = client.post(
+        "/internal/runner/runs/run-1/artifact-capabilities",
+        headers=_headers(),
+        json={
+            "team_version_id": "team-version-1",
+            "member_agent_id": member_agent_id,
+            "task_id": task_id,
+            "invocation_id": invocation_id,
+        },
+    )
+    assert response.status_code == 201
+    return response.json()["capability"]
+
+
+def test_concurrent_team_artifact_capability_is_bound_to_one_active_invocation():
+    snapshot = _gateway_snapshot(team=True)
+    checkpoint = _team_scheduler_checkpoint(snapshot)
+    checkpoint["plan"]["tasks"][1]["depends_on"] = []
+    checkpoint.update({
+        "started_task_ids": ["forecast-task", "review-task"],
+        "active_task_id": None,
+        "active_member_agent_id": None,
+        "active_invocation_id": None,
+        "active_invocations": [
+            {
+                "task_id": "forecast-task",
+                "member_agent_id": "forecast",
+                "invocation_id": "invocation-forecast-7",
+                "checkpoint_status": "running",
+            },
+            {
+                "task_id": "review-task",
+                "member_agent_id": "review",
+                "invocation_id": "invocation-review-11",
+                "checkpoint_status": "running",
+            },
+        ],
+    })
+    client, session, _, _ = _gateway_client(
+        snapshot=snapshot,
+        checkpoint_state=checkpoint,
+    )
+    forecast_capability = _register_artifact_capability(
+        client,
+        member_agent_id="forecast",
+        task_id="forecast-task",
+        invocation_id="invocation-forecast-7",
+    )
+    _register_artifact_capability(
+        client,
+        member_agent_id="review",
+        task_id="review-task",
+        invocation_id="invocation-review-11",
+    )
+    mismatched_registration = client.post(
+        "/internal/runner/runs/run-1/artifact-capabilities",
+        headers=_headers(),
+        json={
+            "team_version_id": "team-version-1",
+            "member_agent_id": "review",
+            "task_id": "review-task",
+            "invocation_id": "invocation-forecast-7",
+        },
+    )
+    forecast_provenance = {
+        "member_agent_id": "forecast",
+        "task_id": "forecast-task",
+        "invocation_id": "invocation-forecast-7",
+    }
+    review_provenance = {
+        "member_agent_id": "review",
+        "task_id": "review-task",
+        "invocation_id": "invocation-review-11",
+    }
+
+    accepted = client.post(
+        "/internal/runner/runs/run-1/artifacts",
+        headers=_headers(key="artifact-capability-forecast"),
+        json=_artifact_request(
+            provenance=forecast_provenance,
+            capability=forecast_capability,
+            path="/artifacts/forecast.txt",
+        ),
+    )
+    cross_member = client.post(
+        "/internal/runner/runs/run-1/artifacts",
+        headers=_headers(key="artifact-capability-cross-member"),
+        json=_artifact_request(
+            provenance=review_provenance,
+            capability=forecast_capability,
+            path="/artifacts/review.txt",
+        ),
+    )
+    forged = client.post(
+        "/internal/runner/runs/run-1/artifacts",
+        headers=_headers(key="artifact-capability-forged"),
+        json=_artifact_request(
+            provenance=forecast_provenance,
+            capability="f" * 43,
+            path="/artifacts/forged.txt",
+        ),
+    )
+    latest = client.get(
+        "/internal/runner/runs/run-1/checkpoints/latest",
+        headers=_headers(),
+    )
+
+    assert accepted.status_code == 201
+    assert mismatched_registration.status_code == 403
+    assert mismatched_registration.json()["code"] == "artifact_capability_invalid"
+    assert cross_member.status_code == 403
+    assert forged.status_code == 403
+    assert latest.status_code == 200
+    assert latest.json()["checkpoint_key"] == "team-scheduler"
+
+    from app.artifacts.models import ArtifactRecord
+    from app.runtime.checkpoint_store import RuntimeCheckpoint
+
+    stored_states = [row.state for row in session.query(RuntimeCheckpoint).all()]
+    artifact = session.query(ArtifactRecord).one()
+    assert forecast_capability not in repr(stored_states)
+    assert all("capability" not in state for state in stored_states)
+    assert "capability" not in artifact.provenance
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        None,
+        {
+            "team_version_id": "spoofed-version",
+            "member_agent_id": "forecast",
+            "task_id": "forecast-task",
+            "invocation_id": "team:team-version-1:forecast-task",
+        },
+        {
+            "team_version_id": "team-version-1",
+            "member_agent_id": "outside",
+            "task_id": "forecast-task",
+            "invocation_id": "team:team-version-1:forecast-task",
+        },
+        {
+            "team_version_id": "team-version-1",
+            "member_agent_id": "review",
+            "task_id": "forecast-task",
+            "invocation_id": "team:team-version-1:forecast-task",
+        },
+        {
+            "team_version_id": "team-version-1",
+            "member_agent_id": "review",
+            "task_id": "review-task",
+            "invocation_id": "team:team-version-1:review-task",
+        },
+    ],
+)
+def test_team_artifact_gateway_rejects_missing_or_spoofed_provenance(provenance):
+    snapshot = _gateway_snapshot(team=True)
+    client, _, _, _ = _gateway_client(
+        snapshot=snapshot,
+        checkpoint_state=_team_scheduler_checkpoint(snapshot),
+    )
+
+    response = client.post(
+        "/internal/runner/runs/run-1/artifacts",
+        headers=_headers(key="artifact-team-invalid"),
+        json=_artifact_request(provenance=provenance),
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "artifact_provenance_invalid"
+
+
+def test_team_artifact_gateway_derives_version_and_persists_validated_provenance():
+    snapshot = _gateway_snapshot(team=True)
+    client, session, _, _ = _gateway_client(
+        snapshot=snapshot,
+        checkpoint_state=_team_scheduler_checkpoint(snapshot),
+    )
+
+    invocation_id = "team:team-version-1:forecast-task"
+    capability = _register_artifact_capability(
+        client,
+        member_agent_id="forecast",
+        task_id="forecast-task",
+        invocation_id=invocation_id,
+    )
+    response = client.post(
+        "/internal/runner/runs/run-1/artifacts",
+        headers=_headers(key="artifact-team-valid"),
+        json=_artifact_request(provenance={
+            "member_agent_id": "forecast",
+            "task_id": "forecast-task",
+            "invocation_id": invocation_id,
+        }, capability=capability),
+    )
+
+    from app.artifacts.models import ArtifactRecord
+
+    assert response.status_code == 201
+    artifact = session.query(ArtifactRecord).one()
+    assert artifact.provenance == {
+        "team_version_id": "team-version-1",
+        "member_agent_id": "forecast",
+        "task_id": "forecast-task",
+    }
+
+
+def test_terminal_team_run_rejects_new_artifact_capability_checkpoint():
+    from app.conversations.models import AgentRun
+    from app.runtime.checkpoint_store import RuntimeCheckpoint
+
+    snapshot = _gateway_snapshot(team=True)
+    client, session, _, _ = _gateway_client(
+        snapshot=snapshot,
+        checkpoint_state=_team_scheduler_checkpoint(snapshot),
+    )
+    session.get(AgentRun, "run-1").status = "failed"
+    session.commit()
+    checkpoint_count = session.query(RuntimeCheckpoint).count()
+
+    response = client.post(
+        "/internal/runner/runs/run-1/artifact-capabilities",
+        headers=_headers(),
+        json={
+            "team_version_id": "team-version-1",
+            "member_agent_id": "forecast",
+            "task_id": "forecast-task",
+            "invocation_id": "team:team-version-1:forecast-task",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "run_not_active"
+    assert session.query(RuntimeCheckpoint).count() == checkpoint_count
+
+
+def test_team_artifact_gateway_rejects_another_started_task_than_active_invocation():
+    snapshot = _gateway_snapshot(team=True)
+    checkpoint = _team_scheduler_checkpoint(snapshot) | {
+        "started_task_ids": ["forecast-task", "review-task"],
+        "active_task_id": "forecast-task",
+        "active_member_agent_id": "forecast",
+        "active_invocation_id": "team:team-version-1:forecast-task",
+    }
+    client, _, _, _ = _gateway_client(
+        snapshot=snapshot,
+        checkpoint_state=checkpoint,
+    )
+
+    response = client.post(
+        "/internal/runner/runs/run-1/artifacts",
+        headers=_headers(key="artifact-team-other-started-task"),
+        json=_artifact_request(provenance={
+            "member_agent_id": "review",
+            "task_id": "review-task",
+            "invocation_id": "team:team-version-1:review-task",
+        }),
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "artifact_provenance_invalid"
+
+
+def test_agent_artifact_gateway_rejects_team_provenance_but_keeps_legacy_upload():
+    client, _, _, _ = _gateway_client()
+
+    rejected = client.post(
+        "/internal/runner/runs/run-1/artifacts",
+        headers=_headers(key="artifact-agent-spoofed"),
+        json=_artifact_request(provenance={
+            "team_version_id": "team-version-1",
+            "member_agent_id": "forecast",
+            "task_id": "forecast-task",
+            "invocation_id": "team:team-version-1:forecast-task",
+        }),
+    )
+    accepted = client.post(
+        "/internal/runner/runs/run-1/artifacts",
+        headers=_headers(key="artifact-agent-compatible"),
+        json={**_artifact_request(), "path": "/artifacts/legacy.txt"},
+    )
+
+    assert rejected.status_code == 403
+    assert rejected.json()["code"] == "artifact_provenance_invalid"
+    assert accepted.status_code == 201
+
+
 def test_runner_cannot_read_other_run_artifact():
     client, _, artifacts, _ = _gateway_client()
     data = b"foreign"
@@ -432,4 +850,35 @@ def test_runner_artifact_upload_removes_object_when_event_persistence_fails():
     assert response.status_code == 502
     assert response.json()["code"] == "artifact_upload_failed"
     assert session.query(ArtifactRecord).count() == 0
+    assert storage.objects == {}
+
+
+def test_artifact_upload_finishing_after_terminal_run_commits_no_platform_state():
+    from app.artifacts.models import ArtifactRecord
+    from app.conversations.models import AgentRun, RunEvent
+    from app.runtime.checkpoint_store import RuntimeRunnerRequest
+
+    client, session, _, storage = _gateway_client()
+    transaction_states = []
+
+    def timeout_during_upload():
+        transaction_states.append(session.in_transaction())
+        with Session(session.bind) as terminal_session:
+            terminal_session.get(AgentRun, "run-1").status = "failed"
+            terminal_session.commit()
+
+    storage.on_put = timeout_during_upload
+
+    response = client.post(
+        "/internal/runner/runs/run-1/artifacts",
+        headers=_headers(key="artifact-terminal-race"),
+        json=_artifact_request(),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "run_not_active"
+    assert transaction_states == [False]
+    assert session.query(ArtifactRecord).count() == 0
+    assert session.query(RunEvent).count() == 0
+    assert session.query(RuntimeRunnerRequest).count() == 0
     assert storage.objects == {}

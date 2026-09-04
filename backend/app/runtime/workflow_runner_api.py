@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-from app.runtime.launcher_client import LauncherClientError, launcher_client_from_env
+from app.runtime.launcher_client import (
+    LauncherClientError,
+    LauncherDeadlineExceededError,
+    launcher_client_from_env,
+)
 from app.runtime.sandbox_inspector import SandboxInspector
 from app.runtime.sandbox_readiness import SandboxReadiness
 
@@ -20,6 +25,7 @@ class RunSubmission(BaseModel):
     agent_version: str
     checkpoint_key: str
     deadline_at: str
+    execution_deadline_at: str
     snapshot_id: str
     snapshot_digest: str
     gateway_url: str
@@ -43,9 +49,19 @@ def create_runner_app(*, sandbox_enabled: bool = False, readiness: SandboxReadin
         return {"status": "healthy", "sandbox": sandbox_ready and not inspection_missing, "missing": missing}
 
     @app.post("/runs")
-    def submit_run(request: RunSubmission) -> dict[str, str]:
+    def submit_run(
+        request: RunSubmission,
+        x_request_deadline_at: str | None = Header(default=None),
+    ) -> dict[str, str]:
         if not sandbox_ready:
             raise HTTPException(status_code=503, detail="Sandbox Executor is not enabled")
+        execution_deadline_at = active_deadline(request.execution_deadline_at)
+        request_deadline_at = execution_deadline_at
+        if x_request_deadline_at is not None:
+            request_deadline_at = min(
+                request_deadline_at,
+                active_deadline(x_request_deadline_at),
+            )
         if launcher_client is not None:
             try:
                 launcher_client.prepare(
@@ -53,11 +69,18 @@ def create_runner_app(*, sandbox_enabled: bool = False, readiness: SandboxReadin
                     agent_version=request.agent_version,
                     checkpoint_key=request.checkpoint_key,
                     deadline_at=request.deadline_at,
+                    execution_deadline_at=request.execution_deadline_at,
                     snapshot_id=request.snapshot_id,
                     snapshot_digest=request.snapshot_digest,
                     gateway_url=request.gateway_url,
                     run_token=request.run_token,
+                    request_deadline_at=request_deadline_at.isoformat(),
                 )
+            except LauncherDeadlineExceededError as exc:
+                raise HTTPException(
+                    status_code=504,
+                    detail="Sandbox execution deadline expired",
+                ) from exc
             except LauncherClientError as exc:
                 raise HTTPException(status_code=503, detail=str(exc)) from exc
         return {"run_id": request.run_id, "status": "accepted"}
@@ -67,20 +90,83 @@ def create_runner_app(*, sandbox_enabled: bool = False, readiness: SandboxReadin
             raise HTTPException(status_code=503, detail="Sandbox Executor is not enabled")
         try:
             return operation()
+        except LauncherDeadlineExceededError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail="Sandbox execution deadline expired",
+            ) from exc
         except LauncherClientError as exc:
             raise HTTPException(status_code=503, detail="Sandbox launcher is unavailable") from exc
 
+    def active_deadline(value: str) -> datetime:
+        try:
+            deadline_at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Sandbox execution deadline is invalid",
+            ) from exc
+        if (
+            deadline_at.tzinfo is None
+            or deadline_at.utcoffset() is None
+            or datetime.now(UTC) >= deadline_at
+        ):
+            raise HTTPException(
+                status_code=504,
+                detail="Sandbox execution deadline expired",
+            )
+        return deadline_at.astimezone(UTC)
+
     @app.get("/runs/{run_id}")
-    def get_run_status(run_id: str) -> dict[str, Any]:
-        return lifecycle(lambda: launcher_client.inspect(run_id))
+    def get_run_status(
+        run_id: str,
+        x_request_deadline_at: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        request_deadline_at = (
+            active_deadline(x_request_deadline_at).isoformat()
+            if x_request_deadline_at is not None
+            else None
+        )
+        return lifecycle(
+            lambda: launcher_client.inspect(
+                run_id,
+                request_deadline_at=request_deadline_at,
+            )
+        )
 
     @app.post("/runs/{run_id}/terminate")
-    def terminate_run(run_id: str) -> dict[str, Any]:
-        return lifecycle(lambda: launcher_client.terminate(run_id))
+    def terminate_run(
+        run_id: str,
+        x_request_deadline_at: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        request_deadline_at = (
+            active_deadline(x_request_deadline_at).isoformat()
+            if x_request_deadline_at is not None
+            else None
+        )
+        return lifecycle(
+            lambda: launcher_client.terminate(
+                run_id,
+                request_deadline_at=request_deadline_at,
+            )
+        )
 
     @app.delete("/runs/{run_id}")
-    def cleanup_run(run_id: str) -> dict[str, Any]:
-        return lifecycle(lambda: launcher_client.cleanup(run_id))
+    def cleanup_run(
+        run_id: str,
+        x_request_deadline_at: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        request_deadline_at = (
+            active_deadline(x_request_deadline_at).isoformat()
+            if x_request_deadline_at is not None
+            else None
+        )
+        return lifecycle(
+            lambda: launcher_client.cleanup(
+                run_id,
+                request_deadline_at=request_deadline_at,
+            )
+        )
 
     return app
 

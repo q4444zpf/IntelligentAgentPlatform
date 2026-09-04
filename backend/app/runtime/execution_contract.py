@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _REFERENCE_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
 _ERROR_CODE_PATTERN = r"^[a-z][a-z0-9_]{0,119}$"
@@ -17,6 +17,7 @@ class RunExecutionRequest(BaseModel):
     agent_version: str = Field(min_length=1, max_length=128, pattern=_REFERENCE_PATTERN)
     checkpoint_key: str = Field(min_length=1, max_length=128, pattern=_REFERENCE_PATTERN)
     deadline_at: datetime
+    execution_deadline_at: datetime
     snapshot_id: str = Field(min_length=1, max_length=128, pattern=_REFERENCE_PATTERN)
     snapshot_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     gateway_url: str = Field(min_length=1, max_length=2048)
@@ -31,6 +32,21 @@ class RunExecutionRequest(BaseModel):
         if normalized <= datetime.now(timezone.utc):
             raise ValueError("deadline_at must be in the future")
         return normalized
+
+    @field_validator("execution_deadline_at")
+    @classmethod
+    def validate_execution_deadline(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(
+                "execution_deadline_at must include timezone information"
+            )
+        return value.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def validate_execution_deadline_ceiling(self) -> RunExecutionRequest:
+        if self.execution_deadline_at > self.deadline_at:
+            raise ValueError("execution_deadline_at must not exceed deadline_at")
+        return self
 
     @field_validator("gateway_url")
     @classmethod

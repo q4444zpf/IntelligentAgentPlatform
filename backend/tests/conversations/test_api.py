@@ -5,16 +5,19 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.agents.service import BUILTIN_AGENT_ID, AgentNotFoundError
+from app.agents.schemas import AgentConfig
+from app.agents.service import BUILTIN_AGENT_ID, AgentNotFoundError, AgentService
+from app.agents.store import AgentStore, DEFAULT_SETTING_KEY
 from app.conversations.dispatcher import UnavailableRunDispatcher
 from app.conversations.models import AgentRun, Message, ToolInvocation
 from app.conversations.repository import ConversationRepository
 from app.conversations.router import create_router
 from app.conversations.service import ConversationService
 from app.db.base import Base
+from app.db.platform_models import PlatformSettingRecord
 
 
 class StubAgentService:
@@ -28,11 +31,17 @@ class StubAgentService:
     def get_default(self):
         return self.agents[BUILTIN_AGENT_ID]
 
+    def get_default_available(self, *, unit_id: str, project_id: str):
+        return self.get(BUILTIN_AGENT_ID)
+
     def get(self, agent_id: str):
         try:
             return self.agents[agent_id]
         except KeyError as error:
             raise AgentNotFoundError(agent_id) from error
+
+    def get_available(self, agent_id: str, *, unit_id: str, project_id: str):
+        return self.get(agent_id)
 
 
 def build_client(dispatcher=None):
@@ -325,6 +334,19 @@ def test_agent_run_list_rejects_unsafe_or_oversized_filters(name, value):
     assert response.status_code == 422
 
 
+def test_agent_run_list_accepts_team_uuid_filter():
+    client = build_client()
+
+    response = client.get(
+        "/api/agent-runs",
+        params={"actor_id": "8c3c8a65-709b-4187-aec8-4a9341f817de"},
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["items"] == []
+
+
 def test_agent_run_list_rejects_naive_time_filters():
     client = build_client()
 
@@ -457,6 +479,104 @@ def test_missing_team_actor_id_returns_422_without_persisting():
     session = client.app.state.conversation_session
     assert session.scalar(select(func.count()).select_from(Message)) == 0
     assert session.scalar(select(func.count()).select_from(AgentRun)) == 0
+
+
+def test_message_agent_selection_uses_persisted_scope_and_common_wildcard(tmp_path):
+    engine = create_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'scoped-conversations.db'}"
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    store = AgentStore(factory)
+    agent_service = AgentService(
+        store,
+        workspace_root=tmp_path / "agent-workspaces",
+    )
+    config = AgentConfig(name="Other project agent").model_dump()
+    store.create(
+        "other-project-agent",
+        config,
+        str(tmp_path / "other-project-agent"),
+        availability_scope="project",
+        unit_id="unit-1",
+        project_id="p2",
+        allowed_project_ids=[],
+    )
+    store.create(
+        "other-unit-agent",
+        config,
+        str(tmp_path / "other-unit-agent"),
+        availability_scope="project",
+        unit_id="unit-2",
+        project_id="p1",
+        allowed_project_ids=[],
+    )
+    with factory.begin() as pointer_session:
+        pointer = pointer_session.get(PlatformSettingRecord, DEFAULT_SETTING_KEY)
+        pointer.value = {
+            "agent_id": "other-project-agent",
+            "scope": "platform",
+        }
+    session = Session(engine)
+    service = ConversationService(
+        ConversationRepository(session),
+        UnavailableRunDispatcher(),
+        agent_service=agent_service,
+    )
+    app = FastAPI()
+    app.state.allow_dev_identity = True
+    app.include_router(create_router(lambda _session: service), prefix="/api")
+    scoped_client = TestClient(app)
+    conversation = scoped_client.post(
+        "/api/conversations",
+        json={"title": "Scoped selection"},
+        headers=HEADERS,
+    ).json()
+    endpoint = f"/api/conversations/{conversation['id']}/messages"
+
+    cross_project = scoped_client.post(
+        endpoint,
+        json={
+            "content": "inspect",
+            "actor_type": "agent",
+            "actor_id": "other-project-agent",
+        },
+        headers=HEADERS,
+    )
+    cross_unit = scoped_client.post(
+        endpoint,
+        json={
+            "content": "inspect",
+            "actor_type": "agent",
+            "actor_id": "other-unit-agent",
+        },
+        headers=HEADERS,
+    )
+    repaired_default = scoped_client.post(
+        endpoint,
+        json={"content": "inspect", "actor_type": "agent"},
+        headers=HEADERS,
+    )
+    common = scoped_client.post(
+        endpoint,
+        json={
+            "content": "inspect",
+            "actor_type": "agent",
+            "actor_id": BUILTIN_AGENT_ID,
+        },
+        headers=HEADERS,
+    )
+
+    assert [
+        cross_project.status_code,
+        cross_unit.status_code,
+        repaired_default.status_code,
+    ] == [422, 422, 202]
+    assert repaired_default.json()["run"]["actor_id"] == BUILTIN_AGENT_ID
+    assert common.status_code == 202
+    assert common.json()["run"]["actor_id"] == BUILTIN_AGENT_ID
+    assert session.scalar(select(func.count()).select_from(Message)) == 2
+    assert session.scalar(select(func.count()).select_from(AgentRun)) == 2
 
 
 def test_sse_honors_last_event_id():

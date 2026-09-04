@@ -1,11 +1,18 @@
 from datetime import timedelta
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from app.approvals.models import Approval
+from app.approvals.router import create_router as create_approval_router
 from app.approvals.service import ApprovalService
+from app.conversations.models import AgentRun
+from app.conversations.router import default_run_dispatcher
+from app.core.database import get_session
 from app.core.request_context import RequestContext
+from app.runtime.checkpoint_store import RuntimeRunnerRequest
 from app.runtime.execution_snapshot import RuntimeExecutionSnapshot
 from app.runtime.model_gateway import ModelUpstreamError
 from app.tools.schemas import ToolExecutionContext
@@ -67,6 +74,33 @@ def test_snapshot_mismatch_and_idempotency_conflicts_are_stable(runner_gateway_e
     )
     assert mismatch.status_code == 409
     assert mismatch.json()["code"] == "snapshot_invalid"
+
+
+def test_pending_run_rejects_mutating_event_without_changing_state(runner_gateway_env):
+    env = runner_gateway_env
+    env.repository.get_run_by_id("run-1").status = "pending"
+    env.session.commit()
+    token = env.issue_token()
+    events_before = env.repository.list_events("run-1", 0)
+    checkpoint_before = env.checkpoint_store.load_latest("run-1")
+    requests_before = env.session.query(RuntimeRunnerRequest).count()
+
+    response = env.client.post(
+        "/internal/runner/runs/run-1/events",
+        headers=env.headers(token, "event:pending-run"),
+        json={
+            "sequence": 1,
+            "event_type": "runner.started",
+            "payload": {"phase": "execute"},
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "run_not_active"
+    assert env.repository.get_run_by_id("run-1").status == "pending"
+    assert env.repository.list_events("run-1", 0) == events_before
+    assert env.checkpoint_store.load_latest("run-1") == checkpoint_before
+    assert env.session.query(RuntimeRunnerRequest).count() == requests_before
 
 
 def test_duplicate_event_and_completion_are_idempotent(runner_gateway_env):
@@ -186,6 +220,8 @@ def test_approval_interruption_can_resume_authorized_execution(runner_gateway_en
 
     assert result.value["run_id"] == "run-1"
     assert env.repository.list_tool_invocations("run-1")[0].status == "completed"
+    env.repository.get_run_by_id("run-1").status = "running"
+    env.session.commit()
 
     resumed = env.client.post(
         "/internal/runner/runs/run-1/tool-invocations",
@@ -196,6 +232,73 @@ def test_approval_interruption_can_resume_authorized_execution(runner_gateway_en
     assert resumed.status_code == 200
     assert resumed.json()["value"]["run_id"] == "run-1"
     assert len(env.repository.list_tool_invocations("run-1")) == 1
+
+
+def test_fail_fast_failure_supersedes_real_waiting_approval_state(
+    runner_gateway_env,
+    monkeypatch,
+):
+    env = runner_gateway_env
+    env.repository.get_run_by_id("run-1").status = "running"
+    env.session.commit()
+    token = env.issue_token()
+    interrupted = env.client.post(
+        "/internal/runner/runs/run-1/tool-invocations",
+        headers=env.headers(token, "tool:parallel-approval"),
+        json=_tool_request("system.get_runtime_context"),
+    )
+    approval = env.session.scalar(select(Approval).where(Approval.run_id == "run-1"))
+    assert approval is not None
+
+    resumed: list[str] = []
+    monkeypatch.setattr(default_run_dispatcher, "resume_approval", resumed.append)
+    approval_app = FastAPI()
+    approval_app.state.allow_dev_identity = True
+    approval_app.dependency_overrides[get_session] = lambda: env.session
+    approval_app.include_router(
+        create_approval_router(
+            lambda session: ApprovalService(session, clock=env.clock)
+        ),
+        prefix="/api/approvals",
+    )
+    with TestClient(approval_app) as approval_client:
+        failed = env.client.post(
+            "/internal/runner/runs/run-1/completion",
+            headers=env.headers(token, "completion:parallel-failure"),
+            json={"status": "failed", "error_code": "sandbox_failed"},
+        )
+        decision = approval_client.post(
+            f"/api/approvals/{approval.id}/approve",
+            json={"reason": "too late"},
+            headers={
+                "X-Unit-ID": "unit-1",
+                "X-User-ID": "reviewer",
+                "X-Project-ID": "project-1",
+                "X-User-Roles": "project_admin",
+            },
+        )
+
+    env.session.expire_all()
+    assert interrupted.status_code == 409
+    assert interrupted.json()["code"] == "tool_approval_required"
+    assert failed.status_code == 200
+    assert decision.status_code == 409
+    assert env.session.get(AgentRun, "run-1").status == "failed"
+    assert env.session.get(Approval, approval.id).status == "pending"
+    assert env.repository.list_tool_invocations("run-1")[0].status == (
+        "waiting_approval"
+    )
+    assert resumed == []
+    completion = next(
+        event
+        for event in env.repository.list_events("run-1", 0)
+        if event.event_type == "runner.completion"
+    )
+    assert completion.payload == {
+        "status": "failed",
+        "error_code": "sandbox_failed",
+        "artifact_refs": [],
+    }
 
 
 def test_model_checkpoint_and_artifact_failures_do_not_leak_details(

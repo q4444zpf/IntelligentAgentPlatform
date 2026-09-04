@@ -66,6 +66,7 @@ class ModelInvocationRequest(BaseModel):
 
     provider_id: str | None = None
     model: str | None = None
+    member_agent_id: str | None = None
     messages: list[ModelMessage] = Field(min_length=1)
     tools: list[ModelToolDefinition] = Field(default_factory=list)
     temperature: float | None = Field(default=None, allow_inf_nan=False)
@@ -97,6 +98,7 @@ class ToolInvocationRequest(BaseModel):
     tool_call_id: str = Field(min_length=1, max_length=128)
     tool_id: str = Field(min_length=1, max_length=128)
     version: str = Field(min_length=1, max_length=32)
+    member_agent_id: str | None = None
     arguments: dict[str, Any]
     invocation_sequence: int = Field(ge=0)
 
@@ -108,6 +110,30 @@ class ToolInvocationResponse(BaseModel):
     value: dict[str, Any]
 
 
+class ArtifactProvenance(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    team_version_id: str | None = Field(default=None, min_length=1, max_length=128)
+    member_agent_id: str = Field(min_length=1, max_length=128)
+    task_id: str = Field(min_length=1, max_length=128)
+    invocation_id: str = Field(min_length=1, max_length=256)
+
+
+class ArtifactCapabilityRegistrationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    team_version_id: str = Field(min_length=1, max_length=128)
+    member_agent_id: str = Field(min_length=1, max_length=128)
+    task_id: str = Field(min_length=1, max_length=128)
+    invocation_id: str = Field(min_length=1, max_length=256)
+
+
+class ArtifactCapabilityResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    capability: str = Field(min_length=32, max_length=256)
+
+
 class ArtifactCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -116,6 +142,8 @@ class ArtifactCreateRequest(BaseModel):
     size_bytes: int = Field(ge=0)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     data_base64: str
+    provenance: ArtifactProvenance | None = None
+    capability: str | None = Field(default=None, min_length=32, max_length=256)
 
 
 class ArtifactFileResponse(BaseModel):

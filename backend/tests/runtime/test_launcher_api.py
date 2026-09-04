@@ -1,3 +1,6 @@
+from datetime import UTC, datetime, timedelta
+
+import pytest
 from fastapi.testclient import TestClient
 
 from app.runtime.container_launcher import LauncherUnavailableError
@@ -32,6 +35,7 @@ def execution_request(workspace_path="/workspace/run-1"):
         "agent_version": "agent-v1",
         "checkpoint_key": "runtime",
         "deadline_at": "2099-01-01T00:00:00Z",
+        "execution_deadline_at": "2098-12-31T23:59:00Z",
         "snapshot_id": "snapshot-1",
         "snapshot_digest": "a" * 64,
         "gateway_url": "http://api:8000/internal/runner",
@@ -78,6 +82,52 @@ def test_launcher_requires_run_scoped_header_for_create():
         json=execution_request(),
     )
     assert response.status_code == 403
+
+
+def test_launcher_rejects_expired_execution_before_create_handler():
+    launcher = FakeLauncher()
+    client = TestClient(create_launcher_app(launcher, runner_token="secret"))
+    headers = {"Authorization": "Bearer secret", "X-Run-Id": "run-1"}
+    request = execution_request()
+    request["execution_deadline_at"] = (
+        datetime.now(UTC) - timedelta(seconds=1)
+    ).isoformat()
+
+    response = client.post(
+        "/runs/run-1/container",
+        headers=headers,
+        json=request,
+    )
+
+    assert response.status_code == 504
+    assert launcher.calls == []
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("get", "/runs/run-1/container"),
+        ("post", "/runs/run-1/container/terminate"),
+        ("delete", "/runs/run-1/container"),
+    ],
+)
+def test_launcher_rejects_expired_lifecycle_deadline_before_operation(
+    method,
+    path,
+):
+    launcher = FakeLauncher()
+    client = TestClient(create_launcher_app(launcher, runner_token="secret"))
+    expired = datetime.now(UTC) - timedelta(seconds=1)
+    headers = {
+        "Authorization": "Bearer secret",
+        "X-Run-Id": "run-1",
+        "X-Request-Deadline-At": expired.isoformat(),
+    }
+
+    response = getattr(client, method)(path, headers=headers)
+
+    assert response.status_code == 504
+    assert launcher.calls == []
 
 
 def test_launcher_maps_readiness_failure_to_service_unavailable():
@@ -135,6 +185,7 @@ def test_launcher_preserves_complete_execution_identity_for_container_creation()
         "agent_version": "agent-v1",
         "checkpoint_key": "runtime",
         "deadline_at": "2099-01-01T00:00:00Z",
+        "execution_deadline_at": "2098-12-31T23:59:00Z",
         "snapshot_id": "snapshot-1",
         "snapshot_digest": "a" * 64,
         "gateway_url": "http://api:8000/internal/runner",

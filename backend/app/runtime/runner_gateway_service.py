@@ -6,9 +6,11 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 from datetime import UTC, datetime
 from time import perf_counter
 
+from pydantic import ValidationError
 from sqlalchemy import func, select
 
 from app.approvals.models import Approval
@@ -24,6 +26,9 @@ from app.artifacts.service import (
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.conversations.models import AgentRun, RunEvent
 from app.conversations.repository import ConversationRepository
+from app.identity.authorization import AuthorizationService
+from app.identity.repository import AuthorizationRepository
+from app.identity.schemas import ResourceScope
 from app.tools.gateway import ToolGateway
 from app.tools.schemas import (
     ToolCall,
@@ -32,17 +37,32 @@ from app.tools.schemas import (
     ToolRuntimeError,
 )
 
-from .checkpoint_store import CheckpointStore, RunnerRequestStore
+from .checkpoint_store import (
+    RUNNER_GATEWAY_RESERVED_CHECKPOINT_PREFIX,
+    CheckpointStore,
+    RunnerRequestStore,
+    is_runner_gateway_reserved_checkpoint,
+)
+from .deadline_commit import (
+    DeadlineCommitExpired,
+    commit_status_transition_before_deadline,
+)
 from .execution_snapshot import (
     ExecutionSnapshotService,
+    PublishedTeamSnapshot,
+    SnapshotTeamMember,
     SnapshotIntegrityError,
     StoredExecutionSnapshot,
+    team_execution_deadline,
     verify_snapshot_digest,
 )
 from .model_gateway import ModelGateway, ModelRuntimeError, ModelSelection
 from .run_tokens import RunTokenClaims
 from .runner_gateway_auth import RunnerGatewayError
 from .runner_gateway_schemas import (
+    ArtifactCapabilityRegistrationRequest,
+    ArtifactCapabilityResponse,
+    ArtifactProvenance,
     ArtifactContentResponse,
     ArtifactCreateRequest,
     ArtifactFileResponse,
@@ -59,8 +79,16 @@ from .runner_gateway_schemas import (
     ToolInvocationRequest,
     ToolInvocationResponse,
 )
+from .team_graph import (
+    TeamActiveInvocation,
+    TeamPlanError,
+    TeamSchedulerState,
+    validate_team_plan,
+)
 
 logger = logging.getLogger(__name__)
+
+_PENDING_MODEL_RESPONSE = {"__runner_gateway_state__": "pending"}
 
 
 def _canonical_digest(value: dict[str, object]) -> str:
@@ -172,9 +200,15 @@ class RunnerGatewayService:
         claims: RunTokenClaims,
         idempotency_key: str,
     ) -> CheckpointResponse:
+        if is_runner_gateway_reserved_checkpoint(checkpoint_key):
+            raise RunnerGatewayError(
+                403,
+                "checkpoint_namespace_reserved",
+                "检查点命名空间未获授权",
+            )
         store = self._require_checkpoint_store()
         repository = self._require_conversation_repository()
-        self._lock_run(repository, run_id)
+        run = self._lock_run(repository, run_id)
         requests = RunnerRequestStore(repository.session)
         action = "checkpoint.write"
         request_digest = _canonical_digest(
@@ -189,6 +223,7 @@ class RunnerGatewayService:
         )
         if replay is not None:
             return CheckpointResponse.model_validate(replay)
+        self._require_active_run(run)
         try:
             checkpoint = store.save(
                 run_id,
@@ -249,7 +284,7 @@ class RunnerGatewayService:
                 413, "event_payload_too_large", "事件数据超过大小限制"
             )
 
-        self._lock_run(repository, run_id)
+        run = self._lock_run(repository, run_id)
         requests = RunnerRequestStore(repository.session)
         action = "event.append"
         request_digest = _canonical_digest(request.model_dump(mode="json"))
@@ -258,6 +293,7 @@ class RunnerGatewayService:
         )
         if replay is not None:
             return EventAppendResponse.model_validate(replay)
+        self._require_active_run(run)
 
         expected_sequence = requests.count(run_id, action) + 1
         if request.sequence != expected_sequence:
@@ -304,7 +340,12 @@ class RunnerGatewayService:
         repository = self._require_conversation_repository()
         model_gateway = self._require_model_gateway()
         snapshot = self._verified_snapshot(run_id, claims)
-        self._lock_run(repository, run_id)
+        team_member = self._schema_v5_team_member(
+            snapshot,
+            request.member_agent_id,
+            error_code="model_not_authorized",
+        )
+        run = self._lock_run(repository, run_id)
         requests = RunnerRequestStore(repository.session)
         action = "model.invoke"
         request_digest = _canonical_digest(
@@ -317,26 +358,91 @@ class RunnerGatewayService:
             requests, run_id, action, idempotency_key, request_digest
         )
         if replay is not None:
+            if replay == _PENDING_MODEL_RESPONSE:
+                repository.session.rollback()
+                raise RunnerGatewayError(
+                    409,
+                    "idempotency_conflict",
+                    "模型调用正在处理中",
+                )
+            repository.session.commit()
             return ModelInvocationResponse.model_validate(replay)
+        self._require_active_run(run)
 
-        selection = ModelSelection(
-            snapshot.payload.model.provider_id,
-            snapshot.payload.model.model,
-        )
+        if team_member is None:
+            selection = ModelSelection(
+                snapshot.payload.model.provider_id,
+                snapshot.payload.model.model,
+            )
+            tools = [
+                ToolDefinition(tool.tool_id, tool.description, tool.input_schema)
+                for tool in request.tools
+            ]
+        else:
+            if team_member.model is None or (
+                request.provider_id,
+                request.model,
+            ) != (
+                team_member.model.provider_id,
+                team_member.model.model,
+            ):
+                raise RunnerGatewayError(
+                    403, "model_not_authorized", "该成员模型未获授权"
+                )
+            captured_tools = {
+                tool.tool_id: tool
+                for tool in (*team_member.tools, *team_member.knowledge_sources)
+                if tool.published and tool.enabled and tool.source_available
+            }
+            allowed_tool_ids = set(team_member.tool_ids) | set(
+                team_member.knowledge_source_ids
+            )
+            requested_tools = []
+            for requested in request.tools:
+                captured = captured_tools.get(requested.tool_id)
+                if requested.tool_id not in allowed_tool_ids or captured is None:
+                    raise RunnerGatewayError(
+                        403, "model_not_authorized", "成员工具未获授权"
+                    )
+                requested_tools.append(
+                    ToolDefinition(
+                        captured.tool_id,
+                        captured.description,
+                        captured.input_schema,
+                    )
+                )
+            selection = ModelSelection(
+                team_member.model.provider_id,
+                team_member.model.model,
+            )
+            tools = requested_tools
         messages = [
             message.model_dump(mode="json", exclude_none=True)
             for message in request.messages
         ]
-        tools = [
-            ToolDefinition(tool.tool_id, tool.description, tool.input_schema)
-            for tool in request.tools
-        ]
+        requests.add(
+            run_id=run_id,
+            action=action,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+            response_json=dict(_PENDING_MODEL_RESPONSE),
+        )
+        repository.session.commit()
         started = perf_counter()
         try:
             result = model_gateway.generate(messages, selection, tools=tools)
         except ModelRuntimeError as error:
             repository.session.rollback()
             try:
+                run = self._lock_run(repository, run_id)
+                reservation = requests.get(run_id, action, idempotency_key)
+                self._require_active_run(run)
+                if (
+                    reservation is not None
+                    and reservation.request_digest == request_digest
+                    and reservation.response_json == _PENDING_MODEL_RESPONSE
+                ):
+                    repository.session.delete(reservation)
                 self._record_model_audit(
                     repository,
                     snapshot,
@@ -349,6 +455,9 @@ class RunnerGatewayService:
                     ),
                 )
                 repository.session.commit()
+            except RunnerGatewayError:
+                repository.session.rollback()
+                raise
             except Exception as audit_error:
                 repository.session.rollback()
                 raise RunnerGatewayError(
@@ -376,6 +485,15 @@ class RunnerGatewayService:
         )
         duration_ms = max(0, round((perf_counter() - started) * 1000))
         try:
+            run = self._lock_run(repository, run_id)
+            reservation = requests.get(run_id, action, idempotency_key)
+            self._require_active_run(run)
+            if (
+                reservation is None
+                or reservation.request_digest != request_digest
+                or reservation.response_json != _PENDING_MODEL_RESPONSE
+            ):
+                raise RuntimeError("model invocation reservation was lost")
             self._record_model_audit(
                 repository,
                 snapshot,
@@ -385,14 +503,11 @@ class RunnerGatewayService:
                 duration_ms=duration_ms,
                 response=response,
             )
-            requests.add(
-                run_id=run_id,
-                action=action,
-                idempotency_key=idempotency_key,
-                request_digest=request_digest,
-                response_json=response.model_dump(mode="json"),
-            )
+            reservation.response_json = response.model_dump(mode="json")
             repository.session.commit()
+        except RunnerGatewayError:
+            repository.session.rollback()
+            raise
         except Exception as error:
             repository.session.rollback()
             raise RunnerGatewayError(
@@ -419,6 +534,8 @@ class RunnerGatewayService:
             "model": selection.model,
             "iteration": request.invocation_sequence,
         }
+        if request.member_agent_id is not None:
+            metadata["member_agent_id"] = request.member_agent_id
         if response is not None:
             metadata.update(
                 {
@@ -448,7 +565,12 @@ class RunnerGatewayService:
                 resource_id=selection.model,
                 idempotency_key=(
                     f"llm:{snapshot.run_id}:"
-                    f"{request.invocation_sequence}:{status}"
+                    + (
+                        f"{request.member_agent_id}:"
+                        if request.member_agent_id is not None
+                        else ""
+                    )
+                    + f"{request.invocation_sequence}:{status}"
                 ),
                 occurred_at=datetime.now(UTC),
                 duration_ms=duration_ms,
@@ -468,6 +590,19 @@ class RunnerGatewayService:
         repository = self._require_conversation_repository()
         tool_gateway = self._require_tool_gateway()
         snapshot = self._verified_snapshot(run_id, claims)
+        team_member = self._schema_v5_team_member(
+            snapshot,
+            request.member_agent_id,
+            error_code="tool_not_authorized",
+        )
+        if team_member is not None:
+            allowed_tool_ids = set(team_member.tool_ids) | set(
+                team_member.knowledge_source_ids
+            )
+            if request.tool_id not in allowed_tool_ids:
+                raise RunnerGatewayError(
+                    403, "tool_not_authorized", "该工具当前不可用"
+                )
         snapshot_tools = {
             tool.tool_id: tool
             for tool in snapshot.payload.tools
@@ -484,7 +619,37 @@ class RunnerGatewayService:
                 403, "tool_not_authorized", "该工具当前不可用"
             )
 
-        self._lock_run(repository, run_id)
+        run = self._lock_run(repository, run_id)
+        context_data = repository.get_run_execution_context(run_id)
+        if context_data is None:
+            raise RunnerGatewayError(404, "run_not_found", "Run 不存在")
+        actor_roles = tuple(context_data["actor_roles"])
+        if isinstance(snapshot.payload.actor, PublishedTeamSnapshot):
+            try:
+                authorization = AuthorizationRepository(
+                    repository.session
+                ).load_current_context(
+                    str(context_data["user_id"]),
+                    str(context_data["unit_id"]),
+                    str(context_data["project_id"]),
+                )
+            except LookupError as error:
+                raise RunnerGatewayError(
+                    403, "tool_not_authorized", "该工具当前不可用"
+                ) from error
+            if not AuthorizationService().allows(
+                authorization,
+                "tool.invoke",
+                ResourceScope(
+                    str(context_data["unit_id"]),
+                    str(context_data["project_id"]),
+                    str(context_data["user_id"]),
+                ),
+            ):
+                raise RunnerGatewayError(
+                    403, "tool_not_authorized", "该工具当前不可用"
+                )
+            actor_roles = authorization.role_codes
         requests = RunnerRequestStore(repository.session)
         action = "tool.invoke"
         request_digest = _canonical_digest(
@@ -498,6 +663,7 @@ class RunnerGatewayService:
         )
         if replay is not None:
             return ToolInvocationResponse.model_validate(replay)
+        self._require_active_run(run)
 
         existing_invocation = repository.get_tool_invocation(
             run_id, request.tool_call_id
@@ -531,16 +697,14 @@ class RunnerGatewayService:
                 repository.session.commit()
                 return response
 
-        context_data = repository.get_run_execution_context(run_id)
-        if context_data is None:
-            raise RunnerGatewayError(404, "run_not_found", "Run 不存在")
+        repository.session.commit()
         context = ToolExecutionContext(
             unit_id=str(context_data["unit_id"]),
             run_id=run_id,
             conversation_id=str(context_data["conversation_id"]),
             project_id=str(context_data["project_id"]),
             user_id=str(context_data["user_id"]),
-            actor_roles=tuple(context_data["actor_roles"]),
+            actor_roles=actor_roles,
         )
         call = ToolCall(
             id=request.tool_call_id,
@@ -581,6 +745,13 @@ class RunnerGatewayService:
             invocation_id=result.invocation_id,
             value=result.value,
         )
+        run = self._lock_run(repository, run_id)
+        replay = self._replay_or_conflict(
+            requests, run_id, action, idempotency_key, request_digest
+        )
+        if replay is not None:
+            return ToolInvocationResponse.model_validate(replay)
+        self._require_active_run(run)
         requests.add(
             run_id=run_id,
             action=action,
@@ -591,6 +762,76 @@ class RunnerGatewayService:
         repository.session.commit()
         return response
 
+    @staticmethod
+    def _schema_v5_team_member(
+        snapshot: StoredExecutionSnapshot,
+        member_agent_id: str | None,
+        *,
+        error_code: str,
+    ) -> SnapshotTeamMember | None:
+        actor = snapshot.payload.actor
+        if snapshot.payload.schema_version != "5" or not isinstance(
+            actor, PublishedTeamSnapshot
+        ):
+            return None
+        if not member_agent_id:
+            raise RunnerGatewayError(403, error_code, "Team 成员未获授权")
+        member = next(
+            (
+                candidate
+                for candidate in (actor.supervisor, *actor.members)
+                if candidate.agent_id == member_agent_id
+            ),
+            None,
+        )
+        if member is None or member.agent is None or member.model is None:
+            raise RunnerGatewayError(403, error_code, "Team 成员未获授权")
+        return member
+
+    def register_artifact_capability(
+        self,
+        run_id: str,
+        request: ArtifactCapabilityRegistrationRequest,
+        claims: RunTokenClaims,
+    ) -> ArtifactCapabilityResponse:
+        repository = self._require_conversation_repository()
+        store = self._require_checkpoint_store()
+        snapshot = self._verified_snapshot(run_id, claims)
+        run = self._lock_run(repository, run_id)
+        self._require_active_run(run)
+        provenance = self._validated_team_invocation(
+            run_id,
+            snapshot,
+            team_version_id=request.team_version_id,
+            member_agent_id=request.member_agent_id,
+            task_id=request.task_id,
+            invocation_id=request.invocation_id,
+            error_code="artifact_capability_invalid",
+        )
+        binding = {
+            "run_id": run_id,
+            "team_version_id": provenance["team_version_id"],
+            "member_agent_id": provenance["member_agent_id"],
+            "task_id": provenance["task_id"],
+            "invocation_id": request.invocation_id,
+        }
+        capability = secrets.token_urlsafe(32)
+        store.save_reserved(
+            run_id,
+            self._artifact_capability_checkpoint_key(binding),
+            {
+                "kind": "artifact_capability",
+                "binding": binding,
+                "capability_sha256": hashlib.sha256(
+                    capability.encode("utf-8")
+                ).hexdigest(),
+            },
+            snapshot.digest,
+            commit=False,
+        )
+        repository.session.commit()
+        return ArtifactCapabilityResponse(capability=capability)
+
     def create_artifact(
         self,
         run_id: str,
@@ -600,14 +841,26 @@ class RunnerGatewayService:
     ) -> ArtifactFileResponse:
         repository = self._require_conversation_repository()
         artifacts = self._require_artifact_service()
-        self._verified_snapshot(run_id, claims)
-        self._lock_run(repository, run_id)
+        snapshot = self._verified_snapshot(run_id, claims)
+        run = self._lock_run(repository, run_id)
+        provenance = self._validated_artifact_provenance(
+            run_id,
+            snapshot,
+            request.provenance,
+            request.capability,
+        )
         requests = RunnerRequestStore(repository.session)
         action = "artifact.create"
         request_digest = _canonical_digest(
             {
                 "snapshot_digest": claims.snapshot_digest,
-                "request": request.model_dump(mode="json"),
+                "request": {
+                    **request.model_dump(
+                        mode="json",
+                        exclude={"provenance", "capability"},
+                    ),
+                    "provenance": provenance,
+                },
             }
         )
         replay = self._replay_or_conflict(
@@ -615,6 +868,7 @@ class RunnerGatewayService:
         )
         if replay is not None:
             return ArtifactFileResponse.model_validate(replay)
+        self._require_active_run(run)
         try:
             data = base64.b64decode(request.data_base64, validate=True)
         except (binascii.Error, ValueError) as error:
@@ -625,15 +879,34 @@ class RunnerGatewayService:
             raise RunnerGatewayError(400, "artifact_invalid", "成果文件大小无效")
         relative_path = self._relative_artifact_path(request.path)
         created = None
+        uploaded = False
         try:
-            created = artifacts.create_for_run(
+            created = artifacts.prepare_for_run(
                 run_id=run_id,
                 path=relative_path,
                 content_type=request.content_type,
                 data=data,
                 sha256=request.sha256,
-                commit=False,
+                provenance=provenance,
             )
+            repository.session.commit()
+            artifacts.upload_prepared(created, data)
+            uploaded = True
+
+            run = self._lock_run(repository, run_id)
+            requests = RunnerRequestStore(repository.session)
+            replay = self._replay_or_conflict(
+                requests, run_id, action, idempotency_key, request_digest
+            )
+            if replay is not None:
+                repository.session.rollback()
+                try:
+                    artifacts.storage.delete_object(created.object_key)
+                except Exception:  # noqa: BLE001
+                    logger.warning("runner artifact cleanup failed")
+                return ArtifactFileResponse.model_validate(replay)
+            self._require_active_run(run)
+            artifacts.persist_prepared(created, commit=False)
             response = self._artifact_response(created)
             repository.append_event(
                 run_id,
@@ -644,6 +917,7 @@ class RunnerGatewayService:
                     "size_bytes": created.size_bytes,
                     "sha256": created.sha256,
                     "content_type": created.content_type,
+                    **({"provenance": provenance} if provenance else {}),
                 },
             )
             requests.add(
@@ -656,19 +930,39 @@ class RunnerGatewayService:
             repository.session.commit()
             return response
         except ArtifactAlreadyExistsError as error:
+            repository.session.rollback()
+            if uploaded and created is not None:
+                try:
+                    artifacts.storage.delete_object(created.object_key)
+                except Exception:  # noqa: BLE001
+                    logger.warning("runner artifact cleanup failed")
             raise RunnerGatewayError(
                 409, "artifact_already_exists", "成果文件已存在"
             ) from error
         except (ArtifactIntegrityError, ArtifactContentTypeError) as error:
+            repository.session.rollback()
             raise RunnerGatewayError(
                 400, "artifact_invalid", "成果文件无效"
             ) from error
         except ArtifactSizeError as error:
+            repository.session.rollback()
             raise RunnerGatewayError(
                 413, "artifact_too_large", "成果文件超过大小限制"
             ) from error
+        except RunnerGatewayError:
+            repository.session.rollback()
+            if uploaded and created is not None:
+                try:
+                    artifacts.storage.delete_object(created.object_key)
+                except Exception:  # noqa: BLE001
+                    logger.warning("runner artifact cleanup failed")
+            raise
         except Exception as error:
-            created_object_key = created.object_key if created is not None else None
+            created_object_key = (
+                created.object_key
+                if uploaded and created is not None
+                else None
+            )
             repository.session.rollback()
             if created_object_key is not None:
                 try:
@@ -679,6 +973,192 @@ class RunnerGatewayService:
                 502, "artifact_upload_failed", "成果文件保存失败"
             ) from error
 
+    def _validated_artifact_provenance(
+        self,
+        run_id: str,
+        snapshot: StoredExecutionSnapshot,
+        requested: ArtifactProvenance | None,
+        capability: str | None,
+    ) -> dict[str, str] | None:
+        actor = snapshot.payload.actor
+        if not isinstance(actor, PublishedTeamSnapshot):
+            if requested is not None or capability is not None:
+                raise RunnerGatewayError(
+                    403,
+                    "artifact_provenance_invalid",
+                    "成果来源无效",
+                )
+            return None
+        if requested is None:
+            raise RunnerGatewayError(
+                403,
+                "artifact_provenance_invalid",
+                "成果来源无效",
+            )
+
+        provenance = self._validated_team_invocation(
+            run_id,
+            snapshot,
+            team_version_id=requested.team_version_id,
+            member_agent_id=requested.member_agent_id,
+            task_id=requested.task_id,
+            invocation_id=requested.invocation_id,
+            error_code="artifact_provenance_invalid",
+        )
+        if capability is None:
+            raise RunnerGatewayError(
+                403,
+                "artifact_provenance_invalid",
+                "成果来源无效",
+            )
+        binding = {
+            "run_id": run_id,
+            **provenance,
+            "invocation_id": requested.invocation_id,
+        }
+        record = self._require_checkpoint_store().load_reserved(
+            run_id,
+            self._artifact_capability_checkpoint_key(binding),
+        )
+        expected_state = {
+            "kind": "artifact_capability",
+            "binding": binding,
+            "capability_sha256": hashlib.sha256(
+                capability.encode("utf-8")
+            ).hexdigest(),
+        }
+        if (
+            record is None
+            or record.snapshot_digest != snapshot.digest
+            or record.state.get("kind") != expected_state["kind"]
+            or record.state.get("binding") != binding
+            or not secrets.compare_digest(
+                str(record.state.get("capability_sha256", "")),
+                expected_state["capability_sha256"],
+            )
+        ):
+            raise RunnerGatewayError(
+                403,
+                "artifact_provenance_invalid",
+                "成果来源无效",
+            )
+        return provenance
+
+    def _validated_team_invocation(
+        self,
+        run_id: str,
+        snapshot: StoredExecutionSnapshot,
+        *,
+        team_version_id: str | None,
+        member_agent_id: str,
+        task_id: str,
+        invocation_id: str,
+        error_code: str,
+    ) -> dict[str, str]:
+        actor = snapshot.payload.actor
+        if not isinstance(actor, PublishedTeamSnapshot) or (
+            team_version_id is not None and team_version_id != actor.version_id
+        ):
+            raise RunnerGatewayError(403, error_code, "成果来源无效")
+        checkpoint = self._require_checkpoint_store().load_latest_record(run_id)
+        if (
+            checkpoint is None
+            or checkpoint.checkpoint_key != "team-scheduler"
+            or checkpoint.snapshot_digest != snapshot.digest
+            or not isinstance(checkpoint.state, dict)
+        ):
+            raise RunnerGatewayError(
+                403,
+                error_code,
+                "成果来源无效",
+            )
+        try:
+            state = TeamSchedulerState.model_validate(checkpoint.state)
+            validate_team_plan(
+                state.plan,
+                actor,
+                runner_max_subagents=snapshot.payload.limits.max_subagents,
+            )
+        except (ValidationError, TeamPlanError) as error:
+            raise RunnerGatewayError(
+                403,
+                error_code,
+                "成果来源无效",
+            ) from error
+        if (
+            state.snapshot_digest != snapshot.digest
+            or state.team_version_id != actor.version_id
+        ):
+            raise RunnerGatewayError(
+                403,
+                error_code,
+                "成果来源无效",
+            )
+
+        active_invocations = state.active_invocations
+        if not active_invocations and state.active_task_id is not None:
+            active_invocations = (
+                TeamActiveInvocation(
+                    task_id=state.active_task_id,
+                    member_agent_id=state.active_member_agent_id or "",
+                    invocation_id=state.active_invocation_id or "",
+                    runtime_state=state.active_runtime_state,
+                    checkpoint_status=(
+                        "interrupted"
+                        if state.stage == "waiting_approval"
+                        else "running"
+                    ),
+                ),
+            )
+        active = next(
+            (
+                item
+                for item in active_invocations
+                if item.task_id == task_id
+                and item.member_agent_id == member_agent_id
+                and item.invocation_id == invocation_id
+            ),
+            None,
+        )
+        if task_id == "synthesis":
+            valid = (
+                member_agent_id == actor.supervisor.agent_id
+                and state.stage == "synthesizing"
+                and active is not None
+            )
+        else:
+            task = next(
+                (
+                    candidate
+                    for candidate in state.plan.tasks
+                    if candidate.id == task_id
+                ),
+                None,
+            )
+            valid = (
+                task is not None
+                and task.member_id == member_agent_id
+                and active is not None
+            )
+        if not valid:
+            raise RunnerGatewayError(
+                403,
+                error_code,
+                "成果来源无效",
+            )
+        return {
+            "team_version_id": actor.version_id,
+            "member_agent_id": member_agent_id,
+            "task_id": task_id,
+        }
+
+    @staticmethod
+    def _artifact_capability_checkpoint_key(binding: dict[str, str]) -> str:
+        return (
+            f"{RUNNER_GATEWAY_RESERVED_CHECKPOINT_PREFIX}artifact-capability:"
+            f"{_canonical_digest(binding)}"
+        )
+
     def complete(
         self,
         run_id: str,
@@ -687,7 +1167,7 @@ class RunnerGatewayService:
         idempotency_key: str,
     ) -> CompletionResponse:
         repository = self._require_conversation_repository()
-        self._verified_snapshot(run_id, claims)
+        snapshot = self._verified_snapshot(run_id, claims)
         run = self._lock_run(repository, run_id)
         requests = RunnerRequestStore(repository.session)
         action = "result.complete"
@@ -715,11 +1195,24 @@ class RunnerGatewayService:
                 "completion_already_committed",
                 "Run 结果已提交",
             )
-        if run.status == "waiting_approval" and request.status != "interrupted":
+        if run.status == "waiting_approval" and request.status == "completed":
             raise RunnerGatewayError(
                 409,
                 "completion_conflicts_with_approval",
                 "Run 正在等待审批",
+            )
+        deadline = team_execution_deadline(snapshot)
+        commit_guarded = request.status == "completed" and deadline is not None
+        expected_status = run.status
+        if (
+            request.status == "completed"
+            and deadline is not None
+            and datetime.now(UTC) >= deadline
+        ):
+            raise RunnerGatewayError(
+                409,
+                "sandbox_timeout",
+                "Team 执行已超过截止时间",
             )
 
         artifacts = self._require_artifact_service()
@@ -730,6 +1223,16 @@ class RunnerGatewayService:
             raise RunnerGatewayError(
                 404, "artifact_not_found", "成果文件不存在"
             ) from error
+        if (
+            request.status == "completed"
+            and deadline is not None
+            and datetime.now(UTC) >= deadline
+        ):
+            raise RunnerGatewayError(
+                409,
+                "sandbox_timeout",
+                "Team 执行已超过截止时间",
+            )
 
         if request.final_assistant_content:
             repository.add_assistant_message(
@@ -760,7 +1263,8 @@ class RunnerGatewayService:
             },
         )
         if run.status != target_status:
-            run.status = target_status
+            if not commit_guarded:
+                run.status = target_status
             repository.append_event(
                 run_id,
                 "run.status",
@@ -779,7 +1283,37 @@ class RunnerGatewayService:
             request_digest=request_digest,
             response_json=response.model_dump(mode="json"),
         )
-        repository.session.commit()
+        repository.session.flush()
+        if (
+            request.status == "completed"
+            and deadline is not None
+            and datetime.now(UTC) >= deadline
+        ):
+            repository.session.rollback()
+            raise RunnerGatewayError(
+                409,
+                "sandbox_timeout",
+                "Team 执行已超过截止时间",
+            )
+        if commit_guarded:
+            try:
+                commit_status_transition_before_deadline(
+                    repository.session,
+                    record=run,
+                    expected_status=expected_status,
+                    target_status=target_status,
+                    deadline=deadline,
+                    clock=lambda: datetime.now(UTC),
+                )
+            except DeadlineCommitExpired:
+                repository.session.rollback()
+                raise RunnerGatewayError(
+                    409,
+                    "sandbox_timeout",
+                    "Team 执行已超过截止时间",
+                ) from None
+        else:
+            repository.session.commit()
         return response
 
     def list_artifacts(
@@ -842,6 +1376,10 @@ class RunnerGatewayService:
 
     @staticmethod
     def _map_tool_error(error: ToolRuntimeError) -> tuple[int, str, str]:
+        if error.code == "sandbox_timeout":
+            return 409, "sandbox_timeout", "沙箱任务执行超时"
+        if error.code == "run_not_active":
+            return 409, "run_not_active", "Run 已结束"
         if error.code == "tool_not_authorized":
             return 403, "tool_not_authorized", "该工具当前不可用"
         if error.code == "tool_invalid_arguments":
@@ -880,11 +1418,19 @@ class RunnerGatewayService:
     @staticmethod
     def _lock_run(repository: ConversationRepository, run_id: str) -> AgentRun:
         run = repository.session.scalar(
-            select(AgentRun).where(AgentRun.id == run_id).with_for_update()
+            select(AgentRun)
+            .where(AgentRun.id == run_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
         )
         if run is None:
             raise RunnerGatewayError(404, "run_not_found", "Run 不存在")
         return run
+
+    @staticmethod
+    def _require_active_run(run: AgentRun) -> None:
+        if run.status != "running":
+            raise RunnerGatewayError(409, "run_not_active", "Run 已结束")
 
     @staticmethod
     def _replay_or_conflict(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from threading import Event, Lock
 from typing import Any, Protocol
 
 import httpx
@@ -33,6 +34,34 @@ class RunnerGatewayModelError(RuntimeError):
     def __init__(self, code: str, _detail: str | None = None) -> None:
         self.code = code if code in _SAFE_MESSAGES else "gateway_unavailable"
         super().__init__(_SAFE_MESSAGES[self.code])
+
+
+@dataclass
+class GatewayModelBudget:
+    max_iterations: int
+    max_tool_calls: int
+    max_subagents: int
+    next_invocation_sequence: int = 0
+    tool_call_count: int = 0
+    subagent_call_count: int = 0
+    _lock: Any = field(default_factory=Lock, init=False, repr=False)
+
+    def reserve_invocation(self) -> int:
+        with self._lock:
+            if self.next_invocation_sequence >= self.max_iterations:
+                raise RunnerGatewayModelError("runtime_iteration_limit")
+            sequence = self.next_invocation_sequence
+            self.next_invocation_sequence += 1
+            return sequence
+
+    def consume_response(self, *, tool_calls: int, subagent_calls: int) -> None:
+        with self._lock:
+            if self.tool_call_count + tool_calls > self.max_tool_calls:
+                raise RunnerGatewayModelError("runtime_tool_call_limit")
+            if self.subagent_call_count + subagent_calls > self.max_subagents:
+                raise RunnerGatewayModelError("runtime_subagent_limit")
+            self.tool_call_count += tool_calls
+            self.subagent_call_count += subagent_calls
 
 
 class ModelInvocationTransport(Protocol):
@@ -96,12 +125,28 @@ class GatewayChatModel(BaseChatModel):
     max_tool_calls: int = Field(default=8, ge=0)
     max_subagents: int = Field(default=4, ge=0)
     max_output_bytes: int = Field(default=4 * 1024 * 1024, gt=0)
-    _next_invocation_sequence: int = PrivateAttr(default=0)
-    _tool_call_count: int = PrivateAttr(default=0)
-    _subagent_call_count: int = PrivateAttr(default=0)
+    provider_id: str | None = None
+    model_id: str | None = None
+    member_agent_id: str | None = None
+    budget_state: GatewayModelBudget | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
+    cancellation_event: Event | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
+    _budget: GatewayModelBudget = PrivateAttr()
 
     def __init__(self, transport: ModelInvocationTransport, **data: Any) -> None:
         super().__init__(transport=transport, **data)
+        self._budget = self.budget_state or GatewayModelBudget(
+            max_iterations=self.max_iterations,
+            max_tool_calls=self.max_tool_calls,
+            max_subagents=self.max_subagents,
+        )
 
     @property
     def _llm_type(self) -> str:
@@ -119,10 +164,7 @@ class GatewayChatModel(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         del stop, run_manager
-        if self._next_invocation_sequence >= self.max_iterations:
-            raise RunnerGatewayModelError("runtime_iteration_limit")
-        sequence = self._next_invocation_sequence
-        self._next_invocation_sequence += 1
+        sequence = self._budget.reserve_invocation()
         tools = [_normalize_tool(tool) for tool in kwargs.get("tools", [])]
         request = {
             "messages": [_normalize_message(message) for message in messages],
@@ -133,10 +175,25 @@ class GatewayChatModel(BaseChatModel):
             ),
             "invocation_sequence": sequence,
         }
+        if self.provider_id is not None:
+            request["provider_id"] = self.provider_id
+        if self.model_id is not None:
+            request["model"] = self.model_id
+        if self.member_agent_id is not None:
+            request["member_agent_id"] = self.member_agent_id
         try:
+            if (
+                self.cancellation_event is not None
+                and self.cancellation_event.is_set()
+            ):
+                raise RunnerGatewayModelError("gateway_unavailable")
             raw_response = self.transport.invoke_model(
                 request,
-                f"model-{sequence}",
+                (
+                    f"model-{self.member_agent_id}-{sequence}"
+                    if self.member_agent_id is not None
+                    else f"model-{sequence}"
+                ),
             )
             response = ModelInvocationResponse.model_validate(raw_response)
         except RunnerGatewayModelError as error:
@@ -145,13 +202,9 @@ class GatewayChatModel(BaseChatModel):
             raise RunnerGatewayModelError("gateway_response_invalid") from error
 
         response_tool_calls = len(response.tool_calls)
-        if self._tool_call_count + response_tool_calls > self.max_tool_calls:
-            raise RunnerGatewayModelError("runtime_tool_call_limit")
         response_subagent_calls = sum(
             call.name == "task" for call in response.tool_calls
         )
-        if self._subagent_call_count + response_subagent_calls > self.max_subagents:
-            raise RunnerGatewayModelError("runtime_subagent_limit")
         output_bytes = json.dumps(
             {
                 "content": response.content or "",
@@ -165,8 +218,10 @@ class GatewayChatModel(BaseChatModel):
         ).encode("utf-8")
         if len(output_bytes) > self.max_output_bytes:
             raise RunnerGatewayModelError("runtime_output_limit")
-        self._tool_call_count += response_tool_calls
-        self._subagent_call_count += response_subagent_calls
+        self._budget.consume_response(
+            tool_calls=response_tool_calls,
+            subagent_calls=response_subagent_calls,
+        )
 
         usage_metadata = None
         if any(

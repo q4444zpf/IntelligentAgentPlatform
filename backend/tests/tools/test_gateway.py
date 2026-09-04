@@ -1,8 +1,9 @@
+import hashlib
 import logging
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, delete, event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -13,6 +14,17 @@ from app.conversations.models import AgentRun, Conversation, Message, RunEvent, 
 from app.conversations.repository import ConversationRepository
 from app.db.base import Base
 from app.db.platform_models import RegisteredToolRecord
+from app.mcp.credential_resolver import McpCredentialResolver
+from app.mcp.store import McpStore
+from app.runtime.execution_snapshot import (
+    ExecutionSnapshotPayload,
+    PublishedTeamSnapshot,
+    RuntimeExecutionSnapshot,
+    SnapshotModelSelection,
+    SnapshotRuntimeLimits,
+    SnapshotTeamMember,
+    canonical_snapshot_bytes,
+)
 from app.tools.builtins import BUILTIN_EXECUTORS, BUILTIN_TOOL_DEFINITIONS
 from app.tools.gateway import ToolGateway
 from app.tools.schemas import ToolCall, ToolExecutionContext, ToolRuntimeError
@@ -65,6 +77,127 @@ def execute(gateway, name="system.get_current_time", arguments=None, call_id="ca
     return gateway.execute(ToolCall(id=call_id, name=name, arguments=arguments or {}), execution_context or context(), authorized if authorized is not None else {name})
 
 
+def configure_team_run(runtime, *, created_at, snapshot_id):
+    factory, _store = runtime
+    with factory.begin() as db:
+        run = db.get(AgentRun, "run-1")
+        run.actor_type = "team"
+        run.actor_id = "team-1"
+        run.actor_version_id = "team-version-1"
+        member = SnapshotTeamMember(
+            agent_id="member-1",
+            role="member",
+            responsibility="operate",
+        )
+        actor = PublishedTeamSnapshot(
+            id="team-1",
+            version_id="team-version-1",
+            version=1,
+            definition_digest="d" * 64,
+            supervisor=SnapshotTeamMember(
+                agent_id="supervisor",
+                role="supervisor",
+                responsibility="coordinate",
+            ),
+            members=(member,),
+            max_steps=2,
+            max_parallel_members=1,
+            timeout_seconds=60,
+            failure_strategy="fail_fast",
+            name="Team",
+            description="",
+            runtime_form="common",
+            language="zh-CN",
+            system_prompt="",
+            context_prompt="",
+            approval_policy="never",
+        )
+        payload = ExecutionSnapshotPayload(
+            schema_version="5",
+            snapshot_id=snapshot_id,
+            run_id=run.id,
+            unit_id="unit-1",
+            project_id="project-1",
+            user_id="user-1",
+            actor=actor,
+            model=SnapshotModelSelection(
+                provider_id="provider-1",
+                model="model-1",
+            ),
+            messages=(),
+            limits=SnapshotRuntimeLimits(snapshot_max_bytes=1_048_576),
+            created_at=created_at,
+        )
+        db.add(
+            RuntimeExecutionSnapshot(
+                snapshot_id=payload.snapshot_id,
+                run_id=run.id,
+                digest=hashlib.sha256(
+                    canonical_snapshot_bytes(payload)
+                ).hexdigest(),
+                payload=payload.model_dump(mode="json"),
+                created_at=created_at,
+                expires_at=None,
+            )
+        )
+
+
+def configure_approved_mcp_tool(runtime):
+    factory, _store = runtime
+    tool_id = "mcp.water.read_wiki_abcd1234"
+    with factory.begin() as db:
+        db.add(
+            RegisteredToolRecord(
+                tool_id=tool_id,
+                version="1.0.0",
+                name="read_wiki",
+                description="Read wiki",
+                source="mcp",
+                risk_level="high",
+                input_schema={"type": "object"},
+                output_schema={"type": "object"},
+                source_resource_id="water",
+                source_capability_id="read_wiki",
+                source_available=True,
+                requires_approval=True,
+                published=True,
+                enabled=True,
+            )
+        )
+    McpStore(factory).create(
+        "water",
+        {
+            "name": "Water MCP",
+            "description": "Water data",
+            "url": "https://example.test/mcp",
+            "transport": "streamable_http",
+            "headers": {},
+            "credential_id": "credential-1",
+            "enabled": True,
+        },
+    )
+    return tool_id
+
+
+def approve_waiting_tool(session, *, now):
+    from app.approvals.service import ApprovalService
+    from app.core.request_context import RequestContext
+
+    approval = session.scalar(select(Approval))
+    ApprovalService(session, clock=lambda: now).approve(
+        approval.id,
+        RequestContext(
+            user_id="reviewer",
+            unit_id="unit-1",
+            project_id="project-1",
+            roles=frozenset({"project_admin"}),
+        ),
+    )
+    session.get(AgentRun, "run-1").status = "queued"
+    session.commit()
+    return approval
+
+
 def test_records_tool_started_and_succeeded_with_context_and_parent(runtime):
     session, gateway = make_gateway(runtime)
     result = execute(gateway)
@@ -90,6 +223,44 @@ def test_records_tool_failure_without_arguments_or_raw_error(runtime, monkeypatc
     assert events[-1].error_code == "tool_execution_failed"
     assert "Asia/Shanghai" not in str(events)
     assert "secret raw failure" not in str(events)
+
+
+def test_tool_finishing_after_terminal_run_commits_no_terminal_state(
+    runtime, monkeypatch
+):
+    session, gateway = make_gateway(runtime)
+    original = BUILTIN_EXECUTORS["system.get_current_time"]
+    external_transaction_state = []
+
+    def finish_after_timeout(arguments, execution_context, clock):
+        external_transaction_state.append(session.in_transaction())
+        with Session(session.bind) as terminal_session:
+            terminal_session.get(AgentRun, "run-1").status = "failed"
+            terminal_session.commit()
+        return original(arguments, execution_context, clock)
+
+    monkeypatch.setitem(
+        BUILTIN_EXECUTORS,
+        "system.get_current_time",
+        finish_after_timeout,
+    )
+
+    with pytest.raises(ToolRuntimeError) as captured:
+        execute(gateway)
+
+    session.expire_all()
+    invocation = session.scalar(select(ToolInvocation))
+    run_events = list(
+        session.scalars(select(RunEvent).where(RunEvent.run_id == "run-1"))
+    )
+    audits = list(
+        session.scalars(select(AuditEvent).where(AuditEvent.run_id == "run-1"))
+    )
+    assert captured.value.code == "run_not_active"
+    assert external_transaction_state == [False]
+    assert invocation.status == "started"
+    assert [event.event_type for event in run_events] == ["tool.started"]
+    assert [audit.action for audit in audits] == ["tool.invoke.started"]
 
 
 def test_current_time_uses_frozen_clock_and_chinese_weekday(runtime):
@@ -280,7 +451,11 @@ def test_required_approval_pauses_run_without_executing_tool(runtime, monkeypatc
         session.close()
 
 
-def test_approved_tool_invocation_executes_after_digest_check(runtime):
+@pytest.mark.parametrize("run_status", ["waiting_approval", "queued"])
+def test_approved_agent_tool_without_snapshot_executes_after_digest_check(
+    runtime,
+    run_status,
+):
     factory, _ = runtime
     with factory.begin() as db:
         tool = db.get(RegisteredToolRecord, "system.get_current_time")
@@ -294,12 +469,1233 @@ def test_approved_tool_invocation_executes_after_digest_check(runtime):
         approval = session.scalar(select(Approval))
         from app.approvals.service import ApprovalService
         ApprovalService(session, clock=lambda: datetime(2026, 8, 2, 4, 30, tzinfo=timezone.utc)).approve(approval.id, __import__("app.core.request_context", fromlist=["RequestContext"]).RequestContext(user_id="reviewer", unit_id="unit-1", project_id="project-1", roles=frozenset({"project_admin"})))
+        session.get(AgentRun, "run-1").status = run_status
+        session.commit()
         result = gateway.execute_approved(approval.id, context())
         invocation = session.scalar(select(ToolInvocation))
         assert result.value["date"] == "2026-08-02"
         assert invocation.status == "completed"
+        assert session.get(AgentRun, "run-1").status == run_status
     finally:
         session.close()
+
+
+def test_approved_team_tool_without_snapshot_fails_before_started_or_executor(
+    runtime,
+    monkeypatch,
+):
+    factory, _ = runtime
+    with factory.begin() as db:
+        tool = db.get(RegisteredToolRecord, "system.get_current_time")
+        tool.requires_approval = True
+        tool.risk_level = "high"
+        run = db.get(AgentRun, "run-1")
+        run.actor_type = "team"
+        run.actor_id = "team-1"
+        run.actor_version_id = "team-version-1"
+
+    session, gateway = make_gateway(runtime)
+    with pytest.raises(ToolRuntimeError) as approval_required:
+        execute(gateway)
+    assert approval_required.value.code == "approval_required"
+    approval = session.scalar(select(Approval))
+    from app.approvals.service import ApprovalService
+    from app.core.request_context import RequestContext
+
+    ApprovalService(
+        session,
+        clock=lambda: datetime(2026, 8, 2, 4, 30, tzinfo=timezone.utc),
+    ).approve(
+        approval.id,
+        RequestContext(
+            user_id="reviewer",
+            unit_id="unit-1",
+            project_id="project-1",
+            roles=frozenset({"project_admin"}),
+        ),
+    )
+    session.get(AgentRun, "run-1").status = "queued"
+    session.commit()
+    external_calls = []
+    original = BUILTIN_EXECUTORS["system.get_current_time"]
+
+    def record_external_call(arguments, execution_context, clock):
+        external_calls.append(True)
+        return original(arguments, execution_context, clock)
+
+    monkeypatch.setitem(
+        BUILTIN_EXECUTORS,
+        "system.get_current_time",
+        record_external_call,
+    )
+
+    with pytest.raises(ToolRuntimeError) as caught:
+        gateway.execute_approved(approval.id, context())
+
+    session.expire_all()
+    invocation = session.scalar(select(ToolInvocation))
+    run_events = list(
+        session.scalars(select(RunEvent).where(RunEvent.run_id == "run-1"))
+    )
+    tool_audits = list(
+        session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.run_id == "run-1",
+                AuditEvent.action.like("tool.invoke.%"),
+            )
+        )
+    )
+    assert caught.value.code == "sandbox_timeout"
+    assert external_calls == []
+    assert invocation.status == "waiting_approval"
+    assert invocation.result_summary is None
+    assert [event.event_type for event in run_events] == [
+        "approval.requested",
+        "run.status",
+    ]
+    assert tool_audits == []
+
+
+def test_approved_tool_finishing_after_terminal_run_commits_no_terminal_state(
+    runtime, monkeypatch
+):
+    factory, _ = runtime
+    with factory.begin() as db:
+        tool = db.get(RegisteredToolRecord, "system.get_current_time")
+        tool.requires_approval = True
+        tool.risk_level = "high"
+    session, gateway = make_gateway(runtime)
+    with pytest.raises(ToolRuntimeError) as approval_required:
+        execute(gateway)
+    assert approval_required.value.code == "approval_required"
+    approval = session.scalar(select(Approval))
+    from app.approvals.service import ApprovalService
+    from app.core.request_context import RequestContext
+
+    ApprovalService(
+        session,
+        clock=lambda: datetime(2026, 8, 2, 4, 30, tzinfo=timezone.utc),
+    ).approve(
+        approval.id,
+        RequestContext(
+            user_id="reviewer",
+            unit_id="unit-1",
+            project_id="project-1",
+            roles=frozenset({"project_admin"}),
+        ),
+    )
+    session.get(AgentRun, "run-1").status = "queued"
+    session.commit()
+    original = BUILTIN_EXECUTORS["system.get_current_time"]
+    external_transaction_state = []
+
+    def finish_after_timeout(arguments, execution_context, clock):
+        external_transaction_state.append(session.in_transaction())
+        with factory.begin() as terminal_session:
+            terminal_session.get(AgentRun, "run-1").status = "failed"
+        return original(arguments, execution_context, clock)
+
+    monkeypatch.setitem(
+        BUILTIN_EXECUTORS,
+        "system.get_current_time",
+        finish_after_timeout,
+    )
+
+    with pytest.raises(ToolRuntimeError) as caught:
+        gateway.execute_approved(approval.id, context())
+
+    session.expire_all()
+    invocation = session.scalar(select(ToolInvocation))
+    events = list(
+        session.scalars(
+            select(RunEvent)
+            .where(RunEvent.run_id == "run-1")
+            .order_by(RunEvent.sequence)
+        )
+    )
+    tool_audits = list(
+        session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.run_id == "run-1",
+                AuditEvent.action.like("tool.invoke.%"),
+            )
+        )
+    )
+    assert caught.value.code == "run_not_active"
+    assert external_transaction_state == [False]
+    assert invocation.status == "started"
+    assert [event.event_type for event in events] == [
+        "approval.requested",
+        "run.status",
+        "tool.started",
+    ]
+    assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
+
+
+def test_approved_team_tool_crossing_deadline_during_started_commit_stops_before_executor(
+    runtime,
+    monkeypatch,
+):
+    factory, store = runtime
+    created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    current_time = [created_at.replace(minute=0, second=30)]
+    configure_team_run(
+        runtime,
+        created_at=created_at,
+        snapshot_id="team-started-commit-snapshot",
+    )
+    with factory.begin() as db:
+        tool = db.get(RegisteredToolRecord, "system.get_current_time")
+        tool.requires_approval = True
+        tool.risk_level = "high"
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time[0],
+    )
+    with pytest.raises(ToolRuntimeError) as approval_required:
+        execute(gateway)
+    assert approval_required.value.code == "approval_required"
+    approval = session.scalar(select(Approval))
+    from app.approvals.service import ApprovalService
+    from app.core.request_context import RequestContext
+
+    ApprovalService(session, clock=lambda: current_time[0]).approve(
+        approval.id,
+        RequestContext(
+            user_id="reviewer",
+            unit_id="unit-1",
+            project_id="project-1",
+            roles=frozenset({"project_admin"}),
+        ),
+    )
+    session.get(AgentRun, "run-1").status = "queued"
+    session.commit()
+
+    crossed_at_started_commit = []
+    external_calls = []
+    original = BUILTIN_EXECUTORS["system.get_current_time"]
+
+    def cross_deadline_before_root_commit(committing_session):
+        if (
+            not committing_session.in_nested_transaction()
+            and not crossed_at_started_commit
+        ):
+            current_time[0] = created_at.replace(minute=1, second=1)
+            crossed_at_started_commit.append(True)
+
+    def record_external_call(arguments, execution_context, clock):
+        external_calls.append(True)
+        return original(arguments, execution_context, clock)
+
+    monkeypatch.setitem(
+        BUILTIN_EXECUTORS,
+        "system.get_current_time",
+        record_external_call,
+    )
+    event.listen(session, "before_commit", cross_deadline_before_root_commit)
+    try:
+        with pytest.raises(ToolRuntimeError) as caught:
+            gateway.execute_approved(approval.id, context())
+    finally:
+        event.remove(session, "before_commit", cross_deadline_before_root_commit)
+
+    session.expire_all()
+    invocation = session.scalar(select(ToolInvocation))
+    run_events = list(
+        session.scalars(select(RunEvent).where(RunEvent.run_id == "run-1"))
+    )
+    tool_audits = list(
+        session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.run_id == "run-1",
+                AuditEvent.action.like("tool.invoke.%"),
+            )
+        )
+    )
+    assert crossed_at_started_commit == [True]
+    assert caught.value.code == "sandbox_timeout"
+    assert external_calls == []
+    assert invocation.status == "started"
+    assert invocation.result_summary is None
+    assert [event.event_type for event in run_events] == [
+        "approval.requested",
+        "run.status",
+        "tool.started",
+    ]
+    assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
+
+
+def test_approved_team_builtin_crossing_deadline_during_admission_rollback_stops_before_executor(
+    runtime,
+    monkeypatch,
+):
+    factory, store = runtime
+    created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    current_time = [created_at.replace(minute=0, second=30)]
+    configure_team_run(
+        runtime,
+        created_at=created_at,
+        snapshot_id="team-builtin-admission-rollback-snapshot",
+    )
+    with factory.begin() as db:
+        tool = db.get(RegisteredToolRecord, "system.get_current_time")
+        tool.requires_approval = True
+        tool.risk_level = "high"
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time[0],
+    )
+    with pytest.raises(ToolRuntimeError) as approval_required:
+        execute(gateway)
+    assert approval_required.value.code == "approval_required"
+    approval = approve_waiting_tool(session, now=current_time[0])
+
+    real_rollback = session.rollback
+    rollback_calls = 0
+    rollback_transaction_states = []
+    external_calls = []
+    original = BUILTIN_EXECUTORS["system.get_current_time"]
+
+    def cross_deadline_during_final_admission_rollback():
+        nonlocal rollback_calls
+        rollback_calls += 1
+        is_final_admission = rollback_calls == 1
+        if is_final_admission:
+            rollback_transaction_states.append(session.in_transaction())
+        real_rollback()
+        if is_final_admission:
+            current_time[0] = created_at.replace(minute=1, second=1)
+            rollback_transaction_states.append(session.in_transaction())
+
+    def record_external_call(arguments, execution_context, clock):
+        external_calls.append(session.in_transaction())
+        return original(arguments, execution_context, clock)
+
+    monkeypatch.setattr(session, "rollback", cross_deadline_during_final_admission_rollback)
+    monkeypatch.setitem(
+        BUILTIN_EXECUTORS,
+        "system.get_current_time",
+        record_external_call,
+    )
+
+    with pytest.raises(ToolRuntimeError) as caught:
+        gateway.execute_approved(approval.id, context())
+
+    with factory() as verification_session:
+        invocation = verification_session.scalar(select(ToolInvocation))
+        assert rollback_transaction_states == [True, False]
+        assert external_calls == []
+        assert caught.value.code == "sandbox_timeout"
+        assert invocation.status == "started"
+        assert invocation.result_summary is None
+        assert invocation.completed_at is None
+        assert invocation.duration_ms is None
+        assert invocation.error_code is None
+
+
+def test_approved_team_tool_crossing_execution_deadline_commits_no_success(
+    runtime,
+    monkeypatch,
+):
+    factory, store = runtime
+    created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    current_time = [created_at.replace(minute=0, second=30)]
+    with factory.begin() as db:
+        tool = db.get(RegisteredToolRecord, "system.get_current_time")
+        tool.requires_approval = True
+        tool.risk_level = "high"
+        run = db.get(AgentRun, "run-1")
+        run.actor_type = "team"
+        run.actor_id = "team-1"
+        run.actor_version_id = "team-version-1"
+        member = SnapshotTeamMember(
+            agent_id="member-1",
+            role="member",
+            responsibility="operate",
+        )
+        actor = PublishedTeamSnapshot(
+            id="team-1",
+            version_id="team-version-1",
+            version=1,
+            definition_digest="d" * 64,
+            supervisor=SnapshotTeamMember(
+                agent_id="supervisor",
+                role="supervisor",
+                responsibility="coordinate",
+            ),
+            members=(member,),
+            max_steps=2,
+            max_parallel_members=1,
+            timeout_seconds=60,
+            failure_strategy="fail_fast",
+            name="Team",
+            description="",
+            runtime_form="common",
+            language="zh-CN",
+            system_prompt="",
+            context_prompt="",
+            approval_policy="always",
+        )
+        payload = ExecutionSnapshotPayload(
+            schema_version="5",
+            snapshot_id="team-deadline-snapshot",
+            run_id=run.id,
+            unit_id="unit-1",
+            project_id="project-1",
+            user_id="user-1",
+            actor=actor,
+            model=SnapshotModelSelection(
+                provider_id="provider-1",
+                model="model-1",
+            ),
+            messages=(),
+            limits=SnapshotRuntimeLimits(snapshot_max_bytes=1_048_576),
+            created_at=created_at,
+        )
+        db.add(
+            RuntimeExecutionSnapshot(
+                snapshot_id=payload.snapshot_id,
+                run_id=run.id,
+                digest=hashlib.sha256(
+                    canonical_snapshot_bytes(payload)
+                ).hexdigest(),
+                payload=payload.model_dump(mode="json"),
+                created_at=created_at,
+                expires_at=None,
+            )
+        )
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time[0],
+    )
+    with pytest.raises(ToolRuntimeError) as approval_required:
+        execute(gateway)
+    assert approval_required.value.code == "approval_required"
+    approval = session.scalar(select(Approval))
+    from app.approvals.service import ApprovalService
+    from app.core.request_context import RequestContext
+
+    ApprovalService(session, clock=lambda: current_time[0]).approve(
+        approval.id,
+        RequestContext(
+            user_id="reviewer",
+            unit_id="unit-1",
+            project_id="project-1",
+            roles=frozenset({"project_admin"}),
+        ),
+    )
+    session.get(AgentRun, "run-1").status = "queued"
+    session.commit()
+
+    external_calls = []
+    original = BUILTIN_EXECUTORS["system.get_current_time"]
+
+    def cross_deadline(arguments, execution_context, clock):
+        external_calls.append((arguments, execution_context.run_id))
+        current_time[0] = created_at.replace(minute=1, second=1)
+        return original(arguments, execution_context, clock)
+
+    monkeypatch.setitem(
+        BUILTIN_EXECUTORS,
+        "system.get_current_time",
+        cross_deadline,
+    )
+
+    with pytest.raises(ToolRuntimeError) as caught:
+        gateway.execute_approved(approval.id, context())
+
+    session.expire_all()
+    invocation = session.scalar(select(ToolInvocation))
+    run_events = list(
+        session.scalars(select(RunEvent).where(RunEvent.run_id == "run-1"))
+    )
+    tool_audits = list(
+        session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.run_id == "run-1",
+                AuditEvent.action.like("tool.invoke.%"),
+            )
+        )
+    )
+    assert caught.value.code == "sandbox_timeout"
+    assert external_calls == [({}, "run-1")]
+    assert invocation.status == "started"
+    assert invocation.result_summary is None
+    assert [event.event_type for event in run_events] == [
+        "approval.requested",
+        "run.status",
+        "tool.started",
+    ]
+    assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
+
+
+def test_team_tool_missing_snapshot_at_terminal_persistence_commits_no_success(
+    runtime,
+    monkeypatch,
+):
+    factory, store = runtime
+    created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    current_time = created_at.replace(minute=0, second=30)
+    configure_team_run(
+        runtime,
+        created_at=created_at,
+        snapshot_id="team-removed-terminal-snapshot",
+    )
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time,
+    )
+    original = BUILTIN_EXECUTORS["system.get_current_time"]
+    external_calls = []
+
+    def remove_snapshot_during_external_call(arguments, execution_context, clock):
+        external_calls.append(True)
+        session.execute(
+            delete(RuntimeExecutionSnapshot).where(
+                RuntimeExecutionSnapshot.run_id == execution_context.run_id
+            )
+        )
+        session.commit()
+        return original(arguments, execution_context, clock)
+
+    monkeypatch.setitem(
+        BUILTIN_EXECUTORS,
+        "system.get_current_time",
+        remove_snapshot_during_external_call,
+    )
+
+    with pytest.raises(ToolRuntimeError) as caught:
+        execute(gateway)
+
+    session.expire_all()
+    invocation = session.scalar(select(ToolInvocation))
+    run_events = list(
+        session.scalars(select(RunEvent).where(RunEvent.run_id == "run-1"))
+    )
+    tool_audits = list(
+        session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.run_id == "run-1",
+                AuditEvent.action.like("tool.invoke.%"),
+            )
+        )
+    )
+    assert caught.value.code == "sandbox_timeout"
+    assert external_calls == [True]
+    assert invocation.status == "started"
+    assert invocation.result_summary is None
+    assert [event.event_type for event in run_events] == ["tool.started"]
+    assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
+
+
+def test_team_tool_terminal_success_before_deadline_commits_result(runtime):
+    factory, store = runtime
+    created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    current_time = created_at.replace(minute=0, second=30)
+    configure_team_run(
+        runtime,
+        created_at=created_at,
+        snapshot_id="team-on-time-terminal-snapshot",
+    )
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time,
+    )
+
+    result = execute(gateway)
+
+    invocation = session.scalar(select(ToolInvocation))
+    run_events = list(
+        session.scalars(select(RunEvent).where(RunEvent.run_id == "run-1"))
+    )
+    tool_audits = list(
+        session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.run_id == "run-1",
+                AuditEvent.action.like("tool.invoke.%"),
+            )
+        )
+    )
+    assert result.invocation_id == invocation.id
+    assert invocation.status == "completed"
+    assert invocation.result_summary["timezone"] == "Asia/Shanghai"
+    assert invocation.completed_at is not None
+    assert [item.event_type for item in run_events] == [
+        "tool.started",
+        "tool.completed",
+    ]
+    assert [audit.action for audit in tool_audits] == [
+        "tool.invoke.started",
+        "tool.invoke.succeeded",
+    ]
+
+
+@pytest.mark.parametrize(
+    "deadline_crossing_point",
+    ("after_flush", "before_commit"),
+)
+def test_team_tool_terminal_boundary_crossing_deadline_commits_no_success(
+    runtime,
+    monkeypatch,
+    deadline_crossing_point,
+):
+    factory, store = runtime
+    created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    current_time = [created_at.replace(minute=0, second=30)]
+    configure_team_run(
+        runtime,
+        created_at=created_at,
+        snapshot_id="team-final-flush-snapshot",
+    )
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time[0],
+    )
+    terminal_success_flushed = []
+    crossed_at_terminal_boundary = []
+
+    def observe_terminal_success_flush(flushed_session, _flush_context):
+        if not terminal_success_flushed and any(
+            isinstance(item, RunEvent) and item.event_type == "tool.completed"
+            for item in flushed_session.new
+        ):
+            terminal_success_flushed.append(True)
+            if deadline_crossing_point == "after_flush":
+                current_time[0] = created_at.replace(minute=1, second=1)
+                crossed_at_terminal_boundary.append(True)
+
+    def cross_before_terminal_commit(committing_session):
+        if (
+            deadline_crossing_point == "before_commit"
+            and terminal_success_flushed
+            and not crossed_at_terminal_boundary
+            and not committing_session.in_nested_transaction()
+        ):
+            current_time[0] = created_at.replace(minute=1, second=1)
+            crossed_at_terminal_boundary.append(True)
+
+    event.listen(session, "after_flush", observe_terminal_success_flush)
+    event.listen(session, "before_commit", cross_before_terminal_commit)
+
+    try:
+        with pytest.raises(ToolRuntimeError) as caught:
+            execute(gateway)
+    finally:
+        event.remove(session, "after_flush", observe_terminal_success_flush)
+        event.remove(session, "before_commit", cross_before_terminal_commit)
+
+    session.expire_all()
+    invocation = session.scalar(select(ToolInvocation))
+    run_events = list(
+        session.scalars(select(RunEvent).where(RunEvent.run_id == "run-1"))
+    )
+    tool_audits = list(
+        session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.run_id == "run-1",
+                AuditEvent.action.like("tool.invoke.%"),
+            )
+        )
+    )
+    assert terminal_success_flushed == [True]
+    assert crossed_at_terminal_boundary == [True]
+    assert caught.value.code == "sandbox_timeout"
+    assert invocation.status == "started"
+    assert invocation.result_summary is None
+    assert [item.event_type for item in run_events] == ["tool.started"]
+    assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
+
+
+def test_approved_team_mcp_tool_crossing_deadline_during_setup_stops_before_transport(
+    runtime,
+):
+    factory, store = runtime
+    created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    current_time = [created_at.replace(minute=0, second=30)]
+    configure_team_run(
+        runtime,
+        created_at=created_at,
+        snapshot_id="team-mcp-setup-deadline-snapshot",
+    )
+    tool_id = configure_approved_mcp_tool(runtime)
+    registry_reads = []
+    credential_resolutions = []
+    transport_calls = []
+    real_mcp_store = McpStore(factory)
+    real_credential_resolver = McpCredentialResolver(
+        {
+            "credential-1": {
+                "unit_id": "unit-1",
+                "headers": {"Authorization": "Bearer test-token"},
+            }
+        }
+    )
+
+    class RecordingMcpStore:
+        def get(self, key):
+            registry_reads.append(key)
+            return real_mcp_store.get(key)
+
+    class DeadlineCrossingCredentialResolver:
+        def resolve(self, credential_id, *, unit_id):
+            headers = real_credential_resolver.resolve(
+                credential_id,
+                unit_id=unit_id,
+            )
+            credential_resolutions.append((credential_id, unit_id))
+            current_time[0] = created_at.replace(minute=1, second=1)
+            return headers
+
+    class ContractValidProtocol:
+        def call_tool(self, url, transport, headers, name, arguments):
+            transport_calls.append(
+                (url, transport, headers, name, arguments)
+            )
+            return {"answer": "ok"}
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time[0],
+        mcp_store=RecordingMcpStore(),
+        mcp_protocol_client=ContractValidProtocol(),
+        mcp_credential_resolver=DeadlineCrossingCredentialResolver(),
+    )
+    with pytest.raises(ToolRuntimeError) as approval_required:
+        execute(
+            gateway,
+            name=tool_id,
+            arguments={"repo": "github"},
+            authorized={tool_id},
+        )
+    assert approval_required.value.code == "approval_required"
+    approval = approve_waiting_tool(session, now=current_time[0])
+
+    with pytest.raises(ToolRuntimeError) as caught:
+        gateway.execute_approved(approval.id, context())
+
+    with factory() as verification_session:
+        invocation = verification_session.scalar(select(ToolInvocation))
+        events = list(
+            verification_session.scalars(
+                select(RunEvent)
+                .where(RunEvent.run_id == "run-1")
+                .order_by(RunEvent.sequence)
+            )
+        )
+        tool_audits = list(
+            verification_session.scalars(
+                select(AuditEvent)
+                .where(
+                    AuditEvent.run_id == "run-1",
+                    AuditEvent.action.like("tool.invoke.%"),
+                )
+                .order_by(AuditEvent.occurred_at, AuditEvent.id)
+            )
+        )
+        assert registry_reads == ["water"]
+        assert credential_resolutions == [("credential-1", "unit-1")]
+        assert transport_calls == []
+        assert caught.value.code == "sandbox_timeout"
+        assert verification_session.get(AgentRun, "run-1").status == "queued"
+        assert verification_session.get(Approval, approval.id).status == "approved"
+        assert invocation.status == "started"
+        assert invocation.result_summary is None
+        assert invocation.completed_at is None
+        assert invocation.duration_ms is None
+        assert invocation.error_code is None
+        assert [event.event_type for event in events] == [
+            "approval.requested",
+            "run.status",
+            "tool.started",
+        ]
+        assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
+
+
+def test_approved_team_mcp_crossing_deadline_during_final_admission_rollback_stops_before_transport(
+    runtime,
+    monkeypatch,
+):
+    factory, store = runtime
+    created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    current_time = [created_at.replace(minute=0, second=30)]
+    configure_team_run(
+        runtime,
+        created_at=created_at,
+        snapshot_id="team-mcp-admission-rollback-snapshot",
+    )
+    tool_id = configure_approved_mcp_tool(runtime)
+    transport_calls = []
+    real_mcp_store = McpStore(factory)
+    real_credential_resolver = McpCredentialResolver(
+        {
+            "credential-1": {
+                "unit_id": "unit-1",
+                "headers": {"Authorization": "Bearer test-token"},
+            }
+        }
+    )
+
+    class ContractValidProtocol:
+        def call_tool(self, url, transport, headers, name, arguments):
+            transport_calls.append(
+                (url, transport, headers, name, arguments)
+            )
+            return {"answer": "ok"}
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time[0],
+        mcp_store=real_mcp_store,
+        mcp_protocol_client=ContractValidProtocol(),
+        mcp_credential_resolver=real_credential_resolver,
+    )
+    with pytest.raises(ToolRuntimeError) as approval_required:
+        execute(
+            gateway,
+            name=tool_id,
+            arguments={"repo": "github"},
+            authorized={tool_id},
+        )
+    assert approval_required.value.code == "approval_required"
+    approval = approve_waiting_tool(session, now=current_time[0])
+
+    real_rollback = session.rollback
+    rollback_calls = 0
+    final_rollback_transaction_states = []
+
+    def cross_deadline_during_final_admission_rollback():
+        nonlocal rollback_calls
+        rollback_calls += 1
+        is_final_admission = rollback_calls == 2
+        if is_final_admission:
+            final_rollback_transaction_states.append(session.in_transaction())
+        real_rollback()
+        if is_final_admission:
+            current_time[0] = created_at.replace(minute=1, second=1)
+            final_rollback_transaction_states.append(session.in_transaction())
+
+    monkeypatch.setattr(session, "rollback", cross_deadline_during_final_admission_rollback)
+
+    with pytest.raises(ToolRuntimeError) as caught:
+        gateway.execute_approved(approval.id, context())
+
+    with factory() as verification_session:
+        invocation = verification_session.scalar(select(ToolInvocation))
+        assert final_rollback_transaction_states == [True, False]
+        assert transport_calls == []
+        assert caught.value.code == "sandbox_timeout"
+        assert invocation.status == "started"
+        assert invocation.result_summary is None
+        assert invocation.completed_at is None
+        assert invocation.duration_ms is None
+        assert invocation.error_code is None
+
+
+def test_approved_team_mcp_tool_deleted_snapshot_during_registry_setup_stops_before_transport(
+    runtime,
+):
+    factory, store = runtime
+    created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    current_time = created_at.replace(minute=0, second=30)
+    configure_team_run(
+        runtime,
+        created_at=created_at,
+        snapshot_id="team-mcp-deleted-boundary-snapshot",
+    )
+    tool_id = configure_approved_mcp_tool(runtime)
+    registry_reads = []
+    snapshot_deletions = []
+    transport_calls = []
+    real_mcp_store = McpStore(factory)
+    real_credential_resolver = McpCredentialResolver(
+        {
+            "credential-1": {
+                "unit_id": "unit-1",
+                "headers": {"Authorization": "Bearer test-token"},
+            }
+        }
+    )
+
+    class SnapshotDeletingMcpStore:
+        def get(self, key):
+            client = real_mcp_store.get(key)
+            registry_reads.append(key)
+            with factory.begin() as mutation_session:
+                result = mutation_session.execute(
+                    delete(RuntimeExecutionSnapshot).where(
+                        RuntimeExecutionSnapshot.run_id == "run-1"
+                    )
+                )
+                snapshot_deletions.append(result.rowcount)
+            return client
+
+    class ContractValidProtocol:
+        def call_tool(self, url, transport, headers, name, arguments):
+            transport_calls.append(
+                (url, transport, headers, name, arguments)
+            )
+            return {"answer": "ok"}
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time,
+        mcp_store=SnapshotDeletingMcpStore(),
+        mcp_protocol_client=ContractValidProtocol(),
+        mcp_credential_resolver=real_credential_resolver,
+    )
+    with pytest.raises(ToolRuntimeError) as approval_required:
+        execute(
+            gateway,
+            name=tool_id,
+            arguments={"repo": "github"},
+            authorized={tool_id},
+        )
+    assert approval_required.value.code == "approval_required"
+    approval = approve_waiting_tool(session, now=current_time)
+
+    with pytest.raises(ToolRuntimeError) as caught:
+        gateway.execute_approved(approval.id, context())
+
+    with factory() as verification_session:
+        invocation = verification_session.scalar(select(ToolInvocation))
+        events = list(
+            verification_session.scalars(
+                select(RunEvent)
+                .where(RunEvent.run_id == "run-1")
+                .order_by(RunEvent.sequence)
+            )
+        )
+        tool_audits = list(
+            verification_session.scalars(
+                select(AuditEvent)
+                .where(
+                    AuditEvent.run_id == "run-1",
+                    AuditEvent.action.like("tool.invoke.%"),
+                )
+                .order_by(AuditEvent.occurred_at, AuditEvent.id)
+            )
+        )
+        assert registry_reads == ["water"]
+        assert snapshot_deletions == [1]
+        assert transport_calls == []
+        assert caught.value.code == "sandbox_timeout"
+        assert verification_session.get(AgentRun, "run-1").status == "queued"
+        assert verification_session.get(Approval, approval.id).status == "approved"
+        assert invocation.status == "started"
+        assert invocation.result_summary is None
+        assert invocation.completed_at is None
+        assert invocation.duration_ms is None
+        assert invocation.error_code is None
+        assert [event.event_type for event in events] == [
+            "approval.requested",
+            "run.status",
+            "tool.started",
+        ]
+        assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
+
+
+def test_approved_team_mcp_tool_corrupted_snapshot_during_credential_setup_stops_before_transport(
+    runtime,
+):
+    factory, store = runtime
+    created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    current_time = created_at.replace(minute=0, second=30)
+    snapshot_id = "team-mcp-corrupt-boundary-snapshot"
+    configure_team_run(
+        runtime,
+        created_at=created_at,
+        snapshot_id=snapshot_id,
+    )
+    tool_id = configure_approved_mcp_tool(runtime)
+    credential_resolutions = []
+    cached_snapshots = []
+    snapshot_corruptions = []
+    transport_calls = []
+    real_mcp_store = McpStore(factory)
+    real_credential_resolver = McpCredentialResolver(
+        {
+            "credential-1": {
+                "unit_id": "unit-1",
+                "headers": {"Authorization": "Bearer test-token"},
+            }
+        }
+    )
+
+    class SnapshotCorruptingCredentialResolver:
+        def resolve(self, credential_id, *, unit_id):
+            headers = real_credential_resolver.resolve(
+                credential_id,
+                unit_id=unit_id,
+            )
+            credential_resolutions.append((credential_id, unit_id))
+            cached_snapshots.append(
+                session.get(RuntimeExecutionSnapshot, snapshot_id)
+            )
+            session.commit()
+            with factory.begin() as mutation_session:
+                snapshot = mutation_session.get(
+                    RuntimeExecutionSnapshot,
+                    snapshot_id,
+                )
+                snapshot.payload = {**snapshot.payload, "user_id": "attacker"}
+                snapshot_corruptions.append(snapshot.snapshot_id)
+            return headers
+
+    class ContractValidProtocol:
+        def call_tool(self, url, transport, headers, name, arguments):
+            transport_calls.append(
+                (url, transport, headers, name, arguments)
+            )
+            return {"answer": "ok"}
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time,
+        mcp_store=real_mcp_store,
+        mcp_protocol_client=ContractValidProtocol(),
+        mcp_credential_resolver=SnapshotCorruptingCredentialResolver(),
+    )
+    with pytest.raises(ToolRuntimeError) as approval_required:
+        execute(
+            gateway,
+            name=tool_id,
+            arguments={"repo": "github"},
+            authorized={tool_id},
+        )
+    assert approval_required.value.code == "approval_required"
+    approval = approve_waiting_tool(session, now=current_time)
+
+    with pytest.raises(ToolRuntimeError) as caught:
+        gateway.execute_approved(approval.id, context())
+
+    with factory() as verification_session:
+        invocation = verification_session.scalar(select(ToolInvocation))
+        events = list(
+            verification_session.scalars(
+                select(RunEvent)
+                .where(RunEvent.run_id == "run-1")
+                .order_by(RunEvent.sequence)
+            )
+        )
+        tool_audits = list(
+            verification_session.scalars(
+                select(AuditEvent)
+                .where(
+                    AuditEvent.run_id == "run-1",
+                    AuditEvent.action.like("tool.invoke.%"),
+                )
+                .order_by(AuditEvent.occurred_at, AuditEvent.id)
+            )
+        )
+        assert credential_resolutions == [("credential-1", "unit-1")]
+        assert [snapshot.snapshot_id for snapshot in cached_snapshots] == [
+            snapshot_id
+        ]
+        assert snapshot_corruptions == [snapshot_id]
+        assert transport_calls == []
+        assert caught.value.code == "sandbox_timeout"
+        assert verification_session.get(AgentRun, "run-1").status == "queued"
+        assert verification_session.get(Approval, approval.id).status == "approved"
+        assert invocation.status == "started"
+        assert invocation.result_summary is None
+        assert invocation.completed_at is None
+        assert invocation.duration_ms is None
+        assert invocation.error_code is None
+        assert [event.event_type for event in events] == [
+            "approval.requested",
+            "run.status",
+            "tool.started",
+        ]
+        assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
+
+
+def test_approved_team_mcp_tool_with_valid_snapshot_executes_without_open_gateway_transaction(
+    runtime,
+):
+    factory, store = runtime
+    created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    current_time = created_at.replace(minute=0, second=30)
+    configure_team_run(
+        runtime,
+        created_at=created_at,
+        snapshot_id="team-mcp-valid-boundary-snapshot",
+    )
+    tool_id = configure_approved_mcp_tool(runtime)
+    transport_transactions = []
+    real_mcp_store = McpStore(factory)
+    real_credential_resolver = McpCredentialResolver(
+        {
+            "credential-1": {
+                "unit_id": "unit-1",
+                "headers": {"Authorization": "Bearer test-token"},
+            }
+        }
+    )
+
+    class ContractValidProtocol:
+        def call_tool(self, url, transport, headers, name, arguments):
+            transport_transactions.append(session.in_transaction())
+            assert (url, transport, headers, name, arguments) == (
+                "https://example.test/mcp",
+                "streamable_http",
+                {"Authorization": "Bearer test-token"},
+                "read_wiki",
+                {"repo": "github"},
+            )
+            return {"answer": "ok"}
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time,
+        mcp_store=real_mcp_store,
+        mcp_protocol_client=ContractValidProtocol(),
+        mcp_credential_resolver=real_credential_resolver,
+    )
+    with pytest.raises(ToolRuntimeError) as approval_required:
+        execute(
+            gateway,
+            name=tool_id,
+            arguments={"repo": "github"},
+            authorized={tool_id},
+        )
+    assert approval_required.value.code == "approval_required"
+    approval = approve_waiting_tool(session, now=current_time)
+
+    result = gateway.execute_approved(approval.id, context())
+
+    with factory() as verification_session:
+        invocation = verification_session.scalar(select(ToolInvocation))
+        assert result.value == {"answer": "ok"}
+        assert transport_transactions == [False]
+        assert verification_session.get(AgentRun, "run-1").status == "queued"
+        assert verification_session.get(Approval, approval.id).status == "approved"
+        assert invocation.status == "completed"
+        assert invocation.result_summary == {"answer": "ok"}
+
+
+def test_approved_agent_mcp_tool_remains_snapshot_optional_during_setup(runtime):
+    factory, store = runtime
+    current_time = [datetime(2026, 8, 2, 4, 0, 30, tzinfo=timezone.utc)]
+    tool_id = configure_approved_mcp_tool(runtime)
+    transaction_states = []
+    real_mcp_store = McpStore(factory)
+    real_credential_resolver = McpCredentialResolver(
+        {
+            "credential-1": {
+                "unit_id": "unit-1",
+                "headers": {"Authorization": "Bearer test-token"},
+            }
+        }
+    )
+
+    class AdvancingMcpStore:
+        def get(self, key):
+            return real_mcp_store.get(key)
+
+    class AdvancingCredentialResolver:
+        def resolve(self, credential_id, *, unit_id):
+            headers = real_credential_resolver.resolve(
+                credential_id,
+                unit_id=unit_id,
+            )
+            current_time[0] = datetime(2036, 8, 2, 4, 1, 1, tzinfo=timezone.utc)
+            return headers
+
+    class ContractValidProtocol:
+        def call_tool(self, url, transport, headers, name, arguments):
+            transaction_states.append(session.in_transaction())
+            assert (url, transport, headers, name, arguments) == (
+                "https://example.test/mcp",
+                "streamable_http",
+                {"Authorization": "Bearer test-token"},
+                "read_wiki",
+                {"repo": "github"},
+            )
+            return {"answer": "ok"}
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time[0],
+        mcp_store=AdvancingMcpStore(),
+        mcp_protocol_client=ContractValidProtocol(),
+        mcp_credential_resolver=AdvancingCredentialResolver(),
+    )
+    with pytest.raises(ToolRuntimeError) as approval_required:
+        execute(
+            gateway,
+            name=tool_id,
+            arguments={"repo": "github"},
+            authorized={tool_id},
+        )
+    assert approval_required.value.code == "approval_required"
+    approval = approve_waiting_tool(session, now=current_time[0])
+
+    result = gateway.execute_approved(approval.id, context())
+
+    session.expire_all()
+    invocation = session.scalar(select(ToolInvocation))
+    events = list(
+        session.scalars(
+            select(RunEvent)
+            .where(RunEvent.run_id == "run-1")
+            .order_by(RunEvent.sequence)
+        )
+    )
+    tool_audits = list(
+        session.scalars(
+            select(AuditEvent)
+            .where(
+                AuditEvent.run_id == "run-1",
+                AuditEvent.action.like("tool.invoke.%"),
+            )
+            .order_by(AuditEvent.occurred_at, AuditEvent.id)
+        )
+    )
+    assert result.value == {"answer": "ok"}
+    assert transaction_states == [False]
+    assert session.get(AgentRun, "run-1").status == "queued"
+    assert session.get(Approval, approval.id).status == "approved"
+    assert invocation.status == "completed"
+    assert invocation.result_summary == {"answer": "ok"}
+    assert [event.event_type for event in events] == [
+        "approval.requested",
+        "run.status",
+        "tool.started",
+        "tool.completed",
+    ]
+    assert [audit.action for audit in tool_audits] == [
+        "tool.invoke.started",
+        "tool.invoke.succeeded",
+    ]
 
 
 def test_mcp_tool_executes_remote_capability_and_records_result(runtime):
@@ -419,6 +1815,60 @@ def test_success_terminal_audit_failure_retries_true_outcome_without_duplicates(
     ]
     assert audits[1].parent_event_id == audits[0].id
     assert [event.event_type for event in events] == ["tool.started", "tool.completed"]
+
+
+def test_terminal_run_during_completion_compensation_bypasses_retry(
+    runtime, monkeypatch
+):
+    factory, store = runtime
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        audit_recorder=OneShotTerminalFailingRecorder(),
+    )
+    original_rollback = gateway._rollback_safely
+    original_persist_terminal = gateway._persist_terminal
+    rollback_count = 0
+    terminal_attempts = []
+
+    def rollback_then_finish_run():
+        nonlocal rollback_count
+        original_rollback()
+        rollback_count += 1
+        if rollback_count == 1:
+            with factory.begin() as terminal_session:
+                terminal_session.get(AgentRun, "run-1").status = "failed"
+
+    def capture_terminal_attempt(*args, **kwargs):
+        terminal_attempts.append(kwargs.get("include_audit", True))
+        return original_persist_terminal(*args, **kwargs)
+
+    monkeypatch.setattr(gateway, "_rollback_safely", rollback_then_finish_run)
+    monkeypatch.setattr(gateway, "_persist_terminal", capture_terminal_attempt)
+
+    with pytest.raises(ToolRuntimeError) as caught:
+        execute(gateway)
+
+    session.expire_all()
+    invocation = session.scalar(select(ToolInvocation))
+    events = list(
+        session.scalars(
+            select(RunEvent)
+            .where(RunEvent.run_id == "run-1")
+            .order_by(RunEvent.sequence)
+        )
+    )
+    audits = list(
+        session.scalars(
+            select(AuditEvent).where(AuditEvent.run_id == "run-1")
+        )
+    )
+    assert caught.value.code == "run_not_active"
+    assert terminal_attempts == [True, True]
+    assert invocation.status == "started"
+    assert [event.event_type for event in events] == ["tool.started"]
+    assert [audit.action for audit in audits] == ["tool.invoke.started"]
 
 
 class PersistentTerminalFailingRecorder(AuditRecorder):

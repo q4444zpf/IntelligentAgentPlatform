@@ -67,6 +67,15 @@ class ToolService:
             resolved.append(tool)
         return resolved
 
+    def resolve_knowledge_sources(self, tool_ids: list[str]) -> list[ToolInfo]:
+        resolved = self.resolve_bindable(tool_ids)
+        for tool in resolved:
+            if tool.source != "knowledge":
+                raise ToolValidationError(
+                    f"Tool '{tool.tool_id}' is not a knowledge source"
+                )
+        return resolved
+
     def toggle(
         self,
         tool_id: str,

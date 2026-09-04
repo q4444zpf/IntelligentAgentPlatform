@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from .container_policy import ContainerPolicy
@@ -73,6 +74,7 @@ class ControlledContainerLauncher:
             agent_version=payload.get("agent_version"),
             checkpoint_key=payload.get("checkpoint_key"),
             deadline_at=payload.get("deadline_at"),
+            execution_deadline_at=payload.get("execution_deadline_at"),
             snapshot_id=payload.get("snapshot_id"),
             snapshot_digest=payload.get("snapshot_digest"),
             gateway_url=payload.get("gateway_url"),
@@ -83,14 +85,26 @@ class ControlledContainerLauncher:
             workspace_path,
             execution_request=request.model_dump_json(),
         )
+        if datetime.now(UTC) >= request.execution_deadline_at:
+            raise LauncherUnavailableError("sandbox execution deadline expired")
         try:
             if hasattr(self.client, "containers_run"):
                 container = self.client.containers_run(**config, detach=True, remove=False)
             else:
                 container = self.client.containers.run(**config, detach=True, remove=False)
+            if datetime.now(UTC) >= request.execution_deadline_at:
+                container.remove(force=True)
+                raise LauncherUnavailableError(
+                    "sandbox execution deadline expired"
+                )
             if hasattr(container, "reload"):
                 container.reload()
             readiness = self.inspector.inspect(getattr(container, "attrs", {}))
+            if datetime.now(UTC) >= request.execution_deadline_at:
+                container.remove(force=True)
+                raise LauncherUnavailableError(
+                    "sandbox execution deadline expired"
+                )
             if not readiness.is_ready():
                 container.remove(force=True)
                 missing = ",".join(readiness.missing())

@@ -20,6 +20,8 @@ from .model_gateway import ModelGateway, OpenAICompatibleModelGateway
 from .run_tokens import RunTokenClaims, RunTokenService
 from .runner_gateway_auth import default_token_service, require_runner_action
 from .runner_gateway_schemas import (
+    ArtifactCapabilityRegistrationRequest,
+    ArtifactCapabilityResponse,
     ArtifactContentResponse,
     ArtifactCreateRequest,
     ArtifactFileResponse,
@@ -308,6 +310,34 @@ def create_router(
         ).invoke_tool(run_id, request, claims, idempotency_key)
 
     @router.post(
+        "/runs/{run_id}/artifact-capabilities",
+        response_model=ArtifactCapabilityResponse,
+        status_code=201,
+    )
+    def register_artifact_capability(
+        run_id: str,
+        request: ArtifactCapabilityRegistrationRequest,
+        claims: Annotated[RunTokenClaims, Depends(artifact_claims)],
+        snapshot_service: Annotated[
+            ExecutionSnapshotService,
+            Depends(snapshot_service_dependency),
+        ],
+        repository: Annotated[
+            ConversationRepository,
+            Depends(conversation_repository_dependency),
+        ],
+        checkpoint_store: Annotated[
+            CheckpointStore,
+            Depends(checkpoint_store_dependency),
+        ],
+    ) -> ArtifactCapabilityResponse:
+        return RunnerGatewayService(
+            snapshot_service,
+            checkpoint_store=checkpoint_store,
+            conversation_repository=repository,
+        ).register_artifact_capability(run_id, request, claims)
+
+    @router.post(
         "/runs/{run_id}/artifacts",
         response_model=ArtifactFileResponse,
         status_code=201,
@@ -328,6 +358,10 @@ def create_router(
             ConversationRepository,
             Depends(conversation_repository_dependency),
         ],
+        checkpoint_store: Annotated[
+            CheckpointStore,
+            Depends(checkpoint_store_dependency),
+        ],
         artifacts: Annotated[
             ArtifactService,
             Depends(artifact_service_dependency),
@@ -335,6 +369,7 @@ def create_router(
     ) -> ArtifactFileResponse:
         return RunnerGatewayService(
             snapshot_service,
+            checkpoint_store=checkpoint_store,
             conversation_repository=repository,
             artifact_service=artifacts,
         ).create_artifact(run_id, request, claims, idempotency_key)
