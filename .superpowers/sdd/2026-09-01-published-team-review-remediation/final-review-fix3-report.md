@@ -752,3 +752,166 @@ implementation and both fix rounds, the range contains 28 paths: 3 added and
 - `M` `backend/tests/runtime/test_workflow_runner_api.py`
 - `M` `backend/tests/test_agents.py`
 - `M` `backend/tests/tools/test_gateway.py`
+
+## Fix Round 3
+
+### Investigation
+
+- The dispatcher loaded the immutable snapshot before current-authorization
+  reconstruction, but treated `None` as an Agent-compatible absence even when
+  `AgentRun.actor_type == "team"`. A Team approval with a deleted snapshot
+  therefore reached `ToolGateway.execute_approved()`.
+- `ToolGateway.execute_approved()` committed `tool.started` and immediately
+  called the builtin/MCP transport. A deadline that crossed during the started
+  transaction was observed only by terminal persistence, after the external
+  side effect had already occurred.
+- Successful terminal Tool persistence also translated a missing snapshot to
+  `deadline = None`, disabling both the application-clock check and the
+  database-time conditional commit. This allowed a Team success result, event,
+  and audit to commit without an immutable deadline.
+- Agent runs intentionally predate mandatory immutable snapshots. Their
+  no-snapshot approval path must remain executable.
+
+### RED evidence
+
+The first draft used an incomplete fake Tool result in two executor-admission
+cases. It produced `tool_execution_failed` during output-schema validation and
+was discarded as inconclusive for the intended error-code assertion. No
+production file had been edited.
+
+The corrected focused command, run unchanged against `5fe65c6`, was:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -p no:cacheprovider backend/tests/conversations/test_dispatcher.py::test_team_approval_resume_without_snapshot_fails_before_gateway backend/tests/conversations/test_dispatcher.py::test_sandbox_dispatcher_executes_approved_agent_tool_without_snapshot_before_resuming_run backend/tests/tools/test_gateway.py::test_approved_team_tool_without_snapshot_fails_before_started_or_executor backend/tests/tools/test_gateway.py::test_approved_team_tool_crossing_deadline_during_started_commit_stops_before_executor backend/tests/tools/test_gateway.py::test_team_tool_missing_snapshot_at_terminal_persistence_commits_no_success backend/tests/tools/test_gateway.py::test_approved_agent_tool_without_snapshot_executes_after_digest_check --basetemp=backend/.tmp-final-review-fix3-round3-red-20260904-b
+```
+
+Result: `4 failed, 3 passed in 16.87s`.
+
+- Dispatcher returned the Team Run id and called the mocked Gateway despite a
+  missing snapshot.
+- Approved Team Tool execution completed successfully with no snapshot.
+- The root `before_commit` deadline race invoked the executor once before
+  terminal persistence rejected the late success.
+- Removing the snapshot during execution allowed terminal success to commit.
+- Both parameterized Agent Gateway cases and the Agent dispatcher case passed,
+  proving the compatibility baseline before implementation.
+
+### Implementation
+
+- The dispatcher now requires a digest-valid Team snapshot whose actor yields
+  an immutable Team deadline. Missing, invalid, non-Team, and expired Team
+  snapshots fail with `sandbox_timeout` before authorization can reach the
+  Gateway.
+- `ToolGateway` owns the definitive admission rule. It locks the active Run,
+  requires a valid Team snapshot/deadline, and checks the injected wall clock
+  both before `tool.started` and again immediately after that transaction
+  commits, before the builtin/MCP transport is invoked.
+- The post-start admission transaction is read-only and explicitly rolled back
+  before transport. Invocation arguments and durable audit identifiers are
+  copied first, preserving the existing guarantee that external executors run
+  without an open application database transaction.
+- Successful terminal persistence reuses the same Team snapshot/deadline
+  requirement. A missing snapshot now follows the existing terminal fence:
+  terminal writes roll back, compensation is bypassed, and only the previously
+  committed `tool.started` state remains.
+- Agent approval execution still permits no snapshot. Existing replay,
+  idempotency, failure compensation, and terminal-run fences remain unchanged.
+- Direct PostgreSQL coverage now holds the successful Tool terminal commit
+  beyond a five-second Team deadline while freezing the application clock. The
+  `clock_timestamp()` predicate rejects the transition after the executor has
+  run once, leaving no result, completion event, or success audit.
+
+### GREEN evidence
+
+Corrected focused rerun:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -p no:cacheprovider backend/tests/conversations/test_dispatcher.py::test_team_approval_resume_without_snapshot_fails_before_gateway backend/tests/conversations/test_dispatcher.py::test_sandbox_dispatcher_executes_approved_agent_tool_without_snapshot_before_resuming_run backend/tests/tools/test_gateway.py::test_approved_team_tool_without_snapshot_fails_before_started_or_executor backend/tests/tools/test_gateway.py::test_approved_team_tool_crossing_deadline_during_started_commit_stops_before_executor backend/tests/tools/test_gateway.py::test_team_tool_missing_snapshot_at_terminal_persistence_commits_no_success backend/tests/tools/test_gateway.py::test_approved_agent_tool_without_snapshot_executes_after_digest_check --basetemp=backend/.tmp-final-review-fix3-round3-green-20260904-a
+```
+
+Result: `7 passed in 13.68s`.
+
+A final pre-commit rerun of the same seven focused cases, using basetemp
+`backend/.tmp-final-review-fix3-round3-final-focused-20260904-a`, passed in
+`16.39s`.
+
+The existing current-membership Team test originally omitted a snapshot and
+therefore reached the new earlier fence. Its fixture was corrected with a valid
+unexpired immutable Team snapshot so it continues to isolate authorization.
+Focused result: `1 passed in 3.50s`.
+
+Complete dispatcher and Tool Gateway modules:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -rs -p no:cacheprovider backend/tests/conversations/test_dispatcher.py backend/tests/tools/test_gateway.py --basetemp=backend/.tmp-final-review-fix3-round3-modules-green-20260904-b
+```
+
+Result: `52 passed in 79.04s`.
+
+Runner replay/idempotency, deadline state/listener, approved-Agent resume, and
+HTTP error-contract modules:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -rs -p no:cacheprovider backend/tests/runtime/test_runner_gateway_state.py backend/tests/runtime/test_runner_gateway_api.py backend/tests/integration/test_runner_gateway_failures.py backend/tests/integration/test_runner_gateway_execution.py --basetemp=backend/.tmp-final-review-fix3-round3-contracts-green-20260904-a
+```
+
+Result: `48 passed in 10.09s`.
+
+Focused direct PostgreSQL Team Tool boundary:
+
+```powershell
+$env:PATH = "I:\智能体平台\IntelligentAgentPlatform\.worktrees\published-team-foundation\.testvenv-task5\Scripts;$env:PATH"
+& .\backend\tests\support\run_postgres_tests.ps1 -PytestPath 'backend/tests/integration/test_runner_gateway_state_concurrency.py::test_team_tool_success_uses_database_time_at_commit_boundary'
+```
+
+Result: `1 passed in 8.90s`, zero skips. The first sandboxed invocation could
+not access the local Docker named pipe; the approved escalated invocation
+succeeded and the wrapper removed its disposable PostgreSQL container.
+
+Full live PostgreSQL concurrency/deadline module:
+
+```powershell
+$env:PATH = "I:\智能体平台\IntelligentAgentPlatform\.worktrees\published-team-foundation\.testvenv-task5\Scripts;$env:PATH"
+& .\backend\tests\support\run_postgres_tests.ps1 -PytestPath 'backend/tests/integration/test_runner_gateway_state_concurrency.py'
+```
+
+Result: `9 passed in 16.02s`, zero skips, with successful disposable-container
+cleanup.
+
+Expanded affected aggregate:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -rs -p no:cacheprovider backend/tests/conversations/test_dispatcher.py backend/tests/runtime/test_launcher_client.py backend/tests/runtime/test_workflow_runner.py backend/tests/runtime/test_gateway_model.py backend/tests/runtime/test_gateway_tools.py backend/tests/runtime/test_sandbox_runtime.py backend/tests/runtime/test_runner_gateway_state.py backend/tests/runtime/test_runner_gateway_api.py backend/tests/integration/test_runner_gateway_execution.py backend/tests/integration/test_runner_gateway_failures.py backend/tests/tools/test_gateway.py backend/tests/test_agents.py --basetemp=backend/.tmp-final-review-fix3-round3-affected-green-20260904-a
+```
+
+Result: `285 passed, 2 skipped in 268.05s`. The only skips are the existing
+Windows file-symlink and directory-symlink capability skips.
+
+### Changed files
+
+- `backend/app/conversations/dispatcher.py`
+- `backend/app/tools/gateway.py`
+- `backend/tests/conversations/test_dispatcher.py`
+- `backend/tests/tools/test_gateway.py`
+- `backend/tests/integration/test_runner_gateway_state_concurrency.py`
+- `.superpowers/sdd/2026-09-01-published-team-review-remediation/final-review-fix3-report.md`
+
+All five production/test paths already belong to the authoritative 28-path
+`1365492..HEAD` review scope, so Fix Round 3 introduces no new path to that
+enumeration.
+
+### Residual risks and self-review
+
+- The definitive transport admission check occurs after the durable started
+  transaction and immediately before the external call. As with any cooperative
+  wall-clock fence, it cannot recall a transport once that call has begun; late
+  terminal success is independently rejected by the database-time commit guard.
+- A timed-out approved Tool intentionally remains `started`. The dispatcher
+  persists the Run-level `failed/sandbox_timeout` terminal state, while Tool
+  success result/event/audit persistence is forbidden.
+- The focused race is deterministic: it advances the injected clock only at
+  the root started commit, ignores nested audit savepoints, and asserts that the
+  real executor wrapper was never entered.
+- The PostgreSQL test uses the real migrated tables, Run and snapshot rows,
+  Approval/ToolInvocation locks, ToolStore, ToolGateway, audit recorder, and
+  database clock. Only the external builtin is wrapped to count admission.

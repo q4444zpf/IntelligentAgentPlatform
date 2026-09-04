@@ -81,6 +81,41 @@ class ToolGateway:
             raise ToolRuntimeError("run_not_active", "Run 已结束。")
         return run
 
+    def _team_deadline_for_run(self, run: AgentRun) -> datetime | None:
+        if run.actor_type != "team":
+            return None
+        try:
+            snapshot = ExecutionSnapshotService(
+                self.repository.session,
+                None,
+                self.repository,
+            ).get_for_run(run.id)
+        except SnapshotIntegrityError as error:
+            raise ToolRuntimeError(
+                "sandbox_timeout",
+                "沙箱任务执行超时",
+            ) from error
+        deadline = (
+            team_execution_deadline(snapshot)
+            if snapshot is not None
+            else None
+        )
+        if deadline is None:
+            raise ToolRuntimeError("sandbox_timeout", "沙箱任务执行超时")
+        return deadline
+
+    def _lock_admitted_run(
+        self,
+        run_id: str,
+        *,
+        allowed_statuses: Collection[str],
+    ) -> tuple[AgentRun, datetime | None]:
+        run = self._lock_active_run(run_id, allowed_statuses=allowed_statuses)
+        deadline = self._team_deadline_for_run(run)
+        if deadline is not None and self.clock() >= deadline:
+            raise ToolRuntimeError("sandbox_timeout", "沙箱任务执行超时")
+        return run, deadline
+
     @staticmethod
     def _validate(schema: dict[str, Any], value: Any, code: str, message: str) -> None:
         try:
@@ -189,28 +224,13 @@ class ToolGateway:
         include_audit: bool = True,
         allowed_run_statuses: Collection[str] = ("running",),
     ) -> None:
-        self._lock_active_run(
+        run = self._lock_active_run(
             invocation.run_id,
             allowed_statuses=allowed_run_statuses,
         )
         deadline = None
         if status == "completed":
-            try:
-                snapshot = ExecutionSnapshotService(
-                    self.repository.session,
-                    None,
-                    self.repository,
-                ).get_for_run(invocation.run_id)
-            except SnapshotIntegrityError as snapshot_error:
-                raise ToolRuntimeError(
-                    "sandbox_timeout",
-                    "沙箱任务执行超时",
-                ) from snapshot_error
-            deadline = (
-                team_execution_deadline(snapshot)
-                if snapshot is not None
-                else None
-            )
+            deadline = self._team_deadline_for_run(run)
             if deadline is not None and self.clock() >= deadline:
                 raise ToolRuntimeError(
                     "sandbox_timeout",
@@ -538,7 +558,7 @@ class ToolGateway:
         executor = BUILTIN_EXECUTORS.get(invocation.tool_id)
         if executor is None and tool["source"] != "mcp":
             raise ToolRuntimeError("tool_execution_failed", "工具执行失败。")
-        self._lock_active_run(
+        self._lock_admitted_run(
             invocation.run_id,
             allowed_statuses=_APPROVED_TOOL_RUN_STATUSES,
         )
@@ -560,27 +580,35 @@ class ToolGateway:
             ),
         )
         self.repository.session.commit()
+        invocation_id = str(invocation.id)
+        arguments = dict(invocation.arguments_summary)
+        started_audit_id = str(started_audit.id)
+        self._lock_admitted_run(
+            invocation.run_id,
+            allowed_statuses=_APPROVED_TOOL_RUN_STATUSES,
+        )
+        self.repository.session.rollback()
         started_at = time.perf_counter()
         try:
             if tool["source"] == "builtin":
                 if executor is None:
                     raise ToolRuntimeError("tool_execution_failed", "工具执行失败。")
-                value = executor(invocation.arguments_summary, context, self.clock)
+                value = executor(arguments, context, self.clock)
             else:
-                value = self._execute_mcp(tool, invocation.arguments_summary, context)
+                value = self._execute_mcp(tool, arguments, context)
             self._validate(tool["output_schema"], value, "tool_execution_failed", "工具执行失败。")
         except ToolRuntimeError as error:
             duration_ms = max(0, round((time.perf_counter() - started_at) * 1000))
-            self._commit_finished(invocation, tool["name"], status="failed", duration_ms=duration_ms, error=error, context=context, parent_event_id=started_audit.id, allowed_run_statuses=_APPROVED_TOOL_RUN_STATUSES)
+            self._commit_finished(invocation, tool["name"], status="failed", duration_ms=duration_ms, error=error, context=context, parent_event_id=started_audit_id, allowed_run_statuses=_APPROVED_TOOL_RUN_STATUSES)
             raise
         except Exception as error:
             safe_error = ToolRuntimeError("tool_execution_failed", "工具执行失败。")
             duration_ms = max(0, round((time.perf_counter() - started_at) * 1000))
-            self._commit_finished(invocation, tool["name"], status="failed", duration_ms=duration_ms, error=safe_error, context=context, parent_event_id=started_audit.id, allowed_run_statuses=_APPROVED_TOOL_RUN_STATUSES)
+            self._commit_finished(invocation, tool["name"], status="failed", duration_ms=duration_ms, error=safe_error, context=context, parent_event_id=started_audit_id, allowed_run_statuses=_APPROVED_TOOL_RUN_STATUSES)
             raise safe_error from error
         duration_ms = max(0, round((time.perf_counter() - started_at) * 1000))
-        self._commit_finished(invocation, tool["name"], status="completed", duration_ms=duration_ms, result=value, context=context, parent_event_id=started_audit.id, allowed_run_statuses=_APPROVED_TOOL_RUN_STATUSES)
-        return ToolExecutionResult(invocation_id=str(invocation.id), value=value)
+        self._commit_finished(invocation, tool["name"], status="completed", duration_ms=duration_ms, result=value, context=context, parent_event_id=started_audit_id, allowed_run_statuses=_APPROVED_TOOL_RUN_STATUSES)
+        return ToolExecutionResult(invocation_id=invocation_id, value=value)
 
     def _execute_mcp(
         self, tool: dict[str, Any], arguments: dict[str, Any], context: ToolExecutionContext

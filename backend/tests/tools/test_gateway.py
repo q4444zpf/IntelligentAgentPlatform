@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import create_engine, event, select
+from sqlalchemy import create_engine, delete, event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -394,7 +394,10 @@ def test_required_approval_pauses_run_without_executing_tool(runtime, monkeypatc
 
 
 @pytest.mark.parametrize("run_status", ["waiting_approval", "queued"])
-def test_approved_tool_invocation_executes_after_digest_check(runtime, run_status):
+def test_approved_agent_tool_without_snapshot_executes_after_digest_check(
+    runtime,
+    run_status,
+):
     factory, _ = runtime
     with factory.begin() as db:
         tool = db.get(RegisteredToolRecord, "system.get_current_time")
@@ -417,6 +420,82 @@ def test_approved_tool_invocation_executes_after_digest_check(runtime, run_statu
         assert session.get(AgentRun, "run-1").status == run_status
     finally:
         session.close()
+
+
+def test_approved_team_tool_without_snapshot_fails_before_started_or_executor(
+    runtime,
+    monkeypatch,
+):
+    factory, _ = runtime
+    with factory.begin() as db:
+        tool = db.get(RegisteredToolRecord, "system.get_current_time")
+        tool.requires_approval = True
+        tool.risk_level = "high"
+        run = db.get(AgentRun, "run-1")
+        run.actor_type = "team"
+        run.actor_id = "team-1"
+        run.actor_version_id = "team-version-1"
+
+    session, gateway = make_gateway(runtime)
+    with pytest.raises(ToolRuntimeError) as approval_required:
+        execute(gateway)
+    assert approval_required.value.code == "approval_required"
+    approval = session.scalar(select(Approval))
+    from app.approvals.service import ApprovalService
+    from app.core.request_context import RequestContext
+
+    ApprovalService(
+        session,
+        clock=lambda: datetime(2026, 8, 2, 4, 30, tzinfo=timezone.utc),
+    ).approve(
+        approval.id,
+        RequestContext(
+            user_id="reviewer",
+            unit_id="unit-1",
+            project_id="project-1",
+            roles=frozenset({"project_admin"}),
+        ),
+    )
+    session.get(AgentRun, "run-1").status = "queued"
+    session.commit()
+    external_calls = []
+    original = BUILTIN_EXECUTORS["system.get_current_time"]
+
+    def record_external_call(arguments, execution_context, clock):
+        external_calls.append(True)
+        return original(arguments, execution_context, clock)
+
+    monkeypatch.setitem(
+        BUILTIN_EXECUTORS,
+        "system.get_current_time",
+        record_external_call,
+    )
+
+    with pytest.raises(ToolRuntimeError) as caught:
+        gateway.execute_approved(approval.id, context())
+
+    session.expire_all()
+    invocation = session.scalar(select(ToolInvocation))
+    run_events = list(
+        session.scalars(select(RunEvent).where(RunEvent.run_id == "run-1"))
+    )
+    tool_audits = list(
+        session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.run_id == "run-1",
+                AuditEvent.action.like("tool.invoke.%"),
+            )
+        )
+    )
+    assert caught.value.code == "sandbox_timeout"
+    assert external_calls == []
+    assert invocation.status == "waiting_approval"
+    assert invocation.result_summary is None
+    assert [event.event_type for event in run_events] == [
+        "approval.requested",
+        "run.status",
+    ]
+    assert tool_audits == []
 
 
 def test_approved_tool_finishing_after_terminal_run_commits_no_terminal_state(
@@ -488,6 +567,102 @@ def test_approved_tool_finishing_after_terminal_run_commits_no_terminal_state(
     assert external_transaction_state == [False]
     assert invocation.status == "started"
     assert [event.event_type for event in events] == [
+        "approval.requested",
+        "run.status",
+        "tool.started",
+    ]
+    assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
+
+
+def test_approved_team_tool_crossing_deadline_during_started_commit_stops_before_executor(
+    runtime,
+    monkeypatch,
+):
+    factory, store = runtime
+    created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    current_time = [created_at.replace(minute=0, second=30)]
+    configure_team_run(
+        runtime,
+        created_at=created_at,
+        snapshot_id="team-started-commit-snapshot",
+    )
+    with factory.begin() as db:
+        tool = db.get(RegisteredToolRecord, "system.get_current_time")
+        tool.requires_approval = True
+        tool.risk_level = "high"
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time[0],
+    )
+    with pytest.raises(ToolRuntimeError) as approval_required:
+        execute(gateway)
+    assert approval_required.value.code == "approval_required"
+    approval = session.scalar(select(Approval))
+    from app.approvals.service import ApprovalService
+    from app.core.request_context import RequestContext
+
+    ApprovalService(session, clock=lambda: current_time[0]).approve(
+        approval.id,
+        RequestContext(
+            user_id="reviewer",
+            unit_id="unit-1",
+            project_id="project-1",
+            roles=frozenset({"project_admin"}),
+        ),
+    )
+    session.get(AgentRun, "run-1").status = "queued"
+    session.commit()
+
+    crossed_at_started_commit = []
+    external_calls = []
+    original = BUILTIN_EXECUTORS["system.get_current_time"]
+
+    def cross_deadline_before_root_commit(committing_session):
+        if (
+            not committing_session.in_nested_transaction()
+            and not crossed_at_started_commit
+        ):
+            current_time[0] = created_at.replace(minute=1, second=1)
+            crossed_at_started_commit.append(True)
+
+    def record_external_call(arguments, execution_context, clock):
+        external_calls.append(True)
+        return original(arguments, execution_context, clock)
+
+    monkeypatch.setitem(
+        BUILTIN_EXECUTORS,
+        "system.get_current_time",
+        record_external_call,
+    )
+    event.listen(session, "before_commit", cross_deadline_before_root_commit)
+    try:
+        with pytest.raises(ToolRuntimeError) as caught:
+            gateway.execute_approved(approval.id, context())
+    finally:
+        event.remove(session, "before_commit", cross_deadline_before_root_commit)
+
+    session.expire_all()
+    invocation = session.scalar(select(ToolInvocation))
+    run_events = list(
+        session.scalars(select(RunEvent).where(RunEvent.run_id == "run-1"))
+    )
+    tool_audits = list(
+        session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.run_id == "run-1",
+                AuditEvent.action.like("tool.invoke.%"),
+            )
+        )
+    )
+    assert crossed_at_started_commit == [True]
+    assert caught.value.code == "sandbox_timeout"
+    assert external_calls == []
+    assert invocation.status == "started"
+    assert invocation.result_summary is None
+    assert [event.event_type for event in run_events] == [
         "approval.requested",
         "run.status",
         "tool.started",
@@ -631,6 +806,67 @@ def test_approved_team_tool_crossing_execution_deadline_commits_no_success(
         "run.status",
         "tool.started",
     ]
+    assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
+
+
+def test_team_tool_missing_snapshot_at_terminal_persistence_commits_no_success(
+    runtime,
+    monkeypatch,
+):
+    factory, store = runtime
+    created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    current_time = created_at.replace(minute=0, second=30)
+    configure_team_run(
+        runtime,
+        created_at=created_at,
+        snapshot_id="team-removed-terminal-snapshot",
+    )
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time,
+    )
+    original = BUILTIN_EXECUTORS["system.get_current_time"]
+    external_calls = []
+
+    def remove_snapshot_during_external_call(arguments, execution_context, clock):
+        external_calls.append(True)
+        session.execute(
+            delete(RuntimeExecutionSnapshot).where(
+                RuntimeExecutionSnapshot.run_id == execution_context.run_id
+            )
+        )
+        session.commit()
+        return original(arguments, execution_context, clock)
+
+    monkeypatch.setitem(
+        BUILTIN_EXECUTORS,
+        "system.get_current_time",
+        remove_snapshot_during_external_call,
+    )
+
+    with pytest.raises(ToolRuntimeError) as caught:
+        execute(gateway)
+
+    session.expire_all()
+    invocation = session.scalar(select(ToolInvocation))
+    run_events = list(
+        session.scalars(select(RunEvent).where(RunEvent.run_id == "run-1"))
+    )
+    tool_audits = list(
+        session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.run_id == "run-1",
+                AuditEvent.action.like("tool.invoke.%"),
+            )
+        )
+    )
+    assert caught.value.code == "sandbox_timeout"
+    assert external_calls == [True]
+    assert invocation.status == "started"
+    assert invocation.result_summary is None
+    assert [event.event_type for event in run_events] == ["tool.started"]
     assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
 
 

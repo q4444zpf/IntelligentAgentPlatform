@@ -73,20 +73,22 @@ def _execute_approved_tool(
             mcp_protocol_client=McpProtocolClient(),
         )
         try:
-            try:
-                snapshot = ExecutionSnapshotService(
-                    session, None, repository
-                ).get_for_run(run_id)
-            except SnapshotIntegrityError as error:
-                raise ToolRuntimeError(
-                    "sandbox_timeout", "沙箱任务执行超时"
-                ) from error
-            if (
-                snapshot is not None
-                and (deadline := team_execution_deadline(snapshot)) is not None
-                and datetime.now(UTC) >= deadline
-            ):
-                raise ToolRuntimeError("sandbox_timeout", "沙箱任务执行超时")
+            if run.actor_type == "team":
+                try:
+                    snapshot = ExecutionSnapshotService(
+                        session, None, repository
+                    ).get_for_run(run_id)
+                except SnapshotIntegrityError as error:
+                    raise ToolRuntimeError(
+                        "sandbox_timeout", "沙箱任务执行超时"
+                    ) from error
+                deadline = (
+                    team_execution_deadline(snapshot)
+                    if snapshot is not None
+                    else None
+                )
+                if deadline is None or datetime.now(UTC) >= deadline:
+                    raise ToolRuntimeError("sandbox_timeout", "沙箱任务执行超时")
             actor_roles = tuple(context_data["actor_roles"])
             if run.actor_type == "team":
                 try:

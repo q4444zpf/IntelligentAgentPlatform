@@ -11,7 +11,16 @@ import pytest
 from sqlalchemy import create_engine, delete, event, func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.conversations.models import AgentRun, Conversation, Message, RunEvent
+from app.approvals.models import Approval
+from app.approvals.service import arguments_digest
+from app.audit.models import AuditEvent
+from app.conversations.models import (
+    AgentRun,
+    Conversation,
+    Message,
+    RunEvent,
+    ToolInvocation,
+)
 from app.conversations.repository import ConversationRepository
 from app.runtime.checkpoint_store import (
     CheckpointStore,
@@ -22,6 +31,7 @@ from app.runtime.execution_snapshot import (
     ExecutionSnapshotPayload,
     PublishedAgentSnapshot,
     PublishedTeamSnapshot,
+    RuntimeExecutionSnapshot,
     SnapshotModelSelection,
     SnapshotRuntimeLimits,
     SnapshotTeamMember,
@@ -37,6 +47,10 @@ from app.runtime.runner_gateway_schemas import (
     EventAppendRequest,
 )
 from app.runtime.runner_gateway_service import RunnerGatewayService
+from app.tools.builtins import BUILTIN_EXECUTORS, BUILTIN_TOOL_DEFINITIONS
+from app.tools.gateway import ToolGateway
+from app.tools.schemas import ToolExecutionContext, ToolRuntimeError
+from app.tools.store import ToolStore
 
 
 pytestmark = pytest.mark.skipif(
@@ -434,12 +448,20 @@ def state_race_environment():
 
     with factory.begin() as cleanup:
         cleanup.execute(
+            delete(AuditEvent).where(AuditEvent.run_id == run_id)
+        )
+        cleanup.execute(
             delete(RuntimeRunnerRequest).where(
                 RuntimeRunnerRequest.run_id == run_id
             )
         )
         cleanup.execute(
             delete(RuntimeCheckpoint).where(RuntimeCheckpoint.run_id == run_id)
+        )
+        cleanup.execute(
+            delete(RuntimeExecutionSnapshot).where(
+                RuntimeExecutionSnapshot.run_id == run_id
+            )
         )
         cleanup.execute(delete(RunEvent).where(RunEvent.run_id == run_id))
         cleanup.execute(delete(AgentRun).where(AgentRun.id == run_id))
@@ -952,3 +974,173 @@ def test_team_completion_uses_database_time_at_commit_boundary(
             .select_from(Message)
             .where(Message.run_id == run_id)
         ) == 0
+
+
+def test_team_tool_success_uses_database_time_at_commit_boundary(
+    state_race_environment,
+    monkeypatch,
+):
+    factory, run_id, _agent_snapshot, _agent_claims = state_race_environment
+    with factory() as clock_session:
+        created_at = clock_session.scalar(select(func.clock_timestamp()))
+    snapshot = _team_snapshot(
+        run_id,
+        created_at=created_at,
+        timeout_seconds=5,
+    )
+    deadline = created_at + timedelta(seconds=5)
+    tool_id = "system.get_current_time"
+    tool_store = ToolStore(factory)
+    tool_definition = next(
+        definition
+        for definition in BUILTIN_TOOL_DEFINITIONS
+        if definition["tool_id"] == tool_id
+    )
+    tool_store.upsert_builtin(
+        {
+            **tool_definition,
+            "requires_approval": True,
+            "risk_level": "high",
+        }
+    )
+
+    with factory.begin() as setup:
+        run = setup.get(AgentRun, run_id)
+        run.actor_type = "team"
+        run.actor_id = snapshot.payload.actor.id
+        run.actor_version_id = snapshot.payload.actor.version_id
+        run.status = "queued"
+        invocation = ToolInvocation(
+            run_id=run_id,
+            tool_call_id="postgres-team-deadline-call",
+            tool_id=tool_id,
+            tool_version=tool_definition["version"],
+            status="waiting_approval",
+            arguments_summary={},
+        )
+        setup.add(invocation)
+        setup.flush()
+        setup.add_all(
+            [
+                Approval(
+                    run_id=run_id,
+                    invocation_id=invocation.id,
+                    tool_id=tool_id,
+                    tool_version=tool_definition["version"],
+                    unit_id=snapshot.payload.unit_id,
+                    project_id=snapshot.payload.project_id,
+                    requester_id=snapshot.payload.user_id,
+                    requester_roles=["user"],
+                    assignee_role="project_admin",
+                    risk_level="high",
+                    arguments_summary={},
+                    arguments_digest=arguments_digest({}),
+                    status="approved",
+                    expires_at=created_at + timedelta(hours=1),
+                ),
+                RuntimeExecutionSnapshot(
+                    snapshot_id=snapshot.snapshot_id,
+                    run_id=run_id,
+                    digest=snapshot.digest,
+                    payload=snapshot.payload.model_dump(mode="json"),
+                    created_at=snapshot.created_at,
+                    expires_at=snapshot.expires_at,
+                ),
+            ]
+        )
+        approval_id = setup.scalar(
+            select(Approval.id).where(Approval.invocation_id == invocation.id)
+        )
+        invocation_id = invocation.id
+
+    application_time = created_at
+    external_calls = []
+    original_executor = BUILTIN_EXECUTORS[tool_id]
+
+    def record_external_call(arguments, execution_context, clock):
+        external_calls.append(execution_context.run_id)
+        return original_executor(arguments, execution_context, clock)
+
+    monkeypatch.setitem(BUILTIN_EXECUTORS, tool_id, record_external_call)
+    terminal_success_flushed = []
+    slept_past_database_deadline = []
+
+    def observe_terminal_success_flush(session, _flush_context):
+        if not terminal_success_flushed and any(
+            isinstance(item, RunEvent) and item.event_type == "tool.completed"
+            for item in session.new
+        ):
+            terminal_success_flushed.append(True)
+
+    def sleep_past_deadline(session):
+        if (
+            session.in_nested_transaction()
+            or not terminal_success_flushed
+            or slept_past_database_deadline
+        ):
+            return
+        before_sleep = session.scalar(select(func.clock_timestamp()))
+        assert before_sleep < deadline
+        session.execute(
+            text("SELECT pg_sleep(:delay_seconds)"),
+            {
+                "delay_seconds": (
+                    deadline - before_sleep
+                ).total_seconds() + 0.25
+            },
+        )
+        slept_past_database_deadline.append(True)
+
+    with factory() as session:
+        gateway = ToolGateway(
+            tool_store=tool_store,
+            repository=ConversationRepository(session),
+            clock=lambda: application_time,
+        )
+        event.listen(session, "after_flush", observe_terminal_success_flush)
+        event.listen(session, "before_commit", sleep_past_deadline)
+        try:
+            with pytest.raises(ToolRuntimeError) as captured:
+                gateway.execute_approved(
+                    approval_id,
+                    ToolExecutionContext(
+                        unit_id=snapshot.payload.unit_id,
+                        run_id=run_id,
+                        conversation_id=f"unused:{run_id}",
+                        project_id=snapshot.payload.project_id,
+                        user_id=snapshot.payload.user_id,
+                        actor_roles=("user",),
+                    ),
+                )
+        finally:
+            event.remove(session, "after_flush", observe_terminal_success_flush)
+            event.remove(session, "before_commit", sleep_past_deadline)
+
+    assert terminal_success_flushed == [True]
+    assert slept_past_database_deadline == [True]
+    assert captured.value.code == "sandbox_timeout"
+    assert external_calls == [run_id]
+    with factory() as verification:
+        invocation = verification.get(ToolInvocation, invocation_id)
+        assert invocation.status == "started"
+        assert invocation.result_summary is None
+        assert invocation.completed_at is None
+        assert [
+            item.event_type
+            for item in verification.scalars(
+                select(RunEvent)
+                .where(RunEvent.run_id == run_id)
+                .order_by(RunEvent.sequence)
+            )
+        ] == ["tool.started"]
+        assert [
+            item.action
+            for item in verification.scalars(
+                select(AuditEvent)
+                .where(
+                    AuditEvent.run_id == run_id,
+                    AuditEvent.action.like("tool.invoke.%"),
+                )
+                .order_by(AuditEvent.occurred_at, AuditEvent.id)
+            )
+        ] == ["tool.invoke.started"]
