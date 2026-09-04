@@ -197,7 +197,10 @@ class WorkflowRunnerClient:
         except RunnerDeadlineExceededError:
             raise
         except (TimeoutError, httpx.TimeoutException) as exc:
-            if monotonic_deadline is not None:
+            if (
+                monotonic_deadline is not None
+                and time.monotonic() >= monotonic_deadline
+            ):
                 raise RunnerDeadlineExceededError(
                     "Workflow Runner deadline expired"
                 ) from exc
@@ -287,6 +290,7 @@ class WorkflowRunnerClient:
             if isinstance(exc, RunnerDeadlineExceededError) or (
                 isinstance(exc, (TimeoutError, httpx.TimeoutException))
                 and monotonic_deadline is not None
+                and time.monotonic() >= monotonic_deadline
             ) or (
                 isinstance(exc, httpx.HTTPStatusError)
                 and exc.response.status_code == 504

@@ -26,6 +26,7 @@ from app.runtime.execution_snapshot import (
     canonical_snapshot_bytes,
 )
 from app.runtime.model_gateway import ModelResult
+from app.tools.schemas import ToolRuntimeError
 
 
 def _install_team_tool_identity(env):
@@ -533,6 +534,36 @@ def test_team_tool_invocation_uses_current_roles_not_accepted_run_roles(
 
     assert response.status_code == 200
     assert contexts[0].actor_roles == ("current_operator",)
+
+
+def test_team_tool_deadline_error_is_returned_as_conflict(
+    runner_gateway_env,
+    monkeypatch,
+):
+    env = runner_gateway_env
+    _, _, member_tool = _install_team_snapshot(env)
+    token = env.issue_token()
+
+    def reject_after_deadline(*_args, **_kwargs):
+        raise ToolRuntimeError("sandbox_timeout", "沙箱任务执行超时")
+
+    monkeypatch.setattr(env.tool_gateway, "execute", reject_after_deadline)
+
+    response = env.client.post(
+        "/internal/runner/runs/run-1/tool-invocations",
+        headers=env.headers(token, "tool:deadline-expired"),
+        json={
+            "tool_call_id": "call-deadline-expired",
+            "tool_id": member_tool.tool_id,
+            "version": member_tool.version,
+            "arguments": {"timezone": "Asia/Shanghai"},
+            "invocation_sequence": 0,
+            "member_agent_id": "member-1",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "sandbox_timeout"
 
 
 @pytest.mark.parametrize(

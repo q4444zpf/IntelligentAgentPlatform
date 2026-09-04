@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from threading import Lock
+from threading import Event, Lock
 from typing import Any, Protocol
 
 import httpx
@@ -133,6 +133,11 @@ class GatewayChatModel(BaseChatModel):
         exclude=True,
         repr=False,
     )
+    cancellation_event: Event | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
     _budget: GatewayModelBudget = PrivateAttr()
 
     def __init__(self, transport: ModelInvocationTransport, **data: Any) -> None:
@@ -177,6 +182,11 @@ class GatewayChatModel(BaseChatModel):
         if self.member_agent_id is not None:
             request["member_agent_id"] = self.member_agent_id
         try:
+            if (
+                self.cancellation_event is not None
+                and self.cancellation_event.is_set()
+            ):
+                raise RunnerGatewayModelError("gateway_unavailable")
             raw_response = self.transport.invoke_model(
                 request,
                 (

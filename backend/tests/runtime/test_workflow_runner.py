@@ -120,9 +120,27 @@ def test_runner_client_preserves_deadline_expiry_identity(transport_error):
     client = WorkflowRunnerClient(DeadlineTransport())
 
     with pytest.raises(RunnerUnavailableError) as captured:
-        client.status("run-1", monotonic_deadline=time.monotonic() + 5)
+        client.status("run-1", monotonic_deadline=time.monotonic() - 1)
 
     assert isinstance(captured.value, RunnerDeadlineExceededError)
+
+
+def test_runner_client_keeps_far_future_connect_timeout_as_unavailable():
+    connect_timeout = httpx.ConnectTimeout(
+        "connection timed out",
+        request=httpx.Request("GET", "http://runner/runs/run-1"),
+    )
+
+    class UnavailableTransport(FakeTransport):
+        def status(self, run_id, *, monotonic_deadline=None):
+            raise connect_timeout
+
+    client = WorkflowRunnerClient(UnavailableTransport())
+
+    with pytest.raises(RunnerUnavailableError) as captured:
+        client.status("run-1", monotonic_deadline=time.monotonic() + 300)
+
+    assert type(captured.value) is RunnerUnavailableError
 
 
 def test_runner_submit_preserves_deadline_expiry_from_health_check():

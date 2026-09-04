@@ -1276,6 +1276,18 @@ class RunnerGatewayService:
             request_digest=request_digest,
             response_json=response.model_dump(mode="json"),
         )
+        repository.session.flush()
+        if (
+            request.status == "completed"
+            and deadline is not None
+            and datetime.now(UTC) >= deadline
+        ):
+            repository.session.rollback()
+            raise RunnerGatewayError(
+                409,
+                "sandbox_timeout",
+                "Team 执行已超过截止时间",
+            )
         repository.session.commit()
         return response
 
@@ -1339,6 +1351,8 @@ class RunnerGatewayService:
 
     @staticmethod
     def _map_tool_error(error: ToolRuntimeError) -> tuple[int, str, str]:
+        if error.code == "sandbox_timeout":
+            return 409, "sandbox_timeout", "沙箱任务执行超时"
         if error.code == "run_not_active":
             return 409, "run_not_active", "Run 已结束"
         if error.code == "tool_not_authorized":

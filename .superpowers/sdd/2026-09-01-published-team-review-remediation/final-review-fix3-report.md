@@ -375,3 +375,192 @@ message parsing or timing tolerance. Generic HTTP 503, connection, and mid-run
 outage behavior remains `launcher_unavailable`. The E2E's temporary diagnostic
 tuple was removed after stabilization. The complete `1365492..HEAD` scope was
 enumerated above, and no temporary artifact is staged.
+
+## Fix Round 1
+
+### Investigation and authority decision
+
+- Generic `TimeoutError` and `httpx.TimeoutException` values were classified as
+  deadline expiry whenever a deadline argument existed, even when that deadline
+  was far in the future. The exception type alone cannot distinguish an
+  exhausted end-to-end budget from a connection outage.
+- Team fail-fast stopped waiting for siblings but only fenced their checkpoint
+  callbacks. A released sibling could still reach its model or Tool transport
+  after the scheduler had observed another member's failure.
+- Team completion and Tool terminal persistence checked the immutable deadline
+  before writes but did not flush and recheck before commit. A deadline crossed
+  during those writes could therefore commit a late success.
+- `RunnerGatewayService._map_tool_error` collapsed the resulting typed Tool
+  `sandbox_timeout` into HTTP 502 instead of the established HTTP 409 conflict.
+- The platform-default pointer is global and has no supported platform HTTP
+  principal. All authenticated HTTP callers therefore remain denied. The
+  established system authority is the internal context-free call
+  `AgentService.set_default(..., context=None)`; no role header or unbindable
+  platform role was invented.
+
+### RED evidence
+
+Core RED command:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -p no:cacheprovider backend/tests/runtime/test_launcher_client.py::test_launcher_client_keeps_far_future_connect_timeout_as_unavailable backend/tests/runtime/test_workflow_runner.py::test_runner_client_keeps_far_future_connect_timeout_as_unavailable backend/tests/runtime/test_sandbox_runtime.py::test_team_fail_fast_fences_blocked_sibling_before_external_tool_invocation backend/tests/runtime/test_runner_gateway_state.py::test_team_success_crossing_deadline_during_completion_writes_rolls_back backend/tests/integration/test_runner_gateway_execution.py::test_team_tool_deadline_error_is_returned_as_conflict --basetemp=backend/.tmp-final-review-fix3-round1-red-core-20260904-a
+```
+
+Result: `5 failed in 4.32s`. The two clients returned deadline subclasses for
+far-future connection timeouts, one late Tool call reached the external
+transport, late completion returned HTTP 200, and Tool timeout mapped to HTTP
+502.
+
+Deep RED command:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -p no:cacheprovider backend/tests/runtime/test_sandbox_runtime.py::test_team_fail_fast_fences_blocked_sibling_before_external_model_invocation backend/tests/tools/test_gateway.py::test_team_tool_terminal_flush_crossing_deadline_commits_no_success --basetemp=backend/.tmp-final-review-fix3-round1-red-deep-20260904-a
+```
+
+Result: `2 failed in 8.17s`. The released sibling reached the external model
+transport, and Tool completion did not raise after its terminal flush crossed
+the deadline.
+
+Live PostgreSQL RED command:
+
+```powershell
+$env:PATH = "I:\智能体平台\IntelligentAgentPlatform\.worktrees\published-team-foundation\.testvenv-task5\Scripts;$env:PATH"
+& .\backend\tests\support\run_postgres_tests.ps1 -PytestPath 'backend/tests/integration/test_runner_gateway_state_concurrency.py::test_team_completion_rechecks_deadline_after_blocked_post_write_flush'
+```
+
+Result: `1 failed in 3.38s`, zero skips. Team success committed after the
+completion flush was blocked across the immutable deadline.
+
+Authorization characterization command:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -p no:cacheprovider backend/tests/test_agents.py::test_unit_admin_cannot_mutate_platform_default_pointer backend/tests/test_agents.py::test_internal_system_authority_mutates_platform_default_for_all_units --basetemp=backend/.tmp-final-review-fix3-round1-auth-characterization-20260904-a
+```
+
+Result: `2 passed in 5.34s`. This confirms existing internal authority and
+cross-unit visibility; it required no production authorization change.
+
+### Implementation
+
+- Launcher and Workflow Runner clients now classify generic timeout exceptions
+  as deadline expiry only after the corresponding wall or monotonic clock has
+  reached the supplied deadline. Typed deadline errors and HTTP 504 responses
+  retain their deadline identity.
+- Each schema-v5 Team member batch passes its shared cancellation `Event` into
+  `GatewayChatModel` and its Tool wrappers. Both check that event immediately
+  before the external transport call. Schema-v4 keeps its required team-wide
+  model/Tool object identity and uses a shared legacy cancellation event.
+- Successful Team completion flushes all messages, events, status, and
+  idempotency writes, rechecks the immutable Team deadline, and rolls back with
+  HTTP 409 `sandbox_timeout` before commit when the deadline was crossed.
+- Successful Tool terminal persistence likewise flushes and rechecks, rolling
+  back to the already-committed `started` record and raising
+  `ToolRuntimeError("sandbox_timeout", ...)` instead of committing success.
+- The Runner Gateway maps Tool `sandbox_timeout` to HTTP 409.
+
+### GREEN evidence
+
+Exact core rerun:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -p no:cacheprovider backend/tests/runtime/test_launcher_client.py::test_launcher_client_keeps_far_future_connect_timeout_as_unavailable backend/tests/runtime/test_workflow_runner.py::test_runner_client_keeps_far_future_connect_timeout_as_unavailable backend/tests/runtime/test_sandbox_runtime.py::test_team_fail_fast_fences_blocked_sibling_before_external_tool_invocation backend/tests/runtime/test_runner_gateway_state.py::test_team_success_crossing_deadline_during_completion_writes_rolls_back backend/tests/integration/test_runner_gateway_execution.py::test_team_tool_deadline_error_is_returned_as_conflict --basetemp=backend/.tmp-final-review-fix3-round1-green-core-20260904-a
+```
+
+Result: `5 passed in 2.99s`.
+
+Deep fail-fast and Tool flush rerun:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -p no:cacheprovider backend/tests/runtime/test_sandbox_runtime.py::test_team_fail_fast_fences_blocked_sibling_before_external_model_invocation backend/tests/tools/test_gateway.py::test_team_tool_terminal_flush_crossing_deadline_commits_no_success --basetemp=backend/.tmp-final-review-fix3-round1-green-deep-20260904-b
+```
+
+Result: `2 passed in 4.54s`.
+
+The first affected aggregate exposed four stale Launcher fixtures that raised a
+generic timeout before their future deadline and one schema-v4 wrapper-identity
+regression: `5 failed, 240 passed, 9 skipped in 183.51s`. The fixtures now
+advance the wall clock to the transport deadline before raising, and the legacy
+Team path retains shared wrapper identity. Targeted compatibility rerun:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -p no:cacheprovider backend/tests/runtime/test_launcher_client.py::test_launcher_prepare_translates_transport_deadline_expiry backend/tests/runtime/test_sandbox_runtime.py::test_schema_v4_team_runtime_preserves_legacy_team_wide_construction backend/tests/runtime/test_sandbox_runtime.py::test_team_fail_fast_fences_blocked_sibling_before_external_tool_invocation backend/tests/runtime/test_sandbox_runtime.py::test_team_fail_fast_fences_blocked_sibling_before_external_model_invocation --basetemp=backend/.tmp-final-review-fix3-round1-regression-green-20260904-a
+```
+
+Result: `9 passed in 3.07s`.
+
+Affected aggregate command:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -rs -p no:cacheprovider backend/tests/runtime/test_launcher_client.py backend/tests/runtime/test_workflow_runner.py backend/tests/runtime/test_gateway_model.py backend/tests/runtime/test_gateway_tools.py backend/tests/runtime/test_sandbox_runtime.py backend/tests/runtime/test_runner_gateway_state.py backend/tests/integration/test_runner_gateway_execution.py backend/tests/tools/test_gateway.py backend/tests/test_agents.py --basetemp=backend/.tmp-final-review-fix3-round1-affected-green-20260904-b
+```
+
+Result: `245 passed, 2 skipped in 180.34s`. Both skips are expected Windows
+capability skips: file symlink creation and directory symlink creation are
+unavailable. No warning class was emitted by this aggregate.
+
+Focused live PostgreSQL GREEN command:
+
+```powershell
+$env:PATH = "I:\智能体平台\IntelligentAgentPlatform\.worktrees\published-team-foundation\.testvenv-task5\Scripts;$env:PATH"
+& .\backend\tests\support\run_postgres_tests.ps1 -PytestPath 'backend/tests/integration/test_runner_gateway_state_concurrency.py::test_team_completion_rechecks_deadline_after_blocked_post_write_flush'
+```
+
+Result: `1 passed in 3.27s`, zero skips.
+
+Full live PostgreSQL concurrency/deadline module:
+
+```powershell
+$env:PATH = "I:\智能体平台\IntelligentAgentPlatform\.worktrees\published-team-foundation\.testvenv-task5\Scripts;$env:PATH"
+& .\backend\tests\support\run_postgres_tests.ps1 -PytestPath 'backend/tests/integration/test_runner_gateway_state_concurrency.py'
+```
+
+Result: `7 passed in 3.96s`, zero skips. The disposable wrapper exited
+successfully and removed its container.
+
+Final whitespace verification command:
+
+```powershell
+git diff --check
+```
+
+Result: exit code `0`. Git emitted only the repository's existing LF-to-CRLF
+working-copy conversion notices; it reported no whitespace errors.
+
+### Independent review correction
+
+Independent review found one Important schema-v4 race in the first GREEN
+implementation: legacy shared wrappers watched a second event set immediately
+after the batch event. A sibling could pass its legacy event check in that
+interval. Deterministic schema-v4 variants release the sibling inside that gap.
+
+Legacy race RED command:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -p no:cacheprovider backend/tests/runtime/test_sandbox_runtime.py::test_team_fail_fast_fences_blocked_sibling_before_external_tool_invocation backend/tests/runtime/test_sandbox_runtime.py::test_team_fail_fast_fences_blocked_sibling_before_external_model_invocation --basetemp=backend/.tmp-final-review-fix3-round1-legacy-race-red-20260904-a
+```
+
+Result: `2 failed, 2 passed in 3.81s`; both schema-v4 siblings reached their
+external transports while both schema-v5 cases remained fenced.
+
+The correction replaces the second event with a stable legacy reference that
+is rebound to the actual per-batch event before worker threads launch. Model
+and Tool object identity remains team-wide for schema v4, while cancellation
+now requires only the single batch-event `set()`.
+
+Legacy race GREEN command:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -p no:cacheprovider backend/tests/runtime/test_sandbox_runtime.py::test_team_fail_fast_fences_blocked_sibling_before_external_tool_invocation backend/tests/runtime/test_sandbox_runtime.py::test_team_fail_fast_fences_blocked_sibling_before_external_model_invocation backend/tests/runtime/test_sandbox_runtime.py::test_schema_v4_team_runtime_preserves_legacy_team_wide_construction --basetemp=backend/.tmp-final-review-fix3-round1-legacy-race-green-20260904-a
+```
+
+Result: `5 passed in 2.94s`. Scoped re-review marked the Important finding
+`ADDRESSED` and found no new Critical or Important breakage.
+
+Final post-review affected aggregate:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -rs -p no:cacheprovider backend/tests/runtime/test_launcher_client.py backend/tests/runtime/test_workflow_runner.py backend/tests/runtime/test_gateway_model.py backend/tests/runtime/test_gateway_tools.py backend/tests/runtime/test_sandbox_runtime.py backend/tests/runtime/test_runner_gateway_state.py backend/tests/integration/test_runner_gateway_execution.py backend/tests/tools/test_gateway.py backend/tests/test_agents.py --basetemp=backend/.tmp-final-review-fix3-round1-affected-green-20260904-c
+```
+
+Result: `247 passed, 2 skipped in 219.31s`, zero failures. The only skips are
+the same Windows file-symlink and directory-symlink capability skips.

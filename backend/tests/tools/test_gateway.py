@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -566,6 +566,117 @@ def test_approved_team_tool_crossing_execution_deadline_commits_no_success(
         "run.status",
         "tool.started",
     ]
+    assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
+
+
+def test_team_tool_terminal_flush_crossing_deadline_commits_no_success(
+    runtime,
+    monkeypatch,
+):
+    factory, store = runtime
+    created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    current_time = [created_at.replace(minute=0, second=30)]
+    with factory.begin() as db:
+        run = db.get(AgentRun, "run-1")
+        run.actor_type = "team"
+        run.actor_id = "team-1"
+        run.actor_version_id = "team-version-1"
+        member = SnapshotTeamMember(
+            agent_id="member-1",
+            role="member",
+            responsibility="operate",
+        )
+        actor = PublishedTeamSnapshot(
+            id="team-1",
+            version_id="team-version-1",
+            version=1,
+            definition_digest="d" * 64,
+            supervisor=SnapshotTeamMember(
+                agent_id="supervisor",
+                role="supervisor",
+                responsibility="coordinate",
+            ),
+            members=(member,),
+            max_steps=2,
+            max_parallel_members=1,
+            timeout_seconds=60,
+            failure_strategy="fail_fast",
+            name="Team",
+            description="",
+            runtime_form="common",
+            language="zh-CN",
+            system_prompt="",
+            context_prompt="",
+            approval_policy="never",
+        )
+        payload = ExecutionSnapshotPayload(
+            schema_version="5",
+            snapshot_id="team-final-flush-snapshot",
+            run_id=run.id,
+            unit_id="unit-1",
+            project_id="project-1",
+            user_id="user-1",
+            actor=actor,
+            model=SnapshotModelSelection(
+                provider_id="provider-1",
+                model="model-1",
+            ),
+            messages=(),
+            limits=SnapshotRuntimeLimits(snapshot_max_bytes=1_048_576),
+            created_at=created_at,
+        )
+        db.add(
+            RuntimeExecutionSnapshot(
+                snapshot_id=payload.snapshot_id,
+                run_id=run.id,
+                digest=hashlib.sha256(
+                    canonical_snapshot_bytes(payload)
+                ).hexdigest(),
+                payload=payload.model_dump(mode="json"),
+                created_at=created_at,
+                expires_at=None,
+            )
+        )
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time[0],
+    )
+    crossed_during_terminal_flush = []
+
+    def cross_after_completed_flush(flushed_session, _flush_context):
+        if not crossed_during_terminal_flush and any(
+            isinstance(item, ToolInvocation) and item.status == "completed"
+            for item in flushed_session.identity_map.values()
+        ):
+            current_time[0] = created_at.replace(minute=1, second=1)
+            crossed_during_terminal_flush.append(True)
+
+    event.listen(session, "after_flush", cross_after_completed_flush)
+
+    with pytest.raises(ToolRuntimeError) as caught:
+        execute(gateway)
+
+    session.expire_all()
+    invocation = session.scalar(select(ToolInvocation))
+    run_events = list(
+        session.scalars(select(RunEvent).where(RunEvent.run_id == "run-1"))
+    )
+    tool_audits = list(
+        session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.run_id == "run-1",
+                AuditEvent.action.like("tool.invoke.%"),
+            )
+        )
+    )
+    assert crossed_during_terminal_flush == [True]
+    assert caught.value.code == "sandbox_timeout"
+    assert invocation.status == "started"
+    assert invocation.result_summary is None
+    assert [item.event_type for item in run_events] == ["tool.started"]
     assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
 
 

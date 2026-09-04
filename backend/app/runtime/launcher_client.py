@@ -306,6 +306,7 @@ class LauncherClient:
             or (
                 isinstance(error, (TimeoutError, httpx.TimeoutException))
                 and deadline_at is not None
+                and datetime.now(UTC) >= deadline_at
             )
             or (
                 isinstance(error, httpx.HTTPStatusError)

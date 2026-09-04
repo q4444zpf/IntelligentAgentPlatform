@@ -189,6 +189,7 @@ class ToolGateway:
             invocation.run_id,
             allowed_statuses=allowed_run_statuses,
         )
+        deadline = None
         if status == "completed":
             try:
                 snapshot = ExecutionSnapshotService(
@@ -255,6 +256,13 @@ class ToolGateway:
                     duration_ms=duration_ms,
                     error_code=error.code if error is not None else None,
                 ),
+            )
+        self.repository.session.flush()
+        if deadline is not None and self.clock() >= deadline:
+            self.repository.session.rollback()
+            raise ToolRuntimeError(
+                "sandbox_timeout",
+                "沙箱任务执行超时",
             )
         self.repository.session.commit()
 

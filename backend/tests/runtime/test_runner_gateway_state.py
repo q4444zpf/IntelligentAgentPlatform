@@ -560,6 +560,55 @@ def test_expired_team_success_is_rejected_at_locked_gateway_boundary(monkeypatch
     )[0].role == "user"
 
 
+def test_team_success_crossing_deadline_during_completion_writes_rolls_back(
+    monkeypatch,
+):
+    from app.runtime import runner_gateway_service as service_module
+
+    snapshot = build_team_snapshot(timeout_seconds=60)
+    current_time = [snapshot.created_at + timedelta(seconds=59)]
+
+    class MutableDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return current_time[0]
+
+    original_add = ConversationRepository.add_assistant_message
+
+    def add_after_deadline(repository, run_id, content):
+        message = original_add(repository, run_id, content)
+        current_time[0] = snapshot.created_at + timedelta(seconds=61)
+        return message
+
+    monkeypatch.setattr(service_module, "datetime", MutableDatetime)
+    monkeypatch.setattr(
+        ConversationRepository,
+        "add_assistant_message",
+        add_after_deadline,
+    )
+    client, repository, _store, _token_service = build_client(snapshot)
+
+    response = client.post(
+        "/internal/runner/runs/run-1/completion",
+        headers=idempotent("completion:crossed-during-writes"),
+        json={
+            "status": "completed",
+            "final_assistant_content": "late Team result",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "sandbox_timeout"
+    assert repository.get_run_by_id("run-1").status == "running"
+    assert repository.list_events("run-1", 0) == []
+    assert [
+        message.role
+        for message in repository.session.scalars(
+            select(Message).where(Message.conversation_id == "conversation-1")
+        )
+    ] == ["user"]
+
+
 def test_completion_rejects_artifact_from_another_run():
     from types import SimpleNamespace
 

@@ -633,6 +633,41 @@ def test_unit_admin_cannot_mutate_platform_default_pointer(client):
 
     assert switched.status_code == 403
     assert client.app.state.agent_service.store.get_default_id() == before
+    other_unit_default = client.get(
+        "/api/agents/default",
+        headers={
+            "X-Unit-ID": "unit-2",
+            "X-User-ID": "user-2",
+            "X-Project-ID": "project-2",
+            "X-User-Roles": "user",
+        },
+    )
+    assert other_unit_default.status_code == 200
+    assert other_unit_default.json()["id"] == before.agent_id
+
+
+def test_internal_system_authority_mutates_platform_default_for_all_units(client):
+    create_common_agent(client, "global-common", allowed_project_ids=["*"])
+
+    switched = client.app.state.agent_service.set_default(
+        "global-common",
+        context=None,
+    )
+    first_unit = client.get("/api/agents/default")
+    second_unit = client.get(
+        "/api/agents/default",
+        headers={
+            "X-Unit-ID": "unit-2",
+            "X-User-ID": "user-2",
+            "X-Project-ID": "project-2",
+            "X-User-Roles": "user",
+        },
+    )
+
+    assert switched.id == "global-common"
+    assert switched.is_default is True
+    assert first_unit.json()["id"] == "global-common"
+    assert second_unit.json()["id"] == "global-common"
 
 
 def test_agent_knowledge_sources_are_persisted_and_must_be_available_knowledge_tools(client):

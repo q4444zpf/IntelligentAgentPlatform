@@ -227,10 +227,31 @@ def test_launcher_client_preserves_deadline_expiry_identity(transport_error):
     with pytest.raises(LauncherClientError) as captured:
         client.inspect(
             "run-1",
-            request_deadline_at="2099-01-01T00:00:00Z",
+            request_deadline_at="2000-01-01T00:00:00Z",
         )
 
     assert isinstance(captured.value, LauncherDeadlineExceededError)
+
+
+def test_launcher_client_keeps_far_future_connect_timeout_as_unavailable():
+    connect_timeout = httpx.ConnectTimeout(
+        "connection timed out",
+        request=httpx.Request("GET", "http://launcher/runs/run-1/container"),
+    )
+
+    class UnavailableTransport(FakeTransport):
+        def inspect(self, run_id, *, deadline_at=None):
+            raise connect_timeout
+
+    client = LauncherClient(UnavailableTransport())
+
+    with pytest.raises(LauncherClientError) as captured:
+        client.inspect(
+            "run-1",
+            request_deadline_at="2099-01-01T00:00:00Z",
+        )
+
+    assert type(captured.value) is LauncherClientError
 
 
 def test_launcher_prepare_preserves_deadline_expiry_from_inspection():
@@ -280,10 +301,24 @@ def test_launcher_prepare_preserves_deadline_expiry_from_inspection():
 def test_launcher_prepare_translates_transport_deadline_expiry(
     failure_point,
     transport_error,
+    monkeypatch,
 ):
+    from app.runtime import launcher_client as launcher_client_module
+
+    execution_deadline = datetime(2098, 12, 31, 23, 59, tzinfo=UTC)
+    current_time = [execution_deadline - timedelta(seconds=1)]
+
+    class MutableDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return current_time[0]
+
+    monkeypatch.setattr(launcher_client_module, "datetime", MutableDatetime)
+
     class DeadlineTransport(FakeTransport):
         def create(self, run_id, workspace_path, execution, *, deadline_at=None):
             if failure_point == "create":
+                current_time[0] = execution_deadline
                 raise transport_error
             return super().create(
                 run_id,
@@ -294,6 +329,7 @@ def test_launcher_prepare_translates_transport_deadline_expiry(
 
         def inspect(self, run_id, *, deadline_at=None):
             if failure_point == "inspect":
+                current_time[0] = execution_deadline
                 raise transport_error
             return super().inspect(run_id, deadline_at=deadline_at)
 

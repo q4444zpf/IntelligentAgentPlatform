@@ -62,6 +62,22 @@ class _AgentRecoveryRequired(RuntimeError):
     pass
 
 
+class _RebindableCancellationEvent(Event):
+    def __init__(self) -> None:
+        super().__init__()
+        self._binding_lock = Lock()
+        self._bound_event: Event | None = None
+
+    def bind(self, event: Event) -> None:
+        with self._binding_lock:
+            self._bound_event = event
+
+    def is_set(self) -> bool:
+        with self._binding_lock:
+            event = self._bound_event
+        return super().is_set() if event is None else event.is_set()
+
+
 @dataclass
 class _DeadlineOperation:
     completed: Event = field(default_factory=Event)
@@ -485,7 +501,9 @@ class SandboxRuntime:
 
         legacy_model = None
         legacy_tools = None
+        legacy_cancellation_event_ref = None
         if snapshot.payload.schema_version != "5":
+            legacy_cancellation_event_ref = _RebindableCancellationEvent()
             legacy_model = GatewayChatModel(
                 self.gateway,
                 max_iterations=limits.max_iterations,
@@ -493,8 +511,13 @@ class SandboxRuntime:
                 max_subagents=limits.max_subagents,
                 max_output_bytes=limits.max_output_bytes,
                 budget_state=model_budget,
+                cancellation_event=legacy_cancellation_event_ref,
             )
-            legacy_tools = build_gateway_tools(snapshot.payload, self.gateway)
+            legacy_tools = build_gateway_tools(
+                snapshot.payload,
+                self.gateway,
+                cancellation_event=legacy_cancellation_event_ref,
+            )
 
         completed = {item.task_id: item for item in state.completed_results}
         failed = {item.task_id: item for item in state.failed_results}
@@ -640,6 +663,8 @@ class SandboxRuntime:
                 }
                 state_lock = Lock()
                 batch_timed_out = Event()
+                if legacy_cancellation_event_ref is not None:
+                    legacy_cancellation_event_ref.bind(batch_timed_out)
 
                 def save_member_runtime_state(task, checkpoint_key, runtime_state):
                     nonlocal state
@@ -694,6 +719,7 @@ class SandboxRuntime:
                         runtime_state=invocation.runtime_state,
                         invocation=invocation,
                         artifact_capability=artifact_capabilities[task.id],
+                        cancellation_event=batch_timed_out,
                         checkpoint_callback=lambda key, runtime_state: (
                             save_member_runtime_state(task, key, runtime_state)
                         ),
@@ -1204,6 +1230,7 @@ class SandboxRuntime:
         runtime_state,
         invocation,
         artifact_capability,
+        cancellation_event,
         checkpoint_callback,
     ):
         model, tools = self._member_runtime_dependencies(
@@ -1214,6 +1241,7 @@ class SandboxRuntime:
             legacy_model,
             legacy_tools,
             invocation_namespace=invocation.invocation_id,
+            cancellation_event=cancellation_event,
         )
         graph = self.agent_factory.build(
             member_agent_snapshot(actor, task.member_id),
@@ -1279,6 +1307,7 @@ class SandboxRuntime:
         legacy_tools,
         *,
         invocation_namespace=None,
+        cancellation_event=None,
     ):
         if snapshot.payload.schema_version != "5":
             return legacy_model, legacy_tools
@@ -1298,6 +1327,7 @@ class SandboxRuntime:
             model_id=member.model.model,
             member_agent_id=member.agent_id,
             budget_state=model_budget,
+            cancellation_event=cancellation_event,
         )
         tools = build_gateway_tools(
             snapshot.payload,
@@ -1307,6 +1337,7 @@ class SandboxRuntime:
             ),
             member_agent_id=member.agent_id,
             invocation_namespace=invocation_namespace,
+            cancellation_event=cancellation_event,
         )
         return model, tools
 

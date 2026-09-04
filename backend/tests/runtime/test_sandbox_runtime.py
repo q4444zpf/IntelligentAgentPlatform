@@ -186,6 +186,19 @@ def _schema_v5_team_snapshot(*, limits=None):
     )
 
 
+def _team_snapshot_with_schema(schema_version: str):
+    snapshot = _schema_v5_team_snapshot()
+    if schema_version == "5":
+        return snapshot
+    payload = snapshot.payload.model_copy(update={"schema_version": schema_version})
+    return snapshot.model_copy(
+        update={
+            "payload": payload,
+            "digest": hashlib.sha256(canonical_snapshot_bytes(payload)).hexdigest(),
+        }
+    )
+
+
 class FakeGateway:
     def __init__(self, snapshot):
         self.snapshot = snapshot
@@ -1536,6 +1549,178 @@ def test_team_fail_fast_does_not_wait_for_blocked_sibling_or_persist_its_result(
         for _key, state, _idempotency_key in gateway.saved_checkpoints
         for invocation in state["active_invocations"]
     )
+
+
+@pytest.mark.parametrize("schema_version", ["4", "5"])
+def test_team_fail_fast_fences_blocked_sibling_before_external_tool_invocation(
+    schema_version,
+):
+    snapshot = _team_snapshot_with_schema(schema_version)
+    plan = {
+        "tasks": [
+            {
+                "id": "blocked-task",
+                "member_id": "member-1",
+                "objective": "operate",
+                "depends_on": [],
+                "position": 0,
+            },
+            {
+                "id": "failed-task",
+                "member_id": "member-2",
+                "objective": "fail",
+                "depends_on": [],
+                "position": 1,
+            },
+        ]
+    }
+    blocked_member_ready = threading.Event()
+    release_tool_attempt = threading.Event()
+    tool_attempt_finished = threading.Event()
+    legacy_cancellation_hooked = threading.Event()
+
+    class Factory:
+        def build(self, member, **kwargs):
+            if member.agent_id == "supervisor":
+                return SimpleNamespace(stage="planning")
+            if member.agent_id == "member-1":
+                cancellation_event = kwargs["model"].cancellation_event
+                if (
+                    schema_version == "4"
+                    and isinstance(cancellation_event, threading.Event)
+                    and not legacy_cancellation_hooked.is_set()
+                ):
+                    legacy_cancellation_hooked.set()
+                    original_set = cancellation_event.set
+
+                    def set_after_released_attempt():
+                        release_tool_attempt.set()
+                        assert tool_attempt_finished.wait(2)
+                        original_set()
+
+                    cancellation_event.set = set_after_released_attempt
+                return SimpleNamespace(stage="blocked", tool=kwargs["tools"][0])
+            return SimpleNamespace(stage="failed")
+
+    class ExternalToolAdapter:
+        def __init__(self, graph, *, checkpoint_store=None):
+            self.graph = graph
+            self.checkpoint_store = checkpoint_store
+
+        def invoke(self, _state, *, metadata=None):
+            del metadata
+            if self.graph.stage == "planning":
+                return SimpleNamespace(content=json.dumps(plan))
+            if self.graph.stage == "failed":
+                assert blocked_member_ready.wait(2)
+                raise RuntimeError("member failed")
+            blocked_member_ready.set()
+            assert release_tool_attempt.wait(2)
+            try:
+                self.graph.tool.run({}, tool_call_id="late-external-tool")
+            except RunnerGatewayToolError:
+                pass
+            finally:
+                tool_attempt_finished.set()
+            return SimpleNamespace(content="late result")
+
+    gateway = FakeGateway(snapshot)
+    result = SandboxRuntime(
+        gateway,
+        agent_factory=Factory(),
+        runtime_adapter_type=ExternalToolAdapter,
+    ).execute(_request(snapshot))
+
+    assert result.status == "failed"
+    release_tool_attempt.set()
+    assert tool_attempt_finished.wait(2)
+    assert gateway.tool_calls == []
+
+
+@pytest.mark.parametrize("schema_version", ["4", "5"])
+def test_team_fail_fast_fences_blocked_sibling_before_external_model_invocation(
+    schema_version,
+):
+    snapshot = _team_snapshot_with_schema(schema_version)
+    plan = {
+        "tasks": [
+            {
+                "id": "blocked-task",
+                "member_id": "member-1",
+                "objective": "analyze",
+                "depends_on": [],
+                "position": 0,
+            },
+            {
+                "id": "failed-task",
+                "member_id": "member-2",
+                "objective": "fail",
+                "depends_on": [],
+                "position": 1,
+            },
+        ]
+    }
+    blocked_member_ready = threading.Event()
+    release_model_attempt = threading.Event()
+    model_attempt_finished = threading.Event()
+    legacy_cancellation_hooked = threading.Event()
+
+    class Factory:
+        def build(self, member, **kwargs):
+            if member.agent_id == "supervisor":
+                return SimpleNamespace(stage="planning")
+            if member.agent_id == "member-1":
+                cancellation_event = kwargs["model"].cancellation_event
+                if (
+                    schema_version == "4"
+                    and isinstance(cancellation_event, threading.Event)
+                    and not legacy_cancellation_hooked.is_set()
+                ):
+                    legacy_cancellation_hooked.set()
+                    original_set = cancellation_event.set
+
+                    def set_after_released_attempt():
+                        release_model_attempt.set()
+                        assert model_attempt_finished.wait(2)
+                        original_set()
+
+                    cancellation_event.set = set_after_released_attempt
+                return SimpleNamespace(stage="blocked", model=kwargs["model"])
+            return SimpleNamespace(stage="failed")
+
+    class ExternalModelAdapter:
+        def __init__(self, graph, *, checkpoint_store=None):
+            self.graph = graph
+            self.checkpoint_store = checkpoint_store
+
+        def invoke(self, _state, *, metadata=None):
+            del metadata
+            if self.graph.stage == "planning":
+                return SimpleNamespace(content=json.dumps(plan))
+            if self.graph.stage == "failed":
+                assert blocked_member_ready.wait(2)
+                raise RuntimeError("member failed")
+            blocked_member_ready.set()
+            assert release_model_attempt.wait(2)
+            try:
+                self.graph.model.invoke([HumanMessage(content="late model call")])
+            except RunnerGatewayModelError:
+                pass
+            finally:
+                model_attempt_finished.set()
+            return SimpleNamespace(content="late result")
+
+    gateway = FakeGateway(snapshot)
+    result = SandboxRuntime(
+        gateway,
+        agent_factory=Factory(),
+        runtime_adapter_type=ExternalModelAdapter,
+    ).execute(_request(snapshot))
+
+    assert result.status == "failed"
+    release_model_attempt.set()
+    assert model_attempt_finished.wait(2)
+    assert gateway.model_calls == []
 
 
 def test_team_fail_fast_resume_stops_before_replaying_after_persisted_failure():

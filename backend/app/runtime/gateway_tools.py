@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from itertools import count
+from threading import Event
 from typing import Any, Protocol
 
 from langchain_core.tools import StructuredTool
@@ -49,6 +50,7 @@ def build_gateway_tools(
     allowed_tool_ids: set[str] | None = None,
     member_agent_id: str | None = None,
     invocation_namespace: str | None = None,
+    cancellation_event: Event | None = None,
 ) -> list[StructuredTool]:
     return [
         _build_tool(
@@ -56,6 +58,7 @@ def build_gateway_tools(
             client,
             member_agent_id=member_agent_id,
             invocation_namespace=invocation_namespace,
+            cancellation_event=cancellation_event,
         )
         for tool in snapshot.tools
         if tool.published
@@ -71,6 +74,7 @@ def _build_tool(
     *,
     member_agent_id: str | None = None,
     invocation_namespace: str | None = None,
+    cancellation_event: Event | None = None,
 ) -> StructuredTool:
     sequences = count()
 
@@ -97,6 +101,8 @@ def _build_tool(
             }
             if member_agent_id is not None:
                 request["member_agent_id"] = member_agent_id
+            if cancellation_event is not None and cancellation_event.is_set():
+                raise RunnerGatewayToolError("gateway_unavailable")
             return client.invoke_tool(
                 **request,
             )

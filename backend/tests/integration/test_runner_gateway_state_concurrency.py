@@ -8,7 +8,7 @@ import uuid
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import create_engine, delete, func, select, text
+from sqlalchemy import create_engine, delete, event, func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.conversations.models import AgentRun, Conversation, Message, RunEvent
@@ -178,8 +178,12 @@ def _claims(snapshot: StoredExecutionSnapshot) -> RunTokenClaims:
     )
 
 
-def _team_snapshot(run_id: str) -> StoredExecutionSnapshot:
-    created_at = datetime(2026, 9, 4, 10, 0, tzinfo=UTC)
+def _team_snapshot(
+    run_id: str,
+    *,
+    created_at: datetime | None = None,
+) -> StoredExecutionSnapshot:
+    created_at = created_at or datetime(2026, 9, 4, 10, 0, tzinfo=UTC)
     model = SnapshotModelSelection(
         provider_id="integration-provider",
         model="integration-model",
@@ -788,3 +792,85 @@ def test_terminal_completion_serializes_before_artifact_capability_and_rejects_i
             .select_from(RuntimeCheckpoint)
             .where(RuntimeCheckpoint.run_id == run_id)
         ) == 1
+
+
+def test_team_completion_rechecks_deadline_after_blocked_post_write_flush(
+    state_race_environment,
+    monkeypatch,
+):
+    from app.runtime import runner_gateway_service as service_module
+
+    factory, run_id, _agent_snapshot, _agent_claims = state_race_environment
+    created_at = datetime(2026, 9, 4, 10, 0, tzinfo=UTC)
+    snapshot = _team_snapshot(run_id, created_at=created_at)
+    claims = _claims(snapshot)
+    current_time = [created_at.replace(second=59)]
+    flush_started = threading.Event()
+    release_flush = threading.Event()
+    outcomes: dict[str, object] = {}
+
+    class MutableDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return current_time[0]
+
+    monkeypatch.setattr(service_module, "datetime", MutableDatetime)
+
+    def block_completion_flush(session, _flush_context, _instances):
+        if any(
+            isinstance(item, RunEvent) and item.event_type == "runner.completion"
+            for item in session.new
+        ):
+            flush_started.set()
+            if not release_flush.wait(10):
+                raise TimeoutError("completion flush was not released")
+
+    def run_completion() -> None:
+        try:
+            with factory() as session:
+                event.listen(session, "before_flush", block_completion_flush)
+                outcomes["completion"] = _service(session, snapshot).complete(
+                    run_id,
+                    CompletionRequest(
+                        status="completed",
+                        final_assistant_content="late Team result",
+                    ),
+                    claims,
+                    f"completion:{run_id}:late-success",
+                )
+        except BaseException as error:
+            outcomes["completion_error"] = error
+
+    completion_thread = threading.Thread(target=run_completion, daemon=True)
+    completion_thread.start()
+    try:
+        assert flush_started.wait(5), "completion did not reach its final flush"
+        current_time[0] = created_at.replace(minute=1, second=1)
+    finally:
+        release_flush.set()
+        completion_thread.join(10)
+
+    assert not completion_thread.is_alive()
+    assert "completion" not in outcomes
+    assert isinstance(outcomes.get("completion_error"), RunnerGatewayError)
+    completion_error = outcomes["completion_error"]
+    assert completion_error.status_code == 409
+    assert completion_error.code == "sandbox_timeout"
+
+    with factory() as verification:
+        assert verification.get(AgentRun, run_id).status == "running"
+        assert verification.scalar(
+            select(func.count())
+            .select_from(RuntimeRunnerRequest)
+            .where(RuntimeRunnerRequest.run_id == run_id)
+        ) == 0
+        assert verification.scalar(
+            select(func.count())
+            .select_from(RunEvent)
+            .where(RunEvent.run_id == run_id)
+        ) == 0
+        assert verification.scalar(
+            select(func.count())
+            .select_from(Message)
+            .where(Message.run_id == run_id)
+        ) == 0
