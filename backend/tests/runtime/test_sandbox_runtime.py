@@ -1464,6 +1464,80 @@ def test_team_fail_fast_failure_wins_over_parallel_approval_interruption():
     )
 
 
+def test_team_fail_fast_does_not_wait_for_blocked_sibling_or_persist_its_result():
+    snapshot = _schema_v5_team_snapshot()
+    plan = {
+        "tasks": [
+            {
+                "id": "blocked-task",
+                "member_id": "member-1",
+                "objective": "inspect",
+                "depends_on": [],
+                "position": 0,
+            },
+            {
+                "id": "failed-task",
+                "member_id": "member-2",
+                "objective": "review",
+                "depends_on": [],
+                "position": 1,
+            },
+        ]
+    }
+    release_blocked_member = threading.Event()
+
+    class Factory:
+        def __init__(self):
+            self.supervisor_calls = 0
+
+        def build(self, member, **_kwargs):
+            if member.agent_id == "supervisor":
+                self.supervisor_calls += 1
+                return SimpleNamespace(stage="planning")
+            if member.agent_id == "member-1":
+                return SimpleNamespace(stage="blocked")
+            return SimpleNamespace(stage="failed")
+
+    class CheckpointingAdapter:
+        def __init__(self, graph, *, checkpoint_store=None):
+            self.graph = graph
+            self.checkpoint_store = checkpoint_store
+
+        def invoke(self, _state, *, metadata=None):
+            del metadata
+            if self.graph.stage == "planning":
+                return SimpleNamespace(content=json.dumps(plan))
+            if self.graph.stage == "failed":
+                raise RuntimeError("member failed")
+            assert release_blocked_member.wait(2)
+            assert self.checkpoint_store is not None
+            self.checkpoint_store.save(
+                "run-1", "late-member", {"stage": "late-member"}
+            )
+            return SimpleNamespace(content="late result")
+
+    gateway = FakeGateway(snapshot)
+    release_timer = threading.Timer(0.75, release_blocked_member.set)
+    release_timer.start()
+    started_at = time.monotonic()
+    result = SandboxRuntime(
+        gateway,
+        agent_factory=Factory(),
+        runtime_adapter_type=CheckpointingAdapter,
+    ).execute(
+        _request(snapshot)
+    )
+
+    assert result.status == "failed"
+    assert time.monotonic() - started_at < 0.5
+    time.sleep(0.8)
+    assert not any(
+        invocation.get("runtime_state") == {"stage": "late-member"}
+        for _key, state, _idempotency_key in gateway.saved_checkpoints
+        for invocation in state["active_invocations"]
+    )
+
+
 def test_team_fail_fast_resume_stops_before_replaying_after_persisted_failure():
     snapshot = _schema_v5_team_snapshot(
         limits=_snapshot().payload.limits.model_copy(update={"max_iterations": 8})
@@ -1800,13 +1874,73 @@ def test_team_timeout_interrupts_slow_synthesis_before_wider_run_deadline():
     assert len(gateway.events) == event_count
 
 
+def test_team_success_expiring_during_final_artifact_collection_reports_timeout():
+    base = _schema_v5_team_snapshot(
+        limits=_snapshot().payload.limits.model_copy(update={"max_iterations": 8})
+    )
+    actor = base.payload.actor.model_copy(update={"timeout_seconds": 1})
+    payload = base.payload.model_copy(update={"actor": actor})
+    snapshot = base.model_copy(
+        update={
+            "payload": payload,
+            "digest": hashlib.sha256(canonical_snapshot_bytes(payload)).hexdigest(),
+        }
+    )
+    plan = {
+        "tasks": [
+            {
+                "id": "fast-task",
+                "member_id": "member-1",
+                "objective": "inspect",
+                "depends_on": [],
+                "position": 0,
+            }
+        ]
+    }
+    now = [0.0]
+
+    class ExpiringArtifactGateway(FakeGateway):
+        def list_artifacts(self):
+            now[0] = 2.0
+            return []
+
+    class Factory:
+        def __init__(self):
+            self.supervisor_calls = 0
+
+        def build(self, member, **_kwargs):
+            if member.agent_id == "supervisor":
+                self.supervisor_calls += 1
+                if self.supervisor_calls == 1:
+                    return TeamPlanGraph(plan)
+                return TextGraph("synthesis")
+            return TextGraph("member result")
+
+    gateway = ExpiringArtifactGateway(snapshot)
+    result = SandboxRuntime(
+        gateway,
+        agent_factory=Factory(),
+        monotonic=lambda: now[0],
+    ).execute(_request(snapshot))
+
+    assert result.status == "failed"
+    assert result.error_code == "sandbox_timeout"
+    assert gateway.completions[-1][0] == {
+        "status": "failed",
+        "error_code": "sandbox_timeout",
+    }
+    assert not any(
+        request[0].get("status") == "completed"
+        for request in gateway.completions
+    )
+
+
 @pytest.mark.parametrize(
-    ("slow_stage", "expiry_call"),
-    [("member", 2), ("synthesis", 3)],
+    "slow_stage",
+    ["member", "synthesis"],
 )
 def test_team_deadline_expiry_before_wait_sets_late_checkpoint_fence(
     slow_stage,
-    expiry_call,
 ):
     snapshot = _schema_v5_team_snapshot(
         limits=_snapshot().payload.limits.model_copy(update={"max_iterations": 8})
@@ -1823,6 +1957,7 @@ def test_team_deadline_expiry_before_wait_sets_late_checkpoint_fence(
         ]
     }
     stage_entered = threading.Event()
+    slow_stage_built = threading.Event()
     release_stage = threading.Event()
     stage_finished = threading.Event()
 
@@ -1837,10 +1972,14 @@ def test_team_deadline_expiry_before_wait_sets_late_checkpoint_fence(
         def build(self, member, **_kwargs):
             if member.agent_id == "supervisor":
                 self.supervisor_calls += 1
-                return Graph(
+                graph = Graph(
                     "planning" if self.supervisor_calls == 1 else "synthesis"
                 )
-            return Graph("member")
+            else:
+                graph = Graph("member")
+            if graph.stage == slow_stage:
+                slow_stage_built.set()
+            return graph
 
     class CheckpointingAdapter:
         def __init__(self, graph, *, checkpoint_store=None):
@@ -1866,11 +2005,11 @@ def test_team_deadline_expiry_before_wait_sets_late_checkpoint_fence(
     class ExpiringBeforeWaitRuntime(SandboxRuntime):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            self.remaining_calls = 0
+            self.expired = False
 
         def _remaining_team_seconds(self, deadline_at):
-            self.remaining_calls += 1
-            if self.remaining_calls == expiry_call:
+            if slow_stage_built.is_set() and not self.expired:
+                self.expired = True
                 raise _TeamTimedOut()
             return super()._remaining_team_seconds(deadline_at)
 

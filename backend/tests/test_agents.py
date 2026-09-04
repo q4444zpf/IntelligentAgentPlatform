@@ -599,7 +599,7 @@ def test_project_admin_cannot_mutate_platform_default_pointer(client):
     "target_id",
     ["reservoir-dispatch", "restricted-common"],
 )
-def test_unit_admin_rejects_default_target_not_available_to_every_project(
+def test_unit_admin_cannot_validate_or_mutate_platform_default_target(
     client,
     target_id,
 ):
@@ -617,31 +617,22 @@ def test_unit_admin_rejects_default_target_not_available_to_every_project(
         headers={"X-User-Roles": "unit_admin"},
     )
 
-    assert response.status_code == 422
+    assert response.status_code == 403
     assert client.app.state.agent_service.store.get_default_id() == before
 
 
-def test_unit_admin_sets_wildcard_common_default_for_multiple_projects(client):
+def test_unit_admin_cannot_mutate_platform_default_pointer(client):
     create_common_agent(client, "global-common", allowed_project_ids=["*"])
+    before = client.app.state.agent_service.store.get_default_id()
 
     switched = client.put(
         "/api/agents/default",
         json={"agent_id": "global-common"},
         headers={"X-User-Roles": "unit_admin"},
     )
-    other_project = client.get(
-        "/api/agents/default",
-        headers={
-            "X-Unit-ID": "unit-2",
-            "X-User-ID": "u2",
-            "X-Project-ID": "p2",
-            "X-User-Roles": "user",
-        },
-    )
 
-    assert switched.status_code == 200
-    assert other_project.status_code == 200
-    assert other_project.json()["id"] == "global-common"
+    assert switched.status_code == 403
+    assert client.app.state.agent_service.store.get_default_id() == before
 
 
 def test_agent_knowledge_sources_are_persisted_and_must_be_available_knowledge_tools(client):
@@ -1124,45 +1115,6 @@ def test_gets_effective_default_agent(client):
     assert response.json()["is_default"] is True
 
 
-def test_switches_default_to_enabled_agent_atomically(client):
-    create_common_agent(client, "global-common", allowed_project_ids=["*"])
-    switched = client.put(
-        "/api/agents/default",
-        json={"agent_id": "global-common"},
-        headers={"X-User-Roles": "unit_admin"},
-    )
-
-    assert switched.status_code == 200
-    assert switched.json()["id"] == "global-common"
-    assert switched.json()["is_default"] is True
-    listed = client.get("/api/agents")
-    defaults = [agent["id"] for agent in listed.json() if agent["is_default"]]
-    assert defaults == ["global-common"]
-
-
-def test_rejects_disabled_or_missing_default_target(client):
-    create_common_agent(
-        client,
-        "disabled-common",
-        allowed_project_ids=["*"],
-        enabled=False,
-    )
-
-    disabled = client.put(
-        "/api/agents/default",
-        json={"agent_id": "disabled-common"},
-        headers={"X-User-Roles": "unit_admin"},
-    )
-    assert disabled.status_code == 422
-    missing = client.put(
-        "/api/agents/default",
-        json={"agent_id": "missing-agent"},
-        headers={"X-User-Roles": "unit_admin"},
-    )
-    assert missing.status_code == 404
-    assert client.get("/api/agents/default").json()["id"] == BUILTIN_AGENT_ID
-
-
 def test_rejects_deleting_or_disabling_active_default(client):
     unit_admin = {"X-User-Roles": "unit_admin"}
     assert (
@@ -1184,91 +1136,6 @@ def test_rejects_deleting_or_disabling_active_default(client):
     )
     assert enabled.status_code == 200
     assert enabled.json()["is_default"] is True
-
-
-def test_old_common_default_can_be_disabled_and_deleted_after_switch(client):
-    create_common_agent(client, "global-common", allowed_project_ids=["*"])
-    unit_admin = {"X-User-Roles": "unit_admin"}
-    assert (
-        client.put(
-        "/api/agents/default",
-        json={"agent_id": "global-common"},
-        headers=unit_admin,
-        ).status_code
-        == 200
-    )
-    assert (
-        client.patch(
-        "/api/agents/global-common/toggle",
-        json={"enabled": False},
-        headers=unit_admin,
-        ).status_code
-        == 409
-    )
-
-    assert (
-        client.put(
-        "/api/agents/default",
-        json={"agent_id": BUILTIN_AGENT_ID},
-        headers=unit_admin,
-        ).status_code
-        == 200
-    )
-    assert (
-        client.patch(
-        "/api/agents/global-common/toggle",
-        json={"enabled": False},
-        headers=unit_admin,
-        ).status_code
-        == 200
-    )
-    assert client.delete(
-        "/api/agents/global-common",
-        headers=unit_admin,
-    ).status_code == 200
-
-
-def test_builtin_agent_cannot_be_deleted_after_default_switch(client):
-    create_common_agent(client, "global-common", allowed_project_ids=["*"])
-    assert (
-        client.put(
-        "/api/agents/default",
-        json={"agent_id": "global-common"},
-        headers={"X-User-Roles": "unit_admin"},
-        ).status_code
-        == 200
-    )
-
-    deleted = client.delete(
-        f"/api/agents/{BUILTIN_AGENT_ID}",
-        headers={"X-User-Roles": "unit_admin"},
-    )
-
-    assert deleted.status_code == 409
-    assert client.get(f"/api/agents/{BUILTIN_AGENT_ID}").status_code == 200
-
-
-def test_maps_concurrent_default_update_to_conflict(client, monkeypatch):
-    create_common_agent(client, "global-common", allowed_project_ids=["*"])
-
-    def reject_stale_update(session, agent_id, expected_version):
-        raise AgentConcurrentUpdateError(
-            "Default agent changed concurrently; retry the request"
-        )
-
-    monkeypatch.setattr(
-        client.app.state.agent_service.store,
-        "set_default_agent_in_session",
-        reject_stale_update,
-    )
-    response = client.put(
-        "/api/agents/default",
-        json={"agent_id": "global-common"},
-        headers={"X-User-Roles": "unit_admin"},
-    )
-
-    assert response.status_code == 409
-    assert "changed concurrently" in response.json()["detail"]
 
 
 def test_rejects_unknown_skills_and_duplicate_id(client):

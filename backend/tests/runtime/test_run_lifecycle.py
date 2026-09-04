@@ -14,7 +14,10 @@ from app.conversations.models import AgentRun, Conversation, Message, RunEvent
 from app.conversations.repository import ConversationRepository
 from app.db.base import Base
 from app.runtime.run_lifecycle import SandboxRunCoordinator
-from app.runtime.workflow_runner import RunnerUnavailableError
+from app.runtime.workflow_runner import (
+    RunnerDeadlineExceededError,
+    RunnerUnavailableError,
+)
 
 
 class SequenceRunner:
@@ -194,7 +197,7 @@ def test_coordinator_maps_container_terminal_states(run_factory, status_payload,
 def test_coordinator_times_out_terminates_and_cleans_up(run_factory):
     factory, run_id = run_factory
     runner = SequenceRunner([{"status": "running"}] * 3)
-    ticks = iter([0.0, 0.5, 1.1])
+    ticks = iter([0.0, 0.5, 1.1, 1.1])
 
     make_coordinator(
         factory,
@@ -226,7 +229,7 @@ def test_timeout_state_is_persisted_before_container_termination(run_factory):
             )
 
     runner = RacingRunner([{"status": "running"}] * 3)
-    ticks = iter([0.0, 0.5, 1.1])
+    ticks = iter([0.0, 0.5, 1.1, 1.1])
 
     make_coordinator(
         factory,
@@ -254,7 +257,7 @@ def test_team_watchdog_uses_snapshot_deadline_before_worker_snapshot_discovery(
     )
     tokens = FakeTokens()
     runner = SequenceRunner([{"status": "running"}] * 3)
-    ticks = iter([0.0, 0.5, 1.1])
+    ticks = iter([0.0, 0.5, 1.1, 1.1])
 
     make_coordinator(
         factory,
@@ -514,6 +517,72 @@ def test_runner_failure_after_team_deadline_remains_sandbox_timeout(run_factory)
     ).payload["code"] == "sandbox_timeout"
 
 
+@pytest.mark.parametrize("operation", ["execute", "recover"])
+def test_runner_error_after_execution_wall_deadline_is_timeout_when_monotonic_lags(
+    run_factory,
+    operation,
+):
+    factory, run_id = run_factory
+    base = datetime(2026, 9, 4, 8, 0, tzinfo=UTC)
+    if operation == "recover":
+        with factory.begin() as session:
+            session.get(AgentRun, run_id).status = "running"
+    runner = SequenceRunner(
+        [{"status": "running"}],
+        status_error=RunnerUnavailableError("runner deadline expired"),
+    )
+
+    coordinator = make_coordinator(
+        factory,
+        runner,
+        poll_interval=0,
+        timeout_seconds=1,
+        monotonic=iter([0.0, 0.5, 0.9, 0.9]).__next__,
+        clock=iter([base, base + timedelta(seconds=1)]).__next__,
+    )
+    getattr(coordinator, operation)(run_id)
+
+    state = snapshot(factory, run_id)
+    assert state.run.status == "failed"
+    assert next(
+        event for event in state.events if event.event_type == "run.error"
+    ).payload["code"] == "sandbox_timeout"
+
+
+@pytest.mark.parametrize("operation", ["execute", "recover"])
+def test_typed_runner_deadline_is_authoritative_before_local_clocks_advance(
+    run_factory,
+    operation,
+):
+    factory, run_id = run_factory
+    base = datetime(2026, 9, 4, 8, 0, tzinfo=UTC)
+    if operation == "recover":
+        with factory.begin() as session:
+            session.get(AgentRun, run_id).status = "running"
+    runner = SequenceRunner(
+        [{"status": "running"}],
+        status_error=RunnerDeadlineExceededError(
+            "Workflow Runner deadline expired"
+        ),
+    )
+
+    coordinator = make_coordinator(
+        factory,
+        runner,
+        poll_interval=0,
+        timeout_seconds=1,
+        monotonic=iter([0.0, 0.5, 0.9, 0.9]).__next__,
+        clock=iter([base, base + timedelta(seconds=0.9)]).__next__,
+    )
+    getattr(coordinator, operation)(run_id)
+
+    state = snapshot(factory, run_id)
+    assert state.run.status == "failed"
+    assert next(
+        event for event in state.events if event.event_type == "run.error"
+    ).payload["code"] == "sandbox_timeout"
+
+
 def test_terminal_success_returned_after_team_deadline_remains_timeout(
     run_factory,
 ):
@@ -631,6 +700,58 @@ def test_timeout_terminate_and_cleanup_share_one_control_allowance(run_factory):
     assert time.monotonic() - started_at < 1.4
     assert ("terminate", run_id) in runner.calls
     assert ("cleanup", run_id) in runner.calls
+
+
+def test_timeout_teardown_gets_live_control_allowance_after_slow_revocation(
+    run_factory,
+    monkeypatch,
+):
+    from app.runtime import run_lifecycle
+
+    factory, run_id = run_factory
+    monkeypatch.setattr(
+        run_lifecycle, "_TIMEOUT_CONTROL_ALLOWANCE_SECONDS", 0.05
+    )
+
+    class SlowFirstRevokeTokens(FakeTokens):
+        def __init__(self):
+            super().__init__()
+            self.revoke_calls = 0
+
+        def revoke(self, current_run_id, reason):
+            self.revoke_calls += 1
+            Event().wait(0.1)
+            super().revoke(current_run_id, reason)
+
+    class RecordingControlRunner(SequenceRunner):
+        def status(self, current_run_id, *, monotonic_deadline=None):
+            return {"run_id": current_run_id, "status": "running"}
+
+        def terminate(self, current_run_id, *, monotonic_deadline=None):
+            assert monotonic_deadline is not None
+            assert monotonic_deadline > time.monotonic()
+            self.calls.append(("terminate", current_run_id))
+            return {"run_id": current_run_id, "status": "terminated"}
+
+        def cleanup(self, current_run_id, *, monotonic_deadline=None):
+            assert monotonic_deadline is not None
+            assert monotonic_deadline > time.monotonic()
+            self.calls.append(("cleanup", current_run_id))
+            return {"run_id": current_run_id, "status": "cleaned"}
+
+    runner = RecordingControlRunner([])
+    tokens = SlowFirstRevokeTokens()
+    make_coordinator(
+        factory,
+        runner,
+        tokens=tokens,
+        poll_interval=0,
+        timeout_seconds=0,
+    ).execute(run_id)
+
+    assert ("terminate", run_id) in runner.calls
+    assert ("cleanup", run_id) in runner.calls
+    assert tokens.revoke_calls == 1
 
 
 def test_timeout_worker_exit_remains_authoritative_when_completion_report_fails(
@@ -806,7 +927,7 @@ def test_recovered_team_run_keeps_original_snapshot_deadline(run_factory):
         snapshots=snapshots,
         poll_interval=0,
         timeout_seconds=10,
-        monotonic=iter([0.0, 0.0]).__next__,
+        monotonic=iter([0.0, 0.0, 0.0]).__next__,
         clock=lambda: base + timedelta(seconds=2),
     ).recover(run_id)
 

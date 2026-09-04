@@ -3,6 +3,7 @@ import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import UTC, datetime
 
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
@@ -20,7 +21,11 @@ from app.mcp.protocol import McpProtocolClient
 from app.mcp.store import McpStore
 from app.model_providers.store import ProviderStore
 from app.runtime.checkpoint_store import CheckpointStore
-from app.runtime.execution_snapshot import ExecutionSnapshotService
+from app.runtime.execution_snapshot import (
+    ExecutionSnapshotService,
+    SnapshotIntegrityError,
+    team_execution_deadline,
+)
 from app.runtime.harness import PlatformAgentHarness
 from app.runtime.model_gateway import ModelGateway, OpenAICompatibleModelGateway
 from app.runtime.run_lifecycle import SandboxRunCoordinator
@@ -68,6 +73,20 @@ def _execute_approved_tool(
             mcp_protocol_client=McpProtocolClient(),
         )
         try:
+            try:
+                snapshot = ExecutionSnapshotService(
+                    session, None, repository
+                ).get_for_run(run_id)
+            except SnapshotIntegrityError as error:
+                raise ToolRuntimeError(
+                    "sandbox_timeout", "沙箱任务执行超时"
+                ) from error
+            if (
+                snapshot is not None
+                and (deadline := team_execution_deadline(snapshot)) is not None
+                and datetime.now(UTC) >= deadline
+            ):
+                raise ToolRuntimeError("sandbox_timeout", "沙箱任务执行超时")
             actor_roles = tuple(context_data["actor_roles"])
             if run.actor_type == "team":
                 try:

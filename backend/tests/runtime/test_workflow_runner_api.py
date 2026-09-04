@@ -1,7 +1,9 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from fastapi.testclient import TestClient
 
+from app.runtime.launcher_client import LauncherDeadlineExceededError
 from app.runtime.sandbox_readiness import SandboxReadiness
 from app.runtime.workflow_runner_api import (
     build_launcher_client_from_env,
@@ -124,6 +126,36 @@ def test_runner_prepares_container_before_accepting_run():
     assert client.delete("/runs/r1").json()["status"] == "cleaned"
 
 
+@pytest.mark.parametrize("operation", ["submit", "status"])
+def test_runner_propagates_launcher_deadline_expiry(operation):
+    class DeadlineLauncherClient:
+        def prepare(self, run_id, **execution):
+            raise LauncherDeadlineExceededError(
+                "sandbox execution deadline expired"
+            )
+
+        def inspect(self, run_id, **execution):
+            raise LauncherDeadlineExceededError(
+                "sandbox execution deadline expired"
+            )
+
+    client = TestClient(
+        create_runner_app(
+            sandbox_enabled=True,
+            readiness=SandboxReadiness(True, True, True, True, True, True),
+            launcher_client=DeadlineLauncherClient(),
+        )
+    )
+
+    response = (
+        client.post("/runs", json=_submission())
+        if operation == "submit"
+        else client.get("/runs/r1")
+    )
+
+    assert response.status_code == 504
+
+
 def test_runner_rejects_expired_downstream_deadline_before_launcher_prepare():
     class FakeLauncherClient:
         def __init__(self):
@@ -149,7 +181,7 @@ def test_runner_rejects_expired_downstream_deadline_before_launcher_prepare():
         json=_submission(),
     )
 
-    assert response.status_code == 503
+    assert response.status_code == 504
     assert launcher.runs == []
 
 
@@ -182,7 +214,7 @@ def test_runner_rejects_expired_execution_with_later_hop_deadline():
         json=request,
     )
 
-    assert response.status_code == 503
+    assert response.status_code == 504
     assert launcher.runs == []
 
 

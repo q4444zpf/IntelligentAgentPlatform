@@ -49,6 +49,7 @@ from .execution_snapshot import (
     SnapshotTeamMember,
     SnapshotIntegrityError,
     StoredExecutionSnapshot,
+    team_execution_deadline,
     verify_snapshot_digest,
 )
 from .model_gateway import ModelGateway, ModelRuntimeError, ModelSelection
@@ -1162,7 +1163,7 @@ class RunnerGatewayService:
         idempotency_key: str,
     ) -> CompletionResponse:
         repository = self._require_conversation_repository()
-        self._verified_snapshot(run_id, claims)
+        snapshot = self._verified_snapshot(run_id, claims)
         run = self._lock_run(repository, run_id)
         requests = RunnerRequestStore(repository.session)
         action = "result.complete"
@@ -1196,6 +1197,17 @@ class RunnerGatewayService:
                 "completion_conflicts_with_approval",
                 "Run 正在等待审批",
             )
+        deadline = team_execution_deadline(snapshot)
+        if (
+            request.status == "completed"
+            and deadline is not None
+            and datetime.now(UTC) >= deadline
+        ):
+            raise RunnerGatewayError(
+                409,
+                "sandbox_timeout",
+                "Team 执行已超过截止时间",
+            )
 
         artifacts = self._require_artifact_service()
         try:
@@ -1205,6 +1217,16 @@ class RunnerGatewayService:
             raise RunnerGatewayError(
                 404, "artifact_not_found", "成果文件不存在"
             ) from error
+        if (
+            request.status == "completed"
+            and deadline is not None
+            and datetime.now(UTC) >= deadline
+        ):
+            raise RunnerGatewayError(
+                409,
+                "sandbox_timeout",
+                "Team 执行已超过截止时间",
+            )
 
         if request.final_assistant_content:
             repository.add_assistant_message(

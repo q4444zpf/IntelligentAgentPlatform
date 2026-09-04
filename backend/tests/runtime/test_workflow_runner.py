@@ -3,9 +3,11 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 
+import httpx
 import pytest
 
 from app.runtime.workflow_runner import (
+    RunnerDeadlineExceededError,
     RunnerUnavailableError,
     WorkflowRunnerClient,
     WorkflowRunnerHttpTransport,
@@ -90,6 +92,59 @@ def test_runner_client_exposes_run_lifecycle_operations():
     assert client.status("run-1")["exit_code"] == 0
     assert client.terminate("run-1")["status"] == "terminated"
     assert client.cleanup("run-1")["status"] == "cleaned"
+
+
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        TimeoutError("Workflow Runner deadline expired"),
+        httpx.ReadTimeout(
+            "Workflow Runner deadline expired",
+            request=httpx.Request("GET", "http://runner/runs/run-1"),
+        ),
+        httpx.HTTPStatusError(
+            "Gateway Timeout",
+            request=httpx.Request("GET", "http://runner/runs/run-1"),
+            response=httpx.Response(
+                504,
+                request=httpx.Request("GET", "http://runner/runs/run-1"),
+            ),
+        ),
+    ],
+)
+def test_runner_client_preserves_deadline_expiry_identity(transport_error):
+    class DeadlineTransport(FakeTransport):
+        def status(self, run_id, *, monotonic_deadline=None):
+            raise transport_error
+
+    client = WorkflowRunnerClient(DeadlineTransport())
+
+    with pytest.raises(RunnerUnavailableError) as captured:
+        client.status("run-1", monotonic_deadline=time.monotonic() + 5)
+
+    assert isinstance(captured.value, RunnerDeadlineExceededError)
+
+
+def test_runner_submit_preserves_deadline_expiry_from_health_check():
+    class DeadlineTransport(FakeTransport):
+        def health_check(self, *, monotonic_deadline=None):
+            raise RunnerDeadlineExceededError("Workflow Runner deadline expired")
+
+    client = WorkflowRunnerClient(DeadlineTransport())
+
+    with pytest.raises(RunnerDeadlineExceededError):
+        client.submit(
+            "run-1",
+            "agent-v1",
+            "runtime",
+            snapshot_id="snapshot-1",
+            snapshot_digest="a" * 64,
+            gateway_url="http://api:8000/internal/runner",
+            run_token="secret-token",
+            deadline_at="2099-01-01T00:00:00Z",
+            execution_deadline_at="2098-12-31T23:59:00Z",
+            monotonic_deadline=time.monotonic() + 5,
+        )
 
 
 def test_workflow_runner_http_transport_uses_json_lifecycle_contract():

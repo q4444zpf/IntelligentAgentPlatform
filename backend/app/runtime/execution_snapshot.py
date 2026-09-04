@@ -4,7 +4,7 @@ import hashlib
 import hmac
 import json
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 from uuid import uuid4
 
@@ -277,6 +277,18 @@ def canonical_snapshot_bytes(payload: ExecutionSnapshotPayload) -> bytes:
 def verify_snapshot_digest(payload: ExecutionSnapshotPayload, digest: str) -> bool:
     expected = hashlib.sha256(canonical_snapshot_bytes(payload)).hexdigest()
     return hmac.compare_digest(expected, digest)
+
+
+def team_execution_deadline(
+    snapshot: StoredExecutionSnapshot,
+) -> datetime | None:
+    actor = snapshot.payload.actor
+    if not isinstance(actor, PublishedTeamSnapshot):
+        return None
+    created_at = snapshot.created_at
+    if created_at.tzinfo is None or created_at.utcoffset() is None:
+        created_at = created_at.replace(tzinfo=UTC)
+    return created_at.astimezone(UTC) + timedelta(seconds=actor.timeout_seconds)
 
 
 class ExecutionSnapshotService:

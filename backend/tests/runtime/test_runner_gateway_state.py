@@ -1,4 +1,5 @@
-from datetime import UTC, datetime
+import hashlib
+from datetime import UTC, datetime, timedelta
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -18,8 +19,10 @@ from app.runtime.checkpoint_store import (
 from app.runtime.execution_snapshot import (
     ExecutionSnapshotPayload,
     PublishedAgentSnapshot,
+    PublishedTeamSnapshot,
     SnapshotModelSelection,
     SnapshotRuntimeLimits,
+    SnapshotTeamMember,
     StoredExecutionSnapshot,
     canonical_snapshot_bytes,
 )
@@ -53,8 +56,6 @@ def build_snapshot(digest_override=None):
         limits=SnapshotRuntimeLimits(snapshot_max_bytes=1048576),
         created_at=datetime(2026, 8, 14, 10, 0, tzinfo=UTC),
     )
-    import hashlib
-
     digest = hashlib.sha256(canonical_snapshot_bytes(payload)).hexdigest()
     return StoredExecutionSnapshot(
         snapshot_id=payload.snapshot_id,
@@ -63,6 +64,50 @@ def build_snapshot(digest_override=None):
         payload=payload,
         created_at=payload.created_at,
         expires_at=None,
+    )
+
+
+def build_team_snapshot(*, timeout_seconds=60):
+    base = build_snapshot()
+    member = SnapshotTeamMember(
+        agent_id="member-1",
+        role="member",
+        responsibility="inspect",
+    )
+    supervisor = member.model_copy(
+        update={
+            "agent_id": "supervisor",
+            "role": "supervisor",
+            "responsibility": "coordinate",
+        }
+    )
+    actor = PublishedTeamSnapshot(
+        id="team-1",
+        version_id="team-version-1",
+        version=1,
+        definition_digest="d" * 64,
+        supervisor=supervisor,
+        members=(member,),
+        max_steps=2,
+        max_parallel_members=1,
+        timeout_seconds=timeout_seconds,
+        failure_strategy="fail_fast",
+        name="Team",
+        description="",
+        runtime_form="common",
+        language="zh-CN",
+        system_prompt="",
+        context_prompt="",
+        approval_policy="never",
+    )
+    payload = base.payload.model_copy(
+        update={"schema_version": "5", "actor": actor}
+    )
+    return base.model_copy(
+        update={
+            "digest": hashlib.sha256(canonical_snapshot_bytes(payload)).hexdigest(),
+            "payload": payload,
+        }
     )
 
 
@@ -133,8 +178,8 @@ def build_client(snapshot=None, *, event_payload_max_bytes=65536, artifacts=None
         id="run-1",
         conversation_id=conversation.id,
         trigger_message_id=message.id,
-        actor_type="agent",
-        actor_id="agent-1",
+        actor_type=snapshot.payload.actor.kind,
+        actor_id=snapshot.payload.actor.id,
         status="running",
     )
     session.add_all([conversation, message, run])
@@ -480,6 +525,39 @@ def test_completion_commits_final_message_status_and_artifact_references_once():
         "runner.completion",
         "run.status",
     ]
+
+
+def test_expired_team_success_is_rejected_at_locked_gateway_boundary(monkeypatch):
+    from app.runtime import runner_gateway_service as service_module
+
+    snapshot = build_team_snapshot(timeout_seconds=60)
+
+    class ExpiredDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return snapshot.created_at + timedelta(seconds=61)
+
+    monkeypatch.setattr(service_module, "datetime", ExpiredDatetime)
+    client, repository, _store, _token_service = build_client(snapshot)
+
+    response = client.post(
+        "/internal/runner/runs/run-1/completion",
+        headers=idempotent("completion:late-team-success"),
+        json={
+            "status": "completed",
+            "final_assistant_content": "This Team result crossed its deadline.",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "sandbox_timeout"
+    assert repository.get_run_by_id("run-1").status == "running"
+    assert repository.list_events("run-1", 0) == []
+    assert list(
+        repository.session.scalars(
+            select(Message).where(Message.conversation_id == "conversation-1")
+        )
+    )[0].role == "user"
 
 
 def test_completion_rejects_artifact_from_another_run():

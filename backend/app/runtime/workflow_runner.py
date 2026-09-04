@@ -19,6 +19,10 @@ class RunnerUnavailableError(RuntimeError):
     pass
 
 
+class RunnerDeadlineExceededError(RunnerUnavailableError):
+    pass
+
+
 class RunnerTransport(Protocol):
     def health_check(
         self, *, monotonic_deadline: float | None = None
@@ -190,6 +194,20 @@ class WorkflowRunnerClient:
             health = self.transport.health_check(
                 monotonic_deadline=monotonic_deadline
             )
+        except RunnerDeadlineExceededError:
+            raise
+        except (TimeoutError, httpx.TimeoutException) as exc:
+            if monotonic_deadline is not None:
+                raise RunnerDeadlineExceededError(
+                    "Workflow Runner deadline expired"
+                ) from exc
+            return False
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 504:
+                raise RunnerDeadlineExceededError(
+                    "Workflow Runner deadline expired"
+                ) from exc
+            return False
         except Exception:  # noqa: BLE001
             return False
         return health.get("status") == "healthy" and health.get("sandbox") is True
@@ -266,6 +284,16 @@ class WorkflowRunnerClient:
                 monotonic_deadline=monotonic_deadline,
             )
         except Exception as exc:
+            if isinstance(exc, RunnerDeadlineExceededError) or (
+                isinstance(exc, (TimeoutError, httpx.TimeoutException))
+                and monotonic_deadline is not None
+            ) or (
+                isinstance(exc, httpx.HTTPStatusError)
+                and exc.response.status_code == 504
+            ):
+                raise RunnerDeadlineExceededError(
+                    "Workflow Runner deadline expired"
+                ) from exc
             raise RunnerUnavailableError("Workflow Runner is unavailable") from exc
         if not isinstance(result, dict):
             raise RunnerUnavailableError("Workflow Runner returned an invalid response")

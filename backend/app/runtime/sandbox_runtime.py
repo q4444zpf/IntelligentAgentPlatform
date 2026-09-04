@@ -312,6 +312,8 @@ class SandboxRuntime:
                     item.artifact_id for item in backend.list("/artifacts")
                 ],
             }
+            if isinstance(actor, PublishedTeamSnapshot):
+                self._ensure_team_deadline(monotonic_deadline)
             self.gateway.complete(completion, "completion:final")
             return RunExecutionResult(
                 status="completed",
@@ -701,19 +703,44 @@ class SandboxRuntime:
                     (task, _DeadlineOperation.start(lambda task=task: invoke(task)))
                     for task in batch
                 ]
-                for _task, operation in operations:
-                    self._wait_before_team_deadline(
-                        operation,
-                        monotonic_deadline,
-                        timeout_event=batch_timed_out,
-                    )
                 outcomes = []
-                for task, operation in operations:
-                    try:
-                        outcomes.append((task, operation.unwrap(), None))
-                    except Exception as error:  # noqa: BLE001
-                        outcomes.append((task, None, error))
-                self._ensure_team_deadline(monotonic_deadline)
+                pending_operations = dict(operations)
+                try:
+                    while pending_operations:
+                        self._ensure_team_deadline(monotonic_deadline)
+                        observed_failure = False
+                        for task, operation in tuple(pending_operations.items()):
+                            if not operation.completed.is_set():
+                                continue
+                            pending_operations.pop(task)
+                            try:
+                                outcomes.append((task, operation.unwrap(), None))
+                            except Exception as error:  # noqa: BLE001
+                                outcomes.append((task, None, error))
+                                if (
+                                    actor.failure_strategy == "fail_fast"
+                                    and not isinstance(
+                                        error, RunnerApprovalInterruption
+                                    )
+                                ):
+                                    batch_timed_out.set()
+                                    observed_failure = True
+                                    break
+                        if observed_failure:
+                            break
+                        if pending_operations:
+                            Event().wait(
+                                timeout=min(
+                                    0.01,
+                                    self._remaining_team_seconds(
+                                        monotonic_deadline
+                                    ),
+                                )
+                            )
+                    self._ensure_team_deadline(monotonic_deadline)
+                except _TeamTimedOut:
+                    batch_timed_out.set()
+                    raise
 
                 interruptions = []
                 first_failure = None

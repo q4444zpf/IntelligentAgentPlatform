@@ -99,7 +99,7 @@ def test_launcher_rejects_expired_execution_before_create_handler():
         json=request,
     )
 
-    assert response.status_code == 503
+    assert response.status_code == 504
     assert launcher.calls == []
 
 
@@ -126,7 +126,7 @@ def test_launcher_rejects_expired_lifecycle_deadline_before_operation(
 
     response = getattr(client, method)(path, headers=headers)
 
-    assert response.status_code == 503
+    assert response.status_code == 504
     assert launcher.calls == []
 
 

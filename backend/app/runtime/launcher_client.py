@@ -19,6 +19,10 @@ class LauncherClientError(RuntimeError):
     pass
 
 
+class LauncherDeadlineExceededError(LauncherClientError):
+    pass
+
+
 class LauncherTransport(Protocol):
     def create(
         self,
@@ -198,7 +202,9 @@ class LauncherClient:
                 self._parse_deadline(request_deadline_at),
             )
         if datetime.now(UTC) >= transport_deadline:
-            raise LauncherClientError("sandbox execution deadline expired")
+            raise LauncherDeadlineExceededError(
+                "sandbox execution deadline expired"
+            )
         try:
             self.transport.create(run_id, f"/workspace/{run_id}", {
                 "agent_version": agent_version,
@@ -215,7 +221,13 @@ class LauncherClient:
                     run_id,
                     deadline_at=transport_deadline,
                 )
+            except LauncherDeadlineExceededError:
+                raise
             except Exception as exc:
+                if self._is_deadline_error(exc, deadline_at=transport_deadline):
+                    raise LauncherDeadlineExceededError(
+                        "sandbox execution deadline expired"
+                    ) from exc
                 self.transport.cleanup(
                     run_id,
                     deadline_at=transport_deadline,
@@ -231,6 +243,10 @@ class LauncherClient:
         except LauncherClientError:
             raise
         except Exception as exc:
+            if self._is_deadline_error(exc, deadline_at=transport_deadline):
+                raise LauncherDeadlineExceededError(
+                    "sandbox execution deadline expired"
+                ) from exc
             raise LauncherClientError("sandbox launcher is unavailable") from exc
 
     def inspect(
@@ -270,10 +286,32 @@ class LauncherClient:
         try:
             result = operation(run_id, deadline_at=deadline_at)
         except Exception as exc:
+            if LauncherClient._is_deadline_error(exc, deadline_at=deadline_at):
+                raise LauncherDeadlineExceededError(
+                    "sandbox execution deadline expired"
+                ) from exc
             raise LauncherClientError("sandbox launcher is unavailable") from exc
         if not isinstance(result, dict):
             raise LauncherClientError("sandbox launcher returned an invalid response")
         return result
+
+    @staticmethod
+    def _is_deadline_error(
+        error: Exception,
+        *,
+        deadline_at: datetime | None,
+    ) -> bool:
+        return (
+            isinstance(error, LauncherDeadlineExceededError)
+            or (
+                isinstance(error, (TimeoutError, httpx.TimeoutException))
+                and deadline_at is not None
+            )
+            or (
+                isinstance(error, httpx.HTTPStatusError)
+                and error.response.status_code == 504
+            )
+        )
 
     @staticmethod
     def _parse_deadline(value: str) -> datetime:

@@ -95,12 +95,11 @@ def create_router(service: AgentService | None = None) -> APIRouter:
         request: Request,
         context: RequestContext = Depends(require_request_context),
     ) -> RequestContext:
-        if "unit_admin" in context.roles:
-            request.state.management_context = context
-            management_request_id(request)
-            return context
         record_failed_management(manager.store.session_factory, manager.audit_recorder, context, source="agent", action="resource.updated", resource_type="agent", resource_id="agents", error_code="PERMISSION_DENIED", request_id=management_request_id(request))
-        raise HTTPException(status_code=403, detail="Unit administrator permission is required")
+        raise HTTPException(
+            status_code=403,
+            detail="Platform default mutation requires system authority",
+        )
 
 
     @router.get("", response_model=list[AgentInfo])

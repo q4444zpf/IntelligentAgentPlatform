@@ -4,11 +4,13 @@ from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 
+import httpx
 import pytest
 
 from app.runtime.launcher_client import (
     LauncherClient,
     LauncherClientError,
+    LauncherDeadlineExceededError,
     LauncherHttpTransport,
 )
 
@@ -193,6 +195,122 @@ def test_launcher_client_exposes_sanitized_status_and_lifecycle_operations():
     assert client.inspect("run-1") == {"run_id": "run-1", "status": "running"}
     assert client.terminate("run-1")["status"] == "terminated"
     assert client.cleanup("run-1")["status"] == "cleaned"
+
+
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        TimeoutError("Sandbox Launcher deadline expired"),
+        httpx.ReadTimeout(
+            "Sandbox Launcher deadline expired",
+            request=httpx.Request("GET", "http://launcher/runs/run-1/container"),
+        ),
+        httpx.HTTPStatusError(
+            "Gateway Timeout",
+            request=httpx.Request("GET", "http://launcher/runs/run-1/container"),
+            response=httpx.Response(
+                504,
+                request=httpx.Request(
+                    "GET", "http://launcher/runs/run-1/container"
+                ),
+            ),
+        ),
+    ],
+)
+def test_launcher_client_preserves_deadline_expiry_identity(transport_error):
+    class DeadlineTransport(FakeTransport):
+        def inspect(self, run_id, *, deadline_at=None):
+            raise transport_error
+
+    client = LauncherClient(DeadlineTransport())
+
+    with pytest.raises(LauncherClientError) as captured:
+        client.inspect(
+            "run-1",
+            request_deadline_at="2099-01-01T00:00:00Z",
+        )
+
+    assert isinstance(captured.value, LauncherDeadlineExceededError)
+
+
+def test_launcher_prepare_preserves_deadline_expiry_from_inspection():
+    class DeadlineTransport(FakeTransport):
+        def inspect(self, run_id, *, deadline_at=None):
+            raise LauncherDeadlineExceededError(
+                "sandbox execution deadline expired"
+            )
+
+    client = LauncherClient(DeadlineTransport())
+
+    with pytest.raises(LauncherDeadlineExceededError):
+        client.prepare(
+            "run-1",
+            agent_version="agent-v1",
+            checkpoint_key="runtime",
+            deadline_at="2099-01-01T00:00:00Z",
+            execution_deadline_at="2098-12-31T23:59:00Z",
+            snapshot_id="snapshot-1",
+            snapshot_digest="a" * 64,
+            gateway_url="http://api:8000/internal/runner",
+            run_token="secret-token",
+        )
+
+
+@pytest.mark.parametrize("failure_point", ["create", "inspect"])
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        TimeoutError("Sandbox Launcher deadline expired"),
+        httpx.ReadTimeout(
+            "Sandbox Launcher deadline expired",
+            request=httpx.Request("POST", "http://launcher/runs/run-1/container"),
+        ),
+        httpx.HTTPStatusError(
+            "Gateway Timeout",
+            request=httpx.Request("POST", "http://launcher/runs/run-1/container"),
+            response=httpx.Response(
+                504,
+                request=httpx.Request(
+                    "POST", "http://launcher/runs/run-1/container"
+                ),
+            ),
+        ),
+    ],
+)
+def test_launcher_prepare_translates_transport_deadline_expiry(
+    failure_point,
+    transport_error,
+):
+    class DeadlineTransport(FakeTransport):
+        def create(self, run_id, workspace_path, execution, *, deadline_at=None):
+            if failure_point == "create":
+                raise transport_error
+            return super().create(
+                run_id,
+                workspace_path,
+                execution,
+                deadline_at=deadline_at,
+            )
+
+        def inspect(self, run_id, *, deadline_at=None):
+            if failure_point == "inspect":
+                raise transport_error
+            return super().inspect(run_id, deadline_at=deadline_at)
+
+    client = LauncherClient(DeadlineTransport())
+
+    with pytest.raises(LauncherDeadlineExceededError):
+        client.prepare(
+            "run-1",
+            agent_version="agent-v1",
+            checkpoint_key="runtime",
+            deadline_at="2099-01-01T00:00:00Z",
+            execution_deadline_at="2098-12-31T23:59:00Z",
+            snapshot_id="snapshot-1",
+            snapshot_digest="a" * 64,
+            gateway_url="http://api:8000/internal/runner",
+            run_token="secret-token",
+        )
 
 
 def test_launcher_prepare_enforces_execution_deadline_during_slow_response():

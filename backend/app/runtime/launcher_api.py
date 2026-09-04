@@ -56,7 +56,7 @@ def create_launcher_app(launcher: Any, *, runner_token: str) -> FastAPI:
             or datetime.now(UTC) >= deadline_at
         ):
             raise HTTPException(
-                status_code=503,
+                status_code=504,
                 detail="Sandbox execution deadline expired",
             )
 

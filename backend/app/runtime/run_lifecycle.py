@@ -13,7 +13,11 @@ from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.conversations.models import AgentRun, RunEvent
 from app.conversations.repository import ConversationRepository
 
-from .workflow_runner import RunnerUnavailableError, WorkflowRunnerClient
+from .workflow_runner import (
+    RunnerDeadlineExceededError,
+    RunnerUnavailableError,
+    WorkflowRunnerClient,
+)
 
 _TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 _NON_STARTABLE_STATUSES = _TERMINAL_STATUSES | {"waiting_approval"}
@@ -122,10 +126,14 @@ class SandboxRunCoordinator:
                     continue
                 self._apply_container_status(run_id, status)
                 return
-        except RunnerUnavailableError:
+        except RunnerUnavailableError as error:
             if (
                 watchdog_deadline is not None
-                and self.monotonic() >= watchdog_deadline
+                and (
+                    isinstance(error, RunnerDeadlineExceededError)
+                    or self.monotonic() >= watchdog_deadline
+                    or self.clock() >= execution_deadline_at
+                )
             ):
                 timeout_control_deadline = self._timeout_run(
                     run_id,
@@ -134,7 +142,8 @@ class SandboxRunCoordinator:
             else:
                 self._finish(run_id, "failed", "launcher_unavailable")
         finally:
-            self._revoke_for_terminal_run(run_id)
+            if timeout_control_deadline is None:
+                self._revoke_for_terminal_run(run_id)
             self._cleanup(
                 run_id,
                 monotonic_deadline=timeout_control_deadline,
@@ -195,8 +204,12 @@ class SandboxRunCoordinator:
                     continue
                 self._apply_container_status(run_id, status)
                 return
-        except RunnerUnavailableError:
-            if self.monotonic() >= watchdog_deadline:
+        except RunnerUnavailableError as error:
+            if (
+                isinstance(error, RunnerDeadlineExceededError)
+                or self.monotonic() >= watchdog_deadline
+                or self.clock() >= execution_deadline_at
+            ):
                 timeout_control_deadline = self._timeout_run(
                     run_id,
                     watchdog_deadline,
@@ -204,7 +217,8 @@ class SandboxRunCoordinator:
             else:
                 self._finish(run_id, "failed", "launcher_unavailable")
         finally:
-            self._revoke_for_terminal_run(run_id)
+            if timeout_control_deadline is None:
+                self._revoke_for_terminal_run(run_id)
             self._cleanup(
                 run_id,
                 monotonic_deadline=timeout_control_deadline,
@@ -511,9 +525,7 @@ class SandboxRunCoordinator:
     def _timeout_run(self, run_id: str, watchdog_deadline: float) -> float:
         self._finish(run_id, "failed", "sandbox_timeout")
         self._revoke_for_terminal_run(run_id)
-        control_deadline = (
-            watchdog_deadline + _TIMEOUT_CONTROL_ALLOWANCE_SECONDS
-        )
+        control_deadline = self.monotonic() + _TIMEOUT_CONTROL_ALLOWANCE_SECONDS
         self._terminate_safely(
             run_id,
             monotonic_deadline=control_deadline,

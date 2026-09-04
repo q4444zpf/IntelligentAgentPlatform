@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+import hashlib
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from sqlalchemy import create_engine, select
@@ -28,7 +29,17 @@ from app.identity.models import (
     UnitMembership,
     User,
 )
+from app.identity.schemas import AuthorizationContext, PermissionGrant
 from app.runtime.checkpoint_store import RuntimeCheckpoint
+from app.runtime.execution_snapshot import (
+    ExecutionSnapshotPayload,
+    PublishedTeamSnapshot,
+    RuntimeExecutionSnapshot,
+    SnapshotModelSelection,
+    SnapshotRuntimeLimits,
+    SnapshotTeamMember,
+    canonical_snapshot_bytes,
+)
 from app.runtime.model_gateway import ModelResult, ModelSelection
 from app.tools.builtins import BUILTIN_TOOL_DEFINITIONS
 from app.tools.schemas import ToolCall, ToolExecutionResult, ToolRuntimeError
@@ -513,6 +524,168 @@ def test_team_approval_resume_rechecks_current_membership_before_side_effect(
             )
         )
         assert error.payload["code"] == "tool_not_authorized"
+    assert executed == []
+
+
+def test_expired_team_approval_resume_stops_before_external_tool(
+    tmp_path,
+    monkeypatch,
+):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'expired-team-approval.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    created_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+    with factory.begin() as session:
+        conversation = Conversation(
+            unit_id="unit-1",
+            project_id="p-tool",
+            owner_id="u-tool",
+            title="过期团队审批",
+        )
+        session.add(conversation)
+        session.flush()
+        message = Message(
+            conversation_id=conversation.id,
+            role="user",
+            content="执行控制操作",
+        )
+        session.add(message)
+        session.flush()
+        run = AgentRun(
+            conversation_id=conversation.id,
+            trigger_message_id=message.id,
+            actor_type="team",
+            actor_id="team-1",
+            actor_version_id="team-version-1",
+            actor_roles_json=["business_operator"],
+            status="queued",
+        )
+        session.add(run)
+        session.flush()
+        invocation = ToolInvocation(
+            run_id=run.id,
+            tool_call_id="expired-team-approval-call",
+            tool_id="system.get_current_time",
+            tool_version="1.0.0",
+            status="waiting_approval",
+            arguments_summary={},
+        )
+        session.add(invocation)
+        session.flush()
+        approval = Approval(
+            run_id=run.id,
+            invocation_id=invocation.id,
+            tool_id=invocation.tool_id,
+            tool_version=invocation.tool_version,
+            unit_id="unit-1",
+            project_id="p-tool",
+            requester_id="u-tool",
+            requester_roles=["business_operator"],
+            assignee_role="project_admin",
+            risk_level="high",
+            arguments_summary={},
+            arguments_digest=arguments_digest({}),
+            status="approved",
+            expires_at=datetime(2098, 1, 1, tzinfo=timezone.utc),
+        )
+        session.add(approval)
+        session.flush()
+        model = SnapshotModelSelection(provider_id="provider-1", model="model-1")
+        supervisor = SnapshotTeamMember(
+            agent_id="supervisor",
+            role="supervisor",
+            responsibility="coordinate",
+        )
+        member = SnapshotTeamMember(
+            agent_id="member-1",
+            role="member",
+            responsibility="operate",
+        )
+        actor = PublishedTeamSnapshot(
+            id="team-1",
+            version_id="team-version-1",
+            version=1,
+            definition_digest="d" * 64,
+            supervisor=supervisor,
+            members=(member,),
+            max_steps=2,
+            max_parallel_members=1,
+            timeout_seconds=60,
+            failure_strategy="fail_fast",
+            name="Team",
+            description="",
+            runtime_form="common",
+            language="zh-CN",
+            system_prompt="",
+            context_prompt="",
+            approval_policy="always",
+        )
+        payload = ExecutionSnapshotPayload(
+            schema_version="5",
+            snapshot_id="expired-team-snapshot",
+            run_id=run.id,
+            unit_id="unit-1",
+            project_id="p-tool",
+            user_id="u-tool",
+            actor=actor,
+            model=model,
+            messages=(),
+            limits=SnapshotRuntimeLimits(snapshot_max_bytes=1_048_576),
+            created_at=created_at,
+        )
+        session.add(
+            RuntimeExecutionSnapshot(
+                snapshot_id=payload.snapshot_id,
+                run_id=run.id,
+                digest=hashlib.sha256(canonical_snapshot_bytes(payload)).hexdigest(),
+                payload=payload.model_dump(mode="json"),
+                created_at=created_at,
+                expires_at=None,
+            )
+        )
+        approval_id = approval.id
+        run_id = run.id
+        invocation_id = invocation.id
+
+    authorization = AuthorizationContext(
+        session_id="current",
+        user_id="u-tool",
+        unit_id="unit-1",
+        current_project_id="p-tool",
+        auth_method="local",
+        authorization_version=1,
+        role_codes=("business_operator",),
+        grants=(
+            PermissionGrant("tool.invoke", "project", frozenset({"p-tool"}), None),
+        ),
+    )
+    monkeypatch.setattr(
+        "app.conversations.dispatcher.AuthorizationRepository.load_current_context",
+        lambda *_args, **_kwargs: authorization,
+    )
+    executed = []
+
+    def record_approved_tool(self, current_approval_id, context, **_kwargs):
+        executed.append((current_approval_id, context))
+        return ToolExecutionResult(invocation_id, {"executed": True})
+
+    monkeypatch.setattr(
+        "app.conversations.dispatcher.ToolGateway.execute_approved",
+        record_approved_tool,
+    )
+
+    assert _execute_approved_tool(factory, approval_id) is None
+    with factory() as session:
+        assert session.get(AgentRun, run_id).status == "failed"
+        assert session.get(ToolInvocation, invocation_id).status == "waiting_approval"
+        error = session.scalar(
+            select(RunEvent).where(
+                RunEvent.run_id == run_id,
+                RunEvent.event_type == "run.error",
+            )
+        )
+        assert error.payload["code"] == "sandbox_timeout"
     assert executed == []
 
 

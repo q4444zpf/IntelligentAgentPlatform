@@ -7,7 +7,11 @@ from typing import Any
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-from app.runtime.launcher_client import LauncherClientError, launcher_client_from_env
+from app.runtime.launcher_client import (
+    LauncherClientError,
+    LauncherDeadlineExceededError,
+    launcher_client_from_env,
+)
 from app.runtime.sandbox_inspector import SandboxInspector
 from app.runtime.sandbox_readiness import SandboxReadiness
 
@@ -72,6 +76,11 @@ def create_runner_app(*, sandbox_enabled: bool = False, readiness: SandboxReadin
                     run_token=request.run_token,
                     request_deadline_at=request_deadline_at.isoformat(),
                 )
+            except LauncherDeadlineExceededError as exc:
+                raise HTTPException(
+                    status_code=504,
+                    detail="Sandbox execution deadline expired",
+                ) from exc
             except LauncherClientError as exc:
                 raise HTTPException(status_code=503, detail=str(exc)) from exc
         return {"run_id": request.run_id, "status": "accepted"}
@@ -81,6 +90,11 @@ def create_runner_app(*, sandbox_enabled: bool = False, readiness: SandboxReadin
             raise HTTPException(status_code=503, detail="Sandbox Executor is not enabled")
         try:
             return operation()
+        except LauncherDeadlineExceededError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail="Sandbox execution deadline expired",
+            ) from exc
         except LauncherClientError as exc:
             raise HTTPException(status_code=503, detail="Sandbox launcher is unavailable") from exc
 
@@ -98,7 +112,7 @@ def create_runner_app(*, sandbox_enabled: bool = False, readiness: SandboxReadin
             or datetime.now(UTC) >= deadline_at
         ):
             raise HTTPException(
-                status_code=503,
+                status_code=504,
                 detail="Sandbox execution deadline expired",
             )
         return deadline_at.astimezone(UTC)

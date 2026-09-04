@@ -22,6 +22,11 @@ from app.conversations.repository import ConversationRepository
 from app.mcp.protocol import McpProtocolClient, McpProtocolError
 from app.mcp.store import McpStore
 from app.mcp.credential_resolver import McpCredentialResolver, CredentialNotFoundError, CredentialScopeError
+from app.runtime.execution_snapshot import (
+    ExecutionSnapshotService,
+    SnapshotIntegrityError,
+    team_execution_deadline,
+)
 
 from .builtins import BUILTIN_EXECUTORS
 from .schemas import ToolCall, ToolExecutionContext, ToolExecutionResult, ToolRuntimeError
@@ -31,6 +36,7 @@ _SENSITIVE_KEY = re.compile(r"authorization|api_?key|token|secret|password|crede
 _REDACTED = "[REDACTED]"
 _TRUNCATED = "[TRUNCATED]"
 _APPROVED_TOOL_RUN_STATUSES = frozenset({"queued", "waiting_approval"})
+_TERMINAL_FENCE_ERROR_CODES = frozenset({"run_not_active", "sandbox_timeout"})
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +189,28 @@ class ToolGateway:
             invocation.run_id,
             allowed_statuses=allowed_run_statuses,
         )
+        if status == "completed":
+            try:
+                snapshot = ExecutionSnapshotService(
+                    self.repository.session,
+                    None,
+                    self.repository,
+                ).get_for_run(invocation.run_id)
+            except SnapshotIntegrityError as snapshot_error:
+                raise ToolRuntimeError(
+                    "sandbox_timeout",
+                    "沙箱任务执行超时",
+                ) from snapshot_error
+            deadline = (
+                team_execution_deadline(snapshot)
+                if snapshot is not None
+                else None
+            )
+            if deadline is not None and self.clock() >= deadline:
+                raise ToolRuntimeError(
+                    "sandbox_timeout",
+                    "沙箱任务执行超时",
+                )
         invocation.status = status
         invocation.duration_ms = duration_ms
         invocation.completed_at = datetime.now(timezone.utc)
@@ -256,7 +284,7 @@ class ToolGateway:
             return True
         except ToolRuntimeError as persistence_error:
             self._rollback_safely()
-            if persistence_error.code == "run_not_active":
+            if persistence_error.code in _TERMINAL_FENCE_ERROR_CODES:
                 raise
         except Exception:
             self._rollback_safely()
@@ -273,7 +301,7 @@ class ToolGateway:
             )
         except ToolRuntimeError as persistence_error:
             self._rollback_safely()
-            if persistence_error.code == "run_not_active":
+            if persistence_error.code in _TERMINAL_FENCE_ERROR_CODES:
                 raise
         except Exception:
             self._rollback_safely()
@@ -306,7 +334,7 @@ class ToolGateway:
             self._rollback_safely()
             if (
                 isinstance(database_error, ToolRuntimeError)
-                and database_error.code == "run_not_active"
+                and database_error.code in _TERMINAL_FENCE_ERROR_CODES
             ):
                 raise
             if self._compensate_failed_completion(

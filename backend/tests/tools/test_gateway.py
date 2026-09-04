@@ -1,3 +1,4 @@
+import hashlib
 import logging
 from datetime import datetime, timezone
 
@@ -13,6 +14,15 @@ from app.conversations.models import AgentRun, Conversation, Message, RunEvent, 
 from app.conversations.repository import ConversationRepository
 from app.db.base import Base
 from app.db.platform_models import RegisteredToolRecord
+from app.runtime.execution_snapshot import (
+    ExecutionSnapshotPayload,
+    PublishedTeamSnapshot,
+    RuntimeExecutionSnapshot,
+    SnapshotModelSelection,
+    SnapshotRuntimeLimits,
+    SnapshotTeamMember,
+    canonical_snapshot_bytes,
+)
 from app.tools.builtins import BUILTIN_EXECUTORS, BUILTIN_TOOL_DEFINITIONS
 from app.tools.gateway import ToolGateway
 from app.tools.schemas import ToolCall, ToolExecutionContext, ToolRuntimeError
@@ -413,6 +423,145 @@ def test_approved_tool_finishing_after_terminal_run_commits_no_terminal_state(
     assert external_transaction_state == [False]
     assert invocation.status == "started"
     assert [event.event_type for event in events] == [
+        "approval.requested",
+        "run.status",
+        "tool.started",
+    ]
+    assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
+
+
+def test_approved_team_tool_crossing_execution_deadline_commits_no_success(
+    runtime,
+    monkeypatch,
+):
+    factory, store = runtime
+    created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    current_time = [created_at.replace(minute=0, second=30)]
+    with factory.begin() as db:
+        tool = db.get(RegisteredToolRecord, "system.get_current_time")
+        tool.requires_approval = True
+        tool.risk_level = "high"
+        run = db.get(AgentRun, "run-1")
+        run.actor_type = "team"
+        run.actor_id = "team-1"
+        run.actor_version_id = "team-version-1"
+        member = SnapshotTeamMember(
+            agent_id="member-1",
+            role="member",
+            responsibility="operate",
+        )
+        actor = PublishedTeamSnapshot(
+            id="team-1",
+            version_id="team-version-1",
+            version=1,
+            definition_digest="d" * 64,
+            supervisor=SnapshotTeamMember(
+                agent_id="supervisor",
+                role="supervisor",
+                responsibility="coordinate",
+            ),
+            members=(member,),
+            max_steps=2,
+            max_parallel_members=1,
+            timeout_seconds=60,
+            failure_strategy="fail_fast",
+            name="Team",
+            description="",
+            runtime_form="common",
+            language="zh-CN",
+            system_prompt="",
+            context_prompt="",
+            approval_policy="always",
+        )
+        payload = ExecutionSnapshotPayload(
+            schema_version="5",
+            snapshot_id="team-deadline-snapshot",
+            run_id=run.id,
+            unit_id="unit-1",
+            project_id="project-1",
+            user_id="user-1",
+            actor=actor,
+            model=SnapshotModelSelection(
+                provider_id="provider-1",
+                model="model-1",
+            ),
+            messages=(),
+            limits=SnapshotRuntimeLimits(snapshot_max_bytes=1_048_576),
+            created_at=created_at,
+        )
+        db.add(
+            RuntimeExecutionSnapshot(
+                snapshot_id=payload.snapshot_id,
+                run_id=run.id,
+                digest=hashlib.sha256(
+                    canonical_snapshot_bytes(payload)
+                ).hexdigest(),
+                payload=payload.model_dump(mode="json"),
+                created_at=created_at,
+                expires_at=None,
+            )
+        )
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time[0],
+    )
+    with pytest.raises(ToolRuntimeError) as approval_required:
+        execute(gateway)
+    assert approval_required.value.code == "approval_required"
+    approval = session.scalar(select(Approval))
+    from app.approvals.service import ApprovalService
+    from app.core.request_context import RequestContext
+
+    ApprovalService(session, clock=lambda: current_time[0]).approve(
+        approval.id,
+        RequestContext(
+            user_id="reviewer",
+            unit_id="unit-1",
+            project_id="project-1",
+            roles=frozenset({"project_admin"}),
+        ),
+    )
+    session.get(AgentRun, "run-1").status = "queued"
+    session.commit()
+
+    external_calls = []
+    original = BUILTIN_EXECUTORS["system.get_current_time"]
+
+    def cross_deadline(arguments, execution_context, clock):
+        external_calls.append((arguments, execution_context.run_id))
+        current_time[0] = created_at.replace(minute=1, second=1)
+        return original(arguments, execution_context, clock)
+
+    monkeypatch.setitem(
+        BUILTIN_EXECUTORS,
+        "system.get_current_time",
+        cross_deadline,
+    )
+
+    with pytest.raises(ToolRuntimeError) as caught:
+        gateway.execute_approved(approval.id, context())
+
+    session.expire_all()
+    invocation = session.scalar(select(ToolInvocation))
+    run_events = list(
+        session.scalars(select(RunEvent).where(RunEvent.run_id == "run-1"))
+    )
+    tool_audits = list(
+        session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.run_id == "run-1",
+                AuditEvent.action.like("tool.invoke.%"),
+            )
+        )
+    )
+    assert caught.value.code == "sandbox_timeout"
+    assert external_calls == [({}, "run-1")]
+    assert invocation.status == "started"
+    assert invocation.result_summary is None
+    assert [event.event_type for event in run_events] == [
         "approval.requested",
         "run.status",
         "tool.started",
