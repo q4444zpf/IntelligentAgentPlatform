@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
@@ -527,6 +527,54 @@ def test_completion_commits_final_message_status_and_artifact_references_once():
     ]
 
 
+def test_team_success_before_deadline_commits_guarded_status_and_result(
+    monkeypatch,
+):
+    from app.runtime import runner_gateway_service as service_module
+
+    snapshot = build_team_snapshot(timeout_seconds=60)
+
+    class BeforeDeadlineDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return snapshot.created_at + timedelta(seconds=30)
+
+    monkeypatch.setattr(service_module, "datetime", BeforeDeadlineDatetime)
+    client, repository, _store, _token_service = build_client(snapshot)
+
+    response = client.post(
+        "/internal/runner/runs/run-1/completion",
+        headers=idempotent("completion:team-before-deadline"),
+        json={
+            "status": "completed",
+            "final_assistant_content": "on-time Team result",
+        },
+    )
+
+    assert response.status_code == 200
+    assert repository.get_run_by_id("run-1").status == "completed"
+    assert [event.event_type for event in repository.list_events("run-1", 0)] == [
+        "runner.completion",
+        "run.status",
+    ]
+    assert repository.session.scalar(
+        select(func.count())
+        .select_from(RuntimeRunnerRequest)
+        .where(RuntimeRunnerRequest.run_id == "run-1")
+    ) == 1
+    assert [
+        (message.role, message.content)
+        for message in repository.session.scalars(
+            select(Message)
+            .where(Message.conversation_id == "conversation-1")
+            .order_by(Message.sequence)
+        )
+    ] == [
+        ("user", "test"),
+        ("assistant", "on-time Team result"),
+    ]
+
+
 def test_expired_team_success_is_rejected_at_locked_gateway_boundary(monkeypatch):
     from app.runtime import runner_gateway_service as service_module
 
@@ -601,6 +649,66 @@ def test_team_success_crossing_deadline_during_completion_writes_rolls_back(
     assert response.json()["code"] == "sandbox_timeout"
     assert repository.get_run_by_id("run-1").status == "running"
     assert repository.list_events("run-1", 0) == []
+    assert [
+        message.role
+        for message in repository.session.scalars(
+            select(Message).where(Message.conversation_id == "conversation-1")
+        )
+    ] == ["user"]
+
+
+def test_team_success_crossing_deadline_immediately_before_commit_rolls_back(
+    monkeypatch,
+):
+    from app.runtime import runner_gateway_service as service_module
+
+    snapshot = build_team_snapshot(timeout_seconds=60)
+    current_time = [snapshot.created_at + timedelta(seconds=59)]
+
+    class MutableDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return current_time[0]
+
+    monkeypatch.setattr(service_module, "datetime", MutableDatetime)
+    client, repository, _store, _token_service = build_client(snapshot)
+    crossed_at_commit = []
+
+    def cross_before_completion_commit(_session):
+        current_time[0] = snapshot.created_at + timedelta(seconds=61)
+        crossed_at_commit.append(True)
+
+    event.listen(
+        repository.session,
+        "before_commit",
+        cross_before_completion_commit,
+    )
+    try:
+        response = client.post(
+            "/internal/runner/runs/run-1/completion",
+            headers=idempotent("completion:crossed-before-commit"),
+            json={
+                "status": "completed",
+                "final_assistant_content": "late Team result",
+            },
+        )
+    finally:
+        event.remove(
+            repository.session,
+            "before_commit",
+            cross_before_completion_commit,
+        )
+
+    assert crossed_at_commit == [True]
+    assert response.status_code == 409
+    assert response.json()["code"] == "sandbox_timeout"
+    assert repository.get_run_by_id("run-1").status == "running"
+    assert repository.list_events("run-1", 0) == []
+    assert repository.session.scalar(
+        select(func.count())
+        .select_from(RuntimeRunnerRequest)
+        .where(RuntimeRunnerRequest.run_id == "run-1")
+    ) == 0
     assert [
         message.role
         for message in repository.session.scalars(

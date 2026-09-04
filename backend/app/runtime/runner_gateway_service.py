@@ -43,6 +43,10 @@ from .checkpoint_store import (
     RunnerRequestStore,
     is_runner_gateway_reserved_checkpoint,
 )
+from .deadline_commit import (
+    DeadlineCommitExpired,
+    commit_status_transition_before_deadline,
+)
 from .execution_snapshot import (
     ExecutionSnapshotService,
     PublishedTeamSnapshot,
@@ -1198,6 +1202,8 @@ class RunnerGatewayService:
                 "Run 正在等待审批",
             )
         deadline = team_execution_deadline(snapshot)
+        commit_guarded = request.status == "completed" and deadline is not None
+        expected_status = run.status
         if (
             request.status == "completed"
             and deadline is not None
@@ -1257,7 +1263,8 @@ class RunnerGatewayService:
             },
         )
         if run.status != target_status:
-            run.status = target_status
+            if not commit_guarded:
+                run.status = target_status
             repository.append_event(
                 run_id,
                 "run.status",
@@ -1288,7 +1295,25 @@ class RunnerGatewayService:
                 "sandbox_timeout",
                 "Team 执行已超过截止时间",
             )
-        repository.session.commit()
+        if commit_guarded:
+            try:
+                commit_status_transition_before_deadline(
+                    repository.session,
+                    record=run,
+                    expected_status=expected_status,
+                    target_status=target_status,
+                    deadline=deadline,
+                    clock=lambda: datetime.now(UTC),
+                )
+            except DeadlineCommitExpired:
+                repository.session.rollback()
+                raise RunnerGatewayError(
+                    409,
+                    "sandbox_timeout",
+                    "Team 执行已超过截止时间",
+                ) from None
+        else:
+            repository.session.commit()
         return response
 
     def list_artifacts(

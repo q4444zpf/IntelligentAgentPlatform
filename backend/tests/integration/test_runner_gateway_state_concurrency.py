@@ -5,7 +5,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import create_engine, delete, event, func, select, text
@@ -182,6 +182,7 @@ def _team_snapshot(
     run_id: str,
     *,
     created_at: datetime | None = None,
+    timeout_seconds: int = 60,
 ) -> StoredExecutionSnapshot:
     created_at = created_at or datetime(2026, 9, 4, 10, 0, tzinfo=UTC)
     model = SnapshotModelSelection(
@@ -220,7 +221,7 @@ def _team_snapshot(
         members=(member("forecast", "member"),),
         max_steps=2,
         max_parallel_members=1,
-        timeout_seconds=60,
+        timeout_seconds=timeout_seconds,
         failure_strategy="fail_fast",
         name="Integration Team",
         description="",
@@ -857,6 +858,83 @@ def test_team_completion_rechecks_deadline_after_blocked_post_write_flush(
     assert completion_error.status_code == 409
     assert completion_error.code == "sandbox_timeout"
 
+    with factory() as verification:
+        assert verification.get(AgentRun, run_id).status == "running"
+        assert verification.scalar(
+            select(func.count())
+            .select_from(RuntimeRunnerRequest)
+            .where(RuntimeRunnerRequest.run_id == run_id)
+        ) == 0
+        assert verification.scalar(
+            select(func.count())
+            .select_from(RunEvent)
+            .where(RunEvent.run_id == run_id)
+        ) == 0
+        assert verification.scalar(
+            select(func.count())
+            .select_from(Message)
+            .where(Message.run_id == run_id)
+        ) == 0
+
+
+def test_team_completion_uses_database_time_at_commit_boundary(
+    state_race_environment,
+    monkeypatch,
+):
+    from app.runtime import runner_gateway_service as service_module
+
+    factory, run_id, _agent_snapshot, _agent_claims = state_race_environment
+    with factory() as clock_session:
+        created_at = clock_session.scalar(select(func.clock_timestamp()))
+    snapshot = _team_snapshot(
+        run_id,
+        created_at=created_at,
+        timeout_seconds=5,
+    )
+    claims = _claims(snapshot)
+    application_time = created_at.replace(microsecond=0)
+    deadline = created_at + timedelta(seconds=5)
+    slept_past_database_deadline = []
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return application_time
+
+    monkeypatch.setattr(service_module, "datetime", FrozenDatetime)
+
+    def sleep_past_deadline(session):
+        before_sleep = session.scalar(select(func.clock_timestamp()))
+        assert before_sleep < deadline
+        session.execute(
+            text("SELECT pg_sleep(:delay_seconds)"),
+            {
+                "delay_seconds": (
+                    deadline - before_sleep
+                ).total_seconds() + 0.25
+            },
+        )
+        slept_past_database_deadline.append(True)
+
+    with factory() as session:
+        event.listen(session, "before_commit", sleep_past_deadline)
+        try:
+            with pytest.raises(RunnerGatewayError) as captured:
+                _service(session, snapshot).complete(
+                    run_id,
+                    CompletionRequest(
+                        status="completed",
+                        final_assistant_content="late database-time Team result",
+                    ),
+                    claims,
+                    f"completion:{run_id}:database-time",
+                )
+        finally:
+            event.remove(session, "before_commit", sleep_past_deadline)
+
+    assert slept_past_database_deadline == [True]
+    assert captured.value.status_code == 409
+    assert captured.value.code == "sandbox_timeout"
     with factory() as verification:
         assert verification.get(AgentRun, run_id).status == "running"
         assert verification.scalar(

@@ -332,10 +332,11 @@ classification.
 
 - `.superpowers/sdd/2026-09-01-published-team-review-remediation/final-review-fix3-report.md`
 
-This is the complete 23-file commit scope: 11 production files, 11 test files,
-and this report. Virtual environments, downloaded dependencies, basetemps,
-logs, XML, build output, and all other pre-existing untracked artifacts were
-excluded.
+This is the complete initial `75da991` commit scope: 11 production files,
+11 test files, and this report. Virtual environments, downloaded dependencies,
+basetemps, logs, XML, build output, and all other pre-existing untracked
+artifacts were excluded. Later fix rounds expand the final committed union
+enumerated at the end of this report.
 
 ## Verification
 
@@ -564,3 +565,190 @@ Final post-review affected aggregate:
 
 Result: `247 passed, 2 skipped in 219.31s`, zero failures. The only skips are
 the same Windows file-symlink and directory-symlink capability skips.
+
+## Fix Round 2
+
+### Investigation
+
+- Round 1 flushed every successful completion write and then rechecked the
+  application clock, but `Session.commit()` remained a separate operation.
+  A Team deadline could therefore cross after the last check and before the
+  terminal transaction committed.
+- SQLAlchemy invokes `before_commit` for nested savepoint commits as well as
+  the root transaction. Tool audit persistence uses `begin_nested()`, so the
+  deterministic Tool regression ignores nested commits and advances its clock
+  only at the root terminal commit.
+- PostgreSQL `CURRENT_TIMESTAMP` and `now()` are transaction-start values.
+  They cannot detect a deadline crossed while the transaction is open; the
+  final predicate must use advancing `clock_timestamp()`.
+
+### RED evidence
+
+Local root-commit boundary command, run before production changes on
+`b0c94b0`:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -p no:cacheprovider backend/tests/runtime/test_runner_gateway_state.py::test_team_success_crossing_deadline_immediately_before_commit_rolls_back "backend/tests/tools/test_gateway.py::test_team_tool_terminal_boundary_crossing_deadline_commits_no_success[before_commit]" --basetemp=backend/.tmp-final-review-fix3-round2-local-red-20260904-b
+```
+
+Result: `2 failed in 2.91s`. Runner completion returned HTTP 200 instead of
+409, and successful Tool persistence did not raise `sandbox_timeout`; both
+terminal successes committed after the test's root `before_commit` listener
+advanced the application clock beyond the immutable Team deadline.
+
+Live PostgreSQL database-clock command, also run before production changes:
+
+```powershell
+$env:PATH = "I:\智能体平台\IntelligentAgentPlatform\.worktrees\published-team-foundation\.testvenv-task5\Scripts;$env:PATH"
+& .\backend\tests\support\run_postgres_tests.ps1 -PytestPath 'backend/tests/integration/test_runner_gateway_state_concurrency.py::test_team_completion_uses_database_time_at_commit_boundary'
+```
+
+Result: `1 failed in 9.11s`, zero skips. A root `before_commit` listener read
+`clock_timestamp()`, slept until 250 ms beyond the five-second Team deadline,
+and the frozen application clock remained before the deadline; completion
+still did not raise. The disposable wrapper reported the expected failed test
+and removed its PostgreSQL container.
+
+### Implementation
+
+- `backend/app/runtime/deadline_commit.py` provides the shared one-commit
+  guard. It installs a per-session `before_commit` listener, performs a
+  conditional status transition, requires exactly one updated row, and removes
+  the listener in `finally` on both success and failure.
+- PostgreSQL accepts the terminal transition only when
+  `clock_timestamp() < :deadline`. SQLite and other local dialects use the
+  existing injected/application clock as a bound boolean predicate, preserving
+  deterministic historical fixtures.
+- Successful Team completion leaves `AgentRun.status` at its prior committed
+  value while the assistant message, completion/status events, and
+  `RuntimeRunnerRequest` idempotency row flush. The guarded update performs the
+  only transition to `completed`; a zero-row result rolls the transaction back
+  and returns HTTP 409 `sandbox_timeout`.
+- Successful Team Tool persistence likewise leaves `ToolInvocation.status` at
+  `started` while result fields, the terminal event, and success audit flush.
+  Its guarded update performs the only transition to `completed`; expiry rolls
+  back those writes, preserves the previously committed started state, and
+  raises `ToolRuntimeError("sandbox_timeout", ...)` without compensation.
+
+### GREEN evidence
+
+Exact local boundary rerun, including the retained during-flush Tool case:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -p no:cacheprovider backend/tests/runtime/test_runner_gateway_state.py::test_team_success_crossing_deadline_immediately_before_commit_rolls_back "backend/tests/tools/test_gateway.py::test_team_tool_terminal_boundary_crossing_deadline_commits_no_success[before_commit]" "backend/tests/tools/test_gateway.py::test_team_tool_terminal_boundary_crossing_deadline_commits_no_success[after_flush]" --basetemp=backend/.tmp-final-review-fix3-round2-local-green-20260904-a
+```
+
+Result: `3 passed in 4.54s`.
+
+Successful completion and terminal-persistence compatibility command:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -p no:cacheprovider backend/tests/runtime/test_runner_gateway_state.py::test_completion_commits_final_message_status_and_artifact_references_once backend/tests/tools/test_gateway.py::test_records_tool_started_and_succeeded_with_context_and_parent backend/tests/tools/test_gateway.py::test_success_persists_invocation_and_ordered_safe_events --basetemp=backend/.tmp-final-review-fix3-round2-success-paths-green-20260904-a
+```
+
+Result: `3 passed in 3.60s`.
+
+Direct guarded Team success and deadline-boundary command:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -p no:cacheprovider backend/tests/runtime/test_runner_gateway_state.py::test_team_success_before_deadline_commits_guarded_status_and_result backend/tests/runtime/test_runner_gateway_state.py::test_team_success_crossing_deadline_immediately_before_commit_rolls_back backend/tests/tools/test_gateway.py::test_team_tool_terminal_success_before_deadline_commits_result "backend/tests/tools/test_gateway.py::test_team_tool_terminal_boundary_crossing_deadline_commits_no_success[before_commit]" "backend/tests/tools/test_gateway.py::test_team_tool_terminal_boundary_crossing_deadline_commits_no_success[after_flush]" --basetemp=backend/.tmp-final-review-fix3-round2-positive-boundary-green-20260904-a
+```
+
+Result: `5 passed in 5.97s`. The two positive cases exercise the guarded
+`rowcount == 1` transitions and confirm that the same session observes the
+committed Team Run and Tool statuses.
+
+Initial directly affected local-module run before adding the two positive
+guarded-transition cases:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -rs -p no:cacheprovider backend/tests/runtime/test_runner_gateway_state.py backend/tests/tools/test_gateway.py --basetemp=backend/.tmp-final-review-fix3-round2-core-modules-green-20260904-a
+```
+
+Result: `53 passed in 51.22s`.
+
+Live PostgreSQL focused GREEN used the same command as the live RED with the
+new implementation. Result: `1 passed in 8.41s`, zero skips, and successful
+disposable-container cleanup.
+
+Full live PostgreSQL concurrency/deadline module:
+
+```powershell
+$env:PATH = "I:\智能体平台\IntelligentAgentPlatform\.worktrees\published-team-foundation\.testvenv-task5\Scripts;$env:PATH"
+& .\backend\tests\support\run_postgres_tests.ps1 -PytestPath 'backend/tests/integration/test_runner_gateway_state_concurrency.py'
+```
+
+Result: `8 passed in 10.01s`, zero skips. The wrapper exited successfully and
+removed its disposable PostgreSQL container.
+
+Final affected aggregate, including both positive guarded-transition cases:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -rs -p no:cacheprovider backend/tests/runtime/test_launcher_client.py backend/tests/runtime/test_workflow_runner.py backend/tests/runtime/test_gateway_model.py backend/tests/runtime/test_gateway_tools.py backend/tests/runtime/test_sandbox_runtime.py backend/tests/runtime/test_runner_gateway_state.py backend/tests/integration/test_runner_gateway_execution.py backend/tests/tools/test_gateway.py backend/tests/test_agents.py --basetemp=backend/.tmp-final-review-fix3-round2-affected-final-green-20260904-a
+```
+
+Result: `251 passed, 2 skipped in 185.78s`, zero failures. The only skips are
+the expected Windows file-symlink and directory-symlink capability skips.
+
+### Changed files
+
+- `backend/app/runtime/deadline_commit.py` (new)
+- `backend/app/runtime/runner_gateway_service.py`
+- `backend/app/tools/gateway.py`
+- `backend/tests/runtime/test_runner_gateway_state.py`
+- `backend/tests/tools/test_gateway.py`
+- `backend/tests/integration/test_runner_gateway_state_concurrency.py`
+- `.superpowers/sdd/2026-09-01-published-team-review-remediation/final-review-fix3-report.md`
+
+### Residual risks and self-review
+
+- The shared PostgreSQL branch is exercised directly through Runner
+  completion, while Tool Gateway exercises the same helper through SQLite's
+  injected-clock branch. There is no separate live PostgreSQL Tool test.
+- The conditional update defines the acceptance instant immediately before the
+  physical commit. A schema-level deferred trigger would be a materially
+  broader design and still executes before PostgreSQL finalizes the commit.
+- Independent Round 2 review found no blocking correctness issue in listener
+  ordering or cleanup, status transitions, ORM synchronization, rollback,
+  nested audit transactions, compensation, or deterministic test behavior.
+  The new helper and this report must be staged explicitly; unrelated existing
+  untracked test artifacts remain excluded.
+
+## Final committed scope
+
+The authoritative range is `1365492..HEAD`, with base
+`1365492a21969959cadaebd6b6ab766b3ad4d3cf`. The implementation content head
+before this report-only amendment was
+`ad0a3b7a2d17897ab7edbe7147cb69cd4231e246`; the amendment replaces that commit
+object without changing any production or test blob. Across the initial
+implementation and both fix rounds, the range contains 28 paths: 3 added and
+25 modified, comprising 14 production files, 13 test files, and this report.
+
+- `A` `.superpowers/sdd/2026-09-01-published-team-review-remediation/final-review-fix3-report.md`
+- `M` `backend/app/agents/router.py`
+- `M` `backend/app/conversations/dispatcher.py`
+- `A` `backend/app/runtime/deadline_commit.py`
+- `M` `backend/app/runtime/execution_snapshot.py`
+- `M` `backend/app/runtime/gateway_model.py`
+- `M` `backend/app/runtime/gateway_tools.py`
+- `M` `backend/app/runtime/launcher_api.py`
+- `M` `backend/app/runtime/launcher_client.py`
+- `M` `backend/app/runtime/run_lifecycle.py`
+- `M` `backend/app/runtime/runner_gateway_service.py`
+- `M` `backend/app/runtime/sandbox_runtime.py`
+- `M` `backend/app/runtime/workflow_runner.py`
+- `M` `backend/app/runtime/workflow_runner_api.py`
+- `M` `backend/app/tools/gateway.py`
+- `M` `backend/tests/conversations/test_dispatcher.py`
+- `M` `backend/tests/integration/test_runner_gateway_execution.py`
+- `M` `backend/tests/integration/test_runner_gateway_state_concurrency.py`
+- `A` `backend/tests/integration/test_runtime_deadline_e2e.py`
+- `M` `backend/tests/runtime/test_launcher_api.py`
+- `M` `backend/tests/runtime/test_launcher_client.py`
+- `M` `backend/tests/runtime/test_run_lifecycle.py`
+- `M` `backend/tests/runtime/test_runner_gateway_state.py`
+- `M` `backend/tests/runtime/test_sandbox_runtime.py`
+- `M` `backend/tests/runtime/test_workflow_runner.py`
+- `M` `backend/tests/runtime/test_workflow_runner_api.py`
+- `M` `backend/tests/test_agents.py`
+- `M` `backend/tests/tools/test_gateway.py`

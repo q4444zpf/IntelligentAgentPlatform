@@ -27,6 +27,10 @@ from app.runtime.execution_snapshot import (
     SnapshotIntegrityError,
     team_execution_deadline,
 )
+from app.runtime.deadline_commit import (
+    DeadlineCommitExpired,
+    commit_status_transition_before_deadline,
+)
 
 from .builtins import BUILTIN_EXECUTORS
 from .schemas import ToolCall, ToolExecutionContext, ToolExecutionResult, ToolRuntimeError
@@ -212,7 +216,10 @@ class ToolGateway:
                     "sandbox_timeout",
                     "沙箱任务执行超时",
                 )
-        invocation.status = status
+        commit_guarded = status == "completed" and deadline is not None
+        expected_status = invocation.status
+        if not commit_guarded:
+            invocation.status = status
         invocation.duration_ms = duration_ms
         invocation.completed_at = datetime.now(timezone.utc)
         invocation.error_code = error.code if error is not None else None
@@ -264,7 +271,24 @@ class ToolGateway:
                 "sandbox_timeout",
                 "沙箱任务执行超时",
             )
-        self.repository.session.commit()
+        if commit_guarded:
+            try:
+                commit_status_transition_before_deadline(
+                    self.repository.session,
+                    record=invocation,
+                    expected_status=expected_status,
+                    target_status=status,
+                    deadline=deadline,
+                    clock=self.clock,
+                )
+            except DeadlineCommitExpired:
+                self.repository.session.rollback()
+                raise ToolRuntimeError(
+                    "sandbox_timeout",
+                    "沙箱任务执行超时",
+                ) from None
+        else:
+            self.repository.session.commit()
 
     def _compensate_failed_completion(
         self,

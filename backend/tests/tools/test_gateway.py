@@ -75,6 +75,71 @@ def execute(gateway, name="system.get_current_time", arguments=None, call_id="ca
     return gateway.execute(ToolCall(id=call_id, name=name, arguments=arguments or {}), execution_context or context(), authorized if authorized is not None else {name})
 
 
+def configure_team_run(runtime, *, created_at, snapshot_id):
+    factory, _store = runtime
+    with factory.begin() as db:
+        run = db.get(AgentRun, "run-1")
+        run.actor_type = "team"
+        run.actor_id = "team-1"
+        run.actor_version_id = "team-version-1"
+        member = SnapshotTeamMember(
+            agent_id="member-1",
+            role="member",
+            responsibility="operate",
+        )
+        actor = PublishedTeamSnapshot(
+            id="team-1",
+            version_id="team-version-1",
+            version=1,
+            definition_digest="d" * 64,
+            supervisor=SnapshotTeamMember(
+                agent_id="supervisor",
+                role="supervisor",
+                responsibility="coordinate",
+            ),
+            members=(member,),
+            max_steps=2,
+            max_parallel_members=1,
+            timeout_seconds=60,
+            failure_strategy="fail_fast",
+            name="Team",
+            description="",
+            runtime_form="common",
+            language="zh-CN",
+            system_prompt="",
+            context_prompt="",
+            approval_policy="never",
+        )
+        payload = ExecutionSnapshotPayload(
+            schema_version="5",
+            snapshot_id=snapshot_id,
+            run_id=run.id,
+            unit_id="unit-1",
+            project_id="project-1",
+            user_id="user-1",
+            actor=actor,
+            model=SnapshotModelSelection(
+                provider_id="provider-1",
+                model="model-1",
+            ),
+            messages=(),
+            limits=SnapshotRuntimeLimits(snapshot_max_bytes=1_048_576),
+            created_at=created_at,
+        )
+        db.add(
+            RuntimeExecutionSnapshot(
+                snapshot_id=payload.snapshot_id,
+                run_id=run.id,
+                digest=hashlib.sha256(
+                    canonical_snapshot_bytes(payload)
+                ).hexdigest(),
+                payload=payload.model_dump(mode="json"),
+                created_at=created_at,
+                expires_at=None,
+            )
+        )
+
+
 def test_records_tool_started_and_succeeded_with_context_and_parent(runtime):
     session, gateway = make_gateway(runtime)
     result = execute(gateway)
@@ -569,74 +634,68 @@ def test_approved_team_tool_crossing_execution_deadline_commits_no_success(
     assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
 
 
-def test_team_tool_terminal_flush_crossing_deadline_commits_no_success(
+def test_team_tool_terminal_success_before_deadline_commits_result(runtime):
+    factory, store = runtime
+    created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    current_time = created_at.replace(minute=0, second=30)
+    configure_team_run(
+        runtime,
+        created_at=created_at,
+        snapshot_id="team-on-time-terminal-snapshot",
+    )
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time,
+    )
+
+    result = execute(gateway)
+
+    invocation = session.scalar(select(ToolInvocation))
+    run_events = list(
+        session.scalars(select(RunEvent).where(RunEvent.run_id == "run-1"))
+    )
+    tool_audits = list(
+        session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.run_id == "run-1",
+                AuditEvent.action.like("tool.invoke.%"),
+            )
+        )
+    )
+    assert result.invocation_id == invocation.id
+    assert invocation.status == "completed"
+    assert invocation.result_summary["timezone"] == "Asia/Shanghai"
+    assert invocation.completed_at is not None
+    assert [item.event_type for item in run_events] == [
+        "tool.started",
+        "tool.completed",
+    ]
+    assert [audit.action for audit in tool_audits] == [
+        "tool.invoke.started",
+        "tool.invoke.succeeded",
+    ]
+
+
+@pytest.mark.parametrize(
+    "deadline_crossing_point",
+    ("after_flush", "before_commit"),
+)
+def test_team_tool_terminal_boundary_crossing_deadline_commits_no_success(
     runtime,
     monkeypatch,
+    deadline_crossing_point,
 ):
     factory, store = runtime
     created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
     current_time = [created_at.replace(minute=0, second=30)]
-    with factory.begin() as db:
-        run = db.get(AgentRun, "run-1")
-        run.actor_type = "team"
-        run.actor_id = "team-1"
-        run.actor_version_id = "team-version-1"
-        member = SnapshotTeamMember(
-            agent_id="member-1",
-            role="member",
-            responsibility="operate",
-        )
-        actor = PublishedTeamSnapshot(
-            id="team-1",
-            version_id="team-version-1",
-            version=1,
-            definition_digest="d" * 64,
-            supervisor=SnapshotTeamMember(
-                agent_id="supervisor",
-                role="supervisor",
-                responsibility="coordinate",
-            ),
-            members=(member,),
-            max_steps=2,
-            max_parallel_members=1,
-            timeout_seconds=60,
-            failure_strategy="fail_fast",
-            name="Team",
-            description="",
-            runtime_form="common",
-            language="zh-CN",
-            system_prompt="",
-            context_prompt="",
-            approval_policy="never",
-        )
-        payload = ExecutionSnapshotPayload(
-            schema_version="5",
-            snapshot_id="team-final-flush-snapshot",
-            run_id=run.id,
-            unit_id="unit-1",
-            project_id="project-1",
-            user_id="user-1",
-            actor=actor,
-            model=SnapshotModelSelection(
-                provider_id="provider-1",
-                model="model-1",
-            ),
-            messages=(),
-            limits=SnapshotRuntimeLimits(snapshot_max_bytes=1_048_576),
-            created_at=created_at,
-        )
-        db.add(
-            RuntimeExecutionSnapshot(
-                snapshot_id=payload.snapshot_id,
-                run_id=run.id,
-                digest=hashlib.sha256(
-                    canonical_snapshot_bytes(payload)
-                ).hexdigest(),
-                payload=payload.model_dump(mode="json"),
-                created_at=created_at,
-                expires_at=None,
-            )
-        )
+    configure_team_run(
+        runtime,
+        created_at=created_at,
+        snapshot_id="team-final-flush-snapshot",
+    )
 
     session = factory()
     gateway = ToolGateway(
@@ -644,20 +703,38 @@ def test_team_tool_terminal_flush_crossing_deadline_commits_no_success(
         repository=ConversationRepository(session),
         clock=lambda: current_time[0],
     )
-    crossed_during_terminal_flush = []
+    terminal_success_flushed = []
+    crossed_at_terminal_boundary = []
 
-    def cross_after_completed_flush(flushed_session, _flush_context):
-        if not crossed_during_terminal_flush and any(
-            isinstance(item, ToolInvocation) and item.status == "completed"
-            for item in flushed_session.identity_map.values()
+    def observe_terminal_success_flush(flushed_session, _flush_context):
+        if not terminal_success_flushed and any(
+            isinstance(item, RunEvent) and item.event_type == "tool.completed"
+            for item in flushed_session.new
+        ):
+            terminal_success_flushed.append(True)
+            if deadline_crossing_point == "after_flush":
+                current_time[0] = created_at.replace(minute=1, second=1)
+                crossed_at_terminal_boundary.append(True)
+
+    def cross_before_terminal_commit(committing_session):
+        if (
+            deadline_crossing_point == "before_commit"
+            and terminal_success_flushed
+            and not crossed_at_terminal_boundary
+            and not committing_session.in_nested_transaction()
         ):
             current_time[0] = created_at.replace(minute=1, second=1)
-            crossed_during_terminal_flush.append(True)
+            crossed_at_terminal_boundary.append(True)
 
-    event.listen(session, "after_flush", cross_after_completed_flush)
+    event.listen(session, "after_flush", observe_terminal_success_flush)
+    event.listen(session, "before_commit", cross_before_terminal_commit)
 
-    with pytest.raises(ToolRuntimeError) as caught:
-        execute(gateway)
+    try:
+        with pytest.raises(ToolRuntimeError) as caught:
+            execute(gateway)
+    finally:
+        event.remove(session, "after_flush", observe_terminal_success_flush)
+        event.remove(session, "before_commit", cross_before_terminal_commit)
 
     session.expire_all()
     invocation = session.scalar(select(ToolInvocation))
@@ -672,7 +749,8 @@ def test_team_tool_terminal_flush_crossing_deadline_commits_no_success(
             )
         )
     )
-    assert crossed_during_terminal_flush == [True]
+    assert terminal_success_flushed == [True]
+    assert crossed_at_terminal_boundary == [True]
     assert caught.value.code == "sandbox_timeout"
     assert invocation.status == "started"
     assert invocation.result_summary is None
