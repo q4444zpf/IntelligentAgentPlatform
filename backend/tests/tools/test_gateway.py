@@ -1159,6 +1159,294 @@ def test_approved_team_mcp_tool_crossing_deadline_during_setup_stops_before_tran
         assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
 
 
+def test_approved_team_mcp_tool_deleted_snapshot_during_registry_setup_stops_before_transport(
+    runtime,
+):
+    factory, store = runtime
+    created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    current_time = created_at.replace(minute=0, second=30)
+    configure_team_run(
+        runtime,
+        created_at=created_at,
+        snapshot_id="team-mcp-deleted-boundary-snapshot",
+    )
+    tool_id = configure_approved_mcp_tool(runtime)
+    registry_reads = []
+    snapshot_deletions = []
+    transport_calls = []
+    real_mcp_store = McpStore(factory)
+    real_credential_resolver = McpCredentialResolver(
+        {
+            "credential-1": {
+                "unit_id": "unit-1",
+                "headers": {"Authorization": "Bearer test-token"},
+            }
+        }
+    )
+
+    class SnapshotDeletingMcpStore:
+        def get(self, key):
+            client = real_mcp_store.get(key)
+            registry_reads.append(key)
+            with factory.begin() as mutation_session:
+                result = mutation_session.execute(
+                    delete(RuntimeExecutionSnapshot).where(
+                        RuntimeExecutionSnapshot.run_id == "run-1"
+                    )
+                )
+                snapshot_deletions.append(result.rowcount)
+            return client
+
+    class ContractValidProtocol:
+        def call_tool(self, url, transport, headers, name, arguments):
+            transport_calls.append(
+                (url, transport, headers, name, arguments)
+            )
+            return {"answer": "ok"}
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time,
+        mcp_store=SnapshotDeletingMcpStore(),
+        mcp_protocol_client=ContractValidProtocol(),
+        mcp_credential_resolver=real_credential_resolver,
+    )
+    with pytest.raises(ToolRuntimeError) as approval_required:
+        execute(
+            gateway,
+            name=tool_id,
+            arguments={"repo": "github"},
+            authorized={tool_id},
+        )
+    assert approval_required.value.code == "approval_required"
+    approval = approve_waiting_tool(session, now=current_time)
+
+    with pytest.raises(ToolRuntimeError) as caught:
+        gateway.execute_approved(approval.id, context())
+
+    with factory() as verification_session:
+        invocation = verification_session.scalar(select(ToolInvocation))
+        events = list(
+            verification_session.scalars(
+                select(RunEvent)
+                .where(RunEvent.run_id == "run-1")
+                .order_by(RunEvent.sequence)
+            )
+        )
+        tool_audits = list(
+            verification_session.scalars(
+                select(AuditEvent)
+                .where(
+                    AuditEvent.run_id == "run-1",
+                    AuditEvent.action.like("tool.invoke.%"),
+                )
+                .order_by(AuditEvent.occurred_at, AuditEvent.id)
+            )
+        )
+        assert registry_reads == ["water"]
+        assert snapshot_deletions == [1]
+        assert transport_calls == []
+        assert caught.value.code == "sandbox_timeout"
+        assert verification_session.get(AgentRun, "run-1").status == "queued"
+        assert verification_session.get(Approval, approval.id).status == "approved"
+        assert invocation.status == "started"
+        assert invocation.result_summary is None
+        assert invocation.completed_at is None
+        assert invocation.duration_ms is None
+        assert invocation.error_code is None
+        assert [event.event_type for event in events] == [
+            "approval.requested",
+            "run.status",
+            "tool.started",
+        ]
+        assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
+
+
+def test_approved_team_mcp_tool_corrupted_snapshot_during_credential_setup_stops_before_transport(
+    runtime,
+):
+    factory, store = runtime
+    created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    current_time = created_at.replace(minute=0, second=30)
+    snapshot_id = "team-mcp-corrupt-boundary-snapshot"
+    configure_team_run(
+        runtime,
+        created_at=created_at,
+        snapshot_id=snapshot_id,
+    )
+    tool_id = configure_approved_mcp_tool(runtime)
+    credential_resolutions = []
+    cached_snapshots = []
+    snapshot_corruptions = []
+    transport_calls = []
+    real_mcp_store = McpStore(factory)
+    real_credential_resolver = McpCredentialResolver(
+        {
+            "credential-1": {
+                "unit_id": "unit-1",
+                "headers": {"Authorization": "Bearer test-token"},
+            }
+        }
+    )
+
+    class SnapshotCorruptingCredentialResolver:
+        def resolve(self, credential_id, *, unit_id):
+            headers = real_credential_resolver.resolve(
+                credential_id,
+                unit_id=unit_id,
+            )
+            credential_resolutions.append((credential_id, unit_id))
+            cached_snapshots.append(
+                session.get(RuntimeExecutionSnapshot, snapshot_id)
+            )
+            session.commit()
+            with factory.begin() as mutation_session:
+                snapshot = mutation_session.get(
+                    RuntimeExecutionSnapshot,
+                    snapshot_id,
+                )
+                snapshot.payload = {**snapshot.payload, "user_id": "attacker"}
+                snapshot_corruptions.append(snapshot.snapshot_id)
+            return headers
+
+    class ContractValidProtocol:
+        def call_tool(self, url, transport, headers, name, arguments):
+            transport_calls.append(
+                (url, transport, headers, name, arguments)
+            )
+            return {"answer": "ok"}
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time,
+        mcp_store=real_mcp_store,
+        mcp_protocol_client=ContractValidProtocol(),
+        mcp_credential_resolver=SnapshotCorruptingCredentialResolver(),
+    )
+    with pytest.raises(ToolRuntimeError) as approval_required:
+        execute(
+            gateway,
+            name=tool_id,
+            arguments={"repo": "github"},
+            authorized={tool_id},
+        )
+    assert approval_required.value.code == "approval_required"
+    approval = approve_waiting_tool(session, now=current_time)
+
+    with pytest.raises(ToolRuntimeError) as caught:
+        gateway.execute_approved(approval.id, context())
+
+    with factory() as verification_session:
+        invocation = verification_session.scalar(select(ToolInvocation))
+        events = list(
+            verification_session.scalars(
+                select(RunEvent)
+                .where(RunEvent.run_id == "run-1")
+                .order_by(RunEvent.sequence)
+            )
+        )
+        tool_audits = list(
+            verification_session.scalars(
+                select(AuditEvent)
+                .where(
+                    AuditEvent.run_id == "run-1",
+                    AuditEvent.action.like("tool.invoke.%"),
+                )
+                .order_by(AuditEvent.occurred_at, AuditEvent.id)
+            )
+        )
+        assert credential_resolutions == [("credential-1", "unit-1")]
+        assert [snapshot.snapshot_id for snapshot in cached_snapshots] == [
+            snapshot_id
+        ]
+        assert snapshot_corruptions == [snapshot_id]
+        assert transport_calls == []
+        assert caught.value.code == "sandbox_timeout"
+        assert verification_session.get(AgentRun, "run-1").status == "queued"
+        assert verification_session.get(Approval, approval.id).status == "approved"
+        assert invocation.status == "started"
+        assert invocation.result_summary is None
+        assert invocation.completed_at is None
+        assert invocation.duration_ms is None
+        assert invocation.error_code is None
+        assert [event.event_type for event in events] == [
+            "approval.requested",
+            "run.status",
+            "tool.started",
+        ]
+        assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
+
+
+def test_approved_team_mcp_tool_with_valid_snapshot_executes_without_open_gateway_transaction(
+    runtime,
+):
+    factory, store = runtime
+    created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    current_time = created_at.replace(minute=0, second=30)
+    configure_team_run(
+        runtime,
+        created_at=created_at,
+        snapshot_id="team-mcp-valid-boundary-snapshot",
+    )
+    tool_id = configure_approved_mcp_tool(runtime)
+    transport_transactions = []
+    real_mcp_store = McpStore(factory)
+    real_credential_resolver = McpCredentialResolver(
+        {
+            "credential-1": {
+                "unit_id": "unit-1",
+                "headers": {"Authorization": "Bearer test-token"},
+            }
+        }
+    )
+
+    class ContractValidProtocol:
+        def call_tool(self, url, transport, headers, name, arguments):
+            transport_transactions.append(session.in_transaction())
+            assert (url, transport, headers, name, arguments) == (
+                "https://example.test/mcp",
+                "streamable_http",
+                {"Authorization": "Bearer test-token"},
+                "read_wiki",
+                {"repo": "github"},
+            )
+            return {"answer": "ok"}
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time,
+        mcp_store=real_mcp_store,
+        mcp_protocol_client=ContractValidProtocol(),
+        mcp_credential_resolver=real_credential_resolver,
+    )
+    with pytest.raises(ToolRuntimeError) as approval_required:
+        execute(
+            gateway,
+            name=tool_id,
+            arguments={"repo": "github"},
+            authorized={tool_id},
+        )
+    assert approval_required.value.code == "approval_required"
+    approval = approve_waiting_tool(session, now=current_time)
+
+    result = gateway.execute_approved(approval.id, context())
+
+    with factory() as verification_session:
+        invocation = verification_session.scalar(select(ToolInvocation))
+        assert result.value == {"answer": "ok"}
+        assert transport_transactions == [False]
+        assert verification_session.get(AgentRun, "run-1").status == "queued"
+        assert verification_session.get(Approval, approval.id).status == "approved"
+        assert invocation.status == "completed"
+        assert invocation.result_summary == {"answer": "ok"}
+
+
 def test_approved_agent_mcp_tool_remains_snapshot_optional_during_setup(runtime):
     factory, store = runtime
     current_time = [datetime(2026, 8, 2, 4, 0, 30, tzinfo=timezone.utc)]

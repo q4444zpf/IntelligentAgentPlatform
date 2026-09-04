@@ -22,6 +22,9 @@ from app.conversations.models import (
     ToolInvocation,
 )
 from app.conversations.repository import ConversationRepository
+from app.db.platform_models import McpClientRecord, RegisteredToolRecord
+from app.mcp.credential_resolver import McpCredentialResolver
+from app.mcp.store import McpStore
 from app.runtime.checkpoint_store import (
     CheckpointStore,
     RuntimeCheckpoint,
@@ -468,6 +471,16 @@ def state_race_environment():
         cleanup.execute(delete(Message).where(Message.id == message_id))
         cleanup.execute(
             delete(Conversation).where(Conversation.id == conversation_id)
+        )
+        cleanup.execute(
+            delete(RegisteredToolRecord).where(
+                RegisteredToolRecord.source_resource_id == f"round5-{run_id}"
+            )
+        )
+        cleanup.execute(
+            delete(McpClientRecord).where(
+                McpClientRecord.client_key == f"round5-{run_id}"
+            )
         )
     engine.dispose()
 
@@ -1125,6 +1138,234 @@ def test_team_tool_success_uses_database_time_at_commit_boundary(
         assert invocation.status == "started"
         assert invocation.result_summary is None
         assert invocation.completed_at is None
+        assert [
+            item.event_type
+            for item in verification.scalars(
+                select(RunEvent)
+                .where(RunEvent.run_id == run_id)
+                .order_by(RunEvent.sequence)
+            )
+        ] == ["tool.started"]
+        assert [
+            item.action
+            for item in verification.scalars(
+                select(AuditEvent)
+                .where(
+                    AuditEvent.run_id == run_id,
+                    AuditEvent.action.like("tool.invoke.%"),
+                )
+                .order_by(AuditEvent.occurred_at, AuditEvent.id)
+            )
+        ] == ["tool.invoke.started"]
+
+
+@pytest.mark.parametrize(
+    "mutation_phase",
+    ("registry_delete", "credential_corrupt"),
+    ids=(
+        "deleted-snapshot-during-registry",
+        "corrupted-snapshot-during-credentials",
+    ),
+)
+def test_team_mcp_transport_rechecks_authoritative_snapshot_after_setup(
+    state_race_environment,
+    mutation_phase,
+):
+    factory, run_id, _agent_snapshot, _agent_claims = state_race_environment
+    with factory() as clock_session:
+        created_at = clock_session.scalar(select(func.clock_timestamp()))
+    snapshot = _team_snapshot(
+        run_id,
+        created_at=created_at,
+        timeout_seconds=60,
+    )
+    application_time = created_at
+    mcp_key = f"round5-{run_id}"
+    tool_id = f"mcp.{mcp_key}.read_wiki"
+    arguments = {"repo": "github"}
+    tool_store = ToolStore(factory)
+    mcp_store = McpStore(factory)
+    mcp_store.create(
+        mcp_key,
+        {
+            "name": "Round 5 MCP",
+            "description": "Team admission boundary fixture",
+            "url": "https://example.test/mcp",
+            "transport": "streamable_http",
+            "headers": {},
+            "credential_id": "credential-1",
+            "enabled": True,
+        },
+    )
+    with factory.begin() as setup:
+        run = setup.get(AgentRun, run_id)
+        run.actor_type = "team"
+        run.actor_id = snapshot.payload.actor.id
+        run.actor_version_id = snapshot.payload.actor.version_id
+        run.status = "queued"
+        setup.add(
+            RegisteredToolRecord(
+                tool_id=tool_id,
+                version="1.0.0",
+                name="read_wiki",
+                description="Read wiki",
+                source="mcp",
+                risk_level="high",
+                input_schema={"type": "object"},
+                output_schema={"type": "object"},
+                source_resource_id=mcp_key,
+                source_capability_id="read_wiki",
+                source_available=True,
+                requires_approval=True,
+                published=True,
+                enabled=True,
+            )
+        )
+        invocation = ToolInvocation(
+            run_id=run_id,
+            tool_call_id=f"round5-{mutation_phase}",
+            tool_id=tool_id,
+            tool_version="1.0.0",
+            status="waiting_approval",
+            arguments_summary=arguments,
+        )
+        setup.add(invocation)
+        setup.flush()
+        setup.add_all(
+            [
+                Approval(
+                    run_id=run_id,
+                    invocation_id=invocation.id,
+                    tool_id=tool_id,
+                    tool_version="1.0.0",
+                    unit_id=snapshot.payload.unit_id,
+                    project_id=snapshot.payload.project_id,
+                    requester_id=snapshot.payload.user_id,
+                    requester_roles=["user"],
+                    assignee_role="project_admin",
+                    risk_level="high",
+                    arguments_summary=arguments,
+                    arguments_digest=arguments_digest(arguments),
+                    status="approved",
+                    expires_at=created_at + timedelta(hours=1),
+                ),
+                RuntimeExecutionSnapshot(
+                    snapshot_id=snapshot.snapshot_id,
+                    run_id=run_id,
+                    digest=snapshot.digest,
+                    payload=snapshot.payload.model_dump(mode="json"),
+                    created_at=snapshot.created_at,
+                    expires_at=snapshot.expires_at,
+                ),
+            ]
+        )
+        approval_id = setup.scalar(
+            select(Approval.id).where(Approval.invocation_id == invocation.id)
+        )
+        invocation_id = invocation.id
+
+    snapshot_mutations = []
+    cached_snapshots = []
+    cached_snapshot_ids = []
+    transport_calls = []
+    real_credential_resolver = McpCredentialResolver(
+        {
+            "credential-1": {
+                "unit_id": snapshot.payload.unit_id,
+                "headers": {"Authorization": "Bearer integration-token"},
+            }
+        }
+    )
+
+    class BoundaryMutatingMcpStore:
+        def get(self, key):
+            client = mcp_store.get(key)
+            if mutation_phase == "registry_delete":
+                with factory.begin() as mutation_session:
+                    result = mutation_session.execute(
+                        delete(RuntimeExecutionSnapshot).where(
+                            RuntimeExecutionSnapshot.run_id == run_id
+                        )
+                    )
+                    snapshot_mutations.append(result.rowcount)
+            return client
+
+    class BoundaryMutatingCredentialResolver:
+        def resolve(self, credential_id, *, unit_id):
+            headers = real_credential_resolver.resolve(
+                credential_id,
+                unit_id=unit_id,
+            )
+            if mutation_phase == "credential_corrupt":
+                cached_snapshot = gateway_session.get(
+                    RuntimeExecutionSnapshot,
+                    snapshot.snapshot_id,
+                )
+                cached_snapshots.append(cached_snapshot)
+                cached_snapshot_ids.append(cached_snapshot.snapshot_id)
+                gateway_session.commit()
+                with factory.begin() as mutation_session:
+                    mutation_session.execute(
+                        text("SET LOCAL session_replication_role = replica")
+                    )
+                    persisted = mutation_session.get(
+                        RuntimeExecutionSnapshot,
+                        snapshot.snapshot_id,
+                    )
+                    persisted.payload = {
+                        **persisted.payload,
+                        "user_id": "attacker",
+                    }
+                    snapshot_mutations.append(persisted.snapshot_id)
+            return headers
+
+    class ContractValidProtocol:
+        def call_tool(self, url, transport, headers, name, call_arguments):
+            transport_calls.append(
+                (url, transport, headers, name, call_arguments)
+            )
+            return {"answer": "ok"}
+
+    with factory() as gateway_session:
+        gateway = ToolGateway(
+            tool_store=tool_store,
+            repository=ConversationRepository(gateway_session),
+            clock=lambda: application_time,
+            mcp_store=BoundaryMutatingMcpStore(),
+            mcp_protocol_client=ContractValidProtocol(),
+            mcp_credential_resolver=BoundaryMutatingCredentialResolver(),
+        )
+        with pytest.raises(ToolRuntimeError) as captured:
+            gateway.execute_approved(
+                approval_id,
+                ToolExecutionContext(
+                    unit_id=snapshot.payload.unit_id,
+                    run_id=run_id,
+                    conversation_id=f"unused:{run_id}",
+                    project_id=snapshot.payload.project_id,
+                    user_id=snapshot.payload.user_id,
+                    actor_roles=("user",),
+                ),
+            )
+
+    assert captured.value.code == "sandbox_timeout"
+    assert transport_calls == []
+    if mutation_phase == "registry_delete":
+        assert snapshot_mutations == [1]
+        assert cached_snapshots == []
+    else:
+        assert snapshot_mutations == [snapshot.snapshot_id]
+        assert len(cached_snapshots) == 1
+        assert cached_snapshot_ids == [snapshot.snapshot_id]
+    with factory() as verification:
+        invocation = verification.get(ToolInvocation, invocation_id)
+        assert verification.get(AgentRun, run_id).status == "queued"
+        assert verification.get(Approval, approval_id).status == "approved"
+        assert invocation.status == "started"
+        assert invocation.result_summary is None
+        assert invocation.completed_at is None
+        assert invocation.duration_ms is None
+        assert invocation.error_code is None
         assert [
             item.event_type
             for item in verification.scalars(

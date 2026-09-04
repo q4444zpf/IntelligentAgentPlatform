@@ -1052,3 +1052,176 @@ and untracked artifacts were preserved.
   `sandbox_timeout` identity, listener cleanup, compensation behavior, and the
   terminal database-time guard were not weakened. Focused, module, contract,
   and affected aggregate verification all passed on the final production diff.
+
+## Fix Round 5
+
+### Investigation
+
+- Round 4 ran the full post-start admission before MCP registry and credential
+  preparation, but the boundary callback captured only the resulting deadline.
+  Immediately before `McpProtocolClient.call_tool()` it called only
+  `_require_before_deadline()`. Snapshot deletion and digest-invalid payload
+  mutation during setup were therefore invisible until terminal persistence,
+  after protocol transport had already begun.
+- The Gateway test session uses `expire_on_commit=False`. `AgentRun` locking
+  already uses `populate_existing=True`, but
+  `ExecutionSnapshotService.get_for_run()` previously did not. Merely calling
+  `_admit_approved_transport()` again could therefore accept an unexpired ORM
+  identity-map copy after another session corrupted the persisted snapshot.
+- The strengthened corruption RED deliberately cached the valid snapshot in
+  the Gateway session, committed that read transaction, then changed the
+  persisted canonical payload in a separate session. The unchanged baseline
+  completed without raising, confirming the freshness defect independently of
+  the missing callback.
+- The live PostgreSQL schema normally rejects snapshot updates through
+  `runtime_execution_snapshots_immutable`. The first live corruption setup was
+  therefore inconclusive: its ordinary update was rejected with
+  `runtime execution snapshots are immutable` and surfaced as
+  `tool_execution_failed`. The corrected disposable-database test uses
+  transaction-local `SET LOCAL session_replication_role = replica` solely to
+  inject storage corruption, then exercises the normal authoritative read and
+  digest verifier. The setting ends with that mutation transaction and does
+  not alter the schema or production code.
+- Root-cause hypothesis before production edits: the actual MCP boundary must
+  invoke the existing full admission again, and the snapshot query within that
+  admission must overwrite any cached ORM state from the database. The focused
+  RED failures and final SQLite/PostgreSQL GREEN runs confirmed both parts.
+
+### RED and compatibility evidence
+
+The two deterministic mutation cases were added and run against unchanged
+`296e3d15bd0504b4a2e46ea4d75294dc7cf59766` before production edits:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -p no:cacheprovider backend/tests/tools/test_gateway.py::test_approved_team_mcp_tool_deleted_snapshot_during_registry_setup_stops_before_transport backend/tests/tools/test_gateway.py::test_approved_team_mcp_tool_corrupted_snapshot_during_credential_setup_stops_before_transport --basetemp=backend/.tmp-final-review-fix3-round5-red-20260904-b
+```
+
+Result: `2 failed in 6.70s`. The deletion case recorded one schema-valid MCP
+protocol call instead of zero. The cached-corruption case reported
+`DID NOT RAISE ToolRuntimeError`, so it also demonstrated that the later
+terminal read could accept stale identity-map state.
+
+The valid Team path and legacy Agent compatibility were characterized on the
+same unchanged production baseline:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -p no:cacheprovider backend/tests/tools/test_gateway.py::test_approved_team_mcp_tool_with_valid_snapshot_executes_without_open_gateway_transaction backend/tests/tools/test_gateway.py::test_approved_agent_mcp_tool_remains_snapshot_optional_during_setup --basetemp=backend/.tmp-final-review-fix3-round5-characterization-20260904-a
+```
+
+Result: `2 passed in 6.48s`.
+
+### Implementation
+
+- `ExecutionSnapshotService.get_for_run()` now executes its by-Run query with
+  `populate_existing=True`, so deletion returns no row and a cached row is
+  refreshed before Pydantic parsing and `verify_snapshot_digest()`.
+- The Team-only MCP boundary callback now calls
+  `_admit_approved_transport(run_id, require_team=True)`. This single-source
+  admission locks and reloads the active Run, requires a present and
+  digest-valid Team snapshot, derives and checks its immutable deadline, and
+  rolls back its short read transaction before protocol transport.
+- `require_team=True` also fails closed if the reloaded Run no longer resolves
+  to a Team deadline. Agent approvals retain their optional-snapshot behavior
+  and receive no MCP boundary callback.
+- Boundary refusal still becomes `_TransportAdmissionRejected`, bypassing
+  ordinary Tool failure persistence and leaving the previously committed
+  invocation/event/audit exactly at `started`.
+
+### GREEN evidence
+
+Focused Team deletion, cached corruption, valid Team, deadline crossing, and
+Agent compatibility:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -p no:cacheprovider backend/tests/tools/test_gateway.py::test_approved_team_mcp_tool_deleted_snapshot_during_registry_setup_stops_before_transport backend/tests/tools/test_gateway.py::test_approved_team_mcp_tool_corrupted_snapshot_during_credential_setup_stops_before_transport backend/tests/tools/test_gateway.py::test_approved_team_mcp_tool_with_valid_snapshot_executes_without_open_gateway_transaction backend/tests/tools/test_gateway.py::test_approved_team_mcp_tool_crossing_deadline_during_setup_stops_before_transport backend/tests/tools/test_gateway.py::test_approved_agent_mcp_tool_remains_snapshot_optional_during_setup --basetemp=backend/.tmp-final-review-fix3-round5-focused-green-20260904-a
+```
+
+Result: `5 passed in 8.91s`.
+
+Complete Tool Gateway and execution-snapshot modules:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -rs -p no:cacheprovider backend/tests/tools/test_gateway.py --basetemp=backend/.tmp-final-review-fix3-round5-tool-module-green-20260904-a
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -rs -p no:cacheprovider backend/tests/runtime/test_execution_snapshot.py --basetemp=backend/.tmp-final-review-fix3-round5-snapshot-module-green-20260904-a
+```
+
+Results: `44 passed in 74.18s` and `18 passed in 2.28s`.
+
+Dispatcher approval resume plus Runner/Gateway replay, idempotency, HTTP,
+listener/state, and compensation-facing contracts:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -rs -p no:cacheprovider backend/tests/conversations/test_dispatcher.py backend/tests/runtime/test_runner_gateway_state.py backend/tests/runtime/test_runner_gateway_api.py backend/tests/runtime/test_gateway_tools.py backend/tests/integration/test_runner_gateway_failures.py backend/tests/integration/test_runner_gateway_execution.py --basetemp=backend/.tmp-final-review-fix3-round5-contracts-green-20260904-a
+```
+
+Result: `71 passed in 26.63s`.
+
+Direct live PostgreSQL MCP deletion and corruption admission:
+
+```powershell
+$env:PATH = "I:\智能体平台\IntelligentAgentPlatform\.worktrees\published-team-foundation\.testvenv-task5\Scripts;$env:PATH"
+& .\backend\tests\support\run_postgres_tests.ps1 -PytestPath 'backend/tests/integration/test_runner_gateway_state_concurrency.py::test_team_mcp_transport_rechecks_authoritative_snapshot_after_setup'
+```
+
+Result: `2 passed in 4.86s`, zero skips. The earlier normal-UPDATE attempt
+returned `1 passed, 1 failed in 5.61s` because the immutable-snapshot trigger
+rejected the corruption fixture before admission. After the transaction-local
+trigger bypass, an intermediate behavior run reached the required
+`sandbox_timeout` with zero transport calls but exposed a detached-instance
+postcondition bug in the test; capturing the scalar id before session close
+corrected that assertion without changing production behavior.
+
+Full live PostgreSQL concurrency/deadline module, including the retained
+terminal database-time guard:
+
+```powershell
+$env:PATH = "I:\智能体平台\IntelligentAgentPlatform\.worktrees\published-team-foundation\.testvenv-task5\Scripts;$env:PATH"
+& .\backend\tests\support\run_postgres_tests.ps1 -PytestPath 'backend/tests/integration/test_runner_gateway_state_concurrency.py'
+```
+
+Result: `11 passed in 20.23s`, zero skips. The disposable container was removed
+successfully.
+
+Expanded affected aggregate:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -rs -p no:cacheprovider backend/tests/conversations/test_dispatcher.py backend/tests/runtime/test_execution_snapshot.py backend/tests/runtime/test_launcher_client.py backend/tests/runtime/test_workflow_runner.py backend/tests/runtime/test_gateway_model.py backend/tests/runtime/test_gateway_tools.py backend/tests/runtime/test_sandbox_runtime.py backend/tests/runtime/test_runner_gateway_state.py backend/tests/runtime/test_runner_gateway_api.py backend/tests/integration/test_runner_gateway_execution.py backend/tests/integration/test_runner_gateway_failures.py backend/tests/tools/test_gateway.py backend/tests/mcp/test_protocol_client.py backend/tests/mcp/test_credentials.py backend/tests/test_mcp.py --basetemp=backend/.tmp-final-review-fix3-round5-affected-green-20260904-a
+```
+
+Result: `276 passed in 220.55s`, zero skips and zero failures.
+
+### Changed files and scope consistency
+
+- `backend/app/runtime/execution_snapshot.py`
+- `backend/app/tools/gateway.py`
+- `backend/tests/integration/test_runner_gateway_state_concurrency.py`
+- `backend/tests/tools/test_gateway.py`
+- `.superpowers/sdd/2026-09-01-published-team-review-remediation/final-review-fix3-report.md`
+
+All five paths were already present in the authoritative final-review-fix3
+committed scope. No new path was introduced. Unrelated virtual environments,
+basetemps, logs, caches, and other pre-existing untracked artifacts remain
+unstaged and unmodified.
+
+### Residual risks and self-review
+
+- The boundary transaction must close before `call_tool()`, so another writer
+  can still delete the snapshot in the interval after rollback and before the
+  protocol method enters. Holding the Run lock across external transport would
+  violate the explicit no-open-Gateway-transaction contract. Within that
+  contract, admission is placed at the last application-controlled statement
+  before transport, and terminal application-clock/database-time guards remain
+  independent backstops.
+- PostgreSQL normally forbids the tested payload corruption. Its trigger bypass
+  exists only in the disposable integration test to prove defense-in-depth
+  digest checking against storage-level corruption; it is not an application
+  capability or production migration.
+- Removing the full callback, removing `populate_existing`, moving admission
+  above setup, admitting a non-Team deadline, persisting an ordinary Tool
+  failure on refusal, or retaining the read transaction through transport
+  breaks a focused assertion.
+- Builtin pre/post-start admission, terminal missing-snapshot and database-time
+  guards, Agent optional snapshots, replay/idempotency, HTTP error identity,
+  listener cleanup, and compensation behavior remain covered by the module,
+  contract, live PostgreSQL, and affected aggregate runs above. No residual
+  load-bearing finding was identified in the scoped Round 5 diff.

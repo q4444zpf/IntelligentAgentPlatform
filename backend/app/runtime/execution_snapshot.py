@@ -351,7 +351,7 @@ class ExecutionSnapshotService:
         row = self.session.scalar(
             select(RuntimeExecutionSnapshot).where(
                 RuntimeExecutionSnapshot.run_id == run_id
-            )
+            ).execution_options(populate_existing=True)
         )
         return self._stored(row) if row is not None else None
 

@@ -123,12 +123,19 @@ class ToolGateway:
         if deadline is not None and self.clock() >= deadline:
             raise ToolRuntimeError("sandbox_timeout", "沙箱任务执行超时")
 
-    def _admit_approved_transport(self, run_id: str) -> datetime | None:
+    def _admit_approved_transport(
+        self,
+        run_id: str,
+        *,
+        require_team: bool = False,
+    ) -> datetime | None:
         try:
             _run, deadline = self._lock_admitted_run(
                 run_id,
                 allowed_statuses=_APPROVED_TOOL_RUN_STATUSES,
             )
+            if require_team and deadline is None:
+                raise ToolRuntimeError("sandbox_timeout", "沙箱任务执行超时")
         except Exception:
             self._rollback_safely()
             raise
@@ -606,8 +613,9 @@ class ToolGateway:
         team_deadline = self._admit_approved_transport(run_id)
         before_mcp_transport = None
         if team_deadline is not None:
-            before_mcp_transport = lambda: self._require_before_deadline(
-                team_deadline
+            before_mcp_transport = lambda: self._admit_approved_transport(
+                run_id,
+                require_team=True,
             )
         started_at = time.perf_counter()
         try:
