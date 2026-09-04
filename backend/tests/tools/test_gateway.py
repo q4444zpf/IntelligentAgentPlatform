@@ -14,6 +14,8 @@ from app.conversations.models import AgentRun, Conversation, Message, RunEvent, 
 from app.conversations.repository import ConversationRepository
 from app.db.base import Base
 from app.db.platform_models import RegisteredToolRecord
+from app.mcp.credential_resolver import McpCredentialResolver
+from app.mcp.store import McpStore
 from app.runtime.execution_snapshot import (
     ExecutionSnapshotPayload,
     PublishedTeamSnapshot,
@@ -138,6 +140,62 @@ def configure_team_run(runtime, *, created_at, snapshot_id):
                 expires_at=None,
             )
         )
+
+
+def configure_approved_mcp_tool(runtime):
+    factory, _store = runtime
+    tool_id = "mcp.water.read_wiki_abcd1234"
+    with factory.begin() as db:
+        db.add(
+            RegisteredToolRecord(
+                tool_id=tool_id,
+                version="1.0.0",
+                name="read_wiki",
+                description="Read wiki",
+                source="mcp",
+                risk_level="high",
+                input_schema={"type": "object"},
+                output_schema={"type": "object"},
+                source_resource_id="water",
+                source_capability_id="read_wiki",
+                source_available=True,
+                requires_approval=True,
+                published=True,
+                enabled=True,
+            )
+        )
+    McpStore(factory).create(
+        "water",
+        {
+            "name": "Water MCP",
+            "description": "Water data",
+            "url": "https://example.test/mcp",
+            "transport": "streamable_http",
+            "headers": {},
+            "credential_id": "credential-1",
+            "enabled": True,
+        },
+    )
+    return tool_id
+
+
+def approve_waiting_tool(session, *, now):
+    from app.approvals.service import ApprovalService
+    from app.core.request_context import RequestContext
+
+    approval = session.scalar(select(Approval))
+    ApprovalService(session, clock=lambda: now).approve(
+        approval.id,
+        RequestContext(
+            user_id="reviewer",
+            unit_id="unit-1",
+            project_id="project-1",
+            roles=frozenset({"project_admin"}),
+        ),
+    )
+    session.get(AgentRun, "run-1").status = "queued"
+    session.commit()
+    return approval
 
 
 def test_records_tool_started_and_succeeded_with_context_and_parent(runtime):
@@ -992,6 +1050,211 @@ def test_team_tool_terminal_boundary_crossing_deadline_commits_no_success(
     assert invocation.result_summary is None
     assert [item.event_type for item in run_events] == ["tool.started"]
     assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
+
+
+def test_approved_team_mcp_tool_crossing_deadline_during_setup_stops_before_transport(
+    runtime,
+):
+    factory, store = runtime
+    created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    current_time = [created_at.replace(minute=0, second=30)]
+    configure_team_run(
+        runtime,
+        created_at=created_at,
+        snapshot_id="team-mcp-setup-deadline-snapshot",
+    )
+    tool_id = configure_approved_mcp_tool(runtime)
+    registry_reads = []
+    credential_resolutions = []
+    transport_calls = []
+    real_mcp_store = McpStore(factory)
+    real_credential_resolver = McpCredentialResolver(
+        {
+            "credential-1": {
+                "unit_id": "unit-1",
+                "headers": {"Authorization": "Bearer test-token"},
+            }
+        }
+    )
+
+    class RecordingMcpStore:
+        def get(self, key):
+            registry_reads.append(key)
+            return real_mcp_store.get(key)
+
+    class DeadlineCrossingCredentialResolver:
+        def resolve(self, credential_id, *, unit_id):
+            headers = real_credential_resolver.resolve(
+                credential_id,
+                unit_id=unit_id,
+            )
+            credential_resolutions.append((credential_id, unit_id))
+            current_time[0] = created_at.replace(minute=1, second=1)
+            return headers
+
+    class ContractValidProtocol:
+        def call_tool(self, url, transport, headers, name, arguments):
+            transport_calls.append(
+                (url, transport, headers, name, arguments)
+            )
+            return {"answer": "ok"}
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time[0],
+        mcp_store=RecordingMcpStore(),
+        mcp_protocol_client=ContractValidProtocol(),
+        mcp_credential_resolver=DeadlineCrossingCredentialResolver(),
+    )
+    with pytest.raises(ToolRuntimeError) as approval_required:
+        execute(
+            gateway,
+            name=tool_id,
+            arguments={"repo": "github"},
+            authorized={tool_id},
+        )
+    assert approval_required.value.code == "approval_required"
+    approval = approve_waiting_tool(session, now=current_time[0])
+
+    with pytest.raises(ToolRuntimeError) as caught:
+        gateway.execute_approved(approval.id, context())
+
+    with factory() as verification_session:
+        invocation = verification_session.scalar(select(ToolInvocation))
+        events = list(
+            verification_session.scalars(
+                select(RunEvent)
+                .where(RunEvent.run_id == "run-1")
+                .order_by(RunEvent.sequence)
+            )
+        )
+        tool_audits = list(
+            verification_session.scalars(
+                select(AuditEvent)
+                .where(
+                    AuditEvent.run_id == "run-1",
+                    AuditEvent.action.like("tool.invoke.%"),
+                )
+                .order_by(AuditEvent.occurred_at, AuditEvent.id)
+            )
+        )
+        assert registry_reads == ["water"]
+        assert credential_resolutions == [("credential-1", "unit-1")]
+        assert transport_calls == []
+        assert caught.value.code == "sandbox_timeout"
+        assert verification_session.get(AgentRun, "run-1").status == "queued"
+        assert verification_session.get(Approval, approval.id).status == "approved"
+        assert invocation.status == "started"
+        assert invocation.result_summary is None
+        assert invocation.completed_at is None
+        assert invocation.duration_ms is None
+        assert invocation.error_code is None
+        assert [event.event_type for event in events] == [
+            "approval.requested",
+            "run.status",
+            "tool.started",
+        ]
+        assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
+
+
+def test_approved_agent_mcp_tool_remains_snapshot_optional_during_setup(runtime):
+    factory, store = runtime
+    current_time = [datetime(2026, 8, 2, 4, 0, 30, tzinfo=timezone.utc)]
+    tool_id = configure_approved_mcp_tool(runtime)
+    transaction_states = []
+    real_mcp_store = McpStore(factory)
+    real_credential_resolver = McpCredentialResolver(
+        {
+            "credential-1": {
+                "unit_id": "unit-1",
+                "headers": {"Authorization": "Bearer test-token"},
+            }
+        }
+    )
+
+    class AdvancingMcpStore:
+        def get(self, key):
+            return real_mcp_store.get(key)
+
+    class AdvancingCredentialResolver:
+        def resolve(self, credential_id, *, unit_id):
+            headers = real_credential_resolver.resolve(
+                credential_id,
+                unit_id=unit_id,
+            )
+            current_time[0] = datetime(2036, 8, 2, 4, 1, 1, tzinfo=timezone.utc)
+            return headers
+
+    class ContractValidProtocol:
+        def call_tool(self, url, transport, headers, name, arguments):
+            transaction_states.append(session.in_transaction())
+            assert (url, transport, headers, name, arguments) == (
+                "https://example.test/mcp",
+                "streamable_http",
+                {"Authorization": "Bearer test-token"},
+                "read_wiki",
+                {"repo": "github"},
+            )
+            return {"answer": "ok"}
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time[0],
+        mcp_store=AdvancingMcpStore(),
+        mcp_protocol_client=ContractValidProtocol(),
+        mcp_credential_resolver=AdvancingCredentialResolver(),
+    )
+    with pytest.raises(ToolRuntimeError) as approval_required:
+        execute(
+            gateway,
+            name=tool_id,
+            arguments={"repo": "github"},
+            authorized={tool_id},
+        )
+    assert approval_required.value.code == "approval_required"
+    approval = approve_waiting_tool(session, now=current_time[0])
+
+    result = gateway.execute_approved(approval.id, context())
+
+    session.expire_all()
+    invocation = session.scalar(select(ToolInvocation))
+    events = list(
+        session.scalars(
+            select(RunEvent)
+            .where(RunEvent.run_id == "run-1")
+            .order_by(RunEvent.sequence)
+        )
+    )
+    tool_audits = list(
+        session.scalars(
+            select(AuditEvent)
+            .where(
+                AuditEvent.run_id == "run-1",
+                AuditEvent.action.like("tool.invoke.%"),
+            )
+            .order_by(AuditEvent.occurred_at, AuditEvent.id)
+        )
+    )
+    assert result.value == {"answer": "ok"}
+    assert transaction_states == [False]
+    assert session.get(AgentRun, "run-1").status == "queued"
+    assert session.get(Approval, approval.id).status == "approved"
+    assert invocation.status == "completed"
+    assert invocation.result_summary == {"answer": "ok"}
+    assert [event.event_type for event in events] == [
+        "approval.requested",
+        "run.status",
+        "tool.started",
+        "tool.completed",
+    ]
+    assert [audit.action for audit in tool_audits] == [
+        "tool.invoke.started",
+        "tool.invoke.succeeded",
+    ]
 
 
 def test_mcp_tool_executes_remote_capability_and_records_result(runtime):

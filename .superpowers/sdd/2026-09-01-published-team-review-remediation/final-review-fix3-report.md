@@ -915,3 +915,140 @@ enumeration.
 - The PostgreSQL test uses the real migrated tables, Run and snapshot rows,
   Approval/ToolInvocation locks, ToolStore, ToolGateway, audit recorder, and
   database clock. Only the external builtin is wrapped to count admission.
+
+## Fix Round 4
+
+### Investigation
+
+- `ApprovalService.prepare_execution()` and both approved-Run admission checks
+  use the Gateway repository session. The durable `tool.started` invocation,
+  event, and audit commit first; the second admission then locks the Run,
+  integrity-checks the immutable Team snapshot, derives its absolute deadline,
+  and rolls back the read transaction before external work.
+- `McpStore.get()` performs registry/config lookup in its own short-lived
+  session, while `McpCredentialResolver.resolve()` validates scope and
+  deep-copies headers in memory. `McpProtocolClient.call_tool()` is the external
+  transport boundary.
+- The round-3 post-start admission happened before both MCP preparation steps.
+  Its transaction was correctly closed, but its deadline result was discarded.
+  Consequently, the immutable Team deadline could expire during registry or
+  credential preparation and `call_tool()` would still begin. The later
+  terminal fence prevented successful persistence but could not prevent the
+  external side effect.
+- Root-cause hypothesis before editing: the MCP branch had no way to carry the
+  authoritative post-start Team deadline to its actual transport boundary, so
+  it used stale admission after preparation. The focused RED confirmed this by
+  recording one schema-valid MCP call after credential resolution crossed the
+  injected deadline.
+
+### RED evidence
+
+The deterministic Team race and Agent compatibility characterization were
+added before production edits and run against unchanged `cc3816e`:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -p no:cacheprovider backend/tests/tools/test_gateway.py::test_approved_team_mcp_tool_crossing_deadline_during_setup_stops_before_transport backend/tests/tools/test_gateway.py::test_approved_agent_mcp_tool_remains_snapshot_optional_during_setup --basetemp=backend/.tmp-final-review-fix3-round4-red-20260904-a
+```
+
+Result: `1 failed, 1 passed in 6.32s`. The Team failure was exactly
+`transport_calls == []`: the contract-valid protocol fake had been entered once
+with the resolved scoped credential and expected MCP arguments. The Agent
+snapshot-optional compatibility case passed on the unchanged baseline.
+
+The Team test delegates to the real persisted `McpStore` and the real
+`McpCredentialResolver`; thin wrappers only record preparation and advance the
+injected clock after credential resolution. A fresh verification session proves
+the exact durable state: Run `queued`, Approval `approved`, invocation `started`
+with no result, error, completion time, or duration; events contain only
+`approval.requested`, `run.status`, and `tool.started`; Tool audits contain only
+`tool.invoke.started`.
+
+### Implementation
+
+- `_lock_admitted_run()` and the MCP boundary now share
+  `_require_before_deadline()`, avoiding a second or divergent interpretation
+  of the immutable Team deadline.
+- `_admit_approved_transport()` preserves the existing post-start locked
+  admission and rollback, and returns its immutable deadline. Builtin execution
+  remains behind that same check.
+- Only a non-`None` Team deadline creates an MCP boundary callback.
+  `_execute_mcp()` invokes it after registry/config and credential preparation
+  and directly before `call_tool()`. The callback is a pure injected-clock
+  comparison and therefore opens no application transaction across transport.
+- A private transport-admission exception bypasses ordinary Tool failure
+  persistence. Deadline refusal retains the established durable `started`
+  state for dispatcher-level `failed/sandbox_timeout` handling instead of
+  creating a misleading `tool.failed` terminal record.
+- Agent deadlines remain `None`, so approved Agent MCP execution receives no
+  added boundary callback. Ordinary non-approved MCP execution and all builtin
+  execution APIs remain unchanged.
+
+### GREEN evidence
+
+Focused final verification after strengthening durable-state assertions to use
+a fresh database session:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -p no:cacheprovider backend/tests/tools/test_gateway.py::test_approved_team_mcp_tool_crossing_deadline_during_setup_stops_before_transport backend/tests/tools/test_gateway.py::test_approved_agent_mcp_tool_remains_snapshot_optional_during_setup --basetemp=backend/.tmp-final-review-fix3-round4-focused-final-green-20260904-a
+```
+
+Result: `2 passed in 4.65s`.
+
+Complete Tool Gateway module:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -rs -p no:cacheprovider backend/tests/tools/test_gateway.py --basetemp=backend/.tmp-final-review-fix3-round4-tool-module-final-green-20260904-a
+```
+
+Result: `41 passed in 81.91s`.
+
+Dispatcher approval resume plus Runner/Gateway HTTP mapping, replay,
+idempotency, listener/state fence, and compensation-facing contracts:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -rs -p no:cacheprovider backend/tests/conversations/test_dispatcher.py backend/tests/runtime/test_runner_gateway_state.py backend/tests/runtime/test_runner_gateway_api.py backend/tests/runtime/test_gateway_tools.py backend/tests/integration/test_runner_gateway_failures.py backend/tests/integration/test_runner_gateway_execution.py --basetemp=backend/.tmp-final-review-fix3-round4-contracts-green-20260904-a
+```
+
+Result: `71 passed in 27.70s`.
+
+Affected Tool, MCP, dispatcher, transport, sandbox, and Runner/Gateway
+aggregate:
+
+```powershell
+.\.testvenv-task5\Scripts\python.exe -m pytest -q -rs -p no:cacheprovider backend/tests/conversations/test_dispatcher.py backend/tests/runtime/test_launcher_client.py backend/tests/runtime/test_workflow_runner.py backend/tests/runtime/test_gateway_model.py backend/tests/runtime/test_gateway_tools.py backend/tests/runtime/test_sandbox_runtime.py backend/tests/runtime/test_runner_gateway_state.py backend/tests/runtime/test_runner_gateway_api.py backend/tests/integration/test_runner_gateway_execution.py backend/tests/integration/test_runner_gateway_failures.py backend/tests/tools/test_gateway.py backend/tests/mcp/test_protocol_client.py backend/tests/mcp/test_credentials.py backend/tests/test_mcp.py --basetemp=backend/.tmp-final-review-fix3-round4-affected-green-20260904-a
+```
+
+Result: `255 passed in 267.16s`, with zero skips.
+
+Direct PostgreSQL was not rerun for this round. The change adds a pure
+application-clock admission immediately before MCP transport and does not alter
+the terminal database-time conditional commit already covered by the retained
+live PostgreSQL tests from Fix Round 3.
+
+### Changed files and scope consistency
+
+- `backend/app/tools/gateway.py`
+- `backend/tests/tools/test_gateway.py`
+- `.superpowers/sdd/2026-09-01-published-team-review-remediation/final-review-fix3-report.md`
+
+All three paths already belong to the authoritative final-review-fix3 committed
+scope. No new source, test, or report path was introduced, and all unrelated
+and untracked artifacts were preserved.
+
+### Residual risks and self-review
+
+- Admission is cooperative: it prevents `call_tool()` from starting when the
+  deadline is already expired, but cannot recall transport after the call has
+  begun. The independent terminal application-clock and database-time guards
+  still prevent a late successful Tool result, event, or audit from committing.
+- `McpProtocolClient.call_tool()` may issue several protocol requests after its
+  boundary is entered. Per-request cancellation is outside this finding; the
+  required external-call admission now occurs directly before that boundary.
+- The mutation check is direct: deleting the boundary callback, passing it for
+  Agents, moving it above credential resolution, or treating its refusal as an
+  ordinary Tool failure breaks one of the new focused assertions.
+- Builtin admission, Team missing-snapshot fail-closed behavior, Agent optional
+  snapshots, no-open-transaction transport, replay/idempotency, HTTP
+  `sandbox_timeout` identity, listener cleanup, compensation behavior, and the
+  terminal database-time guard were not weakened. Focused, module, contract,
+  and affected aggregate verification all passed on the final production diff.

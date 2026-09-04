@@ -45,6 +45,10 @@ _TERMINAL_FENCE_ERROR_CODES = frozenset({"run_not_active", "sandbox_timeout"})
 logger = logging.getLogger(__name__)
 
 
+class _TransportAdmissionRejected(ToolRuntimeError):
+    pass
+
+
 class ToolGateway:
     def __init__(
         self,
@@ -112,9 +116,24 @@ class ToolGateway:
     ) -> tuple[AgentRun, datetime | None]:
         run = self._lock_active_run(run_id, allowed_statuses=allowed_statuses)
         deadline = self._team_deadline_for_run(run)
+        self._require_before_deadline(deadline)
+        return run, deadline
+
+    def _require_before_deadline(self, deadline: datetime | None) -> None:
         if deadline is not None and self.clock() >= deadline:
             raise ToolRuntimeError("sandbox_timeout", "沙箱任务执行超时")
-        return run, deadline
+
+    def _admit_approved_transport(self, run_id: str) -> datetime | None:
+        try:
+            _run, deadline = self._lock_admitted_run(
+                run_id,
+                allowed_statuses=_APPROVED_TOOL_RUN_STATUSES,
+            )
+        except Exception:
+            self._rollback_safely()
+            raise
+        self.repository.session.rollback()
+        return deadline
 
     @staticmethod
     def _validate(schema: dict[str, Any], value: Any, code: str, message: str) -> None:
@@ -581,13 +600,15 @@ class ToolGateway:
         )
         self.repository.session.commit()
         invocation_id = str(invocation.id)
+        run_id = str(invocation.run_id)
         arguments = dict(invocation.arguments_summary)
         started_audit_id = str(started_audit.id)
-        self._lock_admitted_run(
-            invocation.run_id,
-            allowed_statuses=_APPROVED_TOOL_RUN_STATUSES,
-        )
-        self.repository.session.rollback()
+        team_deadline = self._admit_approved_transport(run_id)
+        before_mcp_transport = None
+        if team_deadline is not None:
+            before_mcp_transport = lambda: self._require_before_deadline(
+                team_deadline
+            )
         started_at = time.perf_counter()
         try:
             if tool["source"] == "builtin":
@@ -595,8 +616,16 @@ class ToolGateway:
                     raise ToolRuntimeError("tool_execution_failed", "工具执行失败。")
                 value = executor(arguments, context, self.clock)
             else:
-                value = self._execute_mcp(tool, arguments, context)
+                value = self._execute_mcp(
+                    tool,
+                    arguments,
+                    context,
+                    before_transport=before_mcp_transport,
+                )
             self._validate(tool["output_schema"], value, "tool_execution_failed", "工具执行失败。")
+        except _TransportAdmissionRejected:
+            self._rollback_safely()
+            raise
         except ToolRuntimeError as error:
             duration_ms = max(0, round((time.perf_counter() - started_at) * 1000))
             self._commit_finished(invocation, tool["name"], status="failed", duration_ms=duration_ms, error=error, context=context, parent_event_id=started_audit_id, allowed_run_statuses=_APPROVED_TOOL_RUN_STATUSES)
@@ -611,7 +640,12 @@ class ToolGateway:
         return ToolExecutionResult(invocation_id=invocation_id, value=value)
 
     def _execute_mcp(
-        self, tool: dict[str, Any], arguments: dict[str, Any], context: ToolExecutionContext
+        self,
+        tool: dict[str, Any],
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+        *,
+        before_transport: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         if self.mcp_store is None or self.mcp_protocol_client is None:
             raise ToolRuntimeError("tool_execution_failed", "工具执行失败。")
@@ -629,6 +663,14 @@ class ToolGateway:
                 headers = self.mcp_credential_resolver.resolve(credential_id, unit_id=context.unit_id)
             except (CredentialNotFoundError, CredentialScopeError) as error:
                 raise ToolRuntimeError("tool_execution_failed", "工具执行失败。") from error
+        if before_transport is not None:
+            try:
+                before_transport()
+            except ToolRuntimeError as error:
+                raise _TransportAdmissionRejected(
+                    error.code,
+                    error.safe_message,
+                ) from error
         try:
             result = self.mcp_protocol_client.call_tool(
                 client["url"], client["transport"], headers, capability, arguments
