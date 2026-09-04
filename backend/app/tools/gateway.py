@@ -140,6 +140,7 @@ class ToolGateway:
             self._rollback_safely()
             raise
         self.repository.session.rollback()
+        self._require_before_deadline(deadline)
         return deadline
 
     @staticmethod

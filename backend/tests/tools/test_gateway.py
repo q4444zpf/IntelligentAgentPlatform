@@ -728,6 +728,77 @@ def test_approved_team_tool_crossing_deadline_during_started_commit_stops_before
     assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
 
 
+def test_approved_team_builtin_crossing_deadline_during_admission_rollback_stops_before_executor(
+    runtime,
+    monkeypatch,
+):
+    factory, store = runtime
+    created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    current_time = [created_at.replace(minute=0, second=30)]
+    configure_team_run(
+        runtime,
+        created_at=created_at,
+        snapshot_id="team-builtin-admission-rollback-snapshot",
+    )
+    with factory.begin() as db:
+        tool = db.get(RegisteredToolRecord, "system.get_current_time")
+        tool.requires_approval = True
+        tool.risk_level = "high"
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time[0],
+    )
+    with pytest.raises(ToolRuntimeError) as approval_required:
+        execute(gateway)
+    assert approval_required.value.code == "approval_required"
+    approval = approve_waiting_tool(session, now=current_time[0])
+
+    real_rollback = session.rollback
+    rollback_calls = 0
+    rollback_transaction_states = []
+    external_calls = []
+    original = BUILTIN_EXECUTORS["system.get_current_time"]
+
+    def cross_deadline_during_final_admission_rollback():
+        nonlocal rollback_calls
+        rollback_calls += 1
+        is_final_admission = rollback_calls == 1
+        if is_final_admission:
+            rollback_transaction_states.append(session.in_transaction())
+        real_rollback()
+        if is_final_admission:
+            current_time[0] = created_at.replace(minute=1, second=1)
+            rollback_transaction_states.append(session.in_transaction())
+
+    def record_external_call(arguments, execution_context, clock):
+        external_calls.append(session.in_transaction())
+        return original(arguments, execution_context, clock)
+
+    monkeypatch.setattr(session, "rollback", cross_deadline_during_final_admission_rollback)
+    monkeypatch.setitem(
+        BUILTIN_EXECUTORS,
+        "system.get_current_time",
+        record_external_call,
+    )
+
+    with pytest.raises(ToolRuntimeError) as caught:
+        gateway.execute_approved(approval.id, context())
+
+    with factory() as verification_session:
+        invocation = verification_session.scalar(select(ToolInvocation))
+        assert rollback_transaction_states == [True, False]
+        assert external_calls == []
+        assert caught.value.code == "sandbox_timeout"
+        assert invocation.status == "started"
+        assert invocation.result_summary is None
+        assert invocation.completed_at is None
+        assert invocation.duration_ms is None
+        assert invocation.error_code is None
+
+
 def test_approved_team_tool_crossing_execution_deadline_commits_no_success(
     runtime,
     monkeypatch,
@@ -1157,6 +1228,88 @@ def test_approved_team_mcp_tool_crossing_deadline_during_setup_stops_before_tran
             "tool.started",
         ]
         assert [audit.action for audit in tool_audits] == ["tool.invoke.started"]
+
+
+def test_approved_team_mcp_crossing_deadline_during_final_admission_rollback_stops_before_transport(
+    runtime,
+    monkeypatch,
+):
+    factory, store = runtime
+    created_at = datetime(2026, 8, 2, 4, 0, tzinfo=timezone.utc)
+    current_time = [created_at.replace(minute=0, second=30)]
+    configure_team_run(
+        runtime,
+        created_at=created_at,
+        snapshot_id="team-mcp-admission-rollback-snapshot",
+    )
+    tool_id = configure_approved_mcp_tool(runtime)
+    transport_calls = []
+    real_mcp_store = McpStore(factory)
+    real_credential_resolver = McpCredentialResolver(
+        {
+            "credential-1": {
+                "unit_id": "unit-1",
+                "headers": {"Authorization": "Bearer test-token"},
+            }
+        }
+    )
+
+    class ContractValidProtocol:
+        def call_tool(self, url, transport, headers, name, arguments):
+            transport_calls.append(
+                (url, transport, headers, name, arguments)
+            )
+            return {"answer": "ok"}
+
+    session = factory()
+    gateway = ToolGateway(
+        tool_store=store,
+        repository=ConversationRepository(session),
+        clock=lambda: current_time[0],
+        mcp_store=real_mcp_store,
+        mcp_protocol_client=ContractValidProtocol(),
+        mcp_credential_resolver=real_credential_resolver,
+    )
+    with pytest.raises(ToolRuntimeError) as approval_required:
+        execute(
+            gateway,
+            name=tool_id,
+            arguments={"repo": "github"},
+            authorized={tool_id},
+        )
+    assert approval_required.value.code == "approval_required"
+    approval = approve_waiting_tool(session, now=current_time[0])
+
+    real_rollback = session.rollback
+    rollback_calls = 0
+    final_rollback_transaction_states = []
+
+    def cross_deadline_during_final_admission_rollback():
+        nonlocal rollback_calls
+        rollback_calls += 1
+        is_final_admission = rollback_calls == 2
+        if is_final_admission:
+            final_rollback_transaction_states.append(session.in_transaction())
+        real_rollback()
+        if is_final_admission:
+            current_time[0] = created_at.replace(minute=1, second=1)
+            final_rollback_transaction_states.append(session.in_transaction())
+
+    monkeypatch.setattr(session, "rollback", cross_deadline_during_final_admission_rollback)
+
+    with pytest.raises(ToolRuntimeError) as caught:
+        gateway.execute_approved(approval.id, context())
+
+    with factory() as verification_session:
+        invocation = verification_session.scalar(select(ToolInvocation))
+        assert final_rollback_transaction_states == [True, False]
+        assert transport_calls == []
+        assert caught.value.code == "sandbox_timeout"
+        assert invocation.status == "started"
+        assert invocation.result_summary is None
+        assert invocation.completed_at is None
+        assert invocation.duration_ms is None
+        assert invocation.error_code is None
 
 
 def test_approved_team_mcp_tool_deleted_snapshot_during_registry_setup_stops_before_transport(
