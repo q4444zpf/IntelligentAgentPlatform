@@ -1,18 +1,35 @@
-from collections.abc import Iterator
+import hashlib
+import io
+import secrets
+from collections.abc import Callable, Iterator
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
+import yaml
 from app.core.request_context import RequestContext
 from app.db.base import Base
+from app.identity.catalogue import seed_builtin_catalogue
 from app.identity.models import (
+    AuthSession,
     Project,
     ProjectMembership,
+    ProjectMembershipRole,
+    Role,
     Unit,
     UnitMembership,
     User,
 )
 from app.identity.schemas import AuthorizationContext, PermissionGrant
-from sqlalchemy import create_engine, event
+from app.skills.package import parse_skill_bundle
+from app.skills.package_storage import SkillPackageStorage
+from app.skills.repository import SkillRepository, SkillScope
+from fastapi import FastAPI
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import Session, sessionmaker
+
+from backend.tests.skills.test_package_storage import MemoryS3
 
 
 def make_context(
@@ -51,6 +68,186 @@ def make_context(
         project_id=project_id,
         authorization_context=authorization,
     )
+
+
+def manifest(name: str, body: str = "Initial instructions") -> str:
+    frontmatter = yaml.safe_dump(
+        {"name": name, "description": f"Description for {name}", "version": "1.0"},
+        sort_keys=False,
+    )
+    return f"---\n{frontmatter}---\n{body}\n"
+
+
+def bundle(entries: list[tuple[str, bytes]]) -> bytes:
+    stream = io.BytesIO()
+    with ZipFile(stream, "w", compression=ZIP_DEFLATED) as archive:
+        for path, data in entries:
+            archive.writestr(path, data)
+    return stream.getvalue()
+
+
+def seed_skill(
+    sessions: sessionmaker[Session],
+    storage: SkillPackageStorage,
+    context: RequestContext,
+    *,
+    name: str = "s",
+    body: str = "Initial instructions",
+    attachments: tuple[tuple[str, bytes], ...] = (),
+) -> str:
+    skill_id = str(uuid4())
+    package = parse_skill_bundle(
+        bundle(
+            [
+                (f"{name}/SKILL.md", manifest(name, body).encode()),
+                *((f"{name}/{path}", data) for path, data in attachments),
+            ]
+        )
+    )[0]
+    stored = storage.put(context.unit_id, context.project_id, skill_id, package)
+    with sessions() as session:
+        SkillRepository(session).create(
+            SkillScope(context.unit_id, context.project_id),
+            skill_id=skill_id,
+            name=name,
+            created_by=context.user_id,
+            package=package,
+            stored=stored,
+        )
+        session.commit()
+    return skill_id
+
+
+def publish_skill(
+    sessions: sessionmaker[Session],
+    context: RequestContext,
+    skill_id: str,
+    *,
+    expected_revision: int = 1,
+) -> str:
+    with sessions() as session:
+        version = SkillRepository(session).publish(
+            SkillScope(context.unit_id, context.project_id),
+            skill_id,
+            expected_revision=expected_revision,
+            idempotency_key=secrets.token_urlsafe(12),
+            published_by=context.user_id,
+        )
+        session.commit()
+        return version.id
+
+
+def make_test_app(
+    sessions: sessionmaker[Session],
+    storage_factory: Callable[[], SkillPackageStorage],
+    *,
+    context: RequestContext | None = None,
+    with_write_protection: bool = False,
+) -> FastAPI:
+    from app.core.database import get_session
+    from app.core.request_context import require_request_context
+    from app.skills.project_router import _service, router
+    from app.skills.project_service import ProjectSkillService
+
+    app = FastAPI()
+    app.state.allow_dev_identity = False
+    app.include_router(router)
+
+    def identity_session():
+        session = sessions()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    app.dependency_overrides[get_session] = identity_session
+    app.dependency_overrides[_service] = lambda: ProjectSkillService(
+        sessions, storage_factory=storage_factory
+    )
+    if context is not None:
+        app.dependency_overrides[require_request_context] = lambda: context
+    if with_write_protection:
+        app.state.write_protection_enabled = True
+    return app
+
+
+def issue_session(
+    sessions: sessionmaker[Session],
+    *,
+    user_id: str = "user-1",
+    project_id: str = "project-1",
+    role_code: str = "project_admin",
+) -> str:
+    token = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    with sessions() as session:
+        seed_builtin_catalogue(session, "unit-1")
+        role = session.scalar(
+            select(Role).where(Role.unit_id == "unit-1", Role.code == role_code)
+        )
+        assert role is not None
+        user = session.get(User, user_id)
+        assert user is not None
+        membership = session.scalar(
+            select(ProjectMembership).where(
+                ProjectMembership.user_id == user_id,
+                ProjectMembership.unit_id == "unit-1",
+                ProjectMembership.project_id == project_id,
+            )
+        )
+        if membership is None:
+            session.add(
+                ProjectMembership(
+                    id=str(uuid4()),
+                    user_id=user_id,
+                    unit_id="unit-1",
+                    project_id=project_id,
+                    status="active",
+                )
+            )
+            session.flush()
+        else:
+            membership.status = "active"
+        binding = session.scalar(
+            select(ProjectMembershipRole).where(
+                ProjectMembershipRole.user_id == user_id,
+                ProjectMembershipRole.unit_id == "unit-1",
+                ProjectMembershipRole.project_id == project_id,
+                ProjectMembershipRole.role_id == role.id,
+            )
+        )
+        records = []
+        if binding is None:
+            records.append(
+                ProjectMembershipRole(
+                    id=str(uuid4()),
+                    user_id=user_id,
+                    unit_id="unit-1",
+                    project_id=project_id,
+                    role_id=role.id,
+                    scope_type="project",
+                )
+            )
+        records.append(
+            AuthSession(
+                id=str(uuid4()),
+                session_token_hash=hashlib.sha256(token.encode()).hexdigest(),
+                user_id=user_id,
+                unit_id="unit-1",
+                current_project_id=project_id,
+                auth_method="oidc",
+                csrf_secret_encrypted={"ciphertext": "test"},
+                provider_tokens_encrypted=None,
+                provider_sid=None,
+                authorization_version=user.authorization_version,
+                idle_expires_at=now + timedelta(minutes=30),
+                absolute_expires_at=now + timedelta(hours=8),
+                last_seen_at=now,
+            )
+        )
+        session.add_all(records)
+        session.commit()
+    return token
 
 
 @pytest.fixture(name="sessions")
@@ -170,3 +367,13 @@ def sessions_fixture(tmp_path) -> Iterator[sessionmaker[Session]]:
         yield factory
     finally:
         engine.dispose()
+
+
+@pytest.fixture(name="memory_s3")
+def memory_s3_fixture() -> MemoryS3:
+    return MemoryS3()
+
+
+@pytest.fixture(name="storage")
+def storage_fixture(memory_s3: MemoryS3) -> SkillPackageStorage:
+    return SkillPackageStorage(memory_s3, "project-skill-tests")

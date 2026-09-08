@@ -1,0 +1,239 @@
+import hashlib
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+
+import pytest
+from app.identity.catalogue import seed_builtin_catalogue
+from app.identity.models import (
+    AuthSession,
+    ProjectMembership,
+    ProjectMembershipRole,
+    Role,
+    RolePermission,
+    User,
+)
+from fastapi.testclient import TestClient
+from sqlalchemy import select
+
+from backend.tests.skills.project_support import (
+    issue_session,
+    make_context,
+    make_test_app,
+    seed_skill,
+)
+from backend.tests.skills.project_support import (
+    memory_s3_fixture as _memory_s3_fixture,  # noqa: F401
+)
+from backend.tests.skills.project_support import (
+    sessions_fixture as _sessions_fixture,  # noqa: F401
+)
+from backend.tests.skills.project_support import (
+    storage_fixture as _storage_fixture,  # noqa: F401
+)
+
+
+def cookie_client(sessions, storage, token: str) -> TestClient:
+    app = make_test_app(sessions, lambda: storage, context=None)
+    assert app.state.allow_dev_identity is False
+    client = TestClient(app)
+    client.cookies.set("iap_session", token)
+    return client
+
+
+def test_missing_cookie_rejects_forged_development_identity(sessions, storage):
+    """Catches dev headers authenticating when the isolated app disables dev identity."""
+    client = TestClient(make_test_app(sessions, lambda: storage, context=None))
+    response = client.get(
+        "/api/project-skills",
+        headers={
+            "X-User-ID": "user-1",
+            "X-Unit-ID": "unit-1",
+            "X-Project-ID": "project-1",
+            "X-User-Role": "project_admin",
+        },
+    )
+    assert response.status_code == 401
+
+
+def test_real_cookie_identity_reads_its_selected_project(sessions, storage):
+    """Catches accidental dependence on a test-only request-context override."""
+    skill_id = seed_skill(sessions, storage, make_context("skill.read"))
+    token = issue_session(sessions)
+    response = cookie_client(sessions, storage, token).get("/api/project-skills")
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["items"]] == [skill_id]
+
+
+def test_cookie_request_rejects_expired_and_revoked_sessions(sessions, storage):
+    """Catches stale Cookie sessions remaining authorized."""
+    for field in ("idle_expires_at", "revoked_at"):
+        token = issue_session(sessions)
+        with sessions() as session:
+            auth = session.scalar(
+                select(AuthSession).where(
+                    AuthSession.session_token_hash
+                    == hashlib.sha256(token.encode()).hexdigest()
+                )
+            )
+            setattr(
+                auth,
+                field,
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+                if field == "idle_expires_at"
+                else datetime.now(timezone.utc),
+            )
+            session.commit()
+        assert (
+            cookie_client(sessions, storage, token)
+            .get("/api/project-skills")
+            .status_code
+            == 401
+        )
+
+
+@pytest.mark.parametrize("mutation", ["membership", "permission"])
+def test_cookie_request_rejects_member_or_role_permission_revocation(
+    sessions, storage, mutation
+):
+    """Catches authorization snapshots that survive membership or grant revocation."""
+    role_code = f"reader-{mutation}"
+    with sessions() as session:
+        seed_builtin_catalogue(session, "unit-1")
+        role = Role(
+            id=str(uuid4()),
+            unit_id="unit-1",
+            code=role_code,
+            name=role_code,
+            scope_type="project",
+            built_in=False,
+            status="active",
+        )
+        session.add(role)
+        session.flush()
+        session.add(
+            RolePermission(
+                id=str(uuid4()),
+                role_id=role.id,
+                permission_code="skill.read",
+                unit_id="unit-1",
+                data_scope="project",
+            )
+        )
+        session.commit()
+    token = issue_session(sessions, role_code=role_code)
+    client = cookie_client(sessions, storage, token)
+    initial = client.get("/api/project-skills")
+    assert initial.status_code == 200, initial.text
+    with sessions() as session:
+        if mutation == "membership":
+            membership = session.scalar(
+                select(ProjectMembership).where(
+                    ProjectMembership.user_id == "user-1",
+                    ProjectMembership.project_id == "project-1",
+                )
+            )
+            membership.status = "inactive"
+        else:
+            grant = session.scalar(
+                select(RolePermission).join(Role).where(Role.code == role_code)
+            )
+            session.delete(grant)
+        session.commit()
+    response = client.get("/api/project-skills")
+    assert response.status_code == 403
+
+
+def test_forged_identity_headers_do_not_change_cookie_identity(sessions, storage):
+    """Catches development headers overriding an authenticated Cookie identity."""
+    own = make_context("skill.read")
+    expected = seed_skill(sessions, storage, own, name="selected")
+    seed_skill(
+        sessions,
+        storage,
+        make_context(
+            "skill.read", user_id="user-3", unit_id="unit-2", project_id="project-3"
+        ),
+        name="forged",
+    )
+    token = issue_session(sessions)
+    response = cookie_client(sessions, storage, token).get(
+        "/api/project-skills",
+        headers={
+            "X-User-ID": "user-3",
+            "X-Unit-ID": "unit-2",
+            "X-Project-ID": "project-3",
+        },
+    )
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["items"]] == [expected]
+
+
+def test_invalid_selected_project_is_not_replaced_by_sole_other_membership(
+    sessions, storage
+):
+    """Catches identity fallback leaking a different project through this API."""
+    alternative = make_context("skill.read", project_id="project-2")
+    leaked_id = seed_skill(sessions, storage, alternative, name="must-not-leak")
+    token = issue_session(sessions, project_id="project-1")
+    with sessions() as session:
+        role = session.scalar(
+            select(Role).where(Role.code == "project_admin", Role.unit_id == "unit-1")
+        )
+        session.add_all(
+            [
+                ProjectMembership(
+                    id=str(uuid4()),
+                    user_id="user-1",
+                    unit_id="unit-1",
+                    project_id="project-2",
+                    status="active",
+                ),
+                ProjectMembershipRole(
+                    id=str(uuid4()),
+                    user_id="user-1",
+                    unit_id="unit-1",
+                    project_id="project-2",
+                    role_id=role.id,
+                    scope_type="project",
+                ),
+            ]
+        )
+        original = session.scalar(
+            select(ProjectMembership).where(
+                ProjectMembership.user_id == "user-1",
+                ProjectMembership.project_id == "project-1",
+            )
+        )
+        original.status = "inactive"
+        session.commit()
+
+    response = cookie_client(sessions, storage, token).get("/api/project-skills")
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "skill_project_required"}
+    assert leaked_id not in response.text
+
+
+def test_cookie_does_not_select_project_when_session_has_none(sessions, storage):
+    """Catches implicit project selection for a Cookie with no selected project."""
+    token = issue_session(sessions)
+    with sessions() as session:
+        auth = session.scalar(select(AuthSession))
+        auth.current_project_id = None
+        session.commit()
+    response = cookie_client(sessions, storage, token).get("/api/project-skills")
+    assert response.status_code == 403
+    assert response.json() == {"detail": "skill_project_required"}
+
+
+def test_authorization_version_change_invalidates_cookie(sessions, storage):
+    """Catches stale authorization after user permission version changes."""
+    token = issue_session(sessions)
+    with sessions() as session:
+        user = session.get(User, "user-1")
+        user.authorization_version += 1
+        session.commit()
+    assert (
+        cookie_client(sessions, storage, token).get("/api/project-skills").status_code
+        == 401
+    )

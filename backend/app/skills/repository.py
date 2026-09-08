@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.orm import Session
 
 from .models import Skill, SkillDraft, SkillVersion
@@ -97,14 +98,151 @@ class SkillRepository:
         self._session.flush()
         return skill
 
-    def get(self, scope: SkillScope, skill_id: str) -> Skill | None:
-        return self._session.scalar(self._scoped(scope).where(Skill.id == skill_id))
+    def get(
+        self,
+        scope: SkillScope,
+        skill_id: str,
+        *,
+        owner_ids: frozenset[str] | None = None,
+    ) -> Skill | None:
+        return self._session.scalar(
+            self._scoped(scope, owner_ids=owner_ids).where(Skill.id == skill_id)
+        )
 
     def list(self, scope: SkillScope, *, offset: int = 0, limit: int = 20) -> list[Skill]:
         if offset < 0 or limit < 0:
             raise ValueError("Pagination must be nonnegative")
         statement = self._scoped(scope).order_by(Skill.created_at, Skill.id).offset(offset).limit(limit)
         return list(self._session.scalars(statement))
+
+    def list_summaries(
+        self,
+        scope: SkillScope,
+        *,
+        owner_ids: frozenset[str] | None = None,
+        offset: int = 0,
+        limit: int = 20,
+        q: str | None = None,
+    ) -> tuple[list[Mapping[str, Any]], int]:
+        if offset < 0 or limit < 0:
+            raise ValueError("Pagination must be nonnegative")
+        conditions = self._conditions(scope, owner_ids=owner_ids, q=q)
+        total = (
+            self._session.scalar(
+                select(func.count())
+                .select_from(Skill)
+                .join(SkillDraft, SkillDraft.skill_id == Skill.id)
+                .where(*conditions)
+            )
+            or 0
+        )
+        updated_at = case(
+            (Skill.updated_at >= SkillDraft.updated_at, Skill.updated_at),
+            else_=SkillDraft.updated_at,
+        ).label("updated_at")
+        statement = (
+            select(
+                Skill.id,
+                Skill.name,
+                SkillDraft.description,
+                SkillDraft.display_version,
+                SkillDraft.revision.label("draft_revision"),
+                Skill.published_version_id,
+                Skill.created_at,
+                updated_at,
+            )
+            .join(SkillDraft, SkillDraft.skill_id == Skill.id)
+            .where(*conditions)
+            .order_by(Skill.created_at, Skill.id)
+            .offset(offset)
+            .limit(limit)
+        )
+        return list(self._session.execute(statement).mappings()), int(total)
+
+    def get_summary(
+        self,
+        scope: SkillScope,
+        skill_id: str,
+        *,
+        owner_ids: frozenset[str] | None = None,
+    ) -> Mapping[str, Any] | None:
+        updated_at = case(
+            (Skill.updated_at >= SkillDraft.updated_at, Skill.updated_at),
+            else_=SkillDraft.updated_at,
+        ).label("updated_at")
+        statement = (
+            select(
+                Skill.id,
+                Skill.name,
+                SkillDraft.description,
+                SkillDraft.display_version,
+                SkillDraft.revision.label("draft_revision"),
+                Skill.published_version_id,
+                Skill.created_at,
+                updated_at,
+            )
+            .join(SkillDraft, SkillDraft.skill_id == Skill.id)
+            .where(*self._conditions(scope, owner_ids=owner_ids), Skill.id == skill_id)
+        )
+        return self._session.execute(statement).mappings().one_or_none()
+
+    def get_draft(
+        self,
+        scope: SkillScope,
+        skill_id: str,
+        *,
+        owner_ids: frozenset[str] | None = None,
+    ) -> SkillDraft | None:
+        return self._session.scalar(
+            select(SkillDraft)
+            .join(Skill, Skill.id == SkillDraft.skill_id)
+            .where(*self._conditions(scope, owner_ids=owner_ids), Skill.id == skill_id)
+        )
+
+    def list_version_summaries(
+        self,
+        scope: SkillScope,
+        skill_id: str,
+        *,
+        owner_ids: frozenset[str] | None = None,
+        offset: int = 0,
+        limit: int = 20,
+    ) -> tuple[list[Mapping[str, Any]], int]:
+        if offset < 0 or limit < 0:
+            raise ValueError("Pagination must be nonnegative")
+        conditions = [
+            *self._conditions(scope, owner_ids=owner_ids),
+            Skill.id == skill_id,
+        ]
+        total = (
+            self._session.scalar(
+                select(func.count())
+                .select_from(SkillVersion)
+                .join(Skill, Skill.id == SkillVersion.skill_id)
+                .where(*conditions)
+            )
+            or 0
+        )
+        statement = (
+            select(
+                SkillVersion.id,
+                SkillVersion.skill_id,
+                SkillVersion.version,
+                SkillVersion.source_revision,
+                SkillVersion.name,
+                SkillVersion.description,
+                SkillVersion.display_version,
+                SkillVersion.package_digest,
+                SkillVersion.published_by,
+                SkillVersion.published_at,
+            )
+            .join(Skill, Skill.id == SkillVersion.skill_id)
+            .where(*conditions)
+            .order_by(SkillVersion.version.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+        return list(self._session.execute(statement).mappings()), int(total)
 
     def save_draft(
         self,
@@ -169,16 +307,43 @@ class SkillRepository:
         self._session.flush()
         return version
 
-    def get_version(self, scope: SkillScope, skill_id: str, version_id: str) -> SkillVersion | None:
+    def get_version(
+        self,
+        scope: SkillScope,
+        skill_id: str,
+        version_id: str,
+        *,
+        owner_ids: frozenset[str] | None = None,
+    ) -> SkillVersion | None:
         return self._session.scalar(
-            select(SkillVersion).join(Skill, Skill.id == SkillVersion.skill_id).where(
-                Skill.unit_id == scope.unit_id, Skill.project_id == scope.project_id,
-                Skill.id == skill_id, SkillVersion.id == version_id,
+            select(SkillVersion)
+            .join(Skill, Skill.id == SkillVersion.skill_id)
+            .where(
+                *self._conditions(scope, owner_ids=owner_ids),
+                Skill.id == skill_id,
+                SkillVersion.id == version_id,
             )
         )
 
-    def _scoped(self, scope: SkillScope):
-        return select(Skill).where(Skill.unit_id == scope.unit_id, Skill.project_id == scope.project_id)
+    def _conditions(
+        self,
+        scope: SkillScope,
+        *,
+        owner_ids: frozenset[str] | None = None,
+        q: str | None = None,
+    ) -> list[Any]:
+        conditions = [
+            Skill.unit_id == scope.unit_id,
+            Skill.project_id == scope.project_id,
+        ]
+        if owner_ids is not None:
+            conditions.append(Skill.created_by.in_(owner_ids))
+        if q is not None:
+            conditions.append(Skill.name.contains(q, autoescape=True))
+        return conditions
+
+    def _scoped(self, scope: SkillScope, *, owner_ids: frozenset[str] | None = None):
+        return select(Skill).where(*self._conditions(scope, owner_ids=owner_ids))
 
     def _lock(self, scope: SkillScope, skill_id: str) -> Skill:
         skill = self._session.scalar(
