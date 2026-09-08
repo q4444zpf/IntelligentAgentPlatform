@@ -10,7 +10,6 @@ import pytest
 
 from app.skills.package import SkillPackageError, parse_skill_bundle
 
-
 MIB = 1024 * 1024
 
 
@@ -31,6 +30,38 @@ def make_bundle(entries: list[tuple[str | zipfile.ZipInfo, bytes]]) -> bytes:
     return stream.getvalue()
 
 
+def make_bundle_with_invalid_utf8_member_name() -> bytes:
+    bundle = bytearray(
+        make_bundle([("s/SKILL.md", valid_manifest()), ("s/bad.txt", b"invalid name")])
+    )
+    valid_name = b"s/bad.txt"
+    invalid_name = b"s/\xffad.txt"
+    matches = 0
+    for signature, flags_offset, name_length_offset, name_offset in (
+        (b"PK\x03\x04", 6, 26, 30),
+        (b"PK\x01\x02", 8, 28, 46),
+    ):
+        cursor = 0
+        while (header := bundle.find(signature, cursor)) >= 0:
+            name_length = struct.unpack_from("<H", bundle, header + name_length_offset)[
+                0
+            ]
+            member_name_offset = header + name_offset
+            member_name = bytes(
+                bundle[member_name_offset : member_name_offset + name_length]
+            )
+            if member_name == valid_name:
+                flags = struct.unpack_from("<H", bundle, header + flags_offset)[0]
+                struct.pack_into("<H", bundle, header + flags_offset, flags | 0x800)
+                bundle[member_name_offset : member_name_offset + name_length] = (
+                    invalid_name
+                )
+                matches += 1
+            cursor = member_name_offset + name_length
+    assert matches == 2
+    return bytes(bundle)
+
+
 def test_parses_an_immutable_skill_package():
     package = parse_skill_bundle(
         make_bundle(
@@ -45,9 +76,15 @@ def test_parses_an_immutable_skill_package():
     assert package.description == "Sample"
     assert package.display_version == "1.0"
     assert package.content.endswith("Instructions\n")
-    assert [item.path for item in package.files] == ["SKILL.md", "references/readme.txt"]
+    assert [item.path for item in package.files] == [
+        "SKILL.md",
+        "references/readme.txt",
+    ]
     assert package.files[1].data == b"reference"
-    assert package.files[1].sha256 == "52367a6622b19f08825e915fad80c542ad4f4c34dbcebad9f5007994b3e39208"
+    assert (
+        package.files[1].sha256
+        == "52367a6622b19f08825e915fad80c542ad4f4c34dbcebad9f5007994b3e39208"
+    )
     with pytest.raises(FrozenInstanceError):
         package.name = "changed"
     with pytest.raises(FrozenInstanceError):
@@ -94,6 +131,38 @@ def test_rejects_duplicate_normalized_paths():
     entries = [("s/SKILL.md", valid_manifest()), ("s/a.txt", b"a"), ("s/A.txt", b"b")]
     with pytest.raises(SkillPackageError):
         parse_skill_bundle(make_bundle(entries))
+
+
+@pytest.mark.parametrize(
+    "colliding_entries",
+    [
+        [("s/ref", b"file"), ("s/ref/a.txt", b"nested")],
+        [("s/ref/a.txt", b"nested"), ("s/ref", b"file")],
+        [("s/REF/a.txt", b"nested"), ("s/ref", b"file")],
+    ],
+)
+def test_rejects_regular_file_directory_ancestor_collisions(colliding_entries):
+    with pytest.raises(SkillPackageError):
+        parse_skill_bundle(
+            make_bundle([("s/SKILL.md", valid_manifest()), *colliding_entries])
+        )
+
+
+def test_accepts_explicit_directory_with_descendant_file():
+    package = parse_skill_bundle(
+        make_bundle(
+            [
+                ("s/SKILL.md", valid_manifest()),
+                ("s/references/", b""),
+                ("s/references/readme.txt", b"reference"),
+            ]
+        )
+    )[0]
+
+    assert [item.path for item in package.files] == [
+        "SKILL.md",
+        "references/readme.txt",
+    ]
 
 
 def test_rejects_exact_duplicate_paths():
@@ -148,13 +217,20 @@ def test_rejects_invalid_utf8_manifest():
         parse_skill_bundle(make_bundle([("s/SKILL.md", b"\xff")]))
 
 
+def test_rejects_invalid_utf8_member_name_as_package_error():
+    with pytest.raises(SkillPackageError):
+        parse_skill_bundle(make_bundle_with_invalid_utf8_member_name())
+
+
 def test_rejects_corrupt_member_crc():
     bundle = bytearray(
         make_bundle([("s/SKILL.md", valid_manifest()), ("s/ref.txt", b"reference")])
     )
     central = bundle.find(b"PK\x01\x02")
     while central >= 0:
-        name_length, extra_length, comment_length = struct.unpack_from("<HHH", bundle, central + 28)
+        name_length, extra_length, comment_length = struct.unpack_from(
+            "<HHH", bundle, central + 28
+        )
         name = bytes(bundle[central + 46 : central + 46 + name_length])
         if name == b"s/ref.txt":
             struct.pack_into("<I", bundle, central + 16, 0)

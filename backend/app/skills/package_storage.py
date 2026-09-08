@@ -13,7 +13,6 @@ from botocore.config import Config
 
 from .package import MAX_ZIP_BYTES, READ_CHUNK_BYTES, ValidatedSkillPackage
 
-
 DEFAULT_SKILL_BUCKET = "iap-skills"
 SCOPE_SEGMENT = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$")
 STORED_OBJECT_KEY = re.compile(
@@ -57,7 +56,9 @@ class SkillPackageStorage:
         skill_id: str,
         package: ValidatedSkillPackage,
     ) -> StoredSkillPackage:
-        scope = tuple(_validate_scope_segment(value) for value in (unit_id, project_id, skill_id))
+        scope = tuple(
+            _validate_scope_segment(value) for value in (unit_id, project_id, skill_id)
+        )
         archive = _encode_package(package)
         if len(archive) > MAX_ZIP_BYTES:
             raise SkillPackageStorageError("Encoded skill package exceeds 10 MiB")
@@ -95,31 +96,48 @@ class SkillPackageStorage:
             raise SkillPackageStorageError("Invalid stored skill package reference")
         body = None
         try:
-            response = self._client.get_object(Bucket=self._bucket, Key=stored.object_key)
+            response = self._client.get_object(
+                Bucket=self._bucket, Key=stored.object_key
+            )
             body = response["Body"]
             if response.get("ContentLength") != stored.size_bytes:
-                raise SkillPackageStorageError("Stored skill package length does not match")
+                raise SkillPackageStorageError(
+                    "Stored skill package length does not match"
+                )
             expected_metadata = {
                 "archive-sha256": stored.archive_sha256,
                 "package-digest": stored.package_digest,
                 "size-bytes": str(stored.size_bytes),
             }
-            metadata = {str(key).lower(): str(value) for key, value in response.get("Metadata", {}).items()}
-            if any(metadata.get(key) != value for key, value in expected_metadata.items()):
-                raise SkillPackageStorageError("Stored skill package metadata does not match")
+            metadata = {
+                str(key).lower(): str(value)
+                for key, value in response.get("Metadata", {}).items()
+            }
+            if any(
+                metadata.get(key) != value for key, value in expected_metadata.items()
+            ):
+                raise SkillPackageStorageError(
+                    "Stored skill package metadata does not match"
+                )
 
             chunks: list[bytes] = []
             size = 0
             while chunk := body.read(READ_CHUNK_BYTES):
                 size += len(chunk)
                 if size > MAX_ZIP_BYTES or size > stored.size_bytes:
-                    raise SkillPackageStorageError("Stored skill package exceeds its size limit")
+                    raise SkillPackageStorageError(
+                        "Stored skill package exceeds its size limit"
+                    )
                 chunks.append(chunk)
             archive = b"".join(chunks)
             if size != stored.size_bytes:
-                raise SkillPackageStorageError("Stored skill package length does not match")
+                raise SkillPackageStorageError(
+                    "Stored skill package length does not match"
+                )
             if hashlib.sha256(archive).hexdigest() != stored.archive_sha256:
-                raise SkillPackageStorageError("Stored skill package digest does not match")
+                raise SkillPackageStorageError(
+                    "Stored skill package digest does not match"
+                )
             return archive
         except SkillPackageStorageError:
             raise
@@ -134,7 +152,17 @@ def create_default_skill_package_storage() -> SkillPackageStorage:
     import boto3
 
     bucket = os.environ.get("IAP_SKILL_BUCKET", DEFAULT_SKILL_BUCKET)
-    return SkillPackageStorage(boto3.client("s3", config=STORAGE_CLIENT_CONFIG), bucket)
+    client = boto3.client(
+        "s3",
+        endpoint_url=os.environ.get("IAP_OBJECT_STORAGE_ENDPOINT", "http://minio:9000"),
+        aws_access_key_id=os.environ.get("IAP_OBJECT_STORAGE_ACCESS_KEY", "iap-access"),
+        aws_secret_access_key=os.environ.get(
+            "IAP_OBJECT_STORAGE_SECRET_KEY", "change-me"
+        ),
+        region_name=os.environ.get("IAP_OBJECT_STORAGE_REGION", "us-east-1"),
+        config=STORAGE_CLIENT_CONFIG,
+    )
+    return SkillPackageStorage(client, bucket)
 
 
 def _validate_scope_segment(value: str) -> str:

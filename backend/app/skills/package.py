@@ -7,11 +7,11 @@ import re
 import stat
 import struct
 import zipfile
+from bisect import bisect_left
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
 from .service import SkillValidationError, parse_skill_markdown
-
 
 MAX_ZIP_BYTES = 10 * 1024 * 1024
 MAX_EXPANDED_BYTES = 20 * 1024 * 1024
@@ -65,7 +65,7 @@ def parse_skill_bundle(data: bytes) -> tuple[ValidatedSkillPackage, ...]:
 
             normalized_entries = _validate_entries(entries)
             files = _read_files(archive, normalized_entries)
-    except (zipfile.BadZipFile, RuntimeError, OSError) as error:
+    except (UnicodeDecodeError, zipfile.BadZipFile, RuntimeError, OSError) as error:
         raise SkillPackageError("Invalid ZIP skill bundle") from error
 
     return _build_packages(files)
@@ -79,7 +79,9 @@ def _reject_raw_nul_names(archive: zipfile.ZipFile, entry_count: int) -> None:
         header = archive.fp.read(46)
         if len(header) != 46 or header[:4] != b"PK\x01\x02":
             raise SkillPackageError("Invalid ZIP central directory")
-        name_length, extra_length, comment_length = struct.unpack_from("<HHH", header, 28)
+        name_length, extra_length, comment_length = struct.unpack_from(
+            "<HHH", header, 28
+        )
         raw_name = archive.fp.read(name_length)
         if b"\x00" in raw_name:
             raise SkillPackageError("NUL is not allowed in skill bundle paths")
@@ -91,6 +93,7 @@ def _validate_entries(
 ) -> list[tuple[zipfile.ZipInfo, PurePosixPath]]:
     normalized_entries: list[tuple[zipfile.ZipInfo, PurePosixPath]] = []
     seen: set[str] = set()
+    regular_files: set[str] = set()
     for item in entries:
         normalized = _normalize_path(item.filename)
         folded = normalized.as_posix().casefold()
@@ -98,7 +101,20 @@ def _validate_entries(
             raise SkillPackageError(f"Duplicate path in skill bundle: {item.filename}")
         seen.add(folded)
         _validate_member_type(item)
+        if not item.is_dir():
+            regular_files.add(folded)
         normalized_entries.append((item, normalized))
+
+    sorted_paths = sorted(seen)
+    for regular_file in regular_files:
+        descendant_prefix = f"{regular_file}/"
+        descendant_index = bisect_left(sorted_paths, descendant_prefix)
+        if descendant_index < len(sorted_paths) and sorted_paths[
+            descendant_index
+        ].startswith(descendant_prefix):
+            raise SkillPackageError(
+                f"Regular file is a directory ancestor in skill bundle: {regular_file}"
+            )
     return normalized_entries
 
 
@@ -109,7 +125,9 @@ def _normalize_path(raw_path: str) -> PurePosixPath:
         raise SkillPackageError(f"Absolute path in skill bundle: {raw_path}")
 
     replaced = raw_path.replace("\\", "/")
-    raw_parts = replaced[:-1].split("/") if replaced.endswith("/") else replaced.split("/")
+    raw_parts = (
+        replaced[:-1].split("/") if replaced.endswith("/") else replaced.split("/")
+    )
     if any(part in {"", ".", ".."} for part in raw_parts):
         raise SkillPackageError(f"Unsafe path in skill bundle: {raw_path}")
     path = PurePosixPath(replaced)
@@ -154,7 +172,9 @@ def _read_files(
     return files
 
 
-def _build_packages(files: dict[PurePosixPath, bytes]) -> tuple[ValidatedSkillPackage, ...]:
+def _build_packages(
+    files: dict[PurePosixPath, bytes],
+) -> tuple[ValidatedSkillPackage, ...]:
     manifest_paths = sorted(path for path in files if path.name == "SKILL.md")
     if not manifest_paths:
         raise SkillPackageError("Skill bundle does not contain SKILL.md")
@@ -169,7 +189,9 @@ def _build_packages(files: dict[PurePosixPath, bytes]) -> tuple[ValidatedSkillPa
     for path, file_data in files.items():
         owners = [root for root in roots if _is_relative_to(path, root)]
         if len(owners) != 1:
-            raise SkillPackageError(f"File does not belong to exactly one skill: {path}")
+            raise SkillPackageError(
+                f"File does not belong to exactly one skill: {path}"
+            )
         root = owners[0]
         owned_files[root].append((path.relative_to(root), file_data))
 
@@ -193,7 +215,9 @@ def _build_packages(files: dict[PurePosixPath, bytes]) -> tuple[ValidatedSkillPa
                 data=file_data,
                 sha256=hashlib.sha256(file_data).hexdigest(),
             )
-            for path, file_data in sorted(owned_files[root], key=lambda entry: entry[0].as_posix())
+            for path, file_data in sorted(
+                owned_files[root], key=lambda entry: entry[0].as_posix()
+            )
         )
         digest_entries = [
             {"path": item.path, "size": len(item.data), "sha256": item.sha256}
