@@ -11,6 +11,8 @@ from typing import Any, Protocol
 
 import httpx
 
+from .http_tls import create_runtime_ssl_context
+
 
 _DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
 
@@ -152,16 +154,21 @@ class LauncherHttpTransport:
         remaining = monotonic_deadline - monotonic()
         if remaining <= 0:
             raise TimeoutError("Sandbox Launcher deadline expired")
-        phase_timeout = httpx.Timeout(
-            connect=min(3.0, remaining),
-            pool=min(3.0, remaining),
-            read=remaining,
-            write=remaining,
-        )
         async with asyncio.timeout(remaining):
+            context = await create_runtime_ssl_context()
+            remaining = monotonic_deadline - monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Sandbox Launcher deadline expired")
+            phase_timeout = httpx.Timeout(
+                connect=min(3.0, remaining),
+                pool=min(3.0, remaining),
+                read=remaining,
+                write=remaining,
+            )
             async with httpx.AsyncClient(
                 timeout=phase_timeout,
                 trust_env=False,
+                verify=context,
             ) as client:
                 response = await client.request(
                     method,

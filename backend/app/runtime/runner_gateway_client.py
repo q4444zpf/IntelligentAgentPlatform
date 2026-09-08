@@ -12,6 +12,7 @@ import httpx
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from .execution_contract import RunExecutionRequest
+from .http_tls import create_runtime_ssl_context
 from .runner_gateway_schemas import (
     ArtifactCapabilityRegistrationRequest,
     ArtifactCapabilityResponse,
@@ -425,9 +426,14 @@ class RunnerGatewayClient:
         if remaining <= 0:
             raise TimeoutError("Runner Gateway deadline expired")
         async with asyncio.timeout(remaining):
+            context = await create_runtime_ssl_context()
+            remaining = monotonic_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Runner Gateway deadline expired")
             async with httpx.AsyncClient(
                 timeout=self._timeout_from_remaining(remaining),
                 trust_env=False,
+                verify=context,
             ) as client, client.stream(
                 method,
                 f"{self.base_url.rstrip('/')}/runs/{self.run_id}/{path}",

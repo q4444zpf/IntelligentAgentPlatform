@@ -11,6 +11,8 @@ from typing import Any, Protocol
 
 import httpx
 
+from .http_tls import create_runtime_ssl_context
+
 
 _DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
 
@@ -59,6 +61,85 @@ class WorkflowRunnerHttpTransport:
             headers={},
             monotonic_deadline=monotonic_deadline,
         )
+
+    def submit_when_healthy(
+        self,
+        payload: dict[str, str],
+        *,
+        monotonic_deadline: float | None = None,
+    ) -> dict[str, Any]:
+        deadline = (
+            monotonic_deadline
+            if monotonic_deadline is not None
+            else self.monotonic() + _DEFAULT_REQUEST_TIMEOUT_SECONDS
+        )
+        if self.monotonic() >= deadline:
+            raise TimeoutError("Workflow Runner deadline expired")
+        result = asyncio.run(
+            self._async_submit_when_healthy(
+                payload,
+                deadline=deadline,
+                has_explicit_deadline=monotonic_deadline is not None,
+            )
+        )
+        if monotonic_deadline is not None and self.monotonic() >= deadline:
+            raise TimeoutError("Workflow Runner deadline expired")
+        return result
+
+    async def _async_submit_when_healthy(
+        self,
+        payload: dict[str, str],
+        *,
+        deadline: float,
+        has_explicit_deadline: bool,
+    ) -> dict[str, Any]:
+        remaining = deadline - self.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Workflow Runner deadline expired")
+        timeout = asyncio.timeout(remaining)
+        try:
+            async with timeout:
+                context = await create_runtime_ssl_context()
+                if self.monotonic() >= deadline:
+                    raise TimeoutError("Workflow Runner deadline expired")
+                async with httpx.AsyncClient(trust_env=False, verify=context) as client:
+                    health = await self._request_with_client(
+                        client,
+                        "GET",
+                        f"{self.base_url.rstrip('/')}/health",
+                        headers={},
+                        body=None,
+                        monotonic_deadline=deadline,
+                        monotonic=self.monotonic,
+                        send_deadline_header=has_explicit_deadline,
+                    )
+                    if not isinstance(health, dict) or not (
+                        health.get("status") == "healthy" and health.get("sandbox") is True
+                    ):
+                        raise RunnerUnavailableError("Workflow Runner is unavailable")
+                    if not has_explicit_deadline:
+                        # The legacy default gives each request its own ten seconds.
+                        deadline = self.monotonic() + _DEFAULT_REQUEST_TIMEOUT_SECONDS
+                        timeout.reschedule(
+                            asyncio.get_running_loop().time() + _DEFAULT_REQUEST_TIMEOUT_SECONDS
+                        )
+                    result = await self._request_with_client(
+                        client,
+                        "POST",
+                        f"{self.base_url.rstrip('/')}/runs",
+                        headers={"Content-Type": "application/json"},
+                        body=json.dumps(payload).encode("utf-8"),
+                        monotonic_deadline=deadline,
+                        monotonic=self.monotonic,
+                        send_deadline_header=has_explicit_deadline,
+                    )
+        except TimeoutError as exc:
+            if has_explicit_deadline and timeout.expired():
+                raise RunnerDeadlineExceededError("Workflow Runner deadline expired") from exc
+            raise
+        if self.monotonic() >= deadline:
+            raise TimeoutError("Workflow Runner deadline expired")
+        return result
 
     def submit(
         self,
@@ -142,6 +223,7 @@ class WorkflowRunnerHttpTransport:
                     body=body,
                     monotonic_deadline=deadline,
                     monotonic=self.monotonic,
+                    send_deadline_header=monotonic_deadline is not None,
                 )
             )
         if self.monotonic() >= deadline:
@@ -157,29 +239,67 @@ class WorkflowRunnerHttpTransport:
         body: bytes | None,
         monotonic_deadline: float,
         monotonic: Callable[[], float],
+        send_deadline_header: bool,
     ) -> dict[str, Any]:
         remaining = monotonic_deadline - monotonic()
         if remaining <= 0:
             raise TimeoutError("Workflow Runner deadline expired")
-        phase_timeout = httpx.Timeout(
-            connect=min(3.0, remaining),
-            pool=min(3.0, remaining),
-            read=remaining,
-            write=remaining,
-        )
         async with asyncio.timeout(remaining):
+            context = await create_runtime_ssl_context()
+            if monotonic() >= monotonic_deadline:
+                raise TimeoutError("Workflow Runner deadline expired")
             async with httpx.AsyncClient(
-                timeout=phase_timeout,
                 trust_env=False,
+                verify=context,
             ) as client:
-                response = await client.request(
+                payload = await WorkflowRunnerHttpTransport._request_with_client(
+                    client,
                     method,
                     url,
                     headers=headers,
-                    content=body,
+                    body=body,
+                    monotonic_deadline=monotonic_deadline,
+                    monotonic=monotonic,
+                    send_deadline_header=send_deadline_header,
                 )
-                response.raise_for_status()
-                payload = response.json()
+        if monotonic() >= monotonic_deadline:
+            raise TimeoutError("Workflow Runner deadline expired")
+        return payload
+
+    @staticmethod
+    async def _request_with_client(
+        client: httpx.AsyncClient,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str],
+        body: bytes | None,
+        monotonic_deadline: float,
+        monotonic: Callable[[], float],
+        send_deadline_header: bool,
+    ) -> dict[str, Any]:
+        remaining = monotonic_deadline - monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Workflow Runner deadline expired")
+        request_headers = dict(headers)
+        if send_deadline_header:
+            request_headers["X-Request-Deadline-At"] = (
+                datetime.now(UTC) + timedelta(seconds=remaining)
+            ).isoformat()
+        response = await client.request(
+            method,
+            url,
+            headers=request_headers,
+            content=body,
+            timeout=httpx.Timeout(
+                connect=min(3.0, remaining),
+                pool=min(3.0, remaining),
+                read=remaining,
+                write=remaining,
+            ),
+        )
+        response.raise_for_status()
+        payload = response.json()
         if monotonic() >= monotonic_deadline:
             raise TimeoutError("Workflow Runner deadline expired")
         return payload
@@ -229,21 +349,35 @@ class WorkflowRunnerClient:
         execution_deadline_at: str,
         monotonic_deadline: float | None = None,
     ) -> dict[str, Any]:
+        payload = {
+            "run_id": run_id,
+            "agent_version": agent_version,
+            "checkpoint_key": checkpoint_key,
+            "snapshot_id": snapshot_id,
+            "snapshot_digest": snapshot_digest,
+            "gateway_url": gateway_url,
+            "run_token": run_token,
+            "deadline_at": deadline_at,
+            "execution_deadline_at": execution_deadline_at,
+        }
+        # Custom transports and overridden health/submit behavior retain their path.
+        if (
+            type(self) is WorkflowRunnerClient
+            and "is_healthy" not in vars(self)
+            and type(self.transport) is WorkflowRunnerHttpTransport
+            and self.transport.request is None
+            and not {"health_check", "submit", "_request"}.intersection(vars(self.transport))
+        ):
+            return self._transport_call(
+                self.transport.submit_when_healthy,
+                payload,
+                monotonic_deadline=monotonic_deadline,
+            )
         if not self.is_healthy(monotonic_deadline=monotonic_deadline):
             raise RunnerUnavailableError("Workflow Runner is unavailable")
         return self._transport_call(
             self.transport.submit,
-            {
-                "run_id": run_id,
-                "agent_version": agent_version,
-                "checkpoint_key": checkpoint_key,
-                "snapshot_id": snapshot_id,
-                "snapshot_digest": snapshot_digest,
-                "gateway_url": gateway_url,
-                "run_token": run_token,
-                "deadline_at": deadline_at,
-                "execution_deadline_at": execution_deadline_at,
-            },
+            payload,
             monotonic_deadline=monotonic_deadline,
         )
 

@@ -1,4 +1,5 @@
 import json
+import ssl
 import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -6,6 +7,7 @@ from threading import Event, Thread
 from types import SimpleNamespace
 
 import httpx
+import anyio.to_thread
 import pytest
 
 from app.runtime.execution_contract import RunExecutionRequest
@@ -557,6 +559,64 @@ def test_completion_enforces_one_second_absolute_slow_drip_deadline():
 
     assert operation_elapsed is not None and operation_elapsed < 1.25
     assert captured.value.code == "runner_gateway_unavailable"
+
+
+def test_gateway_deadline_prevents_request_after_slow_tls_initialization(
+    monkeypatch,
+):
+    from app.runtime import runner_gateway_client as gateway_client_module
+
+    started = Event()
+    release = Event()
+    received = Event()
+
+    def blocked_build():
+        started.set()
+        assert release.wait(3)
+        return ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+    async def create_context():
+        return await anyio.to_thread.run_sync(
+            blocked_build, abandon_on_cancel=True
+        )
+
+    monkeypatch.setattr(
+        gateway_client_module,
+        "create_runtime_ssl_context",
+        create_context,
+        raising=False,
+    )
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            received.set()
+            time.sleep(0.2)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    request = _request().model_copy(
+        update={
+            "execution_deadline_at": datetime.now(timezone.utc)
+            + timedelta(seconds=0.05),
+            "gateway_url": f"http://127.0.0.1:{server.server_port}",
+        }
+    )
+    client = RunnerGatewayClient.from_execution_request(request)
+    try:
+        with pytest.raises(RunnerGatewayDeadlineExceeded):
+            client.get_snapshot()
+        assert started.is_set()
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert not received.wait(0.1)
 
 
 def test_execution_deadline_is_rechecked_after_response_validation():

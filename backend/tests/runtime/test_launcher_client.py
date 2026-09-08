@@ -1,10 +1,13 @@
 import json
+import ssl
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 
 import httpx
+import anyio.to_thread
 import pytest
 
 from app.runtime.launcher_client import (
@@ -413,3 +416,68 @@ def test_launcher_prepare_enforces_execution_deadline_during_slow_response():
         thread.join(timeout=2)
 
     assert operation_elapsed is not None and operation_elapsed < 0.5
+
+
+def test_launcher_deadline_prevents_request_after_slow_tls_initialization(
+    monkeypatch,
+):
+    from app.runtime import launcher_client as launcher_client_module
+
+    started = threading.Event()
+    release = threading.Event()
+    received = threading.Event()
+
+    def blocked_build():
+        started.set()
+        assert release.wait(3)
+        return ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+    async def create_context():
+        return await anyio.to_thread.run_sync(
+            blocked_build, abandon_on_cancel=True
+        )
+
+    monkeypatch.setattr(
+        launcher_client_module,
+        "create_runtime_ssl_context",
+        create_context,
+        raising=False,
+    )
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            received.set()
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            body = b'{"run_id":"run-1","status":"created"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    transport = LauncherHttpTransport(
+        f"http://127.0.0.1:{server.server_port}", "secret"
+    )
+    try:
+        with pytest.raises(TimeoutError):
+            transport.create(
+                "run-1",
+                "/workspace/run-1",
+                {},
+                deadline_at=datetime.now(UTC) + timedelta(seconds=0.05),
+            )
+        assert started.is_set()
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert not received.wait(0.1)
