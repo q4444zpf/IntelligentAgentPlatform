@@ -54,14 +54,14 @@ PERMISSION_CODES = (
     "audit.read", "sandbox.read", "integration.read", "integration.manage",
 )
 
-ROLE_PERMISSION_CODES = {
+EXPECTED_ROLE_PERMISSION_CODES = {
     "project_admin": (
         "dashboard.read", "project.read", "project.manage", "project.member.manage",
         "agent.read", "agent.manage", "agent.run", "conversation.read",
         "conversation.manage", "workflow.read", "workflow.manage", "workflow.run",
         "knowledge.read", "knowledge.manage", "knowledge.retrieve", "model.read",
         "model.manage", "model.run", "tool.read", "tool.invoke", "mcp.read",
-        "skill.read", "skill.invoke", "collaboration.read", "collaboration.manage",
+        "skill.read", "skill.manage", "skill.invoke", "collaboration.read", "collaboration.manage",
         "collaboration.run", "prompt.read", "prompt.manage", "resource.read",
         "resource.manage", "resource.publish", "artifact.read", "artifact.manage",
         "approval.read", "integration.read",
@@ -291,15 +291,15 @@ def test_seed_is_idempotent_and_uses_exact_role_grants(session_factory):
         }
         assert by_role["unit_admin"] == {(code, "unit") for code in PERMISSION_CODES}
         assert by_role["unit_auditor"] == {
-            (code, "unit") for code in ROLE_PERMISSION_CODES["unit_auditor"]
+            (code, "unit") for code in EXPECTED_ROLE_PERMISSION_CODES["unit_auditor"]
         }
         for code in ("project_admin", "model_expert", "viewer"):
             assert by_role[code] == {
                 (permission, "project")
-                for permission in ROLE_PERMISSION_CODES[code]
+                for permission in EXPECTED_ROLE_PERMISSION_CODES[code]
             }
         assert by_role["business_operator"] == {
-            *((permission, "project") for permission in ROLE_PERMISSION_CODES["business_operator"]),
+            *((permission, "project") for permission in EXPECTED_ROLE_PERMISSION_CODES["business_operator"]),
             ("conversation.manage", "own"),
         }
 

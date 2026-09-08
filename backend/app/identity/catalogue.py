@@ -79,7 +79,7 @@ ROLE_PERMISSION_CODES = {
         "workflow.manage", "workflow.run", "knowledge.read",
         "knowledge.manage", "knowledge.retrieve", "model.read", "model.manage",
         "model.run", "tool.read", "tool.invoke", "mcp.read", "skill.read",
-        "skill.invoke", "collaboration.read", "collaboration.manage",
+        "skill.manage", "skill.invoke", "collaboration.read", "collaboration.manage",
         "collaboration.run", "prompt.read", "prompt.manage", "resource.read",
         "resource.manage", "resource.publish", "artifact.read",
         "artifact.manage", "approval.read", "integration.read",
