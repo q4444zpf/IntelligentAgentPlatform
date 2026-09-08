@@ -99,6 +99,8 @@ staging 启动 Launcher 时必须通过部署环境注入一次性或密钥管�
 
 当同时配置 `IAP_SANDBOX_LAUNCHER_URL` 和 `IAP_RUNNER_LAUNCHER_TOKEN` 时，Workflow Runner 会在接受 Run 前调用 Launcher 创建并检查当前 Run 容器；创建失败、检查失败或容器非 running 都会返回 503，并清理已创建容器。未配置令牌时该客户端保持关闭。
 
+内部运行时 HTTP 客户端通过 `app.runtime.http_tls` 在可取消等待的工作线程中读取 certifi 并构造验证上下文，保留证书和主机名校验，不采用环境代理或环境 CA 覆盖。真实 Workflow 提交的健康检查与 POST 共用一次异步操作、一个 TLS 上下文和一个 HTTPX 客户端；操作结束后关闭客户端，不在不同提交间共享可变上下文。显式绝对截止时间覆盖初始化及两阶段请求，健康检查失败或截止时间已耗尽时不发送 POST；未传截止时间时保留各请求的默认预算。自定义传输继续走原有兼容调用路径。
+
 Launcher 使用 `IAP_SANDBOX_RUNNER_IMAGE` 指定执行镜像，默认必须是可信 `iap/` 前缀并包含 tag；镜像不应由请求方传入。
 
 Per-Run 容器策略已固定为可信 `iap/` 镜像、非特权、只读根文件系统、`cap_drop=ALL`、`no-new-privileges`、网络关闭、512MB 内存和 128 PID 上限。`ContainerLauncher` 只接受服务端生成的策略和工作区路径，运行结束强制删除容器；Docker client 不可用时直接拒绝，不回退到宿主机执行。
@@ -145,6 +147,26 @@ python -m app.migrations.sqlite_to_postgres
 ```
 
 可通过 `LEGACY_SQLITE_DATA_DIR` 或三个 `LEGACY_*_DATABASE` 环境变量调整源文件路径。导入按数据域幂等执行，只导入空的 PostgreSQL 目标表，不删除 SQLite 文件。
+
+## Skill 文件包与版本基础
+
+新增内部模块 `app.skills.package`、`app.skills.package_storage` 和 `app.skills.repository`：
+
+- 解析器验证 ZIP 路径、条目类型与限额，返回不可变文件清单和内容摘要，不解包到宿主目录、不执行脚本。
+- 存储适配器写入独立对象，以有界读取和 SHA-256 验证完整性；`IAP_SKILL_BUCKET` 默认为 `iap-skills`，调用方需准备该桶。连接信息沿用 `IAP_OBJECT_STORAGE_*`，不要把凭据写入 Skill 文件。
+- 仓储按单位和项目查询，管理草稿 revision、不可变发布版本和发布幂等记录。调用方先预分配 Skill UUID，上传后使用同一 ID 创建资源；调用方负责授权、发布前重新验证对象以及提交或回滚事务。
+- 迁移 `20260908_26` 新增三张 Skill 表和 PostgreSQL 版本不可变保护，不自动导入现有本地 Skill 目录。
+
+这些模块尚未接入现有 `/api/skills`、Agent/Team 绑定和前端界面。项目权限 API、运行时版本捕获及旧数据切换属于后续交付，不能仅部署本迁移就视为完成 Skill 生产化。
+
+从仓库根目录运行聚焦测试：
+
+```powershell
+python -m pytest backend/tests/skills -q
+python -m pytest backend/tests/integration/test_skill_versions_postgres.py backend/tests/integration/test_skill_package_minio.py -q
+```
+
+真实集成测试需要专用 `TEST_DATABASE_URL`，以及 `TEST_S3_ENDPOINT`、`TEST_S3_ACCESS_KEY`、`TEST_S3_SECRET_KEY`。PostgreSQL 测试前需在该测试库升级到当前迁移版本；MinIO 测试只创建和回收自己的临时桶。没有这些变量时集成测试会跳过，跳过不代表通过。不要指向业务数据库；不可变版本测试记录可在专用测试数据库整体回收时清理。
 
 ## 测试
 
