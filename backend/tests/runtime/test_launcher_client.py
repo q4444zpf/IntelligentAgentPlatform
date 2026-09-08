@@ -425,12 +425,16 @@ def test_launcher_deadline_prevents_request_after_slow_tls_initialization(
 
     started = threading.Event()
     release = threading.Event()
+    completed = threading.Event()
     received = threading.Event()
 
     def blocked_build():
         started.set()
         assert release.wait(3)
-        return ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        try:
+            return ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        finally:
+            completed.set()
 
     async def create_context():
         return await anyio.to_thread.run_sync(
@@ -476,8 +480,10 @@ def test_launcher_deadline_prevents_request_after_slow_tls_initialization(
         assert started.is_set()
     finally:
         release.set()
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
-
-    assert not received.wait(0.1)
+        try:
+            assert completed.wait(2)
+            assert not received.wait(0.1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)

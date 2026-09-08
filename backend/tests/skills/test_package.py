@@ -62,6 +62,31 @@ def make_bundle_with_invalid_utf8_member_name() -> bytes:
     return bytes(bundle)
 
 
+def make_bundle_with_invalid_deflate_payload() -> bytes:
+    bundle = bytearray(make_bundle([("s/SKILL.md", valid_manifest())]))
+    header = bundle.find(b"PK\x03\x04")
+    assert header >= 0
+    assert struct.unpack_from("<H", bundle, header + 8)[0] == zipfile.ZIP_DEFLATED
+    name_length, extra_length = struct.unpack_from("<HH", bundle, header + 26)
+    payload_offset = header + 30 + name_length + extra_length
+    bundle[payload_offset] = (bundle[payload_offset] & ~0x06) | 0x06
+    return bytes(bundle)
+
+
+def make_bundle_with_invalid_lzma_payload() -> bytes:
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_LZMA) as archive:
+        archive.writestr("s/SKILL.md", valid_manifest())
+    bundle = bytearray(stream.getvalue())
+    header = bundle.find(b"PK\x03\x04")
+    assert header >= 0
+    assert struct.unpack_from("<H", bundle, header + 8)[0] == zipfile.ZIP_LZMA
+    name_length, extra_length = struct.unpack_from("<HH", bundle, header + 26)
+    payload_offset = header + 30 + name_length + extra_length
+    bundle[payload_offset + 4] = 0xFF
+    return bytes(bundle)
+
+
 def test_parses_an_immutable_skill_package():
     package = parse_skill_bundle(
         make_bundle(
@@ -242,6 +267,16 @@ def test_rejects_corrupt_member_crc():
 
     with pytest.raises(SkillPackageError):
         parse_skill_bundle(bytes(bundle))
+
+
+def test_rejects_malformed_deflate_payload_as_package_error():
+    with pytest.raises(SkillPackageError, match="Invalid ZIP skill bundle"):
+        parse_skill_bundle(make_bundle_with_invalid_deflate_payload())
+
+
+def test_rejects_malformed_lzma_payload_as_package_error():
+    with pytest.raises(SkillPackageError, match="Invalid ZIP skill bundle"):
+        parse_skill_bundle(make_bundle_with_invalid_lzma_payload())
 
 
 @pytest.mark.parametrize("file_type", [stat.S_IFLNK, stat.S_IFIFO])

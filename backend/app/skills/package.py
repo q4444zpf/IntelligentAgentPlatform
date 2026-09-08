@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import lzma
 import re
 import stat
 import struct
 import zipfile
+import zlib
 from bisect import bisect_left
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -65,7 +67,14 @@ def parse_skill_bundle(data: bytes) -> tuple[ValidatedSkillPackage, ...]:
 
             normalized_entries = _validate_entries(entries)
             files = _read_files(archive, normalized_entries)
-    except (UnicodeDecodeError, zipfile.BadZipFile, RuntimeError, OSError) as error:
+    except (
+        UnicodeDecodeError,
+        zipfile.BadZipFile,
+        RuntimeError,
+        OSError,
+        zlib.error,
+        lzma.LZMAError,
+    ) as error:
         raise SkillPackageError("Invalid ZIP skill bundle") from error
 
     return _build_packages(files)
