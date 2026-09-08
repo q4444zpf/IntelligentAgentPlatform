@@ -18,6 +18,7 @@ import app.artifacts.models  # noqa: E402,F401
 import app.runtime.checkpoint_store  # noqa: E402,F401
 import app.runtime.execution_snapshot  # noqa: E402,F401
 import app.runtime.run_tokens  # noqa: E402,F401
+import app.skills.models  # noqa: E402,F401
 
 
 def _identity_before_flush(session, flush_context, instances):
@@ -34,6 +35,22 @@ def _identity_orm_execute(execute_state):
 
 event.listen(Session, "before_flush", _identity_before_flush)
 event.listen(Session, "do_orm_execute", _identity_orm_execute)
+
+
+def _skill_version_before_flush(session, flush_context, instances):
+    from app.skills.models import enforce_skill_version_flush
+
+    enforce_skill_version_flush(session, flush_context, instances)
+
+
+def _skill_version_orm_execute(execute_state):
+    from app.skills.models import enforce_skill_version_execute
+
+    enforce_skill_version_execute(execute_state)
+
+
+event.listen(Session, "before_flush", _skill_version_before_flush)
+event.listen(Session, "do_orm_execute", _skill_version_orm_execute)
 
 identity_models = sys.modules["app.identity.models"]
 if hasattr(identity_models, "Menu"):
