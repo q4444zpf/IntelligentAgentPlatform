@@ -1,6 +1,6 @@
 # Project Skill 生产激活验证
 
-验证日期：2026-09-09。范围是生产 `app.main.app`、真实 PostgreSQL/MinIO、API 镜像启动与 revision mismatch 发布演练。前端/浏览器、Agent runtime/Team 绑定和远程部署不在本次发布范围内。
+验证日期：2026-09-09；最终分支门禁补跑于 2026-09-10。范围是生产 `app.main.app`、真实 PostgreSQL/MinIO、API 镜像启动与 revision mismatch 发布演练。前端/浏览器、Agent runtime/Team 绑定和远程部署不在本次发布范围内。
 
 ## RED / GREEN
 
@@ -123,7 +123,7 @@ python .superpowers/sdd/2026-09-09-project-skill-production-activation/task-6-se
 python .superpowers/sdd/2026-09-09-project-skill-production-activation/task-6-service-mode.py python -m pytest backend/tests/integration/test_skill_versions_postgres.py -q -rs -o cache_dir=.pytest-task6
 Remove-Item Env:TASK6_DATABASE_NAME
 
-powershell -NoProfile -File .superpowers/sdd/2026-09-09-project-skill-production-activation/run_migration_test_mode.ps1 backend/tests/integration/test_project_skill_startup_postgres.py -q -rs -o cache_dir=.pytest-task6
+& .superpowers/sdd/2026-09-09-project-skill-production-activation/run_migration_test_mode.ps1 -PytestArguments @('backend/tests/integration/test_project_skill_startup_postgres.py', '-q', '-rs', '-p', 'no:cacheprovider', '--tb=short')
 ```
 
 | 选择范围 | exit | passed / failed / skipped / warning |
@@ -158,3 +158,28 @@ Runtime 兼容门禁明确为**未通过**：三项失败均来自 `test_real_wo
 生产步骤及退出码门禁见[项目 Skill 生产激活手册](../../deployment/project-skill-production-activation.md)：build API 镜像；单实例显式运行 `migrate`；比对数据库 current 与镜像唯一 head；检查 importer 实际处理的 model providers、Agents 和 MCP clients（不包含 Skill）；运行 `skill-storage-init`；开启 feature flag；执行 health/OpenAPI/401 与真实 Cookie/CSRF smoke。API 启动不迁移、不建桶，MinIO 不成为全局启动门槛。
 
 回滚将 `IAP_PROJECT_SKILLS_API_ENABLED=false` 后必须重新创建或重启全部 API 实例，再确认 OpenAPI 不含 `/api/project-skills` 且旧 `/api/skills` 仍可用；移除路由不要求额外回滚镜像。回滚不 downgrade、不删除数据库/对象/桶。本次没有 push 或远程部署。
+
+## 最终分支门禁（2026-09-10）
+
+最终安全 fetch 使用临时 TLS/HTTP 代理参数，exit `0`；`git merge --no-edit origin/main` exit `0` 并返回 `Already up to date`。没有修改全局 Git 配置。
+
+清除全部外部 `TEST_*`，仅把 `DATABASE_URL` 指向专用 `iap_skill_control_test_20260908_a` 后运行完整后端：
+
+```powershell
+python -m pytest backend/tests -q -p no:cacheprovider --tb=short
+```
+
+exit `1`，`1618 passed, 103 skipped, 3 failed in 1210.94s`。三个失败精确为 `test_real_worker_process_does_not_join_abandoned_team_deadline_work` 的 planning/member/synthesis 参数，与第 154 行记录的 Windows module preload 和固定 ready budget 不匹配一致；无其他失败。因此本文明确不声明完整后端回归通过。
+
+真实服务重新运行：真实生产主应用 `2 passed in 13.35s`；三个 MinIO 文件、control-plane PostgreSQL 和 version PostgreSQL 合并选择 `44 passed in 17.94s`；专用 migration PostgreSQL 启动选择 `1 passed in 7.49s`。三组 exit 均为 `0`，零配置 skip。首次通过 `powershell -File` 传递 pytest 位置参数在参数绑定阶段 exit `1`，未启动 pytest 或连接数据库；改用上文显式 `-PytestArguments` 数组后通过。
+
+静态和发布边界结果：
+
+- 计划复用的项目虚拟环境运行 `python -m pip check` exit `0`，输出 `No broken requirements found.`；工作站全局 Python 的 `pip check` 仍有与本分支无关的预装水利/AI 包依赖冲突。
+- 全仓 `python -m ruff check backend` exit `1`，报告 575 个既有 lint 问题。分支变更 Python 文件的普通 Ruff exit `1`，仅剩 4 个 `I001`，对应在计划基线已不满足 import sorting 的 `settings.py`、`main.py`、`test_settings.py`、`test_main.py`；对这些已记录基线项使用 `--ignore I001` 后 exit `0`。
+- 分支变更 Python 文件的 Black check exit `1`：4 个既有文件已在 `4930f67` 基线上失败，新增 `project_startup.py` 还有一处仅合并函数调用换行的格式差异。最终修复波次已经评审封闭，未追加未评审格式化改动，因此本文不声明 Black 门禁通过。
+- `git diff --check 4930f67 HEAD`、普通 `docker compose config --quiet`、operations profile Compose config、API 镜像构建均 exit `0`。
+- 镜像实际 `Config.Cmd` 为 `["uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--proxy-headers"]`。
+- 从计划基线比较，旧 Skill router/service、frontend、agents、collaboration 和 runtime 均无 diff；`backend/app/main.py` 是唯一应用 composition 变更。
+
+最终全分支评审及唯一 consolidated fix wave 的 scoped re-review 均没有遗留 Critical/Important。由于完整后端和 Black 门禁仍非绿色，分支保留在隔离 worktree，不执行合并、推送、远程部署或 SDD scratch 清理。
