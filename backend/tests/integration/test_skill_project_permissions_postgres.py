@@ -7,12 +7,16 @@ import sqlalchemy as sa
 from app.identity.catalogue import seed_builtin_catalogue
 from app.identity.models import Role, RolePermission, Unit
 from sqlalchemy import create_engine, select, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 from sqlalchemy.orm import Session
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("TEST_DATABASE_URL"),
     reason="requires dedicated PostgreSQL migration database",
 )
+
+MIGRATION_DATABASE = "iap_skill_control_migration_20260908_a"
 
 ALEMBIC = (
     sys.executable,
@@ -84,9 +88,31 @@ def _run_migration(*arguments: str) -> None:
 
 @pytest.fixture(autouse=True)
 def empty_migration_database():
-    engine = create_engine(os.environ["TEST_DATABASE_URL"])
+    configured_url = os.getenv("TEST_DATABASE_URL")
+    if not configured_url:
+        pytest.skip("requires dedicated PostgreSQL migration database")
+    rejection = "requires exact dedicated PostgreSQL migration database without query parameters"
+    try:
+        url = make_url(configured_url)
+    except (ArgumentError, ValueError):
+        raise ValueError(rejection) from None
+    # Driver query parameters can override the parsed connection target.
+    if (
+        url.get_backend_name() != "postgresql"
+        or url.database != MIGRATION_DATABASE
+        or url.query
+    ):
+        raise ValueError(rejection)
+    engine = create_engine(url)
     try:
         with engine.begin() as connection:
+            if (
+                connection.scalar(text("SELECT current_database()"))
+                != MIGRATION_DATABASE
+            ):
+                raise ValueError(
+                    "connected database is not the dedicated migration database"
+                )
             connection.execute(text("DROP SCHEMA public CASCADE"))
             connection.execute(text("CREATE SCHEMA public"))
         yield
