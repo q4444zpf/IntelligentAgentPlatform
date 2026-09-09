@@ -6,7 +6,7 @@ import zipfile
 from dataclasses import FrozenInstanceError
 
 import pytest
-
+from app.skills import package_storage
 from app.skills.package import MAX_ZIP_BYTES, parse_skill_bundle
 from app.skills.package_storage import (
     STORAGE_CLIENT_CONFIG,
@@ -189,6 +189,48 @@ def test_default_factory_uses_object_storage_defaults(monkeypatch, memory_s3):
     }
 
 
+def test_shared_settings_are_frozen_redacted_and_supply_client_and_bucket(
+    monkeypatch, memory_s3, package
+):
+    settings = package_storage.SkillStorageSettings(
+        endpoint_url="https://shared.example.test",
+        access_key_id="shared-access-sensitive",
+        secret_access_key="shared-secret-sensitive",
+        region_name="eu-west-1",
+        bucket="shared-skill-bucket",
+    )
+    assert "shared-access-sensitive" not in repr(settings)
+    assert "shared-secret-sensitive" not in repr(settings)
+    with pytest.raises(FrozenInstanceError):
+        settings.bucket = "changed"
+    monkeypatch.setattr(
+        package_storage, "load_skill_storage_settings", lambda: settings
+    )
+    calls = []
+
+    def create_client(service, **kwargs):
+        calls.append((service, kwargs))
+        return memory_s3
+
+    monkeypatch.setattr("boto3.client", create_client)
+    storage = create_default_skill_package_storage()
+    stored = storage.put("unit", "project", "skill", package)
+
+    assert calls == [
+        (
+            "s3",
+            {
+                "endpoint_url": "https://shared.example.test",
+                "aws_access_key_id": "shared-access-sensitive",
+                "aws_secret_access_key": "shared-secret-sensitive",
+                "region_name": "eu-west-1",
+                "config": STORAGE_CLIENT_CONFIG,
+            },
+        )
+    ]
+    assert ("shared-skill-bucket", stored.object_key) in memory_s3.objects
+
+
 @pytest.mark.parametrize(
     "scope", ["", ".", "..", "has/slash", "has\\slash", " leading"]
 )
@@ -233,7 +275,7 @@ def test_rejects_metadata_mismatch(memory_s3, package):
     stored = storage.put("unit", "project", "skill", package)
     memory_s3.objects[("test-skills", stored.object_key)]["Metadata"][
         "package-digest"
-    ] = "0" * 64
+    ] = ("0" * 64)
 
     with pytest.raises(SkillPackageStorageError):
         storage.read(stored)

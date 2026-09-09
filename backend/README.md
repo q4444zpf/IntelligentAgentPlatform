@@ -155,7 +155,7 @@ python -m app.migrations.sqlite_to_postgres
 新增内部模块 `app.skills.package`、`app.skills.package_storage` 和 `app.skills.repository`：
 
 - 解析器验证 ZIP 路径、条目类型与限额，返回不可变文件清单和内容摘要，不解包到宿主目录、不执行脚本。
-- 存储适配器写入独立对象，以有界读取和 SHA-256 验证完整性；`IAP_SKILL_BUCKET` 默认为 `iap-skills`，调用方需准备该桶。连接信息沿用 `IAP_OBJECT_STORAGE_*`，不要把凭据写入 Skill 文件。
+- 存储适配器写入独立对象，以有界读取和 SHA-256 验证完整性；`IAP_SKILL_BUCKET` 默认为 `iap-skills`。连接信息沿用 `IAP_OBJECT_STORAGE_*`，区域变量 `IAP_OBJECT_STORAGE_REGION` 默认为 `us-east-1`，不要把凭据写入 Skill 文件。
 - 仓储按单位和项目查询，管理草稿 revision、不可变发布版本和发布幂等记录。调用方先预分配 Skill UUID，上传后使用同一 ID 创建资源；调用方负责授权、发布前重新验证对象以及提交或回滚事务。
 - 迁移 `20260908_26` 新增三张 Skill 表和 PostgreSQL 版本不可变保护，不自动导入现有本地 Skill 目录。
 
@@ -169,6 +169,21 @@ python -m pytest backend/tests/integration/test_skill_versions_postgres.py backe
 ```
 
 真实集成测试需要专用 `TEST_DATABASE_URL`，以及 `TEST_S3_ENDPOINT`、`TEST_S3_ACCESS_KEY`、`TEST_S3_SECRET_KEY`。PostgreSQL 测试前需在该测试库升级到当前迁移版本；MinIO 测试只创建和回收自己的临时桶。没有这些变量时集成测试会跳过，跳过不代表通过。不要指向业务数据库；不可变版本测试记录可在专用测试数据库整体回收时清理。
+
+首次启用项目 Skill 前，按[生产激活手册](../docs/deployment/project-skill-production-activation.md)显式初始化专用桶：
+
+```powershell
+docker compose --profile operations run --rm skill-storage-init
+if ($LASTEXITCODE -ne 0) { throw "Project Skill storage initialization failed" }
+```
+
+非容器环境可在 `backend/` 目录执行 `python -m app.skills.storage_bootstrap`。初始化与 API 共用冻结的存储配置；已有且可访问的桶只做 HEAD，缺桶才创建，并在创建后验证 HEAD，可重复运行。默认区域创建只传桶名，其他区域传 `LocationConstraint`。权限不足、其他账户占用、网络错误或创建后无法访问均返回退出码 `1`，stderr 只输出 `unable to initialize project skill bucket`，不会输出配置或凭据。API 不依赖初始化作业，也不会在启动时自动建桶。
+
+```powershell
+python -m pytest backend/tests/integration/test_project_skill_storage_bootstrap_minio.py -q -p no:cacheprovider
+```
+
+桶初始化集成测试仅从 `TEST_S3_*` 读取连接配置，可选 `TEST_S3_REGION` 默认为 `us-east-1`；每次创建新 UUID 桶，执行初始化两次并验证 HEAD，最后仅删除该空桶。服务验收必须提供配置并确认零跳过。
 
 ### 项目 Skill 隔离接口
 

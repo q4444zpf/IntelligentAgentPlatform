@@ -52,9 +52,11 @@ services:
       AGENT_WORKSPACE_ROOT: /data/agent-workspaces
       IAP_OBJECT_STORAGE_ENDPOINT: "${IAP_OBJECT_STORAGE_ENDPOINT:-http://minio:9000}"
       IAP_OBJECT_STORAGE_PUBLIC_ENDPOINT: "${IAP_OBJECT_STORAGE_PUBLIC_ENDPOINT:-http://127.0.0.1:9000}"
+      IAP_OBJECT_STORAGE_REGION: "${IAP_OBJECT_STORAGE_REGION:-us-east-1}"
       IAP_OBJECT_STORAGE_ACCESS_KEY: "${IAP_OBJECT_STORAGE_ACCESS_KEY:-iap-access}"
       IAP_OBJECT_STORAGE_SECRET_KEY: "${IAP_OBJECT_STORAGE_SECRET_KEY:-change-me-minio-secret}"
       IAP_ARTIFACT_BUCKET: "${IAP_ARTIFACT_BUCKET:-iap-artifacts}"
+      IAP_SKILL_BUCKET: "${IAP_SKILL_BUCKET:-iap-skills}"
       IAP_WORKFLOW_RUNNER_URL: "${IAP_WORKFLOW_RUNNER_URL:-http://workflow-runner:8090}"
       IAP_WORKFLOW_RUNNER_HEALTH_URL: "${IAP_WORKFLOW_RUNNER_HEALTH_URL:-http://workflow-runner:8090/health}"
       IAP_WORKFLOW_RUNNER_SANDBOX_ENABLED: "${IAP_WORKFLOW_RUNNER_SANDBOX_ENABLED:-false}"
@@ -99,6 +101,21 @@ services:
         condition: service_healthy
     volumes:
       - model-provider-data:/data
+    restart: "no"
+
+  skill-storage-init:
+    profiles: ["operations"]
+    image: intelligent-agent-platform-api:local
+    command: ["python", "-m", "app.skills.storage_bootstrap"]
+    environment:
+      IAP_OBJECT_STORAGE_ENDPOINT: "${IAP_OBJECT_STORAGE_ENDPOINT:-http://minio:9000}"
+      IAP_OBJECT_STORAGE_ACCESS_KEY: "${IAP_OBJECT_STORAGE_ACCESS_KEY:-iap-access}"
+      IAP_OBJECT_STORAGE_SECRET_KEY: "${IAP_OBJECT_STORAGE_SECRET_KEY:-change-me-minio-secret}"
+      IAP_OBJECT_STORAGE_REGION: "${IAP_OBJECT_STORAGE_REGION:-us-east-1}"
+      IAP_SKILL_BUCKET: "${IAP_SKILL_BUCKET:-iap-skills}"
+    depends_on:
+      minio:
+        condition: service_healthy
     restart: "no"
 
   workflow-runner:

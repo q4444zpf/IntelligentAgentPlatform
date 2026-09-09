@@ -50,3 +50,39 @@ def test_services_receive_only_their_required_project_skill_deployment_environme
 
 def test_project_skill_api_is_disabled_in_example_environment():
     assert _example_environment()["IAP_PROJECT_SKILLS_API_ENABLED"] == "false"
+
+
+def test_skill_storage_initialization_is_explicit_and_api_independent():
+    services = _compose()["services"]
+    operation = services["skill-storage-init"]
+    assert operation["profiles"] == ["operations"]
+    assert operation["image"] == services["api"]["image"]
+    assert operation["command"] == ["python", "-m", "app.skills.storage_bootstrap"]
+    assert operation["restart"] == "no"
+    assert operation["depends_on"] == {"minio": {"condition": "service_healthy"}}
+    assert operation["environment"] == {
+        "IAP_OBJECT_STORAGE_ENDPOINT": "${IAP_OBJECT_STORAGE_ENDPOINT:-http://minio:9000}",
+        "IAP_OBJECT_STORAGE_ACCESS_KEY": "${IAP_OBJECT_STORAGE_ACCESS_KEY:-iap-access}",
+        "IAP_OBJECT_STORAGE_SECRET_KEY": "${IAP_OBJECT_STORAGE_SECRET_KEY:-change-me-minio-secret}",
+        "IAP_OBJECT_STORAGE_REGION": "${IAP_OBJECT_STORAGE_REGION:-us-east-1}",
+        "IAP_SKILL_BUCKET": "${IAP_SKILL_BUCKET:-iap-skills}",
+    }
+    assert "skill-storage-init" not in services["api"].get("depends_on", {})
+    assert "migrate" not in services["api"].get("depends_on", {})
+
+
+def test_api_and_operation_share_configurable_skill_bucket():
+    services = _compose()["services"]
+    assert (
+        services["api"]["environment"]["IAP_SKILL_BUCKET"]
+        == "${IAP_SKILL_BUCKET:-iap-skills}"
+    )
+    assert _example_environment()["IAP_SKILL_BUCKET"] == "iap-skills"
+
+
+def test_api_and_operation_share_configurable_storage_region():
+    services = _compose()["services"]
+    for service in ("api", "skill-storage-init"):
+        assert services[service]["environment"]["IAP_OBJECT_STORAGE_REGION"] == (
+            "${IAP_OBJECT_STORAGE_REGION:-us-east-1}"
+        )

@@ -6,7 +6,7 @@ import os
 import re
 import uuid
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from botocore.config import Config
@@ -28,6 +28,15 @@ STORAGE_CLIENT_CONFIG = Config(
     read_timeout=10,
     retries={"max_attempts": 3, "mode": "standard"},
 )
+
+
+@dataclass(frozen=True)
+class SkillStorageSettings:
+    endpoint_url: str
+    access_key_id: str = field(repr=False)
+    secret_access_key: str = field(repr=False)
+    region_name: str
+    bucket: str
 
 
 @dataclass(frozen=True)
@@ -148,21 +157,32 @@ class SkillPackageStorage:
                 body.close()
 
 
-def create_default_skill_package_storage() -> SkillPackageStorage:
+def load_skill_storage_settings() -> SkillStorageSettings:
+    return SkillStorageSettings(
+        endpoint_url=os.environ.get("IAP_OBJECT_STORAGE_ENDPOINT", "http://minio:9000"),
+        access_key_id=os.environ.get("IAP_OBJECT_STORAGE_ACCESS_KEY", "iap-access"),
+        secret_access_key=os.environ.get("IAP_OBJECT_STORAGE_SECRET_KEY", "change-me"),
+        region_name=os.environ.get("IAP_OBJECT_STORAGE_REGION", "us-east-1"),
+        bucket=os.environ.get("IAP_SKILL_BUCKET", DEFAULT_SKILL_BUCKET),
+    )
+
+
+def create_skill_storage_client(config: SkillStorageSettings) -> Any:
     import boto3
 
-    bucket = os.environ.get("IAP_SKILL_BUCKET", DEFAULT_SKILL_BUCKET)
-    client = boto3.client(
+    return boto3.client(
         "s3",
-        endpoint_url=os.environ.get("IAP_OBJECT_STORAGE_ENDPOINT", "http://minio:9000"),
-        aws_access_key_id=os.environ.get("IAP_OBJECT_STORAGE_ACCESS_KEY", "iap-access"),
-        aws_secret_access_key=os.environ.get(
-            "IAP_OBJECT_STORAGE_SECRET_KEY", "change-me"
-        ),
-        region_name=os.environ.get("IAP_OBJECT_STORAGE_REGION", "us-east-1"),
+        endpoint_url=config.endpoint_url,
+        aws_access_key_id=config.access_key_id,
+        aws_secret_access_key=config.secret_access_key,
+        region_name=config.region_name,
         config=STORAGE_CLIENT_CONFIG,
     )
-    return SkillPackageStorage(client, bucket)
+
+
+def create_default_skill_package_storage() -> SkillPackageStorage:
+    config = load_skill_storage_settings()
+    return SkillPackageStorage(create_skill_storage_client(config), config.bucket)
 
 
 def _validate_scope_segment(value: str) -> str:
