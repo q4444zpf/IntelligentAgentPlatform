@@ -2,7 +2,9 @@ import hashlib
 import io
 import secrets
 from collections.abc import Callable, Iterator
+from contextlib import chdir
 from datetime import datetime, timedelta, timezone
+from tempfile import TemporaryDirectory
 from uuid import uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -27,6 +29,7 @@ from app.skills.package_storage import SkillPackageStorage
 from app.skills.repository import SkillRepository, SkillScope
 from fastapi import FastAPI
 from sqlalchemy import create_engine, event, select
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from backend.tests.skills.test_package_storage import MemoryS3
@@ -167,7 +170,29 @@ def make_test_app(
     if context is not None:
         app.dependency_overrides[require_request_context] = lambda: context
     if with_write_protection:
-        app.state.write_protection_enabled = True
+        from app.core.settings import settings
+        from app.skills.service import SkillService
+
+        if (
+            make_url(settings.database_url).database
+            != "iap_skill_control_test_20260908_a"
+        ):
+            raise RuntimeError(
+                "Middleware assembly requires the dedicated service test database"
+            )
+        original_init = SkillService.__init__
+        with (
+            TemporaryDirectory(prefix="iap-skill-middleware-") as directory,
+            pytest.MonkeyPatch.context() as patch,
+            chdir(directory),
+        ):
+
+            def isolated_init(self, root=None):
+                original_init(self, directory)
+
+            patch.setattr(SkillService, "__init__", isolated_init)
+            from app.main import disable_auth_response_caching
+        app.middleware("http")(disable_auth_response_caching)
     return app
 
 

@@ -4,11 +4,13 @@ import sys
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
 from backend.tests.skills.project_support import (
     make_context,
     make_test_app,
+    manifest,
     publish_skill,
     seed_skill,
 )
@@ -21,6 +23,76 @@ from backend.tests.skills.project_support import (
 from backend.tests.skills.project_support import (
     storage_fixture as _storage_fixture,  # noqa: F401
 )
+
+
+@pytest.mark.parametrize(
+    "grant,status", [("none", 403), ("own", 404), ("other-project", 404)]
+)
+def test_write_permission_and_scope_precede_resource_access(
+    sessions, storage, grant, status
+):
+    skill_id = seed_skill(
+        sessions, storage, make_context("skill.manage", user_id="user-2")
+    )
+    context = (
+        make_context("skill.read")
+        if grant == "none"
+        else make_context(
+            "skill.manage",
+            data_scope="own" if grant == "own" else "project",
+            project_id="project-2" if grant == "other-project" else "project-1",
+        )
+    )
+    with TestClient(
+        make_test_app(sessions, lambda: storage, context=context)
+    ) as client:
+        response = client.put(
+            f"/api/project-skills/{skill_id}/draft",
+            json={"expected_revision": 1, "content": manifest("s", "Changed")},
+        )
+    assert response.status_code == status
+
+
+def test_manage_grant_writes_without_requiring_read_grant(sessions, storage):
+    context = make_context("skill.manage")
+    with TestClient(
+        make_test_app(sessions, lambda: storage, context=context)
+    ) as client:
+        created = client.post("/api/project-skills", json={"content": manifest("s")})
+        assert created.status_code == 201
+        changed = client.put(
+            f"/api/project-skills/{created.json()['id']}/draft",
+            json={"expected_revision": 1, "content": manifest("s", "Changed")},
+        )
+        assert changed.status_code == 200
+        assert changed.headers["cache-control"] == "no-store"
+        assert set(changed.json()) == {
+            "skill_id",
+            "name",
+            "description",
+            "display_version",
+            "revision",
+            "content",
+            "files",
+            "package_digest",
+            "updated_at",
+        }
+
+
+def test_unknown_audit_failure_remains_generic_http500(sessions, storage):
+    from app.skills.project_router import _service
+    from app.skills.project_service import ProjectSkillService
+
+    from backend.tests.skills.test_project_drafts import FailingAudit
+
+    app = make_test_app(sessions, lambda: storage, context=make_context("skill.manage"))
+    app.dependency_overrides[_service] = lambda: ProjectSkillService(
+        sessions, storage_factory=lambda: storage, audit_recorder=FailingAudit()
+    )
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post("/api/project-skills", json={"content": manifest("s")})
+    assert response.status_code == 500
+    assert "audit failed" not in response.text
 
 
 def test_read_routes_return_explicit_payloads_and_no_store(sessions, storage):

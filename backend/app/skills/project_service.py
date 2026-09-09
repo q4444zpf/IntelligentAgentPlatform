@@ -1,15 +1,33 @@
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.audit.recorder import AuditRecorder
+from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.core.request_context import RequestContext
 
-from .package_storage import SkillPackageStorage, create_default_skill_package_storage
-from .project_access import require_skill_access
+from .models import Skill, SkillDraft
+from .package import SkillPackageError
+from .package_storage import (
+    SkillPackageStorage,
+    SkillPackageStorageError,
+    create_default_skill_package_storage,
+)
+from .project_access import SkillAccess, require_skill_access
 from .project_errors import ProjectSkillError
+from .project_packages import (
+    package_from_content,
+    read_verified_package,
+    replace_manifest,
+    snapshot_draft,
+)
 from .project_schemas import (
+    ProjectSkillCreate,
+    ProjectSkillDraftUpdate,
     PublishedSkillInfo,
     SkillDraftInfo,
     SkillPage,
@@ -17,7 +35,7 @@ from .project_schemas import (
     SkillVersionInfo,
     SkillVersionPage,
 )
-from .repository import SkillRepository
+from .repository import SkillRepository, SkillResourceNotFound, SkillRevisionConflict
 
 
 class ProjectSkillService:
@@ -33,6 +51,223 @@ class ProjectSkillService:
         self._session_factory = session_factory
         self._storage_factory = storage_factory
         self._audit_recorder = audit_recorder
+
+    def check_access(self, context: RequestContext, permission: str) -> SkillAccess:
+        with self._session_factory() as session:
+            return require_skill_access(session, context, permission)
+
+    def create(
+        self, context: RequestContext, request: ProjectSkillCreate
+    ) -> SkillSummary:
+        access = self.check_access(context, "skill.manage")
+        self._require_create_owner(context, access)
+        try:
+            package = package_from_content(request.content)
+            with self._session_factory() as session:
+                access = require_skill_access(session, context, "skill.manage")
+                self._require_create_owner(context, access)
+                if (
+                    session.scalar(
+                        select(Skill.id).where(
+                            Skill.unit_id == access.scope.unit_id,
+                            Skill.project_id == access.scope.project_id,
+                            Skill.name == package.name,
+                        )
+                    )
+                    is not None
+                ):
+                    raise ProjectSkillError("skill_name_conflict", 409)
+            skill_id = str(uuid4())
+            stored = self._storage_factory().put(
+                access.scope.unit_id, access.scope.project_id, skill_id, package
+            )
+            with self._session_factory() as session, session.begin():
+                access = require_skill_access(session, context, "skill.manage")
+                self._require_create_owner(context, access)
+                repository = SkillRepository(session)
+                repository.create(
+                    access.scope,
+                    skill_id=skill_id,
+                    name=package.name,
+                    created_by=context.user_id,
+                    package=package,
+                    stored=stored,
+                )
+                self._record_change(
+                    session,
+                    context,
+                    skill_id,
+                    "skill.create",
+                    revision=1,
+                    digest=stored.package_digest,
+                )
+                result = SkillSummary(
+                    **dict(
+                        self._found(
+                            repository.get_summary(
+                                access.scope, skill_id, owner_ids=access.owner_ids
+                            )
+                        )
+                    )
+                )
+            return result
+        except (SkillPackageError, SkillPackageStorageError, IntegrityError) as error:
+            self._raise_known(error)
+            raise
+
+    def save_draft(
+        self, context: RequestContext, skill_id: str, request: ProjectSkillDraftUpdate
+    ) -> SkillDraftInfo:
+        try:
+            with self._session_factory() as session:
+                access = require_skill_access(session, context, "skill.manage")
+                draft = SkillRepository(session).get_draft(
+                    access.scope, skill_id, owner_ids=access.owner_ids
+                )
+                if draft is None:
+                    raise ProjectSkillError("skill_not_found", 404)
+                if draft.revision != request.expected_revision:
+                    raise ProjectSkillError("skill_revision_conflict", 409)
+                original = snapshot_draft(draft)
+            if original.stored.object_key.split("/")[:3] != [
+                access.scope.unit_id,
+                access.scope.project_id,
+                skill_id,
+            ]:
+                raise ProjectSkillError("skill_storage_unavailable", 503)
+            storage = self._storage_factory()
+            package = replace_manifest(
+                read_verified_package(storage, original), request.content
+            )
+            if package.name != original.name:
+                raise ProjectSkillError("skill_name_immutable", 422)
+            stored = storage.put(
+                access.scope.unit_id, access.scope.project_id, skill_id, package
+            )
+            with self._session_factory() as session, session.begin():
+                access = require_skill_access(session, context, "skill.manage")
+                repository = SkillRepository(session)
+                repository.lock_skill(
+                    access.scope, skill_id, owner_ids=access.owner_ids
+                )
+                current = repository.get_draft(
+                    access.scope, skill_id, owner_ids=access.owner_ids
+                )
+                if current is None or snapshot_draft(current) != original:
+                    raise ProjectSkillError("skill_revision_conflict", 409)
+                draft = repository.save_draft(
+                    access.scope,
+                    skill_id,
+                    expected_revision=request.expected_revision,
+                    package=package,
+                    stored=stored,
+                )
+                self._record_change(
+                    session,
+                    context,
+                    skill_id,
+                    "skill.draft.save",
+                    revision=draft.revision,
+                    digest=stored.package_digest,
+                )
+                result = SkillDraftInfo(**self._draft_fields(draft))
+            return result
+        except (
+            SkillPackageError,
+            SkillPackageStorageError,
+            SkillRevisionConflict,
+            SkillResourceNotFound,
+            IntegrityError,
+        ) as error:
+            self._raise_known(error)
+            raise
+
+    @staticmethod
+    def _require_create_owner(context: RequestContext, access: SkillAccess) -> None:
+        if access.owner_ids is not None and context.user_id not in access.owner_ids:
+            raise ProjectSkillError("skill_permission_denied", 403)
+
+    @staticmethod
+    def _raise_known(error: Exception) -> None:
+        if isinstance(error, SkillPackageError):
+            raise ProjectSkillError("skill_package_invalid", 422) from error
+        if isinstance(error, SkillPackageStorageError):
+            raise ProjectSkillError("skill_storage_unavailable", 503) from error
+        if isinstance(error, SkillRevisionConflict):
+            raise ProjectSkillError("skill_revision_conflict", 409) from error
+        if isinstance(error, SkillResourceNotFound):
+            raise ProjectSkillError("skill_not_found", 404) from error
+        if isinstance(error, IntegrityError):
+            constraint = getattr(
+                getattr(error.orig, "diag", None), "constraint_name", None
+            )
+            if constraint == "uq_skills_scope_name" or str(error.orig) == (
+                "UNIQUE constraint failed: skills.unit_id, skills.project_id, skills.name"
+            ):
+                raise ProjectSkillError("skill_name_conflict", 409) from error
+
+    @staticmethod
+    def _draft_fields(row: SkillDraft) -> dict[str, object]:
+        return {
+            field: getattr(row, field)
+            for field in (
+                "skill_id",
+                "name",
+                "description",
+                "display_version",
+                "revision",
+                "content",
+                "files",
+                "package_digest",
+                "updated_at",
+            )
+        }
+
+    def _record_change(
+        self,
+        session: Session,
+        context: RequestContext,
+        skill_id: str,
+        action: str,
+        *,
+        revision: int,
+        digest: str,
+        version_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> None:
+        metadata: dict[str, object] = {"revision": revision, "digest": digest}
+        if version_id is not None:
+            metadata["version_id"] = version_id
+        key = (
+            f"skill:{skill_id}:publish:{version_id}"
+            if version_id is not None
+            else f"skill:{skill_id}:{action}:{uuid4()}"
+        )
+        authorization = context.authorization_context
+        (self._audit_recorder or AuditRecorder()).record(
+            session,
+            AuditRecordRequest(
+                unit_id=context.unit_id,
+                project_id=context.project_id,
+                user_id=context.user_id,
+                actor_roles=context.role_codes,
+                auth_method=authorization.auth_method if authorization else None,
+                category="management",
+                source="system",
+                resource_type="skill",
+                resource_id=skill_id,
+                event_scope="project",
+                authorization_scope="project",
+                status="succeeded",
+                risk_level="medium",
+                action=action,
+                occurred_at=datetime.now(UTC),
+                trace_id=trace_id or str(uuid4()),
+                idempotency_key=key,
+                metadata=metadata,
+                allowed_metadata_keys=frozenset({"revision", "digest", "version_id"}),
+            ),
+        )
 
     def list(
         self,

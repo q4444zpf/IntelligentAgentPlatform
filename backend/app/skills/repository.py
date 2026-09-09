@@ -339,8 +339,13 @@ class SkillRepository:
         return select(Skill).where(*self._conditions(scope, owner_ids=owner_ids))
 
     def _lock(self, scope: SkillScope, skill_id: str) -> Skill:
+        return self.lock_skill(scope, skill_id)
+
+    def lock_skill(
+        self, scope: SkillScope, skill_id: str, *, owner_ids: frozenset[str] | None = None,
+    ) -> Skill:
         skill = self._session.scalar(
-            self._scoped(scope).where(Skill.id == skill_id).with_for_update()
+            self._scoped(scope, owner_ids=owner_ids).where(Skill.id == skill_id).with_for_update()
             .execution_options(populate_existing=True)
         )
         if skill is None:

@@ -8,6 +8,8 @@ from app.core.request_context import RequestContext, require_request_context
 
 from .project_errors import ProjectSkillError
 from .project_schemas import (
+    ProjectSkillCreate,
+    ProjectSkillDraftUpdate,
     ProjectSkillListQuery,
     ProjectSkillPageQuery,
     SkillDraftInfo,
@@ -27,6 +29,46 @@ def _service() -> ProjectSkillService:
 
 def _raise_http(error: ProjectSkillError) -> None:
     raise HTTPException(error.status_code, error.code) from error
+
+
+def _manage_context(
+    context: Annotated[RequestContext, Depends(require_request_context)],
+    service: Annotated[ProjectSkillService, Depends(_service)],
+) -> RequestContext:
+    try:
+        service.check_access(context, "skill.manage")
+    except ProjectSkillError as error:
+        _raise_http(error)
+    return context
+
+
+@router.post("", response_model=SkillSummary, status_code=201)
+def create_skill(
+    request: ProjectSkillCreate,
+    response: Response,
+    context: Annotated[RequestContext, Depends(_manage_context)],
+    service: Annotated[ProjectSkillService, Depends(_service)],
+):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return service.create(context, request)
+    except ProjectSkillError as error:
+        _raise_http(error)
+
+
+@router.put("/{skill_id}/draft", response_model=SkillDraftInfo)
+def save_skill_draft(
+    skill_id: UUID,
+    request: ProjectSkillDraftUpdate,
+    response: Response,
+    context: Annotated[RequestContext, Depends(_manage_context)],
+    service: Annotated[ProjectSkillService, Depends(_service)],
+):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return service.save_draft(context, str(skill_id), request)
+    except ProjectSkillError as error:
+        _raise_http(error)
 
 
 @router.get("", response_model=SkillPage)

@@ -1,4 +1,5 @@
 import hashlib
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -19,6 +20,7 @@ from backend.tests.skills.project_support import (
     issue_session,
     make_context,
     make_test_app,
+    manifest,
     seed_skill,
 )
 from backend.tests.skills.project_support import (
@@ -30,6 +32,74 @@ from backend.tests.skills.project_support import (
 from backend.tests.skills.project_support import (
     storage_fixture as _storage_fixture,  # noqa: F401
 )
+
+
+def test_cookie_writes_require_csrf_header_and_allow_present_header(sessions, storage):
+    token = issue_session(sessions)
+    app = make_test_app(sessions, lambda: storage, with_write_protection=True)
+    with TestClient(app) as client:
+        client.cookies.set("iap_session", token)
+        blocked = client.post("/api/project-skills", json={"content": manifest("s")})
+        assert blocked.status_code == 403
+        accepted = client.post(
+            "/api/project-skills",
+            json={"content": manifest("s")},
+            headers={"X-CSRF-Token": "test-present"},
+        )
+        assert accepted.status_code == 201
+        changed = client.put(
+            f"/api/project-skills/{accepted.json()['id']}/draft",
+            json={"expected_revision": 1, "content": manifest("s", "Updated")},
+            headers={"X-CSRF-Token": "test-present"},
+        )
+        assert changed.status_code == 200
+        assert changed.json()["revision"] == 2
+
+
+def test_cookie_write_rejects_mismatched_origin(sessions, storage, monkeypatch):
+    token = issue_session(sessions)
+    app = make_test_app(sessions, lambda: storage, with_write_protection=True)
+    from app import main
+
+    monkeypatch.setattr(
+        main,
+        "settings",
+        replace(main.settings, public_base_url="https://platform.example"),
+    )
+    with TestClient(app) as client:
+        client.cookies.set("iap_session", token)
+        response = client.post(
+            "/api/project-skills",
+            json={"content": manifest("s")},
+            headers={"X-CSRF-Token": "test-present", "Origin": "https://other.example"},
+        )
+    assert response.status_code == 403
+
+
+def test_cookie_write_ignores_forged_admin_and_project(sessions, storage, memory_s3):
+    token = issue_session(sessions, role_code="viewer")
+    app = make_test_app(sessions, lambda: storage, with_write_protection=True)
+    with TestClient(app) as client:
+        client.cookies.set("iap_session", token)
+        response = client.post(
+            "/api/project-skills",
+            json={"content": manifest("s")},
+            headers={
+                "X-CSRF-Token": "test-present",
+                "X-User-Role": "project_admin",
+                "X-Project-ID": "project-2",
+            },
+        )
+    assert response.status_code == 403
+    assert memory_s3.objects == {}
+
+
+def test_unauthenticated_valid_write_leaves_no_objects(sessions, storage, memory_s3):
+    app = make_test_app(sessions, lambda: storage, with_write_protection=True)
+    with TestClient(app) as client:
+        response = client.post("/api/project-skills", json={"content": manifest("s")})
+    assert response.status_code == 401
+    assert memory_s3.objects == {}
 
 
 def cookie_client(sessions, storage, token: str) -> TestClient:

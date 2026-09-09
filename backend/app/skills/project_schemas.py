@@ -7,6 +7,14 @@ class StrictProjectSkillModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class ProjectSkillCreate(StrictProjectSkillModel):
+    content: str = Field(min_length=1, max_length=200_000)
+
+
+class ProjectSkillDraftUpdate(ProjectSkillCreate):
+    expected_revision: int = Field(strict=True, gt=0)
+
+
 class SkillFileInfo(StrictProjectSkillModel):
     path: str
     size: int
