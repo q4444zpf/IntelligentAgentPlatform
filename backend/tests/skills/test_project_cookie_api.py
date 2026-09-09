@@ -398,3 +398,197 @@ def test_cookie_import_requires_authenticated_selected_project(
             assert (skill.project_id, skill.created_by) == ("project-1", "user-1")
         else:
             assert skill is None
+
+
+OPERATIONS = (
+    "list",
+    "get",
+    "draft",
+    "versions",
+    "version",
+    "create",
+    "save",
+    "import",
+    "publish",
+)
+
+
+def project_operation(client, operation, skill_id, version_id, *, headers=None):
+    import json
+
+    from backend.tests.skills.project_support import bundle
+
+    root = "/api/project-skills"
+    paths = {
+        "list": root,
+        "get": f"{root}/{skill_id}",
+        "draft": f"{root}/{skill_id}/draft",
+        "versions": f"{root}/{skill_id}/versions",
+        "version": f"{root}/{skill_id}/versions/{version_id}",
+    }
+    headers = {"X-CSRF-Token": "test-present", **(headers or {})}
+    if operation in paths:
+        return client.get(paths[operation], headers=headers)
+    if operation == "create":
+        return client.post(root, json={"content": manifest("created")}, headers=headers)
+    if operation == "save":
+        return client.put(
+            f"{root}/{skill_id}/draft",
+            json={"expected_revision": 2, "content": manifest("s", "Saved")},
+            headers=headers,
+        )
+    if operation == "import":
+        return client.post(
+            f"{root}/import",
+            headers=headers,
+            files={
+                "file": (
+                    "bundle.zip",
+                    bundle([("SKILL.md", manifest("s", "Imported").encode())]),
+                )
+            },
+            data={
+                "manifest": json.dumps(
+                    [
+                        {
+                            "source_name": "s",
+                            "action": "update",
+                            "skill_id": skill_id,
+                            "expected_revision": 2,
+                        }
+                    ]
+                )
+            },
+        )
+    return client.post(
+        f"{root}/{skill_id}/publish",
+        json={"expected_revision": 2},
+        headers={**headers, "Idempotency-Key": "cookie-publish"},
+    )
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+@pytest.mark.parametrize("state", ["valid", "missing", "no-permission", "cross-scope"])
+def test_nine_method_cookie_authorization_matrix(sessions, storage, operation, state):
+    from app.audit.models import AuditEvent
+    from app.skills.models import Skill, SkillDraft, SkillVersion
+
+    from backend.tests.skills.project_support import publish_skill
+
+    skill_id = seed_skill(sessions, storage, make_context("skill.manage"))
+    version_id = publish_skill(sessions, make_context("skill.manage"), skill_id)
+    if state == "no-permission":
+        with sessions.begin() as session:
+            session.add(
+                Role(
+                    id=str(uuid4()),
+                    unit_id="unit-1",
+                    code="no-skills",
+                    name="No skills",
+                    scope_type="project",
+                    built_in=False,
+                    status="active",
+                )
+            )
+    token = issue_session(
+        sessions,
+        project_id="project-2" if state == "cross-scope" else "project-1",
+        role_code="no-skills" if state == "no-permission" else "project_admin",
+    )
+    app = make_test_app(sessions, lambda: storage, with_write_protection=True)
+    with TestClient(app) as client:
+        if state != "missing":
+            client.cookies.set("iap_session", token)
+        response = project_operation(client, operation, skill_id, version_id)
+    expected = 201 if operation == "create" else 200
+    if state == "missing":
+        expected = 401
+    elif state == "no-permission":
+        expected = 403
+    elif state == "cross-scope" and operation not in {"list", "create"}:
+        expected = 404
+    assert response.status_code == expected, response.text
+    if expected < 300:
+        assert response.headers["cache-control"] == "no-store"
+    if state == "cross-scope" and operation == "list":
+        assert response.json()["items"] == [] and response.json()["total"] == 0
+    with sessions() as session:
+        original = session.get(SkillDraft, skill_id)
+        if state != "valid" or operation not in {"save", "import", "publish"}:
+            assert original.revision == 2 and original.content == manifest("s")
+            assert session.get(Skill, skill_id).published_version_id == version_id
+            assert len(session.scalars(select(SkillVersion)).all()) == 1
+        if state == "cross-scope" and operation == "create":
+            created = session.get(Skill, response.json()["id"])
+            assert (created.project_id, created.created_by) == ("project-2", "user-1")
+        if expected >= 400:
+            assert session.scalar(select(AuditEvent)) is None
+
+
+@pytest.mark.parametrize("operation", ["save", "import", "publish"])
+@pytest.mark.parametrize("failure", ["csrf", "origin"])
+def test_cookie_write_matrix_rejects_missing_csrf_and_foreign_origin(
+    sessions, storage, monkeypatch, operation, failure
+):
+    from app import main
+    from app.audit.models import AuditEvent
+    from app.skills.models import Skill, SkillDraft
+
+    from backend.tests.skills.project_support import publish_skill
+
+    skill_id = seed_skill(sessions, storage, make_context("skill.manage"))
+    version_id = publish_skill(sessions, make_context("skill.manage"), skill_id)
+    token = issue_session(sessions)
+    app = make_test_app(sessions, lambda: storage, with_write_protection=True)
+    monkeypatch.setattr(
+        main,
+        "settings",
+        replace(main.settings, public_base_url="https://platform.example"),
+    )
+    with TestClient(app) as client:
+        client.cookies.set("iap_session", token)
+        headers = (
+            {"X-CSRF-Token": ""}
+            if failure == "csrf"
+            else {"Origin": "https://other.example"}
+        )
+        response = project_operation(
+            client, operation, skill_id, version_id, headers=headers
+        )
+    assert response.status_code == 403
+    with sessions() as session:
+        assert session.get(SkillDraft, skill_id).revision == 2
+        assert session.get(Skill, skill_id).published_version_id == version_id
+        assert session.scalar(select(AuditEvent)) is None
+
+
+def test_cookie_publish_replay_rejects_revoked_manage_permission(sessions, storage):
+    from app.audit.models import AuditEvent
+    from app.skills.models import SkillDraft, SkillVersion
+
+    skill_id = seed_skill(sessions, storage, make_context("skill.manage"))
+    token = issue_session(sessions)
+    with TestClient(
+        make_test_app(sessions, lambda: storage, with_write_protection=True)
+    ) as client:
+        client.cookies.set("iap_session", token)
+        path = f"/api/project-skills/{skill_id}/publish"
+        headers = {"X-CSRF-Token": "test-present", "Idempotency-Key": "same"}
+        first = client.post(path, headers=headers, json={"expected_revision": 1})
+        assert first.status_code == 200, first.text
+        with sessions.begin() as session:
+            grant = session.scalar(
+                select(RolePermission)
+                .join(Role)
+                .where(
+                    Role.code == "project_admin",
+                    RolePermission.permission_code == "skill.manage",
+                )
+            )
+            session.delete(grant)
+        replay = client.post(path, headers=headers, json={"expected_revision": 1})
+    assert replay.status_code == 403
+    with sessions() as session:
+        assert session.get(SkillDraft, skill_id).revision == 2
+        assert len(session.scalars(select(SkillVersion)).all()) == 1
+        assert len(session.scalars(select(AuditEvent)).all()) == 1

@@ -157,7 +157,7 @@ python -m app.migrations.sqlite_to_postgres
 - 仓储按单位和项目查询，管理草稿 revision、不可变发布版本和发布幂等记录。调用方先预分配 Skill UUID，上传后使用同一 ID 创建资源；调用方负责授权、发布前重新验证对象以及提交或回滚事务。
 - 迁移 `20260908_26` 新增三张 Skill 表和 PostgreSQL 版本不可变保护，不自动导入现有本地 Skill 目录。
 
-这些模块尚未接入现有 `/api/skills`、Agent/Team 绑定和前端界面。项目权限 API、运行时版本捕获及旧数据切换属于后续交付，不能仅部署本迁移就视为完成 Skill 生产化。
+这些模块尚未接入现有 `/api/skills`、Agent/Team 绑定和前端界面。项目权限 API 已提供下述隔离测试装配；生产挂载、运行时版本捕获及旧数据切换属于后续交付，不能仅部署本迁移就视为完成 Skill 生产化。
 
 从仓库根目录运行聚焦测试：
 
@@ -167,6 +167,42 @@ python -m pytest backend/tests/integration/test_skill_versions_postgres.py backe
 ```
 
 真实集成测试需要专用 `TEST_DATABASE_URL`，以及 `TEST_S3_ENDPOINT`、`TEST_S3_ACCESS_KEY`、`TEST_S3_SECRET_KEY`。PostgreSQL 测试前需在该测试库升级到当前迁移版本；MinIO 测试只创建和回收自己的临时桶。没有这些变量时集成测试会跳过，跳过不代表通过。不要指向业务数据库；不可变版本测试记录可在专用测试数据库整体回收时清理。
+
+### 项目 Skill 隔离接口
+
+`app.skills.project_router.router` 只在测试应用中装配，`app.main` 未导入或挂载，不存在生产启用开关。旧 Skill 接口的认证风险本轮未整改，Web UI、运行时、Agent/Team、业务数据和本地 Skill 目录均未切换或双写。
+
+| 方法 | 路径（前缀 `/api/project-skills`） | 权限与结果 |
+| --- | --- | --- |
+| GET | 空路径 | `skill.read`，分页摘要 |
+| GET | `/{skill_id}` | `skill.read`，资源摘要 |
+| GET | `/{skill_id}/draft` | `skill.read`，含正文草稿 |
+| GET | `/{skill_id}/versions` | `skill.read`，版本摘要分页 |
+| GET | `/{skill_id}/versions/{version_id}` | `skill.read`，含正文固定版本 |
+| POST | 空路径 | `skill.manage`，创建 revision 1 草稿，201 |
+| PUT | `/{skill_id}/draft` | `skill.manage`，按 expected_revision 保存，200 |
+| POST | `/import` | `skill.manage`，ZIP 批量 create/update/skip，200 |
+| POST | `/{skill_id}/publish` | `skill.manage`，复验并幂等发布，200 |
+
+身份来自有效会话，必须显式选择当前单位下的活动项目；不接受客户端身份头替代会话。不登录为 401，无所选项目或入口权限为 403，资源不在该权限的项目/owner 范围内统一为 404。`own` 授权在 SQL 查询及分页 total 中过滤。测试应用复用真实 Cookie 写保护，校验 CSRF 请求头和 Origin；读响应及含正文的写响应均 `Cache-Control: no-store`。该验证不代表完成旧接口安全改造。
+
+创建仅接收 `content`；保存接收 `content`、严格正整数 `expected_revision`；发布仅接收 `expected_revision`，并要求 `Idempotency-Key` 为 1–128 个可打印 ASCII 字符，原样保留空格。客户端不能指定版本号、对象位置、摘要或所有者。已提交同键同请求直接返回原版本，即使后来保存草稿或对象存储不可用；每次重放仍重新授权，同键不同 revision/发布者为 409。
+
+JSON 正文上限 200,000 字符。ZIP 上限 10 MiB，实际解压内容 20 MiB、500 条目；multipart 的可选 manifest 必须是非空 JSON 文本，最多 500 项且 UTF-8 编码不超过 256 KiB，明确指定每个源 Skill 的 create/update/skip。列表默认 offset 0、limit 20，limit 1–100，q 最长 120 字符且按名称字面包含匹配。上传超限返回 413；参数/包格式非法返回 422；名称、revision 或幂等冲突返回 409；对象读取、摘要或完整快照复验失败返回 503。未知内部异常保留为通用 500。
+
+对象 I/O 不持有数据库会话或行锁。发布在短写事务中重新授权、锁定资源、比较完整已验证草稿快照，版本、发布指针、revision 消耗及成功审计原子提交。数据库提交失败后已上传但未被引用的对象可暂留；本模块不自动删除对象、桶或共享数据，孤立对象补偿需由后续受控运维流程处理。
+
+权限迁移 `20260908_27` 仅追加 `skill.read`、`skill.manage` 目录和项目管理员的项目授权，不扩大旧角色。降级保留已发放的权限/授权，不做删除式回滚，也不迁移旧 Skill 数据。
+
+在专用测试环境从仓库根目录验证：
+
+```powershell
+$env:PYTHONPATH = "backend"
+python -m pytest backend/tests/skills/test_project_publish.py backend/tests/skills/test_project_api.py backend/tests/skills/test_project_cookie_api.py backend/tests/skills/test_repository.py -q -p no:cacheprovider
+python -m pytest backend/tests/integration/test_skill_control_plane_postgres.py backend/tests/integration/test_skill_control_plane_minio.py backend/tests/integration/test_skill_versions_postgres.py -q -p no:cacheprovider
+```
+
+普通测试清除外部 `TEST_*`，中间件测试的 `DATABASE_URL` 仅指向专用服务测试库 `iap_skill_control_test_20260908_a`；服务集成还需将 `TEST_DATABASE_URL` 指向同一库，迁移前置状态为 `20260908_27`。权限迁移升降级使用独立迁移库，禁止对服务库运行整个可降级迁移套件。真实集成使用 PostgreSQL 独立连接与 Event/Barrier 验证竞争；MinIO 使用本次创建的 UUID 桶并回收自身对象。已提交不可变版本所在的 UUID 测试范围留在专用数据库，不关闭保护触发器；该库可由后续显式环境回收流程整体回收。
 
 ## 测试
 

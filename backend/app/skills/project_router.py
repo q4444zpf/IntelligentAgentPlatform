@@ -6,6 +6,7 @@ from fastapi import (
     Depends,
     File,
     Form,
+    Header,
     HTTPException,
     Query,
     Request,
@@ -20,10 +21,13 @@ from app.core.request_context import RequestContext, require_request_context
 from .package import MAX_ZIP_BYTES
 from .project_errors import ProjectSkillError
 from .project_schemas import (
+    IdempotencyKey,
     ProjectSkillCreate,
     ProjectSkillDraftUpdate,
     ProjectSkillListQuery,
     ProjectSkillPageQuery,
+    ProjectSkillPublish,
+    PublishedSkillInfo,
     SkillDraftInfo,
     SkillImportResult,
     SkillPage,
@@ -125,6 +129,22 @@ def save_skill_draft(
     response.headers["Cache-Control"] = "no-store"
     try:
         return service.save_draft(context, str(skill_id), request)
+    except ProjectSkillError as error:
+        _raise_http(error)
+
+
+@router.post("/{skill_id}/publish", response_model=PublishedSkillInfo)
+def publish_skill(
+    skill_id: UUID,
+    request: ProjectSkillPublish,
+    response: Response,
+    idempotency_key: Annotated[IdempotencyKey, Header()],
+    context: Annotated[RequestContext, Depends(_manage_context)],
+    service: Annotated[ProjectSkillService, Depends(_service)],
+):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return service.publish(context, str(skill_id), request, idempotency_key)
     except ProjectSkillError as error:
         _raise_http(error)
 

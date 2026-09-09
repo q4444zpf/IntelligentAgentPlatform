@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstraints
 
 from .service import NAME_PATTERN
 
@@ -17,6 +17,18 @@ class ProjectSkillCreate(StrictProjectSkillModel):
 
 class ProjectSkillDraftUpdate(ProjectSkillCreate):
     expected_revision: int = Field(strict=True, gt=0)
+
+
+class ProjectSkillPublish(StrictProjectSkillModel):
+    expected_revision: int = Field(strict=True, gt=0)
+
+
+IdempotencyKey = Annotated[
+    str,
+    StringConstraints(
+        strict=True, min_length=1, max_length=128, pattern=r"^[\x20-\x7e]+$"
+    ),
+]
 
 
 def _validate_import_name(value: str) -> str:

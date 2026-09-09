@@ -9,13 +9,17 @@ import pytest
 from app.audit.models import AuditEvent
 from app.audit.recorder import AuditRecorder
 from app.identity.models import Project, Unit, User
-from app.skills.models import Skill, SkillDraft
-from app.skills.package_storage import SkillPackageStorage
+from app.skills.models import Skill, SkillDraft, SkillVersion
+from app.skills.package_storage import SkillPackageStorage, SkillPackageStorageError
 from app.skills.project_errors import ProjectSkillError
-from app.skills.project_schemas import ProjectSkillCreate, ProjectSkillDraftUpdate
+from app.skills.project_schemas import (
+    ProjectSkillCreate,
+    ProjectSkillDraftUpdate,
+    ProjectSkillPublish,
+)
 from app.skills.project_service import ProjectSkillService
 from app.skills.repository import SkillRepository
-from sqlalchemy import create_engine, delete, select, text
+from sqlalchemy import create_engine, delete, event, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -34,7 +38,13 @@ def pg_environment():
     assert make_url(url).database == "iap_skill_control_test_20260908_a"
     engine = create_engine(url, hide_parameters=True)
     assert engine.dialect.name == "postgresql"
-    sessions = sessionmaker(engine, expire_on_commit=False, class_=Session)
+    extra_user_ids = []
+    sessions = sessionmaker(
+        engine,
+        expire_on_commit=False,
+        class_=Session,
+        info={"extra_user_ids": extra_user_ids},
+    )
     context = make_context(
         "skill.read",
         "skill.manage",
@@ -75,22 +85,38 @@ def pg_environment():
             ids = select(Skill.id).where(
                 Skill.unit_id == context.unit_id, Skill.project_id == context.project_id
             )
-            connection.execute(
-                delete(AuditEvent).where(
-                    AuditEvent.unit_id == context.unit_id,
-                    AuditEvent.project_id == context.project_id,
+            # Committed versions forbid DELETE even in tests. Retain their UUID
+            # scopes in the dedicated database, as the version integration suite does.
+            if (
+                connection.scalar(
+                    select(SkillVersion.id)
+                    .where(SkillVersion.skill_id.in_(ids))
+                    .limit(1)
                 )
-            )
-            connection.execute(delete(SkillDraft).where(SkillDraft.skill_id.in_(ids)))
-            connection.execute(
-                delete(Skill).where(
-                    Skill.unit_id == context.unit_id,
-                    Skill.project_id == context.project_id,
+                is None
+            ):
+                connection.execute(
+                    delete(AuditEvent).where(
+                        AuditEvent.unit_id == context.unit_id,
+                        AuditEvent.project_id == context.project_id,
+                    )
                 )
-            )
-            connection.execute(delete(Project).where(Project.id == context.project_id))
-            connection.execute(delete(Unit).where(Unit.id == context.unit_id))
-            connection.execute(delete(User).where(User.id == context.user_id))
+                connection.execute(
+                    delete(SkillDraft).where(SkillDraft.skill_id.in_(ids))
+                )
+                connection.execute(
+                    delete(Skill).where(
+                        Skill.unit_id == context.unit_id,
+                        Skill.project_id == context.project_id,
+                    )
+                )
+                connection.execute(
+                    delete(Project).where(Project.id == context.project_id)
+                )
+                connection.execute(delete(Unit).where(Unit.id == context.unit_id))
+                connection.execute(
+                    delete(User).where(User.id.in_([context.user_id, *extra_user_ids]))
+                )
         engine.dispose()
 
 
@@ -504,4 +530,375 @@ def test_postgres_second_import_audit_failure_rolls_back_whole_batch(
                 select(AuditEvent).where(AuditEvent.project_id == context.project_id)
             )
             is None
+        )
+
+
+@pytest.mark.parametrize("competition", ["same-key", "different-key", "different-user"])
+def test_postgres_publish_race_waits_for_lock_and_commits_one_version_and_audit(
+    pg_environment, pg_storage, monkeypatch, competition
+):
+    sessions, context = pg_environment
+    skill_id = seed_skill(sessions, pg_storage, context)
+    second_context = context
+    second_user = None
+    if competition == "different-user":
+        second_user = str(uuid4())
+        with sessions.begin() as session:
+            session.add(
+                User(id=second_user, display_name="Second publisher", status="active")
+            )
+        sessions.kw["info"]["extra_user_ids"].append(second_user)
+        second_context = make_context(
+            "skill.manage",
+            unit_id=context.unit_id,
+            project_id=context.project_id,
+            user_id=second_user,
+        )
+    boundary = Barrier(2, timeout=15)
+    first_audit = Event()
+    release = Event()
+    both_writes = Event()
+    state_lock = Lock()
+    pids = set()
+    engine = sessions.kw["bind"]
+    read = pg_storage.read
+
+    def synchronized_read(*args):
+        data = read(*args)
+        boundary.wait()
+        return data
+
+    def track_lock(
+        connection, cursor, statement, parameters, execution_context, executemany
+    ):
+        if "FOR UPDATE" in statement and "skills" in statement:
+            with state_lock:
+                pids.add(connection.connection.driver_connection.info.backend_pid)
+                if len(pids) == 2:
+                    both_writes.set()
+
+    class HoldAudit(AuditRecorder):
+        def record(self, session, request):
+            result = super().record(session, request)
+            first_audit.set()
+            assert release.wait(15), "Observer did not release publication transaction"
+            return result
+
+    monkeypatch.setattr(pg_storage, "read", synchronized_read)
+    event.listen(engine, "before_cursor_execute", track_lock)
+    services = [
+        ProjectSkillService(
+            sessions, storage_factory=lambda: pg_storage, audit_recorder=HoldAudit()
+        )
+        for _ in range(2)
+    ]
+
+    def publish(index):
+        try:
+            return services[index].publish(
+                context if index == 0 else second_context,
+                skill_id,
+                ProjectSkillPublish(expected_revision=1),
+                f"key-{index}" if competition == "different-key" else "shared",
+            )
+        except ProjectSkillError as error:
+            return error.code
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            futures = [workers.submit(publish, index) for index in range(2)]
+            try:
+                assert both_writes.wait(15)
+                assert first_audit.wait(15)
+                blocked = False
+                deadline = monotonic() + 10
+                with engine.connect() as observer:
+                    while monotonic() < deadline:
+                        with state_lock:
+                            observed = tuple(pids)
+                        for pid in observed:
+                            blockers = observer.scalar(
+                                text("SELECT pg_blocking_pids(:pid)"), {"pid": pid}
+                            )
+                            if set(blockers).intersection(observed):
+                                blocked = True
+                                break
+                        if blocked:
+                            break
+                        release.wait(0.01)
+                assert blocked, "Publishers must contend on a real PostgreSQL row lock"
+            finally:
+                release.set()
+                boundary.abort()
+            results = [future.result(timeout=20) for future in futures]
+        assert len(pids) == 2
+        successful = [result for result in results if not isinstance(result, str)]
+        if competition == "same-key":
+            assert len(successful) == 2 and successful[0] == successful[1]
+        else:
+            assert len(successful) == 1
+            assert (
+                "skill_revision_conflict"
+                if competition == "different-key"
+                else "skill_idempotency_conflict"
+            ) in results
+        with sessions() as session:
+            versions = session.scalars(
+                select(SkillVersion).where(SkillVersion.skill_id == skill_id)
+            ).all()
+            audits = session.scalars(
+                select(AuditEvent).where(AuditEvent.resource_id == skill_id)
+            ).all()
+            assert len(versions) == len(audits) == 1
+            assert versions[0].content == manifest("s")
+            assert (versions[0].version, versions[0].source_revision) == (1, 1)
+            assert session.get(SkillDraft, skill_id).revision == 2
+            assert (
+                session.get(Skill, skill_id).published_version_id
+                == versions[0].id
+                == successful[0].id
+            )
+            assert audits[0].metadata_json == {
+                "revision": 1,
+                "digest": versions[0].package_digest,
+                "version_id": versions[0].id,
+            }
+    finally:
+        release.set()
+        boundary.abort()
+        event.remove(engine, "before_cursor_execute", track_lock)
+
+
+@pytest.mark.parametrize("competitor", ["save", "publish", "publish-read-failure"])
+def test_postgres_publish_rechecks_after_concurrent_storage_boundary(
+    pg_environment, pg_storage, monkeypatch, competitor
+):
+    sessions, context = pg_environment
+    skill_id = seed_skill(sessions, pg_storage, context)
+    captured = Event()
+    release = Event()
+    engine = sessions.kw["bind"]
+    waiting_storage = SkillPackageStorage(pg_storage._client, pg_storage._bucket)
+    read = waiting_storage.read
+
+    def blocked_read(*args):
+        assert engine.pool.checkedout() == 0
+        with engine.begin() as connection:
+            connection.execute(
+                select(Skill.id)
+                .where(Skill.id == skill_id)
+                .with_for_update(nowait=True)
+            ).one()
+        data = read(*args)
+        captured.set()
+        assert release.wait(15)
+        if competitor == "publish-read-failure":
+            raise SkillPackageStorageError("read failed after competitor committed")
+        return data
+
+    monkeypatch.setattr(waiting_storage, "read", blocked_read)
+    first = ProjectSkillService(sessions, storage_factory=lambda: waiting_storage)
+    second = ProjectSkillService(sessions, storage_factory=lambda: pg_storage)
+    request = ProjectSkillPublish(expected_revision=1)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        future = workers.submit(first.publish, context, skill_id, request, "shared")
+        try:
+            assert captured.wait(15)
+            if competitor == "save":
+                competing = workers.submit(
+                    second.save_draft,
+                    context,
+                    skill_id,
+                    ProjectSkillDraftUpdate(
+                        expected_revision=1, content=manifest("s", "Changed")
+                    ),
+                )
+            else:
+                competing = workers.submit(
+                    second.publish, context, skill_id, request, "shared"
+                )
+            committed = competing.result(timeout=15)
+        finally:
+            release.set()
+        if competitor == "save":
+            with pytest.raises(ProjectSkillError) as caught:
+                future.result(timeout=15)
+            assert caught.value.code == "skill_revision_conflict"
+        else:
+            assert future.result(timeout=15) == committed
+    with sessions() as session:
+        draft = session.get(SkillDraft, skill_id)
+        assert draft.revision == 2
+        versions = session.scalars(
+            select(SkillVersion).where(SkillVersion.skill_id == skill_id)
+        ).all()
+        audits = session.scalars(
+            select(AuditEvent).where(AuditEvent.resource_id == skill_id)
+        ).all()
+        assert len(audits) == 1
+        if competitor == "save":
+            assert versions == [] and draft.content == manifest("s", "Changed")
+            assert session.get(Skill, skill_id).published_version_id is None
+            assert audits[0].action == "skill.draft.save"
+        else:
+            assert len(versions) == 1 and versions[0].id == committed.id
+            assert draft.content == manifest("s")
+            assert session.get(Skill, skill_id).published_version_id == committed.id
+            assert audits[0].action == "skill.publish"
+
+
+@pytest.mark.parametrize("failure", ["audit", "commit"])
+def test_postgres_publish_failure_preserves_snapshot_revision_pointer_and_audit(
+    pg_environment, pg_storage, failure
+):
+    from app.skills.project_packages import snapshot_draft
+
+    sessions, context = pg_environment
+    skill_id = seed_skill(sessions, pg_storage, context)
+    service = ProjectSkillService(sessions, storage_factory=lambda: pg_storage)
+    first = service.publish(
+        context, skill_id, ProjectSkillPublish(expected_revision=1), "first"
+    )
+    with sessions() as session:
+        original = snapshot_draft(session.get(SkillDraft, skill_id))
+
+    def fail_commit(session):
+        assert (
+            len(
+                session.scalars(
+                    select(SkillVersion).where(SkillVersion.skill_id == skill_id)
+                ).all()
+            )
+            == 2
+        )
+        assert (
+            len(
+                session.scalars(
+                    select(AuditEvent).where(AuditEvent.resource_id == skill_id)
+                ).all()
+            )
+            == 2
+        )
+        raise RuntimeError("commit failed after audit insertion")
+
+    if failure == "commit":
+        event.listen(sessions, "before_commit", fail_commit)
+    try:
+        with pytest.raises(RuntimeError, match="failed"):
+            ProjectSkillService(
+                sessions,
+                storage_factory=lambda: pg_storage,
+                audit_recorder=FailingAudit() if failure == "audit" else None,
+            ).publish(
+                context, skill_id, ProjectSkillPublish(expected_revision=2), "second"
+            )
+    finally:
+        if failure == "commit":
+            event.remove(sessions, "before_commit", fail_commit)
+    with sessions() as session:
+        assert snapshot_draft(session.get(SkillDraft, skill_id)) == original
+        assert session.get(Skill, skill_id).published_version_id == first.id
+        assert (
+            len(
+                session.scalars(
+                    select(SkillVersion).where(SkillVersion.skill_id == skill_id)
+                ).all()
+            )
+            == 1
+        )
+        assert (
+            len(
+                session.scalars(
+                    select(AuditEvent).where(AuditEvent.resource_id == skill_id)
+                ).all()
+            )
+            == 1
+        )
+    retried = service.publish(
+        context, skill_id, ProjectSkillPublish(expected_revision=2), "second"
+    )
+    assert (retried.version, retried.source_revision) == (2, 2)
+
+
+def test_postgres_publish_rechecks_replay_when_revision_turns_stale_after_preflight(
+    pg_environment, pg_storage
+):
+    sessions, context = pg_environment
+    skill_id = seed_skill(sessions, pg_storage, context)
+    request = ProjectSkillPublish(expected_revision=1)
+    observed_empty = Event()
+    release = Event()
+    state = local()
+    pids = set()
+    engine = sessions.kw["bind"]
+
+    def pause_empty_result(
+        connection, cursor, statement, parameters, execution_context, executemany
+    ):
+        if (
+            getattr(state, "first_request", False)
+            and not observed_empty.is_set()
+            and (
+                statement.startswith("SELECT")
+                and "skill_versions.idempotency_key =" in statement
+            )
+        ):
+            pids.add(connection.connection.driver_connection.info.backend_pid)
+            observed_empty.set()
+            assert release.wait(15)
+
+    class TrackAudit(AuditRecorder):
+        def record(self, session, request):
+            pids.add(session.scalar(text("SELECT pg_backend_pid()")))
+            return super().record(session, request)
+
+    def unavailable():
+        raise AssertionError(
+            "Stale snapshot must recheck the now committed replay before storage"
+        )
+
+    first = ProjectSkillService(sessions, storage_factory=unavailable)
+    second = ProjectSkillService(
+        sessions, storage_factory=lambda: pg_storage, audit_recorder=TrackAudit()
+    )
+
+    def run_first():
+        state.first_request = True
+        return first.publish(context, skill_id, request, "same")
+
+    event.listen(engine, "after_cursor_execute", pause_empty_result)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            future = workers.submit(run_first)
+            try:
+                assert observed_empty.wait(15)
+                competing = workers.submit(
+                    second.publish, context, skill_id, request, "same"
+                )
+                committed = competing.result(timeout=15)
+            finally:
+                release.set()
+            assert future.result(timeout=15) == committed
+        assert len(pids) == 2
+    finally:
+        release.set()
+        event.remove(engine, "after_cursor_execute", pause_empty_result)
+    with sessions() as session:
+        assert session.get(SkillDraft, skill_id).revision == 2
+        assert session.get(Skill, skill_id).published_version_id == committed.id
+        assert (
+            len(
+                session.scalars(
+                    select(SkillVersion).where(SkillVersion.skill_id == skill_id)
+                ).all()
+            )
+            == 1
+        )
+        assert (
+            len(
+                session.scalars(
+                    select(AuditEvent).where(AuditEvent.resource_id == skill_id)
+                ).all()
+            )
+            == 1
         )

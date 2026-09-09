@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.core.request_context import RequestContext
 
-from .models import Skill, SkillDraft
+from .models import Skill, SkillDraft, SkillVersion
 from .package import SkillPackageError, ValidatedSkillPackage, parse_skill_bundle
 from .package_storage import (
     SkillPackageStorage,
@@ -31,10 +31,12 @@ from .project_packages import (
     snapshot_draft,
 )
 from .project_schemas import (
+    IdempotencyKey,
     ProjectSkillCreate,
     ProjectSkillDraftUpdate,
     ProjectSkillImportCreate,
     ProjectSkillImportEntry,
+    ProjectSkillPublish,
     PublishedSkillInfo,
     SkillDraftInfo,
     SkillImportItem,
@@ -44,7 +46,12 @@ from .project_schemas import (
     SkillVersionInfo,
     SkillVersionPage,
 )
-from .repository import SkillRepository, SkillResourceNotFound, SkillRevisionConflict
+from .repository import (
+    SkillIdempotencyConflict,
+    SkillRepository,
+    SkillResourceNotFound,
+    SkillRevisionConflict,
+)
 
 
 @dataclass(frozen=True)
@@ -61,6 +68,8 @@ class PreparedSkillImport:
 _IMPORT_MANIFEST = TypeAdapter(
     Annotated[list[ProjectSkillImportEntry], Field(max_length=500)]
 )
+_IDEMPOTENCY_KEY = TypeAdapter(IdempotencyKey)
+_PUBLISH_REVISION = TypeAdapter(Annotated[int, Field(strict=True, gt=0)])
 
 
 class ProjectSkillService:
@@ -80,6 +89,155 @@ class ProjectSkillService:
     def check_access(self, context: RequestContext, permission: str) -> SkillAccess:
         with self._session_factory() as session:
             return require_skill_access(session, context, permission)
+
+    def publish(
+        self,
+        context: RequestContext,
+        skill_id: str,
+        request: ProjectSkillPublish,
+        idempotency_key: str,
+    ) -> PublishedSkillInfo:
+        try:
+            self.check_access(context, "skill.manage")
+            try:
+                _IDEMPOTENCY_KEY.validate_python(idempotency_key)
+                _PUBLISH_REVISION.validate_python(request.expected_revision)
+            except ValidationError as error:
+                raise ProjectSkillError("skill_publish_request_invalid", 422) from error
+            replay = self._publish_replay(context, skill_id, request, idempotency_key)
+            if replay is not None:
+                return replay
+            with self._session_factory() as session:
+                access = require_skill_access(session, context, "skill.manage")
+                draft = SkillRepository(session).get_draft(
+                    access.scope, skill_id, owner_ids=access.owner_ids
+                )
+                if draft is None:
+                    raise ProjectSkillError("skill_not_found", 404)
+                original = (
+                    snapshot_draft(draft)
+                    if draft.revision == request.expected_revision
+                    else None
+                )
+            if original is None:
+                replay = self._publish_replay(
+                    context, skill_id, request, idempotency_key
+                )
+                if replay is not None:
+                    return replay
+                raise ProjectSkillError("skill_revision_conflict", 409)
+            if original.stored.object_key.split("/")[:3] != [
+                access.scope.unit_id,
+                access.scope.project_id,
+                skill_id,
+            ]:
+                raise ProjectSkillError("skill_storage_unavailable", 503)
+            try:
+                read_verified_package(self._storage_factory(), original)
+            except (SkillPackageStorageError, ProjectSkillError) as error:
+                if isinstance(error, ProjectSkillError) and not (
+                    error.code == "skill_storage_unavailable"
+                    and isinstance(
+                        error.__cause__, (SkillPackageError, SkillPackageStorageError)
+                    )
+                ):
+                    raise
+                replay = self._publish_replay(
+                    context, skill_id, request, idempotency_key
+                )
+                if replay is not None:
+                    return replay
+                raise
+            with self._session_factory() as session, session.begin():
+                access = require_skill_access(session, context, "skill.manage")
+                repository = SkillRepository(session)
+                repository.lock_skill(
+                    access.scope, skill_id, owner_ids=access.owner_ids
+                )
+                replay = repository.find_publish_replay(
+                    access.scope,
+                    skill_id,
+                    expected_revision=request.expected_revision,
+                    idempotency_key=idempotency_key,
+                    published_by=context.user_id,
+                    owner_ids=access.owner_ids,
+                )
+                if replay is not None:
+                    return PublishedSkillInfo(**self._version_fields(replay))
+                current = repository.get_draft(
+                    access.scope, skill_id, owner_ids=access.owner_ids
+                )
+                if current is not None:
+                    session.refresh(current)
+                if current is None or snapshot_draft(current) != original:
+                    raise ProjectSkillError("skill_revision_conflict", 409)
+                version = repository.publish(
+                    access.scope,
+                    skill_id,
+                    expected_revision=request.expected_revision,
+                    idempotency_key=idempotency_key,
+                    published_by=context.user_id,
+                )
+                self._record_change(
+                    session,
+                    context,
+                    skill_id,
+                    "skill.publish",
+                    revision=version.source_revision,
+                    digest=version.package_digest,
+                    version_id=version.id,
+                )
+                result = PublishedSkillInfo(**self._version_fields(version))
+            return result
+        except (
+            SkillPackageStorageError,
+            SkillRevisionConflict,
+            SkillIdempotencyConflict,
+            SkillResourceNotFound,
+        ) as error:
+            self._raise_known(error)
+            raise
+
+    def _publish_replay(
+        self,
+        context: RequestContext,
+        skill_id: str,
+        request: ProjectSkillPublish,
+        idempotency_key: str,
+    ) -> PublishedSkillInfo | None:
+        with self._session_factory() as session:
+            access = require_skill_access(session, context, "skill.manage")
+            replay = SkillRepository(session).find_publish_replay(
+                access.scope,
+                skill_id,
+                expected_revision=request.expected_revision,
+                idempotency_key=idempotency_key,
+                published_by=context.user_id,
+                owner_ids=access.owner_ids,
+            )
+            return (
+                PublishedSkillInfo(**self._version_fields(replay))
+                if replay is not None
+                else None
+            )
+
+    @staticmethod
+    def _version_fields(row: SkillVersion) -> dict[str, object]:
+        return {
+            field: getattr(row, field)
+            for field in (
+                "id",
+                "skill_id",
+                "version",
+                "source_revision",
+                "name",
+                "description",
+                "display_version",
+                "package_digest",
+                "published_by",
+                "published_at",
+            )
+        }
 
     def import_bundle(
         self, context: RequestContext, data: bytes, manifest_json: str | None
@@ -415,6 +573,8 @@ class ProjectSkillService:
             raise ProjectSkillError("skill_storage_unavailable", 503) from error
         if isinstance(error, SkillRevisionConflict):
             raise ProjectSkillError("skill_revision_conflict", 409) from error
+        if isinstance(error, SkillIdempotencyConflict):
+            raise ProjectSkillError("skill_idempotency_conflict", 409) from error
         if isinstance(error, SkillResourceNotFound):
             raise ProjectSkillError("skill_not_found", 404) from error
         if isinstance(error, IntegrityError):

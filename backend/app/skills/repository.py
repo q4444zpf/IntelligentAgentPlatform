@@ -34,6 +34,20 @@ class SkillResourceNotFound(LookupError):
     pass
 
 
+def _publish_request_digest(
+    skill_id: str, expected_revision: int, published_by: str
+) -> str:
+    request = {
+        "operation": "publish",
+        "skill_id": skill_id,
+        "expected_revision": expected_revision,
+        "published_by": published_by,
+    }
+    return hashlib.sha256(
+        json.dumps(request, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def _snapshot(
     scope: SkillScope,
     skill_id: str,
@@ -251,15 +265,7 @@ class SkillRepository:
             raise ValueError("An idempotency key of at most 128 characters is required")
         if self.get(scope, skill_id) is None:
             raise SkillResourceNotFound("Skill not found in scope")
-        request = {
-            "operation": "publish",
-            "skill_id": skill_id,
-            "expected_revision": expected_revision,
-            "published_by": published_by,
-        }
-        request_digest = hashlib.sha256(
-            json.dumps(request, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
+        request_digest = _publish_request_digest(skill_id, expected_revision, published_by)
         existing = self._replay(skill_id, idempotency_key, request_digest)
         if existing is not None:
             return existing
@@ -287,6 +293,24 @@ class SkillRepository:
         skill.published_version_id = version.id
         self._session.flush()
         return version
+
+    def find_publish_replay(
+        self,
+        scope: SkillScope,
+        skill_id: str,
+        *,
+        expected_revision: int,
+        idempotency_key: str,
+        published_by: str,
+        owner_ids: frozenset[str] | None = None,
+    ) -> SkillVersion | None:
+        if self.get(scope, skill_id, owner_ids=owner_ids) is None:
+            raise SkillResourceNotFound("Skill not found in scope")
+        return self._replay(
+            skill_id,
+            idempotency_key,
+            _publish_request_digest(skill_id, expected_revision, published_by),
+        )
 
     def get_version(
         self,

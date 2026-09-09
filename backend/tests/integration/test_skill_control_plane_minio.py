@@ -4,11 +4,11 @@ from uuid import uuid4
 import boto3
 import pytest
 from app.audit.models import AuditEvent
-from app.skills.models import Skill, SkillDraft
+from app.skills.models import Skill, SkillDraft, SkillVersion
 from app.skills.package_storage import create_default_skill_package_storage
 from app.skills.project_errors import ProjectSkillError
 from app.skills.project_packages import read_verified_package, snapshot_draft
-from app.skills.project_schemas import ProjectSkillDraftUpdate
+from app.skills.project_schemas import ProjectSkillDraftUpdate, ProjectSkillPublish
 from app.skills.project_service import ProjectSkillService
 from botocore.config import Config
 from sqlalchemy import select
@@ -55,6 +55,118 @@ def minio_storage(monkeypatch):
                 client.delete_object(Bucket=bucket, Key=item["Key"])
         client.delete_bucket(Bucket=bucket)
         client.close()
+
+
+def test_minio_verified_publish_replays_after_later_draft_and_original_object_loss(
+    pg_environment, minio_storage
+):
+    sessions, context = pg_environment
+    storage, client, bucket = minio_storage
+    skill_id = seed_skill(
+        sessions,
+        storage,
+        context,
+        attachments=(("references/control.txt", b"control limits\x00\xff"),),
+    )
+    with sessions() as session:
+        original = snapshot_draft(session.get(SkillDraft, skill_id))
+    service = ProjectSkillService(sessions)
+    request = ProjectSkillPublish(expected_revision=1)
+    first = service.publish(context, skill_id, request, "minio-publish")
+    assert {
+        item.path: item.data for item in read_verified_package(storage, original).files
+    }["references/control.txt"] == b"control limits\x00\xff"
+    service.save_draft(
+        context,
+        skill_id,
+        ProjectSkillDraftUpdate(
+            expected_revision=2, content=manifest("s", "Later draft")
+        ),
+    )
+    client.delete_object(Bucket=bucket, Key=original.stored.object_key)
+
+    def unavailable():
+        raise AssertionError("Committed replay must not create a MinIO client")
+
+    replay = ProjectSkillService(sessions, storage_factory=unavailable).publish(
+        context, skill_id, request, "minio-publish"
+    )
+    assert replay == first
+    with sessions() as session:
+        assert session.get(SkillDraft, skill_id).revision == 3
+        assert session.get(SkillDraft, skill_id).content == manifest("s", "Later draft")
+        assert session.get(Skill, skill_id).published_version_id == first.id
+        versions = session.scalars(
+            select(SkillVersion).where(SkillVersion.skill_id == skill_id)
+        ).all()
+        assert len(versions) == 1 and versions[0].content == manifest("s")
+        audits = session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.resource_id == skill_id, AuditEvent.action == "skill.publish"
+            )
+        ).all()
+        assert len(audits) == 1
+
+
+@pytest.mark.parametrize("damage", ["archive", "metadata", "missing", "snapshot"])
+def test_minio_publish_rejects_corruption_without_changing_existing_publication(
+    pg_environment, minio_storage, damage
+):
+    sessions, context = pg_environment
+    storage, client, bucket = minio_storage
+    skill_id = seed_skill(sessions, storage, context)
+    service = ProjectSkillService(sessions)
+    first = service.publish(
+        context, skill_id, ProjectSkillPublish(expected_revision=1), "first"
+    )
+    with sessions() as session:
+        original = snapshot_draft(session.get(SkillDraft, skill_id))
+    if damage == "missing":
+        client.delete_object(Bucket=bucket, Key=original.stored.object_key)
+    elif damage == "snapshot":
+        with sessions.begin() as session:
+            session.get(SkillDraft, skill_id).files = []
+    else:
+        response = client.get_object(Bucket=bucket, Key=original.stored.object_key)
+        data = response["Body"].read()
+        response["Body"].close()
+        metadata = response["Metadata"]
+        if damage == "archive":
+            data = data[:-1] + bytes([data[-1] ^ 1])
+        else:
+            metadata["package-digest"] = "0" * 64
+        client.put_object(
+            Bucket=bucket, Key=original.stored.object_key, Body=data, Metadata=metadata
+        )
+    with sessions() as session:
+        before_publish = snapshot_draft(session.get(SkillDraft, skill_id))
+    with pytest.raises(ProjectSkillError) as caught:
+        service.publish(
+            context, skill_id, ProjectSkillPublish(expected_revision=2), "second"
+        )
+    assert (caught.value.code, caught.value.status_code) == (
+        "skill_storage_unavailable",
+        503,
+    )
+    with sessions() as session:
+        assert snapshot_draft(session.get(SkillDraft, skill_id)) == before_publish
+        assert session.get(Skill, skill_id).published_version_id == first.id
+        assert (
+            len(
+                session.scalars(
+                    select(SkillVersion).where(SkillVersion.skill_id == skill_id)
+                ).all()
+            )
+            == 1
+        )
+        assert (
+            len(
+                session.scalars(
+                    select(AuditEvent).where(AuditEvent.resource_id == skill_id)
+                ).all()
+            )
+            == 1
+        )
 
 
 def test_minio_default_factory_preserves_attachments_and_previous_archive(

@@ -421,3 +421,64 @@ def test_upload_reader_bounds_reads_and_closes_on_failure():
     assert caught.value.status_code == 413
     assert stream.total == MAX_ZIP_BYTES + 1
     assert stream.closed
+
+
+@pytest.mark.parametrize(
+    "key,body",
+    [
+        (None, {"expected_revision": 1}),
+        ("", {"expected_revision": 1}),
+        ("x" * 129, {"expected_revision": 1}),
+        (b"\xc3\xa9", {"expected_revision": 1}),
+        ("key", {"expected_revision": True}),
+        ("key", {"expected_revision": 1.0}),
+        ("key", {"expected_revision": 1, "object_key": "forged"}),
+        ("key", {"expected_revision": 1, "package_digest": "forged"}),
+        ("key", {"expected_revision": 1, "version": 9}),
+    ],
+)
+def test_publish_route_rejects_invalid_header_and_client_snapshot(
+    sessions, storage, key, body
+):
+    skill_id = seed_skill(sessions, storage, make_context("skill.manage"))
+    with TestClient(
+        make_test_app(sessions, lambda: storage, context=make_context("skill.manage"))
+    ) as client:
+        response = client.post(
+            f"/api/project-skills/{skill_id}/publish",
+            json=body,
+            headers={} if key is None else {"Idempotency-Key": key},
+        )
+    assert response.status_code == 422
+
+
+def test_publish_route_returns_fixed_metadata_and_replay(sessions, storage):
+    skill_id = seed_skill(sessions, storage, make_context("skill.manage"))
+    with TestClient(
+        make_test_app(sessions, lambda: storage, context=make_context("skill.manage"))
+    ) as client:
+        first = client.post(
+            f"/api/project-skills/{skill_id}/publish",
+            json={"expected_revision": 1},
+            headers={"Idempotency-Key": " key "},
+        )
+        replay = client.post(
+            f"/api/project-skills/{skill_id}/publish",
+            json={"expected_revision": 1},
+            headers={"Idempotency-Key": " key "},
+        )
+    assert first.status_code == replay.status_code == 200
+    assert first.json() == replay.json()
+    assert first.headers["cache-control"] == "no-store"
+    assert set(first.json()) == {
+        "id",
+        "skill_id",
+        "version",
+        "source_revision",
+        "name",
+        "description",
+        "display_version",
+        "package_digest",
+        "published_by",
+        "published_at",
+    }
