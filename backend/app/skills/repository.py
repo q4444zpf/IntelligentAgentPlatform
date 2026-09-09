@@ -136,23 +136,8 @@ class SkillRepository:
             )
             or 0
         )
-        updated_at = case(
-            (Skill.updated_at >= SkillDraft.updated_at, Skill.updated_at),
-            else_=SkillDraft.updated_at,
-        ).label("updated_at")
         statement = (
-            select(
-                Skill.id,
-                Skill.name,
-                SkillDraft.description,
-                SkillDraft.display_version,
-                SkillDraft.revision.label("draft_revision"),
-                Skill.published_version_id,
-                Skill.created_at,
-                updated_at,
-            )
-            .join(SkillDraft, SkillDraft.skill_id == Skill.id)
-            .where(*conditions)
+            self._summary_statement(conditions)
             .order_by(Skill.created_at, Skill.id)
             .offset(offset)
             .limit(limit)
@@ -166,24 +151,11 @@ class SkillRepository:
         *,
         owner_ids: frozenset[str] | None = None,
     ) -> Mapping[str, Any] | None:
-        updated_at = case(
-            (Skill.updated_at >= SkillDraft.updated_at, Skill.updated_at),
-            else_=SkillDraft.updated_at,
-        ).label("updated_at")
-        statement = (
-            select(
-                Skill.id,
-                Skill.name,
-                SkillDraft.description,
-                SkillDraft.display_version,
-                SkillDraft.revision.label("draft_revision"),
-                Skill.published_version_id,
-                Skill.created_at,
-                updated_at,
-            )
-            .join(SkillDraft, SkillDraft.skill_id == Skill.id)
-            .where(*self._conditions(scope, owner_ids=owner_ids), Skill.id == skill_id)
-        )
+        conditions = [
+            *self._conditions(scope, owner_ids=owner_ids),
+            Skill.id == skill_id,
+        ]
+        statement = self._summary_statement(conditions)
         return self._session.execute(statement).mappings().one_or_none()
 
     def get_draft(
@@ -341,6 +313,27 @@ class SkillRepository:
         if q is not None:
             conditions.append(Skill.name.contains(q, autoescape=True))
         return conditions
+
+    @staticmethod
+    def _summary_statement(conditions: list[Any]):
+        updated_at = case(
+            (Skill.updated_at >= SkillDraft.updated_at, Skill.updated_at),
+            else_=SkillDraft.updated_at,
+        ).label("updated_at")
+        return (
+            select(
+                Skill.id,
+                Skill.name,
+                SkillDraft.description,
+                SkillDraft.display_version,
+                SkillDraft.revision.label("draft_revision"),
+                Skill.published_version_id,
+                Skill.created_at,
+                updated_at,
+            )
+            .join(SkillDraft, SkillDraft.skill_id == Skill.id)
+            .where(*conditions)
+        )
 
     def _scoped(self, scope: SkillScope, *, owner_ids: frozenset[str] | None = None):
         return select(Skill).where(*self._conditions(scope, owner_ids=owner_ids))

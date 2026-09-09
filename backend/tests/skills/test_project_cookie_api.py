@@ -214,6 +214,59 @@ def test_invalid_selected_project_is_not_replaced_by_sole_other_membership(
     assert leaked_id not in response.text
 
 
+def test_invalid_selected_project_precedes_missing_fallback_permission(
+    sessions, storage
+):
+    """Catches fallback capability denial masking an invalid selected project."""
+    token = issue_session(sessions, project_id="project-1")
+    with sessions() as session:
+        no_read_role = Role(
+            id=str(uuid4()),
+            unit_id="unit-1",
+            code="no-skill-read",
+            name="No Skill Read",
+            scope_type="project",
+            built_in=False,
+            status="active",
+        )
+        session.add_all(
+            [
+                no_read_role,
+                ProjectMembership(
+                    id=str(uuid4()),
+                    user_id="user-1",
+                    unit_id="unit-1",
+                    project_id="project-2",
+                    status="active",
+                ),
+            ]
+        )
+        session.flush()
+        session.add(
+            ProjectMembershipRole(
+                id=str(uuid4()),
+                user_id="user-1",
+                unit_id="unit-1",
+                project_id="project-2",
+                role_id=no_read_role.id,
+                scope_type="project",
+            )
+        )
+        original = session.scalar(
+            select(ProjectMembership).where(
+                ProjectMembership.user_id == "user-1",
+                ProjectMembership.project_id == "project-1",
+            )
+        )
+        original.status = "inactive"
+        session.commit()
+
+    response = cookie_client(sessions, storage, token).get("/api/project-skills")
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "skill_project_required"}
+
+
 def test_cookie_does_not_select_project_when_session_has_none(sessions, storage):
     """Catches implicit project selection for a Cookie with no selected project."""
     token = issue_session(sessions)

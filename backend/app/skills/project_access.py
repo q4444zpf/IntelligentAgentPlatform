@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.core.request_context import RequestContext
 from app.identity.authorization import AuthorizationService
-from app.identity.models import Project
+from app.identity.models import AuthSession, Project
 from app.identity.schemas import ResourceScope
 
 from .project_errors import ProjectSkillError
@@ -30,6 +30,10 @@ def require_skill_access(
         or (authorization.current_project_id or "") != (context.project_id or "")
     ):
         raise ProjectSkillError("skill_authentication_required", 401)
+
+    persisted = session.get(AuthSession, authorization.session_id)
+    if persisted is not None and persisted.current_project_id != context.project_id:
+        raise ProjectSkillError("skill_project_required", 403)
 
     if not context.project_id:
         raise ProjectSkillError("skill_project_required", 403)

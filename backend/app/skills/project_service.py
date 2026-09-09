@@ -5,10 +5,9 @@ from sqlalchemy.orm import Session
 
 from app.audit.recorder import AuditRecorder
 from app.core.request_context import RequestContext
-from app.identity.models import AuthSession
 
 from .package_storage import SkillPackageStorage, create_default_skill_package_storage
-from .project_access import SkillAccess, require_skill_access
+from .project_access import require_skill_access
 from .project_errors import ProjectSkillError
 from .project_schemas import (
     PublishedSkillInfo,
@@ -44,7 +43,7 @@ class ProjectSkillService:
         q: str | None = None,
     ) -> SkillPage:
         with self._session_factory() as session:
-            access = self._access(session, context)
+            access = require_skill_access(session, context, "skill.read")
             rows, total = SkillRepository(session).list_summaries(
                 access.scope,
                 owner_ids=access.owner_ids,
@@ -61,7 +60,7 @@ class ProjectSkillService:
 
     def get(self, context: RequestContext, skill_id: str) -> SkillSummary:
         with self._session_factory() as session:
-            access = self._access(session, context)
+            access = require_skill_access(session, context, "skill.read")
             row = SkillRepository(session).get_summary(
                 access.scope, skill_id, owner_ids=access.owner_ids
             )
@@ -69,7 +68,7 @@ class ProjectSkillService:
 
     def get_draft(self, context: RequestContext, skill_id: str) -> SkillDraftInfo:
         with self._session_factory() as session:
-            access = self._access(session, context)
+            access = require_skill_access(session, context, "skill.read")
             draft = SkillRepository(session).get_draft(
                 access.scope, skill_id, owner_ids=access.owner_ids
             )
@@ -96,7 +95,7 @@ class ProjectSkillService:
         limit: int = 20,
     ) -> SkillVersionPage:
         with self._session_factory() as session:
-            access = self._access(session, context)
+            access = require_skill_access(session, context, "skill.read")
             repository = SkillRepository(session)
             self._found(
                 repository.get_summary(
@@ -121,7 +120,7 @@ class ProjectSkillService:
         self, context: RequestContext, skill_id: str, version_id: str
     ) -> SkillVersionInfo:
         with self._session_factory() as session:
-            access = self._access(session, context)
+            access = require_skill_access(session, context, "skill.read")
             version = SkillRepository(session).get_version(
                 access.scope,
                 skill_id,
@@ -144,17 +143,6 @@ class ProjectSkillService:
                 content=version.content,
                 files=version.files,
             )
-
-    @staticmethod
-    def _access(session: Session, context: RequestContext) -> SkillAccess:
-        access = require_skill_access(session, context, "skill.read")
-        authorization = context.authorization_context
-        if authorization is None:
-            raise ProjectSkillError("skill_authentication_required", 401)
-        persisted = session.get(AuthSession, authorization.session_id)
-        if persisted is not None and persisted.current_project_id != context.project_id:
-            raise ProjectSkillError("skill_project_required", 403)
-        return access
 
     @staticmethod
     def _found(row: Mapping[str, Any] | None) -> Mapping[str, Any]:
