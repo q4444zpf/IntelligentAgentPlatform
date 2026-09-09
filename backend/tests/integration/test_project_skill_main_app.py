@@ -19,14 +19,15 @@ REQUIRED_ENVIRONMENT = (
     "TEST_S3_ACCESS_KEY",
     "TEST_S3_SECRET_KEY",
 )
-if not all(os.environ.get(name) for name in REQUIRED_ENVIRONMENT):
+if os.environ.get("IAP_PROJECT_SKILLS_API_ENABLED", "").lower() != "true" or not all(
+    os.environ.get(name) for name in REQUIRED_ENVIRONMENT
+):
     pytest.skip(
         "requires enabled Project Skill service PostgreSQL and MinIO configuration",
         allow_module_level=True,
     )
 
 DATABASE_NAME = "iap_project_skill_activation_test_20260909_a"
-assert os.environ["IAP_PROJECT_SKILLS_API_ENABLED"].lower() == "true"
 assert make_url(os.environ["DATABASE_URL"]).database == DATABASE_NAME
 assert make_url(os.environ["TEST_DATABASE_URL"]).database == DATABASE_NAME
 assert not make_url(os.environ["TEST_DATABASE_URL"]).query

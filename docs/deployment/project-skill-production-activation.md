@@ -57,8 +57,16 @@
 
 ## 回滚
 
-应用回滚时先将 `IAP_PROJECT_SKILLS_API_ENABLED=false`，再回滚 API 镜像或停止项目 Skill 流量。数据库迁移只向前处理，回滚绝不执行 `alembic downgrade`，也不得删除或重建数据库卷。若新版本无法继续使用，应保持功能关闭，保留数据库与迁移日志，并通过经审核的向前修复迁移恢复服务。
+应用回滚时，将 API 服务配置改为 `IAP_PROJECT_SKILLS_API_ENABLED=false`，随后重新创建或重启全部 API 实例，使启动时路由配置重新加载。例如 Compose 部署执行：
 
-仅关闭 `IAP_PROJECT_SKILLS_API_ENABLED` 即可从 OpenAPI 和流量入口移除 `/api/project-skills`；旧 `/api/skills` 继续可用。不要在回滚中删除 Skill 对象、数据库行或桶。
+```powershell
+docker compose up -d --force-recreate api
+```
+
+滚动部署平台应执行等价的全实例滚动重启。等待实例健康后，重新获取 `/openapi.json`，要求不再包含 `/api/project-skills` 且仍包含旧 `/api/skills`。移除项目 Skill 路由不要求回滚 API 镜像或单独停止流量。
+
+数据库迁移只向前处理，回滚绝不执行 `alembic downgrade`，也不得删除或重建数据库卷。若新版本无法继续使用，应保持功能关闭，保留数据库与迁移日志，并通过经审核的向前修复迁移恢复服务。
+
+关闭 `IAP_PROJECT_SKILLS_API_ENABLED` 并完成上述 API 重启后，`/api/project-skills` 才会从 OpenAPI 和流量入口移除；旧 `/api/skills` 继续可用。不要在回滚中删除 Skill 对象、数据库行或桶。
 
 本次激活不包含前端/浏览器接入、Agent runtime 绑定、Team 绑定或远程部署；这些边界必须由各自后续发布独立验收。
