@@ -206,14 +206,20 @@ feat: gate project skill production routes
 
 - [ ] **Step 1: Write migration-head reader RED tests.**
 
-Create `test_project_startup.py` with tests asserting:
+Create `test_project_startup.py` with a repository-layout behavior test:
 
 ```python
-def test_loads_the_repository_migration_head():
-    assert load_code_migration_heads() == frozenset({"20260908_27"})
+def test_loads_repository_migration_heads_without_using_current_directory(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.chdir(tmp_path)
+    heads = load_code_migration_heads()
+    assert heads
+    assert all(head.isascii() and head.strip() == head for head in heads)
 ```
 
-Use temporary Alembic directories to cover an empty/broken graph and a synthetic two-head graph. Graph-read failures must raise `ProjectSkillStartupError("project skill migration graph is unavailable")` with no retained cause/context.
+This catches an implementation that resolves `alembic.ini` from the process working directory while avoiding a test that must be edited whenever a legitimate migration advances the repository head. Use temporary Alembic directories to cover an empty/broken graph and a synthetic two-head graph with hand-written literal revision identifiers. Graph-read failures must raise `ProjectSkillStartupError("project skill migration graph is unavailable")` with no retained cause/context.
 
 - [ ] **Step 2: Write database comparison RED tests.**
 
@@ -400,7 +406,7 @@ app.add_exception_handler(
 )
 ```
 
-The enabled-main subprocess test must assert the handler mapping points to this function. The default main must still omit the new route.
+Extend the enabled-main subprocess with an actual HTTP probe through the production `app` object. In the subprocess only, override the existing request-context/session dependencies with the same narrow fixtures used by Project Skill API tests, send the exact surrogate request bytes to the real `/api/project-skills` route, and assert 422 with a decodable `detail` payload. Do not inspect `app.exception_handlers` or assert the registered callable's identity. The default main must still omit the new route.
 
 - [ ] **Step 5: Run GREEN, compatibility regression and commit.**
 
@@ -426,13 +432,9 @@ fix: serialize project skill validation errors safely
 
 - [ ] **Step 1: Write structured deployment RED tests.**
 
-Parse `compose.yaml` with `yaml.safe_load`; read Dockerfile and `.env.example` as UTF-8. Assert:
+Parse `compose.yaml` with `yaml.safe_load`; parse `.env.example` into key/value entries. Assert:
 
 ```python
-assert "alembic upgrade" not in dockerfile
-assert "sqlite_to_postgres" not in dockerfile
-assert 'CMD ["uvicorn", "app.main:app"' in dockerfile
-
 migrate = compose["services"]["migrate"]
 assert migrate["profiles"] == ["operations"]
 assert migrate["restart"] == "no"
@@ -452,7 +454,7 @@ Also assert API receives `${IAP_PROJECT_SKILLS_API_ENABLED:-false}`, migrate rec
 python -m pytest backend/tests/test_project_skill_deployment.py -q -p no:cacheprovider --tb=short
 ```
 
-Expected: Dockerfile still contains both automatic operations and Compose lacks `migrate`.
+Expected: Compose lacks `migrate`, API lacks the feature environment entry, and the env example lacks the disabled feature flag.
 
 - [ ] **Step 3: Separate the image command and Compose service.**
 
@@ -491,7 +493,7 @@ The runbook must say: build/tag API; leave feature false; run `docker compose --
 
 - [ ] **Step 5: Run GREEN and Compose/image checks.**
 
-Run the RED test, existing Compose boundary tests, `docker compose config`, then build the API image. Inspect its configured command and require the Uvicorn argv with no shell migration chain.
+Run the RED test, existing Compose boundary tests and `docker compose config`, then build the API image. Inspect the built image through `docker image inspect --format '{{json .Config.Cmd}}' intelligent-agent-platform-api:local`; parse the returned JSON and require the exact Uvicorn argv with no shell migration chain. This image behavior check, rather than a Dockerfile source-text assertion, is the Docker command acceptance gate.
 
 - [ ] **Step 6: Execute migrate against only the dedicated service database.**
 
