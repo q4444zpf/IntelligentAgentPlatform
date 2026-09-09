@@ -161,7 +161,7 @@ python -m app.migrations.sqlite_to_postgres
 - 仓储按单位和项目查询，管理草稿 revision、不可变发布版本和发布幂等记录。调用方先预分配 Skill UUID，上传后使用同一 ID 创建资源；调用方负责授权、发布前重新验证对象以及提交或回滚事务。
 - 迁移 `20260908_26` 新增三张 Skill 表和 PostgreSQL 版本不可变保护，不自动导入现有本地 Skill 目录。
 
-这些模块尚未接入现有 `/api/skills`、Agent/Team 绑定和前端界面。项目权限 API 已提供下述隔离测试装配；生产挂载、运行时版本捕获及旧数据切换属于后续交付，不能仅部署本迁移就视为完成 Skill 生产化。
+这些模块未接入现有 `/api/skills`、Agent/Team 绑定和前端界面。项目权限 API 已接入生产 `app.main`，但默认关闭；仅当 `IAP_PROJECT_SKILLS_API_ENABLED=true` 时挂载 `/api/project-skills`，旧 `/api/skills` 始终保留。启用前必须按生产激活手册显式完成迁移、revision 比对和桶初始化；运行时版本捕获及旧数据切换仍属于后续交付，不能仅部署迁移或打开开关就视为完成全部 Skill 生产化。
 
 从仓库根目录运行聚焦测试：
 
@@ -189,7 +189,7 @@ python -m pytest backend/tests/integration/test_project_skill_storage_bootstrap_
 
 ### 项目 Skill 隔离接口
 
-`app.skills.project_router.router` 只在测试应用中装配，`app.main` 未导入或挂载，不存在生产启用开关。旧 Skill 接口的认证风险本轮未整改，Web UI、运行时、Agent/Team、业务数据和本地 Skill 目录均未切换或双写。
+`app.skills.project_router.router` 已接入生产 `app.main`，默认不挂载；仅在进程启动前设置 `IAP_PROJECT_SKILLS_API_ENABLED=true` 时挂载。开关开启后，启动校验要求数据库 Alembic revision 与当前代码 head 精确一致，失败即拒绝启动；API 不执行迁移或建桶，运维人员必须先显式运行 `migrate`、比对 current/head 并完成 `skill-storage-init`。旧 `/api/skills` 继续挂载；其认证风险本轮未整改，Web UI、运行时、Agent/Team、业务数据和本地 Skill 目录均未切换或双写。
 
 | 方法 | 路径（前缀 `/api/project-skills`） | 权限与结果 |
 | --- | --- | --- |

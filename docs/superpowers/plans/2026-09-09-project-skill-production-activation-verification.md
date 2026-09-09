@@ -26,6 +26,7 @@ python .superpowers/sdd/2026-09-09-project-skill-production-activation/task-6-se
 ```powershell
 $env:TASK6_FEATURE_FLAG = 'false'
 python .superpowers/sdd/2026-09-09-project-skill-production-activation/task-6-service-mode.py python -m pytest backend/tests/integration/test_project_skill_main_app.py backend/tests/test_main.py::test_project_skill_routes_are_absent_by_default -q -rs -o cache_dir=.pytest-task6-fix1-false
+Remove-Item Env:TASK6_FEATURE_FLAG
 ```
 
 exit `0`，`1 passed, 1 skipped in 6.10s`；skip 位于该真实 main-app 模块，且无 collection error。随后恢复 helper 默认 `true` 的真实 service mode，exit `0`，`2 passed in 12.75s`，零 skipped/warning。

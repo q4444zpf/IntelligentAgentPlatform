@@ -52,9 +52,7 @@ def test_project_skill_surrogate_validation_error_is_utf8_safe(
 
 
 def test_utf8_safe_recursively_sanitizes_validation_values():
-    assert utf8_safe({"\ud800": [b"\xff", ("\udfff",)]}) == {
-        "?": ["\ufffd", ["?"]]
-    }
+    assert utf8_safe({"\ud800": [b"\xff", ("\udfff",)]}) == {"?": ["\ufffd", ["?"]]}
 
 
 def _make_validation_app(*, with_project_handler: bool) -> FastAPI:
@@ -97,3 +95,33 @@ def test_non_project_validation_matches_fastapi_default(path, body):
         wrapped_response.headers["content-type"]
         == default_response.headers["content-type"]
     )
+
+
+def test_surrogate_non_project_validation_matches_fastapi_default():
+    raw_body = b'{"value":"\\ud800"}'
+    headers = {"Content-Type": "application/json"}
+    default_client = TestClient(
+        _make_validation_app(with_project_handler=False),
+        raise_server_exceptions=False,
+    )
+    wrapped_client = TestClient(
+        _make_validation_app(with_project_handler=True),
+        raise_server_exceptions=False,
+    )
+
+    default_response = default_client.post(
+        "/api/items/1", content=raw_body, headers=headers
+    )
+    wrapped_response = wrapped_client.post(
+        "/api/items/1", content=raw_body, headers=headers
+    )
+
+    assert wrapped_response.status_code == default_response.status_code
+    assert wrapped_response.content == default_response.content
+    assert {
+        name: wrapped_response.headers[name]
+        for name in ("content-type", "content-length")
+    } == {
+        name: default_response.headers[name]
+        for name in ("content-type", "content-length")
+    }
