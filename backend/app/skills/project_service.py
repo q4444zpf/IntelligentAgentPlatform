@@ -1,8 +1,10 @@
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
+from pydantic import Field, TypeAdapter, ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -11,31 +13,54 @@ from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.core.request_context import RequestContext
 
 from .models import Skill, SkillDraft
-from .package import SkillPackageError
+from .package import SkillPackageError, ValidatedSkillPackage, parse_skill_bundle
 from .package_storage import (
     SkillPackageStorage,
     SkillPackageStorageError,
+    StoredSkillPackage,
     create_default_skill_package_storage,
 )
 from .project_access import SkillAccess, require_skill_access
 from .project_errors import ProjectSkillError
 from .project_packages import (
+    DraftPackageSnapshot,
     package_from_content,
     read_verified_package,
+    rename_manifest,
     replace_manifest,
     snapshot_draft,
 )
 from .project_schemas import (
     ProjectSkillCreate,
     ProjectSkillDraftUpdate,
+    ProjectSkillImportCreate,
+    ProjectSkillImportEntry,
     PublishedSkillInfo,
     SkillDraftInfo,
+    SkillImportItem,
+    SkillImportResult,
     SkillPage,
     SkillSummary,
     SkillVersionInfo,
     SkillVersionPage,
 )
 from .repository import SkillRepository, SkillResourceNotFound, SkillRevisionConflict
+
+
+@dataclass(frozen=True)
+class PreparedSkillImport:
+    source_name: str
+    action: Literal["create", "update"]
+    skill_id: str
+    name: str
+    expected_snapshot: DraftPackageSnapshot | None
+    package: ValidatedSkillPackage
+    stored: StoredSkillPackage
+
+
+_IMPORT_MANIFEST = TypeAdapter(
+    Annotated[list[ProjectSkillImportEntry], Field(max_length=500)]
+)
 
 
 class ProjectSkillService:
@@ -55,6 +80,201 @@ class ProjectSkillService:
     def check_access(self, context: RequestContext, permission: str) -> SkillAccess:
         with self._session_factory() as session:
             return require_skill_access(session, context, permission)
+
+    def import_bundle(
+        self, context: RequestContext, data: bytes, manifest_json: str | None
+    ) -> SkillImportResult:
+        self.check_access(context, "skill.manage")
+        try:
+            packages = parse_skill_bundle(data)
+            entries = self._import_entries(packages, manifest_json)
+            by_name = {package.name: package for package in packages}
+            update_ids = [
+                str(entry.skill_id) for entry in entries if entry.action == "update"
+            ]
+            planned = []
+            results = {}
+            create_names = set()
+            with self._session_factory() as session:
+                access = require_skill_access(session, context, "skill.manage")
+                repository = SkillRepository(session)
+                for entry in entries:
+                    if entry.action == "skip":
+                        results[entry.source_name] = SkillImportItem(
+                            source_name=entry.source_name,
+                            action="skip",
+                            skill_id=None,
+                            name=entry.source_name,
+                            draft_revision=None,
+                        )
+                        continue
+                    original = None
+                    if entry.action == "create":
+                        self._require_create_owner(context, access)
+                        name = entry.target_name or entry.source_name
+                        if name in create_names or repository.name_exists(
+                            access.scope, name
+                        ):
+                            raise ProjectSkillError("skill_name_conflict", 409)
+                        create_names.add(name)
+                        skill_id = str(uuid4())
+                    else:
+                        skill_id = str(entry.skill_id)
+                        draft = repository.get_draft(
+                            access.scope, skill_id, owner_ids=access.owner_ids
+                        )
+                        if draft is None:
+                            raise ProjectSkillError("skill_not_found", 404)
+                        if draft.revision != entry.expected_revision:
+                            raise ProjectSkillError("skill_revision_conflict", 409)
+                        original = snapshot_draft(draft)
+                        name = original.name
+                    package = by_name[entry.source_name]
+                    if package.name != name:
+                        package = rename_manifest(package, name)
+                    planned.append(
+                        (
+                            entry.source_name,
+                            entry.action,
+                            skill_id,
+                            name,
+                            original,
+                            package,
+                        )
+                    )
+            if not planned:
+                return SkillImportResult(
+                    items=[results[entry.source_name] for entry in entries],
+                    created_count=0,
+                    updated_count=0,
+                    skipped_count=len(entries),
+                )
+            # Every target is authorized before object I/O; no session or locks span it.
+            storage = self._storage_factory()
+            prepared = [
+                PreparedSkillImport(
+                    source_name,
+                    action,
+                    skill_id,
+                    name,
+                    original,
+                    package,
+                    stored=storage.put(
+                        access.scope.unit_id, access.scope.project_id, skill_id, package
+                    ),
+                )
+                for source_name, action, skill_id, name, original, package in planned
+            ]
+            trace_id = str(uuid4())
+            with self._session_factory() as session, session.begin():
+                access = require_skill_access(session, context, "skill.manage")
+                repository = SkillRepository(session)
+                for skill_id in sorted(update_ids):
+                    repository.lock_skill(
+                        access.scope, skill_id, owner_ids=access.owner_ids
+                    )
+                for item in prepared:
+                    results[item.source_name] = self._apply_import(
+                        session, repository, context, access, item, trace_id
+                    )
+            return SkillImportResult(
+                items=[results[entry.source_name] for entry in entries],
+                created_count=len(create_names),
+                updated_count=len(update_ids),
+                skipped_count=len(entries) - len(prepared),
+            )
+        except (
+            SkillPackageError,
+            SkillPackageStorageError,
+            SkillRevisionConflict,
+            SkillResourceNotFound,
+            IntegrityError,
+        ) as error:
+            self._raise_known(error)
+            raise
+
+    @staticmethod
+    def _import_entries(
+        packages: tuple[ValidatedSkillPackage, ...], manifest_json: str | None
+    ) -> list[ProjectSkillImportEntry]:
+        if manifest_json is None:
+            return [
+                ProjectSkillImportCreate(action="create", source_name=package.name)
+                for package in packages
+            ]
+        try:
+            if len(manifest_json.encode("utf-8")) > 256 * 1024:
+                raise ProjectSkillError("skill_import_manifest_invalid", 422)
+            entries = _IMPORT_MANIFEST.validate_json(manifest_json)
+        except (ValidationError, UnicodeEncodeError) as error:
+            raise ProjectSkillError("skill_import_manifest_invalid", 422) from error
+        names = [entry.source_name for entry in entries]
+        update_ids = [
+            str(entry.skill_id) for entry in entries if entry.action == "update"
+        ]
+        if (
+            len(names) != len(set(names))
+            or set(names) != {package.name for package in packages}
+            or len(update_ids) != len(set(update_ids))
+        ):
+            raise ProjectSkillError("skill_import_manifest_invalid", 422)
+        return entries
+
+    def _apply_import(
+        self,
+        session: Session,
+        repository: SkillRepository,
+        context: RequestContext,
+        access: SkillAccess,
+        item: PreparedSkillImport,
+        trace_id: str,
+    ) -> SkillImportItem:
+        if item.action == "create":
+            self._require_create_owner(context, access)
+            repository.create(
+                access.scope,
+                skill_id=item.skill_id,
+                name=item.name,
+                created_by=context.user_id,
+                package=item.package,
+                stored=item.stored,
+            )
+            revision = 1
+        else:
+            original = item.expected_snapshot
+            current = repository.get_draft(
+                access.scope, item.skill_id, owner_ids=access.owner_ids
+            )
+            if (
+                original is None
+                or current is None
+                or snapshot_draft(current) != original
+            ):
+                raise ProjectSkillError("skill_revision_conflict", 409)
+            draft = repository.save_draft(
+                access.scope,
+                item.skill_id,
+                expected_revision=original.revision,
+                package=item.package,
+                stored=item.stored,
+            )
+            revision = draft.revision
+        self._record_change(
+            session,
+            context,
+            item.skill_id,
+            "skill.import",
+            revision=revision,
+            digest=item.stored.package_digest,
+            trace_id=trace_id,
+        )
+        return SkillImportItem(
+            source_name=item.source_name,
+            action=item.action,
+            skill_id=item.skill_id,
+            name=item.name,
+            draft_revision=revision,
+        )
 
     def create(
         self, context: RequestContext, request: ProjectSkillCreate

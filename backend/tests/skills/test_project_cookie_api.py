@@ -148,9 +148,11 @@ def test_cookie_request_rejects_expired_and_revoked_sessions(sessions, storage):
             setattr(
                 auth,
                 field,
-                datetime.now(timezone.utc) - timedelta(seconds=1)
-                if field == "idle_expires_at"
-                else datetime.now(timezone.utc),
+                (
+                    datetime.now(timezone.utc) - timedelta(seconds=1)
+                    if field == "idle_expires_at"
+                    else datetime.now(timezone.utc)
+                ),
             )
             session.commit()
         assert (
@@ -360,3 +362,39 @@ def test_authorization_version_change_invalidates_cookie(sessions, storage):
         cookie_client(sessions, storage, token).get("/api/project-skills").status_code
         == 401
     )
+
+
+@pytest.mark.parametrize(
+    "state,status", [("valid", 200), ("missing", 401), ("no-project", 403)]
+)
+def test_cookie_import_requires_authenticated_selected_project(
+    sessions, storage, state, status
+):
+    from app.skills.models import Skill
+
+    from backend.tests.skills.project_support import bundle, manifest
+
+    token = issue_session(sessions)
+    if state == "no-project":
+        with sessions.begin() as session:
+            session.scalar(select(AuthSession)).current_project_id = None
+    client = cookie_client(sessions, storage, token)
+    if state == "missing":
+        client.cookies.clear()
+    with client:
+        response = client.post(
+            "/api/project-skills/import",
+            files={
+                "file": (
+                    "bundle.zip",
+                    bundle([("SKILL.md", manifest("imported").encode())]),
+                ),
+            },
+        )
+    assert response.status_code == status
+    with sessions() as session:
+        skill = session.scalar(select(Skill))
+        if state == "valid":
+            assert (skill.project_id, skill.created_by) == ("project-1", "user-1")
+        else:
+            assert skill is None

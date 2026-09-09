@@ -10,6 +10,7 @@ from .package_storage import (
     StoredSkillPackage,
 )
 from .project_errors import ProjectSkillError
+from .service import update_manifest
 
 
 @dataclass(frozen=True)
@@ -105,3 +106,9 @@ def replace_manifest(
             for item in package.files
         ]
     )
+
+
+def rename_manifest(
+    package: ValidatedSkillPackage, target_name: str
+) -> ValidatedSkillPackage:
+    return replace_manifest(package, update_manifest(package.content, name=target_name))

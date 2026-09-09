@@ -109,6 +109,15 @@ class SkillRepository:
             self._scoped(scope, owner_ids=owner_ids).where(Skill.id == skill_id)
         )
 
+    def name_exists(self, scope: SkillScope, name: str) -> bool:
+        return self._session.scalar(
+            select(Skill.id).where(
+                Skill.unit_id == scope.unit_id,
+                Skill.project_id == scope.project_id,
+                Skill.name == name,
+            )
+        ) is not None
+
     def list(self, scope: SkillScope, *, offset: int = 0, limit: int = 20) -> list[Skill]:
         if offset < 0 or limit < 0:
             raise ValueError("Pagination must be nonnegative")

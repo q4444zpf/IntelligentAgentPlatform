@@ -4,7 +4,7 @@ from uuid import uuid4
 import boto3
 import pytest
 from app.audit.models import AuditEvent
-from app.skills.models import SkillDraft
+from app.skills.models import Skill, SkillDraft
 from app.skills.package_storage import create_default_skill_package_storage
 from app.skills.project_errors import ProjectSkillError
 from app.skills.project_packages import read_verified_package, snapshot_draft
@@ -18,6 +18,11 @@ from backend.tests.integration.test_skill_control_plane_postgres import (
 )
 from backend.tests.skills.project_support import manifest, seed_skill
 from backend.tests.skills.test_project_drafts import FailingAudit
+from backend.tests.skills.test_project_import import (
+    FailSecondAudit,
+    mixed_manifest,
+    two_packages,
+)
 
 
 @pytest.fixture
@@ -153,3 +158,71 @@ def test_minio_upload_survives_failed_atomic_audit_without_replacing_draft(
         )
     assert read_verified_package(storage, original).content == manifest("s")
     assert len(client.list_objects_v2(Bucket=bucket)["Contents"]) == 2
+
+
+def test_minio_import_all_database_references_read_back(pg_environment, minio_storage):
+    sessions, context = pg_environment
+    storage, client, bucket = minio_storage
+    result = ProjectSkillService(sessions).import_bundle(context, two_packages(), None)
+    assert result.created_count == 2
+    with sessions() as session:
+        snapshots = [
+            snapshot_draft(session.get(SkillDraft, item.skill_id))
+            for item in result.items
+        ]
+    for snapshot, name in zip(snapshots, ("a", "b")):
+        assert read_verified_package(storage, snapshot).content == manifest(name)
+    assert len(client.list_objects_v2(Bucket=bucket)["Contents"]) == 2
+
+
+@pytest.mark.parametrize("failure", ["second-object", "second-audit"])
+def test_minio_failed_mixed_import_keeps_database_unchanged(
+    pg_environment, minio_storage, monkeypatch, failure
+):
+    sessions, context = pg_environment
+    storage, client, bucket = minio_storage
+    skill_id = seed_skill(sessions, storage, context, name="original")
+    with sessions() as session:
+        original = snapshot_draft(session.get(SkillDraft, skill_id))
+    if failure == "second-object":
+        put = storage._client.put_object
+        calls = 0
+
+        def fail_second(**request):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("simulated second store failure")
+            return put(**request)
+
+        monkeypatch.setattr(storage._client, "put_object", fail_second)
+    service = ProjectSkillService(
+        sessions,
+        storage_factory=lambda: storage,
+        audit_recorder=FailSecondAudit() if failure == "second-audit" else None,
+    )
+    with pytest.raises(
+        ProjectSkillError if failure == "second-object" else RuntimeError
+    ):
+        service.import_bundle(context, two_packages(), mixed_manifest(skill_id, 1))
+    with sessions() as session:
+        assert snapshot_draft(session.get(SkillDraft, skill_id)) == original
+        assert session.get(Skill, skill_id).published_version_id is None
+        assert (
+            len(
+                session.scalars(
+                    select(Skill).where(Skill.project_id == context.project_id)
+                ).all()
+            )
+            == 1
+        )
+        assert (
+            session.scalar(
+                select(AuditEvent).where(AuditEvent.project_id == context.project_id)
+            )
+            is None
+        )
+    assert read_verified_package(storage, original).content == manifest("original")
+    assert len(client.list_objects_v2(Bucket=bucket)["Contents"]) == (
+        2 if failure == "second-object" else 3
+    )

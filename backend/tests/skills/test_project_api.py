@@ -1,3 +1,5 @@
+import io
+import json
 import os
 import subprocess
 import sys
@@ -8,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend.tests.skills.project_support import (
+    bundle,
     make_context,
     make_test_app,
     manifest,
@@ -234,3 +237,148 @@ assert ("GET", "/api/skills/{skill_name}") in routes
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_import_route_accepts_zip_bytes_and_returns_only_result_metadata(
+    sessions, storage
+):
+    data = bundle([("SKILL.md", manifest("imported").encode())])
+    with TestClient(
+        make_test_app(sessions, lambda: storage, context=make_context("skill.manage"))
+    ) as client:
+        response = client.post(
+            "/api/project-skills/import", files={"file": ("bundle.bin", data)}
+        )
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert set(response.json()) == {
+        "items",
+        "created_count",
+        "updated_count",
+        "skipped_count",
+    }
+    assert set(response.json()["items"][0]) == {
+        "source_name",
+        "action",
+        "skill_id",
+        "name",
+        "draft_revision",
+    }
+    assert response.json()["created_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "unknown",
+        "duplicate-file",
+        "duplicate-manifest",
+        "missing-file",
+        "file-as-text",
+        "manifest-as-file",
+        "invalid-action",
+        "duplicate-source",
+        "manifest-too-large",
+        "upload-too-large",
+        "denied",
+        "invalid-zip",
+    ],
+)
+def test_import_rejection_closes_every_parsed_upload(
+    sessions, storage, monkeypatch, case
+):
+    from app.skills.package import MAX_ZIP_BYTES
+    from starlette.datastructures import UploadFile
+
+    uploads = []
+    original_init = UploadFile.__init__
+
+    def tracked_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        uploads.append(self)
+
+    monkeypatch.setattr(UploadFile, "__init__", tracked_init)
+    data = bundle([("SKILL.md", manifest("a").encode())])
+    files = [("file", ("bundle.zip", data))]
+    expected = 422
+    context = make_context("skill.manage")
+    if case == "unknown":
+        files.append(("unexpected", (None, "forged")))
+    elif case == "duplicate-file":
+        files.append(("file", ("second.zip", data)))
+    elif case == "duplicate-manifest":
+        files.extend([("manifest", (None, "[]")), ("manifest", (None, "[]"))])
+    elif case == "missing-file":
+        files = [("manifest", (None, "[]"))]
+    elif case == "file-as-text":
+        files = [("file", (None, "text"))]
+    elif case == "manifest-as-file":
+        files.append(("manifest", ("manifest.json", b"[]")))
+    elif case == "invalid-action":
+        files.append(("manifest", (None, '[{"source_name":"a","action":"unknown"}]')))
+    elif case == "duplicate-source":
+        files.append(
+            (
+                "manifest",
+                (None, json.dumps([{"source_name": "a", "action": "skip"}] * 2)),
+            )
+        )
+    elif case == "manifest-too-large":
+        files.append(("manifest", (None, " " * (256 * 1024 + 1))))
+    elif case == "upload-too-large":
+        files = [("file", ("large.zip", b"x" * (MAX_ZIP_BYTES + 1)))]
+        expected = 413
+    elif case == "invalid-zip":
+        files = [("file", ("bad.zip", b"bad"))]
+    elif case == "denied":
+        context = make_context("skill.read")
+        expected = 403
+    with TestClient(
+        make_test_app(sessions, lambda: storage, context=context)
+    ) as client:
+        response = client.post("/api/project-skills/import", files=files)
+    assert response.status_code == expected
+    assert all(upload.file.closed for upload in uploads)
+    if case not in {"missing-file", "file-as-text"}:
+        assert uploads
+
+
+def test_import_manage_check_precedes_business_upload_and_parse(sessions, monkeypatch):
+    import app.skills.project_router as router
+    import app.skills.project_service as service
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("unauthorized import performed business I/O")
+
+    monkeypatch.setattr(router, "_read_upload", forbidden)
+    monkeypatch.setattr(service, "parse_skill_bundle", forbidden)
+    with TestClient(
+        make_test_app(sessions, forbidden, context=make_context("skill.read"))
+    ) as client:
+        response = client.post(
+            "/api/project-skills/import", files={"file": ("a.zip", b"bad")}
+        )
+    assert response.status_code == 403
+
+
+def test_upload_reader_bounds_reads_and_closes_on_failure():
+    from app.skills.package import MAX_ZIP_BYTES
+    from app.skills.project_errors import ProjectSkillError
+    from app.skills.project_router import _read_upload
+    from fastapi import UploadFile
+
+    class TrackedStream(io.BytesIO):
+        total = 0
+
+        def read(self, size=-1):
+            assert 0 < size <= 65536
+            chunk = super().read(size)
+            self.total += len(chunk)
+            return chunk
+
+    stream = TrackedStream(b"x" * (MAX_ZIP_BYTES + 100))
+    with pytest.raises(ProjectSkillError) as caught:
+        _read_upload(UploadFile(stream))
+    assert caught.value.status_code == 413
+    assert stream.total == MAX_ZIP_BYTES + 1
+    assert stream.closed

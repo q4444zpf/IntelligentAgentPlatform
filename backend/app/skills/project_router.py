@@ -1,11 +1,23 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from app.core.database import SessionFactory
 from app.core.request_context import RequestContext, require_request_context
 
+from .package import MAX_ZIP_BYTES
 from .project_errors import ProjectSkillError
 from .project_schemas import (
     ProjectSkillCreate,
@@ -13,6 +25,7 @@ from .project_schemas import (
     ProjectSkillListQuery,
     ProjectSkillPageQuery,
     SkillDraftInfo,
+    SkillImportResult,
     SkillPage,
     SkillSummary,
     SkillVersionInfo,
@@ -40,6 +53,51 @@ def _manage_context(
     except ProjectSkillError as error:
         _raise_http(error)
     return context
+
+
+async def _validate_import_fields(request: Request) -> None:
+    form = await request.form()
+    counts: dict[str, int] = {}
+    for name, value in form.multi_items():
+        counts[name] = counts.get(name, 0) + 1
+        if (
+            name not in {"file", "manifest"}
+            or (name == "file" and not isinstance(value, StarletteUploadFile))
+            or (name == "manifest" and not isinstance(value, str))
+        ):
+            raise HTTPException(422, "skill_import_manifest_invalid")
+    if counts.get("file") != 1 or counts.get("manifest", 0) > 1:
+        raise HTTPException(422, "skill_import_manifest_invalid")
+
+
+def _read_upload(file: UploadFile) -> bytes:
+    chunks = []
+    size = 0
+    try:
+        while chunk := file.file.read(min(65536, MAX_ZIP_BYTES + 1 - size)):
+            size += len(chunk)
+            if size > MAX_ZIP_BYTES:
+                raise ProjectSkillError("skill_upload_too_large", 413)
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        file.file.close()
+
+
+@router.post("/import", response_model=SkillImportResult)
+def import_skills(
+    response: Response,
+    context: Annotated[RequestContext, Depends(_manage_context)],
+    service: Annotated[ProjectSkillService, Depends(_service)],
+    fields: Annotated[None, Depends(_validate_import_fields)],
+    file: Annotated[UploadFile, File()],
+    manifest: Annotated[str | None, Form()] = None,
+):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return service.import_bundle(context, _read_upload(file), manifest)
+    except ProjectSkillError as error:
+        _raise_http(error)
 
 
 @router.post("", response_model=SkillSummary, status_code=201)

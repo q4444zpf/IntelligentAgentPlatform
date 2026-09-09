@@ -1,6 +1,8 @@
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, Event, Lock, local
+from time import monotonic
 from uuid import uuid4
 
 import pytest
@@ -12,6 +14,7 @@ from app.skills.package_storage import SkillPackageStorage
 from app.skills.project_errors import ProjectSkillError
 from app.skills.project_schemas import ProjectSkillCreate, ProjectSkillDraftUpdate
 from app.skills.project_service import ProjectSkillService
+from app.skills.repository import SkillRepository
 from sqlalchemy import create_engine, delete, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
@@ -20,6 +23,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from backend.tests.skills.project_support import make_context, manifest, seed_skill
 from backend.tests.skills.test_package_storage import MemoryS3
 from backend.tests.skills.test_project_drafts import FailingAudit
+from backend.tests.skills.test_project_import import FailSecondAudit, two_packages
 
 
 @pytest.fixture(name="pg_environment")
@@ -316,5 +320,188 @@ def test_postgres_unknown_integrity_error_is_not_converted(pg_environment, pg_st
     with sessions() as session:
         assert (
             session.scalar(select(Skill).where(Skill.project_id == context.project_id))
+            is None
+        )
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+def test_postgres_import_competition_waits_on_database_and_commits_one_batch(
+    pg_environment, pg_storage, monkeypatch, operation
+):
+    sessions, context = pg_environment
+    entries = None
+    if operation == "update":
+        ids = [
+            seed_skill(sessions, pg_storage, context, name=name) for name in ("a", "b")
+        ]
+        entries = json.dumps(
+            [
+                {
+                    "action": "update",
+                    "source_name": name,
+                    "skill_id": skill_id,
+                    "expected_revision": 1,
+                }
+                for name, skill_id in zip(("a", "b"), ids)
+            ]
+        )
+    storage_barrier = Barrier(2, timeout=15)
+    first_holds_transaction = Event()
+    both_entered_write = Event()
+    release_first = Event()
+    state_lock = Lock()
+    thread_state = local()
+    pids = set()
+    put = pg_storage.put
+
+    def synchronized_put(*args):
+        stored = put(*args)
+        thread_state.put_count = getattr(thread_state, "put_count", 0) + 1
+        if thread_state.put_count == 2:
+            storage_barrier.wait()
+        return stored
+
+    method_name = "create" if operation == "create" else "lock_skill"
+    repository_method = getattr(SkillRepository, method_name)
+
+    def track_write(repository, *args, **kwargs):
+        pid = repository._session.scalar(text("SELECT pg_backend_pid()"))
+        with state_lock:
+            pids.add(pid)
+            if len(pids) == 2:
+                both_entered_write.set()
+        return repository_method(repository, *args, **kwargs)
+
+    class HoldFirstAudit(AuditRecorder):
+        def record(self, session, request):
+            result = super().record(session, request)
+            if not first_holds_transaction.is_set():
+                first_holds_transaction.set()
+                assert release_first.wait(
+                    15
+                ), "Observer did not release first transaction"
+            return result
+
+    monkeypatch.setattr(pg_storage, "put", synchronized_put)
+    monkeypatch.setattr(SkillRepository, method_name, track_write)
+    service = ProjectSkillService(
+        sessions, storage_factory=lambda: pg_storage, audit_recorder=HoldFirstAudit()
+    )
+
+    def run_import():
+        try:
+            result = service.import_bundle(context, two_packages(), entries)
+            return result.created_count + result.updated_count
+        except ProjectSkillError as error:
+            return error.code
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        futures = [workers.submit(run_import) for _ in range(2)]
+        try:
+            assert both_entered_write.wait(15)
+            assert first_holds_transaction.wait(15)
+            blocked = False
+            deadline = monotonic() + 10
+            with sessions.kw["bind"].connect() as observer:
+                while monotonic() < deadline:
+                    for pid in tuple(pids):
+                        blockers = observer.scalar(
+                            text("SELECT pg_blocking_pids(:pid)"), {"pid": pid}
+                        )
+                        if set(blockers).intersection(pids):
+                            blocked = True
+                            break
+                    if blocked:
+                        break
+                    release_first.wait(0.01)
+            assert blocked, "Expected a real PostgreSQL unique/row-lock wait"
+        finally:
+            release_first.set()
+        results = [future.result(timeout=20) for future in futures]
+    assert results.count(2) == 1
+    assert (
+        results.count(
+            "skill_name_conflict"
+            if operation == "create"
+            else "skill_revision_conflict"
+        )
+        == 1
+    )
+    with sessions() as session:
+        skills = session.scalars(
+            select(Skill).where(Skill.project_id == context.project_id)
+        ).all()
+        assert len(skills) == 2
+        assert all(
+            session.get(SkillDraft, skill.id).revision
+            == (1 if operation == "create" else 2)
+            for skill in skills
+        )
+        events = session.scalars(
+            select(AuditEvent).where(AuditEvent.project_id == context.project_id)
+        ).all()
+        assert len(events) == 2
+        assert {item.action for item in events} == {"skill.import"}
+        assert len({item.trace_id for item in events}) == 1
+
+
+def test_postgres_import_uploads_without_sessions_or_locks(
+    pg_environment, pg_storage, monkeypatch
+):
+    sessions, context = pg_environment
+    skill_id = seed_skill(sessions, pg_storage, context, name="b")
+    engine = sessions.kw["bind"]
+    put = pg_storage.put
+
+    def checked_put(*args):
+        assert engine.pool.checkedout() == 0
+        with engine.begin() as connection:
+            connection.execute(
+                select(Skill.id)
+                .where(Skill.id == skill_id)
+                .with_for_update(nowait=True)
+            ).one()
+        return put(*args)
+
+    monkeypatch.setattr(pg_storage, "put", checked_put)
+    result = ProjectSkillService(
+        sessions, storage_factory=lambda: pg_storage
+    ).import_bundle(
+        context,
+        two_packages(),
+        json.dumps(
+            [
+                {"action": "create", "source_name": "a"},
+                {
+                    "action": "update",
+                    "source_name": "b",
+                    "skill_id": skill_id,
+                    "expected_revision": 1,
+                },
+            ]
+        ),
+    )
+    assert (result.created_count, result.updated_count) == (1, 1)
+
+
+def test_postgres_second_import_audit_failure_rolls_back_whole_batch(
+    pg_environment, pg_storage
+):
+    sessions, context = pg_environment
+    with pytest.raises(RuntimeError, match="second audit failed"):
+        ProjectSkillService(
+            sessions,
+            storage_factory=lambda: pg_storage,
+            audit_recorder=FailSecondAudit(),
+        ).import_bundle(context, two_packages(), None)
+    with sessions() as session:
+        assert (
+            session.scalar(select(Skill).where(Skill.project_id == context.project_id))
+            is None
+        )
+        assert (
+            session.scalar(
+                select(AuditEvent).where(AuditEvent.project_id == context.project_id)
+            )
             is None
         )
