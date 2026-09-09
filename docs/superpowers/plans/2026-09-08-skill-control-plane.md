@@ -31,13 +31,15 @@
 - [x] 书面设计已获用户确认。
 - [x] 核对实际源码、权限目录、审计接口、迁移 head 与测试辅助 API。
 - [x] 计划自检完成，纳入本次文档定向提交。
-- [ ] 执行方式选择。
-- [ ] Task 1：项目授权和增量权限迁移。
-- [ ] Task 2：作用域查询、响应契约及只读 HTTP API。
-- [ ] Task 3：有界包处理与草稿创建/保存。
-- [ ] Task 4：原子批量导入。
-- [ ] Task 5：对象复验、幂等发布及同事务审计。
-- [ ] 全分支审查、真实集成、完整回归及交付记录。
+- [x] 执行方式选择：同会话子代理顺序实施和审查。
+- [x] Task 1：项目授权和增量权限迁移。
+- [x] Task 2：作用域查询、响应契约及只读 HTTP API。
+- [x] Task 3：有界包处理与草稿创建/保存。
+- [x] Task 4：原子批量导入。
+- [x] Task 5：对象复验、幂等发布及同事务审计。
+- [x] 全分支审查、真实集成、完整回归及交付记录。
+
+本阶段隔离 API 验收完成；最终源码 `aa06783` 完整后端回归 1556 passed / 100 skipped。证据、首次失败及重跑、TDD 历史偏差和未处理限制见[验收报告](2026-09-08-skill-control-plane-verification.md)。下文细分步骤保留原计划，不将有历史限定的 RED 步骤补记为无偏差执行。尚未挂载生产路由、切换前端、合并 main、推送或部署。
 
 Tasks 1–5 顺序执行，避免同时编辑 project_service、project_router 和 repository。最终审查及全量验收由控制端统一执行，不为每个小改动重复全量套件。
 
@@ -65,7 +67,7 @@ $env:PYTHONPATH = 'backend'
 | `backend/app/skills/project_access.py` | Task 1；认证上下文一致性、项目有效性及查询所需所有者范围 |
 | `backend/app/skills/project_errors.py` | Task 1；新 API 预期错误的 code/status 契约，不改变旧异常 |
 | `backend/app/identity/catalogue.py` | Task 1；只补 project_admin 的 skill.manage 默认项目授权 |
-| `backend/alembic/versions/20260908_27_skill_project_manage.py` | Task 1；对已有内置项目管理员追加缺失授权 |
+| `backend/alembic/versions/20260908_27_project_skill_permissions.py` | Task 1；对已有内置项目管理员追加缺失授权 |
 | `backend/app/skills/repository.py` | Task 2 查询扩展；Tasks 3/4 公开作用域锁，Task 5 公开幂等查询和复用请求摘要 |
 | `backend/app/skills/project_schemas.py` | Task 2 读取 DTO；Task 3 写请求；Task 4 导入 discriminated union；Task 5 发布请求 |
 | `backend/app/skills/project_service.py` | Task 2 起；请求级编排、拥有独立事务和审计；按能力增量补齐，禁止实例级共享 Session |
