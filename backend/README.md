@@ -16,6 +16,8 @@ python -m uvicorn app.main:app --reload --port 8000
 
 容器镜像的默认命令只启动 API，不再自动迁移数据库。首次部署及每次包含数据库迁移的升级，都必须先按[项目 Skill 生产激活手册](../docs/deployment/project-skill-production-activation.md)构建镜像并显式运行一次 `migrate` 操作；普通 `docker compose up` 不会执行迁移。
 
+项目 Skill API 默认关闭。完成显式 `migrate`、Alembic current/head 比对和 `skill-storage-init` 后，才可为 API 设置 `IAP_PROJECT_SKILLS_API_ENABLED=true`。API 启动只校验 revision，不执行迁移或建桶；MinIO 不作为全局 API 启动门槛。回滚时只关闭该开关，保留数据库、对象与旧 `/api/skills`。
+
 `IAP_ALLOW_DEV_IDENTITY` 默认是 `false`。开启后，请求仍必须同时提供 `X-Unit-ID`、`X-User-ID` 和 `X-Project-ID`；这只是本地开发适配器，不得作为生产认证。生产环境应使用可信认证会话，并保持该开关关闭。
 
 根目录 Compose 同样默认关闭开发身份。需要在容器化本机环境调试会话或审计页面时，必须同时显式设置 `IAP_ALLOW_DEV_IDENTITY=true`、`VITE_DEV_UNIT_ID`、`VITE_DEV_USER_ID`、`VITE_DEV_PROJECT_ID` 和 `VITE_DEV_USER_ROLES` 并重新构建 Web 镜像；`VITE_DEV_USER_ROLES` 是逗号分隔的 `user`、`project_admin`、`unit_auditor` 集合。这些变量只用于非敏感测试身份，不得用于生产部署。
