@@ -37,6 +37,7 @@ services:
       - "9001:9001"
 
   api:
+    image: intelligent-agent-platform-api:local
     build:
       context: .
       dockerfile: backend/Dockerfile
@@ -46,6 +47,7 @@ services:
       IAP_ALLOW_DEV_IDENTITY: "${IAP_ALLOW_DEV_IDENTITY:-false}"
       IAP_DEV_IDENTITY_TRUSTED_CIDRS: "${IAP_DEV_IDENTITY_TRUSTED_CIDRS:-}"
       IAP_SESSION_COOKIE_SECURE: "${IAP_SESSION_COOKIE_SECURE:-true}"
+      IAP_PROJECT_SKILLS_API_ENABLED: "${IAP_PROJECT_SKILLS_API_ENABLED:-false}"
       LEGACY_SQLITE_DATA_DIR: /data
       AGENT_WORKSPACE_ROOT: /data/agent-workspaces
       IAP_OBJECT_STORAGE_ENDPOINT: "${IAP_OBJECT_STORAGE_ENDPOINT:-http://minio:9000}"
@@ -81,6 +83,23 @@ services:
       timeout: 3s
       retries: 6
       start_period: 10s
+
+  migrate:
+    profiles: ["operations"]
+    image: intelligent-agent-platform-api:local
+    command:
+      - sh
+      - -c
+      - python -m alembic upgrade head && exec python -m app.migrations.sqlite_to_postgres
+    environment:
+      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://iap:iap@postgres:5432/iap}"
+      LEGACY_SQLITE_DATA_DIR: "${LEGACY_SQLITE_DATA_DIR:-/data}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - model-provider-data:/data
+    restart: "no"
 
   workflow-runner:
     build:
