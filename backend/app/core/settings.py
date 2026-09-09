@@ -118,6 +118,7 @@ class Settings:
     oidc_clock_skew_seconds: int
     trusted_proxy_cidrs: tuple[str, ...]
     dev_identity_trusted_cidrs: tuple[str, ...]
+    project_skills_api_enabled: bool = False
 
     @property
     def current_encryption_key_id(self) -> str | None:
@@ -171,6 +172,7 @@ class Settings:
             oidc_clock_skew_seconds=_read_nonnegative_int("OIDC_CLOCK_SKEW_SECONDS", 60),
             trusted_proxy_cidrs=trusted_proxy_cidrs,
             dev_identity_trusted_cidrs=dev_identity_trusted_cidrs,
+            project_skills_api_enabled=_read_bool("IAP_PROJECT_SKILLS_API_ENABLED", False),
         )
 
     def validate_startup(self) -> None:

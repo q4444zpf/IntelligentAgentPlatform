@@ -16,6 +16,7 @@ from .model_providers.router import router as model_router
 from .mcp.router import router as mcp_router
 from .mcp.scheduler import default_mcp_health_scheduler
 from .platform.router import router as platform_router
+from .skills.project_router import router as project_skills_router
 from .skills.router import router as skills_router
 from .tools.router import router as tools_router
 from .identity.admin_router import router as identity_admin_router
@@ -82,6 +83,8 @@ app.include_router(agents_router, prefix="/api/agents", tags=["agents"])
 app.include_router(mcp_router, prefix="/api/mcp", tags=["mcp"])
 app.include_router(platform_router, prefix="/api/platform", tags=["platform"])
 app.include_router(skills_router, prefix="/api/skills", tags=["skills"])
+if settings.project_skills_api_enabled:
+    app.include_router(project_skills_router)
 app.include_router(tools_router, prefix="/api/tools", tags=["tools"])
 app.include_router(conversations_router, prefix="/api", tags=["conversations"])
 app.include_router(audit_router, prefix="/api/audit", tags=["audit"])

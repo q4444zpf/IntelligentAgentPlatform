@@ -64,6 +64,41 @@ def test_reads_database_and_dev_identity_settings(monkeypatch):
     )
 
 
+def test_project_skills_api_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("IAP_PROJECT_SKILLS_API_ENABLED", raising=False)
+    assert Settings.from_env().project_skills_api_enabled is False
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes", "TRUE"])
+def test_project_skills_api_accepts_supported_true_values(monkeypatch, value):
+    monkeypatch.setenv("IAP_PROJECT_SKILLS_API_ENABLED", value)
+    assert Settings.from_env().project_skills_api_enabled is True
+
+
+def test_explicit_settings_default_project_skills_api_to_disabled():
+    settings = Settings(
+        database_url="postgresql+psycopg://iap:iap@127.0.0.1:5432/iap",
+        allow_dev_identity=False,
+        environment="development",
+        public_base_url=None,
+        session_cookie_secure=True,
+        session_hmac_key=None,
+        auth_encryption_keys={},
+        oidc_issuer=None,
+        oidc_client_id=None,
+        oidc_client_secret=None,
+        oidc_redirect_uri=None,
+        oidc_scope="openid profile email",
+        oidc_connect_timeout_seconds=5.0,
+        oidc_read_timeout_seconds=10.0,
+        oidc_clock_skew_seconds=60,
+        trusted_proxy_cidrs=(),
+        dev_identity_trusted_cidrs=(),
+    )
+
+    assert settings.project_skills_api_enabled is False
+
+
 def test_production_rejects_development_identity(monkeypatch):
     monkeypatch.setenv("IAP_ENVIRONMENT", "production")
     monkeypatch.setenv("IAP_ALLOW_DEV_IDENTITY", "true")
