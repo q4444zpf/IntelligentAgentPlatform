@@ -63,7 +63,7 @@ async def _validate_import_fields(request: Request) -> None:
         if (
             name not in {"file", "manifest"}
             or (name == "file" and not isinstance(value, StarletteUploadFile))
-            or (name == "manifest" and not isinstance(value, str))
+            or (name == "manifest" and (not isinstance(value, str) or value == ""))
         ):
             raise HTTPException(422, "skill_import_manifest_invalid")
     if counts.get("file") != 1 or counts.get("manifest", 0) > 1:

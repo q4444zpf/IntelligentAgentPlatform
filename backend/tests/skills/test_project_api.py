@@ -267,6 +267,45 @@ def test_import_route_accepts_zip_bytes_and_returns_only_result_metadata(
     assert response.json()["created_count"] == 1
 
 
+@pytest.mark.parametrize("manifest_present", [False, True], ids=["omitted", "empty"])
+def test_import_distinguishes_empty_manifest_from_omitted(
+    sessions, storage, memory_s3, monkeypatch, manifest_present
+):
+    from app.audit.models import AuditEvent
+    from app.skills.models import Skill, SkillDraft
+    from sqlalchemy import func, select
+    from starlette.datastructures import UploadFile
+
+    uploads = []
+    original_init = UploadFile.__init__
+
+    def tracked_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        uploads.append(self)
+
+    monkeypatch.setattr(UploadFile, "__init__", tracked_init)
+    files = [("file", ("bundle.zip", bundle([("SKILL.md", manifest("a").encode())])))]
+    if manifest_present:
+        files.append(("manifest", (None, "")))
+    with TestClient(
+        make_test_app(sessions, lambda: storage, context=make_context("skill.manage"))
+    ) as client:
+        response = client.post("/api/project-skills/import", files=files)
+
+    expected_count = 0 if manifest_present else 1
+    with sessions() as session:
+        counts = tuple(
+            session.scalar(select(func.count()).select_from(model))
+            for model in (Skill, SkillDraft, AuditEvent)
+        )
+    assert counts == (expected_count, expected_count, expected_count)
+    assert len(memory_s3.objects) == expected_count
+    assert response.status_code == (422 if manifest_present else 200)
+    if manifest_present:
+        assert response.json() == {"detail": "skill_import_manifest_invalid"}
+    assert uploads and all(upload.file.closed for upload in uploads)
+
+
 @pytest.mark.parametrize(
     "case",
     [
