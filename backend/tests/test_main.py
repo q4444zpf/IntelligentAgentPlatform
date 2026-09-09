@@ -4,11 +4,12 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.conversations.router import default_run_dispatcher
-from app.main import app, default_mcp_health_scheduler
-
+from app.main import SessionFactory, app, default_mcp_health_scheduler, settings
+from app.skills.project_startup import ProjectSkillStartupError
 
 PROJECT_METHODS = {
     "/api/project-skills": {"get", "post"},
@@ -30,9 +31,11 @@ def _enabled_openapi_methods() -> dict[str, set[str]]:
         [
             sys.executable,
             "-c",
-            "import json; from app.main import app; "
-            "print(json.dumps({path: sorted(methods) for path, methods in "
-            "app.openapi()['paths'].items()}))",
+            (
+                "import json; from app.main import app; "
+                "print(json.dumps({path: sorted(methods) for path, methods in "
+                "app.openapi()['paths'].items()}))"
+            ),
         ],
         check=True,
         capture_output=True,
@@ -88,10 +91,27 @@ def test_application_shutdown_closes_run_dispatcher(monkeypatch):
     assert calls == [(False, True)]
 
 
-def test_application_starts_and_stops_mcp_health_scheduler(monkeypatch):
+def test_application_validates_startup_before_starting_scheduler(monkeypatch):
     calls = []
 
-    monkeypatch.setattr(default_mcp_health_scheduler, "start", lambda: calls.append("start"))
+    def validate_project_skills(enabled, session_factory):
+        assert enabled is settings.project_skills_api_enabled
+        assert session_factory is SessionFactory
+        calls.append("project")
+
+    monkeypatch.setattr(
+        "app.main.validate_runner_gateway_startup",
+        lambda: calls.append("runner"),
+    )
+    monkeypatch.setattr(
+        "app.main.validate_project_skills_startup",
+        validate_project_skills,
+    )
+    monkeypatch.setattr(
+        default_mcp_health_scheduler,
+        "start",
+        lambda: calls.append("scheduler"),
+    )
     monkeypatch.setattr(default_mcp_health_scheduler, "cancel", lambda: calls.append("cancel"))
 
     async def wait_closed():
@@ -100,4 +120,37 @@ def test_application_starts_and_stops_mcp_health_scheduler(monkeypatch):
     monkeypatch.setattr(default_mcp_health_scheduler, "wait_closed", wait_closed)
     with TestClient(app):
         pass
-    assert calls == ["start", "cancel", "closed"]
+    assert calls == ["runner", "project", "scheduler", "cancel", "closed"]
+
+
+def test_project_skill_startup_failure_prevents_scheduler_start(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        "app.main.validate_runner_gateway_startup",
+        lambda: calls.append("runner"),
+    )
+
+    def reject_project_skills(enabled, session_factory):
+        assert enabled is settings.project_skills_api_enabled
+        assert session_factory is SessionFactory
+        calls.append("project")
+        raise ProjectSkillStartupError("project skill database revision mismatch")
+
+    monkeypatch.setattr(
+        "app.main.validate_project_skills_startup",
+        reject_project_skills,
+    )
+    monkeypatch.setattr(
+        default_mcp_health_scheduler,
+        "start",
+        lambda: calls.append("scheduler"),
+    )
+
+    with (
+        pytest.raises(ProjectSkillStartupError, match="revision mismatch"),
+        TestClient(app),
+    ):
+        pass
+
+    assert calls == ["runner", "project"]

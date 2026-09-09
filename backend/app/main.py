@@ -11,12 +11,14 @@ from .conversations.router import (
     default_run_dispatcher,
     router as conversations_router,
 )
+from .core.database import SessionFactory
 from .core.settings import settings
 from .model_providers.router import router as model_router
 from .mcp.router import router as mcp_router
 from .mcp.scheduler import default_mcp_health_scheduler
 from .platform.router import router as platform_router
 from .skills.project_router import router as project_skills_router
+from .skills.project_startup import validate_project_skills_startup
 from .skills.router import router as skills_router
 from .tools.router import router as tools_router
 from .identity.admin_router import router as identity_admin_router
@@ -30,9 +32,14 @@ from .runtime.runner_gateway_auth import (
 from .runtime.runner_gateway_router import router as runner_gateway_router
 from .collaboration.router import router as collaboration_router
 
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     validate_runner_gateway_startup()
+    validate_project_skills_startup(
+        settings.project_skills_api_enabled,
+        SessionFactory,
+    )
     default_mcp_health_scheduler.start()
     try:
         yield
