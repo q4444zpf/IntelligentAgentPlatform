@@ -4,7 +4,6 @@ import subprocess
 import sys
 import threading
 import time
-import textwrap
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -2927,98 +2926,24 @@ def test_real_worker_process_does_not_join_abandoned_team_deadline_work(
     slow_stage,
     tmp_path,
 ):
-    probe = textwrap.dedent(
-        """
-        import json
-        import runpy
-        import sys
-        import time
-        from datetime import UTC, datetime, timedelta
-        from pathlib import Path
-
-        from app.runtime import run_worker
-        from app.runtime.sandbox_runtime import SandboxRuntime
-
-        stage = sys.argv[1]
-        helpers = runpy.run_path(sys.argv[2])
-        ready_path = Path(sys.argv[3])
-        snapshot = helpers["_schema_v5_team_snapshot"]()
-        gateway = helpers["FakeGateway"](snapshot)
-        request = helpers["_request"](snapshot).model_copy(
-            update={
-                "deadline_at": datetime.now(UTC) + timedelta(seconds=5),
-                    "execution_deadline_at": datetime.now(UTC)
-                    + timedelta(seconds=0.75),
-            }
-        )
-        plan = {
-            "tasks": [
-                {
-                    "id": "probe-task",
-                    "member_id": "member-1",
-                    "objective": "probe",
-                    "depends_on": [],
-                    "position": 0,
-                }
-            ]
-        }
-
-        class Factory:
-            def __init__(self):
-                self.supervisor_calls = 0
-
-            def build(self, member, **_kwargs):
-                def slow(inner):
-                    class SlowGraph:
-                        def invoke(self, state, *, config=None):
-                            ready_path.write_text(stage, encoding="utf-8")
-                            time.sleep(5)
-                            return inner.invoke(state, config=config)
-
-                    return SlowGraph()
-
-                if member.agent_id == "supervisor":
-                    self.supervisor_calls += 1
-                    if stage == "planning" and self.supervisor_calls == 1:
-                        return slow(helpers["TextGraph"](json.dumps(plan)))
-                    if self.supervisor_calls == 1:
-                        return helpers["TeamPlanGraph"](plan)
-                    if stage == "synthesis":
-                        return slow(helpers["TextGraph"]("late synthesis"))
-                    return helpers["TextGraph"]("synthesis")
-                graph = helpers["TextGraph"]("member")
-                return (
-                    slow(graph)
-                    if stage == "member"
-                    else graph
-                )
-
-        class ClientFactory:
-            @staticmethod
-            def from_execution_request(_request):
-                return gateway
-
-        run_worker.load_execution_request = lambda: request
-        run_worker.RunnerGatewayClient = ClientFactory
-        run_worker.SandboxRuntime = lambda current_gateway: SandboxRuntime(
-            current_gateway, agent_factory=Factory()
-        )
-        run_worker.sys.argv = ["run_worker"]
-        raise SystemExit(run_worker.main())
-        """
-    )
-    test_file = Path(__file__).resolve()
+    snapshot = _schema_v5_team_snapshot()
+    request = _request(snapshot)
     ready_path = tmp_path / f"{slow_stage}.ready"
+    snapshot_path = tmp_path / f"{slow_stage}.snapshot.json"
+    request_path = tmp_path / f"{slow_stage}.request.json"
+    snapshot_path.write_text(snapshot.model_dump_json(), encoding="utf-8")
+    request_path.write_text(request.model_dump_json(), encoding="utf-8")
+    probe_path = Path(__file__).with_name("worker_deadline_probe.py")
     process = subprocess.Popen(
         [
             sys.executable,
-            "-c",
-            probe,
+            str(probe_path),
             slow_stage,
-            str(test_file),
             str(ready_path),
+            str(snapshot_path),
+            str(request_path),
         ],
-        cwd=test_file.parents[2],
+        cwd=Path(__file__).resolve().parents[2],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
