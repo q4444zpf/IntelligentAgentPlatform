@@ -26,25 +26,25 @@ No production runtime behavior, API behavior, database schema, object storage, f
 
 Create a focused helper under `backend/tests/runtime/` that can be launched as a Python child process. It owns only the fixture construction required for the deadline test:
 
-- a schema-v5 team execution snapshot and matching execution request;
+- a schema-v5 team execution snapshot and matching execution request serialized by the parent test;
 - a minimal gateway implementing the methods exercised by `SandboxRuntime`;
 - minimal plan and text graphs;
 - the stage-selecting agent factory;
 - wiring `run_worker` to the request, gateway, and `SandboxRuntime`;
 - writing the supplied ready file only when the selected planning, member, or synthesis graph actually begins its slow `invoke()` call.
 
-The helper accepts the stage and ready-file path as command-line arguments. It does not import or execute `test_sandbox_runtime.py`, does not expose secrets, and does not add production interfaces. The parent test continues to own process creation, bounded waiting, termination, stdout/stderr capture, temporary paths, and the assertions on exit code and elapsed time.
+The helper accepts the stage, ready-file path, snapshot JSON path, and request JSON path as command-line arguments. It does not import or execute `test_sandbox_runtime.py`, does not expose secrets, and does not add production interfaces. The parent test continues to own fixture serialization, process creation, bounded waiting, termination, stdout/stderr capture, temporary paths, and the assertions on exit code and elapsed time.
 
 ### Timing Semantics
 
 The existing time budgets remain unchanged:
 
 - at most 10 seconds for the child to reach the selected slow production stage;
-- a 0.75-second execution deadline in the request;
+- a 0.75-second production execution window, bound in the child after helper imports, JSON validation, and test wiring complete;
 - at most 2.5 seconds after the ready marker for the worker to exit with code 4;
 - bounded kill/wait cleanup in `finally`.
 
-This keeps the regression sensitive to worker deadline handling. It removes only unrelated test-module import cost, rather than increasing a timeout until the current machine happens to pass.
+Immediately before invoking real `run_worker.main()`, the child replaces only the serialized request's timing fields with `deadline_at = now + 5 seconds` and `execution_deadline_at = now + 0.75 seconds`. This matches the old inline probe, which constructed its request after child imports and test-module loading, and prevents interpreter/import latency from consuming the execution window. No production clock is replaced. This keeps the regression sensitive to worker deadline handling while removing unrelated process-bootstrap cost, rather than increasing a timeout until the current machine happens to pass.
 
 ### Formatting Remediation
 

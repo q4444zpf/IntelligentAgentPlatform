@@ -4,7 +4,7 @@
 
 **Goal:** Remove whole-test-module startup cost from the real worker deadline probe, format the branch-owned Project Skill startup module, and restore green backend and branch-owned static gates.
 
-**Architecture:** The parent runtime test serializes its already-built snapshot and request into its pytest temporary directory, then launches a focused test-only child script. The child script owns only the minimal gateway and graph doubles needed to execute the real `run_worker.main()` and writes the existing ready marker only from the selected slow graph. Production runtime code and all existing deadline budgets remain unchanged.
+**Architecture:** The parent runtime test serializes its already-built snapshot and request into its pytest temporary directory, then launches a focused test-only child script. After imports, JSON validation, and test wiring, the child binds the same five-second overall and 0.75-second execution windows used by the old inline probe, executes the real `run_worker.main()`, and writes the existing ready marker only from the selected slow graph. Production runtime code and all existing deadline budgets remain unchanged.
 
 **Tech Stack:** Python 3.12, pytest, Pydantic 2 model JSON, subprocess, FastAPI backend test infrastructure, Black, Ruff, Docker Compose.
 
@@ -13,7 +13,7 @@
 - Implement the confirmed design in `docs/superpowers/specs/2026-09-10-runtime-probe-test-remediation-design.md`.
 - Continue in the linked worktree and branch `codex/project-skill-production-activation`; do not write implementation code on `main`.
 - Do not change any file under `backend/app/runtime/` or any other production runtime behavior.
-- Preserve the 10-second selected-stage ready budget, 0.75-second execution deadline, 2.5-second post-ready exit budget, exit code 4 assertion, and bounded child cleanup.
+- Preserve the 10-second selected-stage ready budget, the 0.75-second production execution window started after child bootstrap, the 2.5-second post-ready exit budget, exit code 4 assertion, and bounded child cleanup.
 - The new child process must not import or execute `test_sandbox_runtime.py`.
 - The child ready marker may be written only when the selected planning, member, or synthesis graph begins its slow `invoke()` call.
 - Format only `backend/app/skills/project_startup.py`; do not reformat the four files whose Black/import-order failures already exist at plan base `4930f67`.
@@ -62,16 +62,11 @@ Expected on the current harness: all three parameters fail at `worker did not en
 
 - [ ] **Step 2: Add serialized parent fixtures.**
 
-In the existing test, build the snapshot and request in the parent process before `Popen`:
+In the existing test, build the snapshot and base request in the parent process before `Popen`. The child owns the short-lived timing fields so process bootstrap cannot consume the production execution window:
 
 ```python
 snapshot = _schema_v5_team_snapshot()
-request = _request(snapshot).model_copy(
-    update={
-        "deadline_at": datetime.now(UTC) + timedelta(seconds=5),
-        "execution_deadline_at": datetime.now(UTC) + timedelta(seconds=0.75),
-    }
-)
+request = _request(snapshot)
 snapshot_path = tmp_path / f"{slow_stage}.snapshot.json"
 request_path = tmp_path / f"{slow_stage}.request.json"
 snapshot_path.write_text(snapshot.model_dump_json(), encoding="utf-8")
@@ -160,7 +155,7 @@ class ProbeGateway:
         raise AssertionError("probe graphs must not invoke tools")
 
     def register_artifact_capability(self, **request):
-        raise AssertionError("probe graphs must not register artifacts")
+        return f"capability:{request['invocation_id']}"
 
     def list_artifacts(self):
         return []
@@ -181,9 +176,16 @@ run_worker.SandboxRuntime = lambda current_gateway: SandboxRuntime(
     agent_factory=ProbeAgentFactory(stage, ready_path),
 )
 run_worker.sys.argv = ["run_worker"]
+now = datetime.now(UTC)
+request = request.model_copy(
+    update={
+        "deadline_at": now + timedelta(seconds=5),
+        "execution_deadline_at": now + timedelta(seconds=0.75),
+    }
+)
 ```
 
-The helper must end with `raise SystemExit(main())`. It must never import `backend/tests/runtime/test_sandbox_runtime.py` or use `runpy`.
+Bind those timing fields only after imports, JSON validation, and test wiring are complete and immediately before the real `run_worker.main()` call. Do not replace the production runtime clock. The helper must end with `raise SystemExit(main())`. It must never import `backend/tests/runtime/test_sandbox_runtime.py` or use `runpy`.
 
 - [ ] **Step 4: Run GREEN and mutation-oriented checks.**
 
