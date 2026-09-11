@@ -626,27 +626,36 @@ def test_team_watchdog_clamps_poll_sleep_to_remaining_deadline(run_factory):
     factory, run_id = run_factory
     sleep_calls = []
 
+    class ControllableMonotonicClock:
+        def __init__(self):
+            self.value = 0.0
+
+        def __call__(self):
+            return self.value
+
+        def sleep(self, seconds):
+            sleep_calls.append(seconds)
+            self.value += seconds
+
     def recording_sleep(seconds):
-        sleep_calls.append(seconds)
-        time.sleep(seconds)
+        clock.sleep(seconds)
 
     class RunningRunner(SequenceRunner):
         def status(self, current_run_id, *, monotonic_deadline=None):
             self.calls.append(("status", current_run_id))
             return {"run_id": current_run_id, "status": "running"}
 
-    started_at = time.monotonic()
+    clock = ControllableMonotonicClock()
     make_coordinator(
         factory,
         RunningRunner([]),
         poll_interval=0.6,
         timeout_seconds=0.15,
+        monotonic=clock,
         sleeper=recording_sleep,
     ).execute(run_id)
 
-    assert sleep_calls
-    assert max(sleep_calls) <= 0.15
-    assert time.monotonic() - started_at < 0.45
+    assert sleep_calls == [0.15]
 
 
 def test_timeout_terminate_and_cleanup_share_one_control_allowance(run_factory):
