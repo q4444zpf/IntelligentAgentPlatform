@@ -524,6 +524,7 @@ def test_real_gateway_slow_drip_expiry_completes_as_sandbox_timeout():
     snapshot = _snapshot()
     snapshot_body = snapshot.model_dump_json().encode()
     completions = []
+    snapshot_body_fully_sent = threading.Event()
 
     class SlowSnapshotHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"
@@ -543,6 +544,7 @@ def test_real_gateway_slow_drip_expiry_completes_as_sandbox_timeout():
                     time.sleep(0.05)
             except OSError:
                 return
+            snapshot_body_fully_sent.set()
 
         def do_POST(self):
             length = int(self.headers.get("Content-Length", "0"))
@@ -572,11 +574,8 @@ def test_real_gateway_slow_drip_expiry_completes_as_sandbox_timeout():
         }
     )
     gateway = RunnerGatewayClient.from_execution_request(request)
-    started_at = time.monotonic()
-    operation_elapsed = None
     try:
         result = SandboxRuntime(gateway).execute(request)
-        operation_elapsed = time.monotonic() - started_at
     finally:
         server.shutdown()
         server.server_close()
@@ -587,7 +586,7 @@ def test_real_gateway_slow_drip_expiry_completes_as_sandbox_timeout():
     assert completions == [
         {"status": "failed", "error_code": "sandbox_timeout"}
     ]
-    assert operation_elapsed is not None and operation_elapsed < 0.6
+    assert not snapshot_body_fully_sent.is_set()
 
 
 def test_model_gateway_error_observed_after_execution_deadline_reports_timeout():
