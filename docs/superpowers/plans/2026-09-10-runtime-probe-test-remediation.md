@@ -250,7 +250,7 @@ Inspect the diff and require only mechanical line wrapping. No identifiers, stri
 Run:
 
 ```powershell
-python -m pytest backend/tests/skills/test_project_startup.py backend/tests/integration/test_migration_graph.py -q -p no:cacheprovider --tb=short
+python -m pytest backend/tests/skills/test_project_startup.py backend/tests/integration/test_postgres_migrations.py -q -p no:cacheprovider --tb=short
 python -m ruff check backend/app/skills/project_startup.py
 python -m black --check backend/app/skills/project_startup.py
 git diff --check
