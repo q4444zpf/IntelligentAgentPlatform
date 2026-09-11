@@ -269,6 +269,7 @@ style: format project skill startup validation
 ## Task 3: Final Regression and Durable Evidence
 
 **Files:**
+- Modify when the verified floating-point baseline failure is present: `backend/tests/runtime/test_run_lifecycle.py`
 - Modify: `docs/superpowers/plans/2026-09-09-project-skill-production-activation-verification.md`
 
 **Interfaces:**
@@ -284,7 +285,7 @@ python -m pytest backend/tests/runtime -q -rs -p no:cacheprovider --tb=short
 python -m pytest backend/tests -q -rs -p no:cacheprovider --tb=short
 ```
 
-Require the runtime suite and complete backend suite to have zero failures. Record passed/skipped/warning counts and durations without adding overlapping totals.
+Require the runtime suite and complete backend suite to have zero failures. Record passed/skipped/warning counts and durations without adding overlapping totals. If `test_team_watchdog_clamps_poll_sleep_to_remaining_deadline` alone fails because a real `time.monotonic()` subtraction yields a sleep such as `0.1500000000014552` against the exact `0.15` assertion, preserve `poll_interval=0.6` and `timeout_seconds=0.15` but replace that test's wall-clock coupling with a test-local controllable monotonic clock and a sleeper that records and advances the clock. Assert the exact deterministic sleep call and remove the redundant real elapsed-time assertion. Do not change `backend/app/runtime/run_lifecycle.py` or any timeout value. Verify RED before the test edit, GREEN after it, and temporarily mutate the production clamp expression to prove the deterministic test detects an unclamped poll sleep; restore production immediately and confirm its diff is clean.
 
 - [ ] **Step 2: Run real PostgreSQL and MinIO selections with zero configuration skips.**
 
@@ -336,10 +337,10 @@ Run the secure fetch and merge commands from Task 1. If `origin/main` changes so
 
 Update the final-gates section with the new commands, exit codes, counts, durations, review result and exact residual baseline debt. Remove the obsolete statement that the new `project_startup.py` has a Black difference. Do not describe the runtime or backend suite as passing unless the fresh commands exited `0`.
 
-Stage only the verification document and commit:
+If the deterministic watchdog correction was required, stage exactly that test file and the verification document together; otherwise stage only the verification document. Commit:
 
 ```text
-docs: close runtime probe remediation gates
+test: stabilize watchdog deadline regression
 ```
 
 ## Final Review and Branch Finish
