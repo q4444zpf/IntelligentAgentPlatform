@@ -177,9 +177,73 @@ exit `1`，`1618 passed, 103 skipped, 3 failed in 1210.94s`。三个失败精确
 
 - 计划复用的项目虚拟环境运行 `python -m pip check` exit `0`，输出 `No broken requirements found.`；工作站全局 Python 的 `pip check` 仍有与本分支无关的预装水利/AI 包依赖冲突。
 - 全仓 `python -m ruff check backend` exit `1`，报告 575 个既有 lint 问题。分支变更 Python 文件的普通 Ruff exit `1`，仅剩 4 个 `I001`，对应在计划基线已不满足 import sorting 的 `settings.py`、`main.py`、`test_settings.py`、`test_main.py`；对这些已记录基线项使用 `--ignore I001` 后 exit `0`。
-- 分支变更 Python 文件的 Black check exit `1`：4 个既有文件已在 `4930f67` 基线上失败，新增 `project_startup.py` 还有一处仅合并函数调用换行的格式差异。最终修复波次已经评审封闭，未追加未评审格式化改动，因此本文不声明 Black 门禁通过。
+- 分支变更 Python 文件的 Black check exit `1`：既有文件已在 `4930f67` 基线上失败。最终修复波次已经评审封闭，未追加未评审格式化改动，因此本文不声明 Black 门禁通过。
 - `git diff --check 4930f67 HEAD`、普通 `docker compose config --quiet`、operations profile Compose config、API 镜像构建均 exit `0`。
 - 镜像实际 `Config.Cmd` 为 `["uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--proxy-headers"]`。
 - 从计划基线比较，旧 Skill router/service、frontend、agents、collaboration 和 runtime 均无 diff；`backend/app/main.py` 是唯一应用 composition 变更。
 
 最终全分支评审及唯一 consolidated fix wave 的 scoped re-review 均没有遗留 Critical/Important。由于完整后端和 Black 门禁仍非绿色，分支保留在隔离 worktree，不执行合并、推送、远程部署或 SDD scratch 清理。
+
+## Runtime Probe Remediation Final Gates (2026-09-11)
+
+本节是 `2026-09-10-runtime-probe-test-remediation` 的 Task 3 持久证据。所有 timing-sensitive pytest 选择集均顺序运行。每次完整后端运行前，外部 `TEST_*` 均被清除；仅在该测试进程内以现有测试容器凭据安全构造 `DATABASE_URL`，目标精确为获批 Cookie 专用库 `iap_skill_control_test_20260908_a`。命令、临时捕获和本文均未打印或持久化凭据。
+
+### Runtime and complete backend
+
+```powershell
+python -m pytest backend/tests/runtime -q -rs -p no:cacheprovider --tb=short
+python -m pytest backend/tests -q -rs -p no:cacheprovider --tb=short
+```
+
+运行时选择集 exit `1`，`510 passed, 1 failed, 0 skipped, 0 warnings in 336.93s`；完整后端初次有效捕获 exit `1`，`1620 passed, 103 skipped, 1 failed, 0 warnings in 1242.87s`。两者唯一失败均为 `backend/tests/runtime/test_run_lifecycle.py::test_team_watchdog_clamps_poll_sleep_to_remaining_deadline`：`max(sleep_calls)` 为 `0.1500000000014552`，而断言要求 `<= 0.15`。
+
+依照 systematic-debugging，focused 重现命令 exit `1`，`1 failed in 6.32s`；`4930f67..HEAD` 未改变该测试或 `backend/app/runtime/run_lifecycle.py`。现有测试以真实 `time.monotonic()` 计算二进制浮点剩余时间并对非精确十进制上界作精确比较，因此失败是可重现的既有基线测试精度债务，非 worker deadline probe、生产 runtime 或 timeout 改动。没有放宽 timeout、改生产代码或修复无关基线。
+
+### Real PostgreSQL and MinIO
+
+以下 credential-safe helper 只在进程内读取既有测试容器凭据；未 reset/downgrade `iap`，且 MinIO 测试只操作自有 UUID 桶：
+
+```powershell
+python .superpowers/sdd/2026-09-09-project-skill-production-activation/task-6-service-mode.py
+
+$env:TASK6_DATABASE_NAME = 'iap_skill_control_test_20260908_a'
+python .superpowers/sdd/2026-09-09-project-skill-production-activation/task-6-service-mode.py python -m pytest backend/tests/integration/test_project_skill_storage_bootstrap_minio.py backend/tests/integration/test_skill_package_minio.py backend/tests/integration/test_skill_control_plane_minio.py backend/tests/integration/test_skill_control_plane_postgres.py backend/tests/integration/test_skill_versions_postgres.py -q -rs -p no:cacheprovider --tb=short
+Remove-Item Env:TASK6_DATABASE_NAME
+
+& .superpowers/sdd/2026-09-09-project-skill-production-activation/run_migration_test_mode.ps1 -PytestArguments @('backend/tests/integration/test_project_skill_startup_postgres.py', '-q', '-rs', '-p', 'no:cacheprovider', '--tb=short')
+```
+
+结果依次为 exit `0`、`2 passed in 13.57s`；exit `0`、`44 passed in 21.25s`；exit `0`、`1 passed in 14.08s`。三组均为零 failed、零 skipped、零 warnings，因而没有 configuration skip。
+
+### Static and release boundaries
+
+| Command | exit | Result |
+| --- | ---: | --- |
+| `..\skill-version-foundation\.venv\Scripts\python.exe -m pip check` | 0 | `No broken requirements found.` |
+| `python -m ruff check --ignore I001 @changedPython` (`4930f67..HEAD`) | 0 | branch-owned, baseline-aware Ruff passed |
+| `python -m black --check @addedPython` (`4930f67..HEAD`, added files) | 0 | added-file Black passed |
+| `git diff --check 4930f67 HEAD` | 0 | no whitespace errors |
+| `docker compose config --quiet` | 0 | passed |
+| `docker compose --profile operations config --quiet` | 0 | passed |
+| `docker compose build api` | 0 | API image built |
+| protected-path `git diff --exit-code 4930f67 HEAD -- backend/app/skills/router.py backend/app/skills/service.py frontend backend/app/agents backend/app/collaboration backend/app/runtime` | 0 | protected paths unchanged |
+
+镜像检查 `docker image inspect --format '{{json .Config.Cmd}}' intelligent-agent-platform-api:local` exit `0`，精确输出 `["uvicorn","app.main:app","--host","0.0.0.0","--port","8000","--proxy-headers"]`。
+
+普通基线记录没有被掩盖：`python -m ruff check backend` exit `1`，`575` 个既有问题；普通分支变更文件 `python -m black --check @changedPython` exit `1`，仅报告既有的 `backend/app/core/settings.py`、`backend/app/main.py`、`backend/tests/core/test_settings.py`、`backend/tests/test_main.py` 和 `backend/tests/runtime/test_sandbox_runtime.py`。不再存在 `project_startup.py` 的 Black 差异。
+
+### Fetch, merge, and post-fetch rerun
+
+```powershell
+git -c http.sslVerify=true -c http.sslBackend=openssl -c http.proxy=http://127.0.0.1:7897 -c https.proxy=http://127.0.0.1:7897 -c http.version=HTTP/1.1 -c http.sslVersion=tlsv1.2 fetch origin
+git merge --no-edit origin/main
+python -m pytest "backend/tests/runtime/test_sandbox_runtime.py::test_real_worker_process_does_not_join_abandoned_team_deadline_work" -q -p no:cacheprovider --tb=short
+```
+
+secure fetch exit `0`；merge exit `0`、`Already up to date`，未改变源代码。post-fetch 三参数 deadline test exit `0`、`3 passed, 0 skipped, 0 warnings in 57.73s`。post-fetch 完整后端再次在相同受控环境运行，exit `1`、`1620 passed, 103 skipped, 1 failed, 0 warnings in 1228.03s`；唯一失败未变化。post-fetch added-file Black、branch Ruff (`--ignore I001`)、`git diff --check` 和 protected-path diff 均 exit `0`。
+
+### Final status
+
+**BLOCKED.** 真实 PostgreSQL/MinIO、baseline-aware static/release、镜像 Cmd、protected paths，以及三参数 deadline probe 均通过；但 fresh complete backend suite 仍因上述一个既有浮点精度断言 exit `1`。因此不宣称 complete backend 或全分支门禁通过，也不执行合并、推送、远程部署或此 remediation SDD workspace 清理。
+
+Whole-remediation independent review package covered `258cae0...a41b9ce`, including scope, timing semantics, cleanup, test quality and evidence accuracy. Standards review reported no Critical/Important findings. Spec review found one Important evidence-completeness issue: missing zero skipped/warning fields and deferred review status in this final-gates record. This amendment adds those exact fields and this conclusion; it changes no runtime, test, production, deployment or service helper code. Scoped re-review of that documentation-only amendment found no new Critical/Important issue.
