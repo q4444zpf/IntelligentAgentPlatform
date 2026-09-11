@@ -14,9 +14,7 @@ class ProjectSkillStartupError(RuntimeError):
 def load_code_migration_heads(config_path: Path | None = None) -> frozenset[str]:
     path = config_path or Path(__file__).resolve().parents[2] / "alembic.ini"
     try:
-        heads = frozenset(
-            ScriptDirectory.from_config(Config(str(path))).get_heads()
-        )
+        heads = frozenset(ScriptDirectory.from_config(Config(str(path))).get_heads())
     except Exception:  # noqa: BLE001 - startup boundary replaces graph failures
         heads = frozenset()
     if not heads:
