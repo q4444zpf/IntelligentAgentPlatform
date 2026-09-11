@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import subprocess
@@ -10,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
@@ -28,6 +30,7 @@ from app.runtime.execution_snapshot import (
     SnapshotTool,
     canonical_snapshot_bytes,
 )
+from app.runtime.http_tls import create_runtime_ssl_context
 from app.runtime.gateway_model import RunnerGatewayModelError
 from app.runtime.gateway_tools import (
     RunnerApprovalInterruption,
@@ -525,26 +528,38 @@ def test_real_gateway_slow_drip_expiry_completes_as_sandbox_timeout():
     snapshot_body = snapshot.model_dump_json().encode()
     completions = []
     snapshot_body_fully_sent = threading.Event()
+    snapshot_handler_finished = threading.Event()
 
     class SlowSnapshotHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"
 
         def do_GET(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(snapshot_body)))
-            self.end_headers()
-            chunk_size = max(1, len(snapshot_body) // 12)
+            if self.path == "/ready":
+                body = b"{}"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(snapshot_body)))
+                self.end_headers()
+                chunk_size = max(1, len(snapshot_body) // 12)
                 for offset in range(0, len(snapshot_body), chunk_size):
                     self.wfile.write(
                         snapshot_body[offset : offset + chunk_size]
                     )
                     self.wfile.flush()
+                    if offset + chunk_size >= len(snapshot_body):
+                        snapshot_body_fully_sent.set()
                     time.sleep(0.05)
             except OSError:
                 return
-            snapshot_body_fully_sent.set()
+            finally:
+                snapshot_handler_finished.set()
 
         def do_POST(self):
             length = int(self.headers.get("Content-Length", "0"))
@@ -565,6 +580,16 @@ def test_real_gateway_slow_drip_expiry_completes_as_sandbox_timeout():
     server = TestServer(("127.0.0.1", 0), SlowSnapshotHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+
+    async def warm_gateway_transport():
+        context = await create_runtime_ssl_context()
+        async with httpx.AsyncClient(verify=context, trust_env=False) as client:
+            response = await client.get(
+                f"http://127.0.0.1:{server.server_port}/ready"
+            )
+            response.raise_for_status()
+
+    asyncio.run(warm_gateway_transport())
     request = _request(snapshot).model_copy(
         update={
             "deadline_at": datetime.now(UTC) + timedelta(seconds=5),
@@ -576,6 +601,7 @@ def test_real_gateway_slow_drip_expiry_completes_as_sandbox_timeout():
     gateway = RunnerGatewayClient.from_execution_request(request)
     try:
         result = SandboxRuntime(gateway).execute(request)
+        assert snapshot_handler_finished.wait(5), "snapshot handler did not finish"
     finally:
         server.shutdown()
         server.server_close()
