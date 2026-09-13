@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Literal
@@ -16,10 +17,18 @@ from sqlalchemy import JSON, DateTime, Index, String, select
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from app.db.base import Base
+from app.skills.service import SkillNotFoundError
 
 
 class SnapshotIntegrityError(ValueError):
     pass
+
+
+class SkillUnavailableError(SnapshotIntegrityError):
+    code = "skill_unavailable"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
 
 
 class PublishedAgentSnapshot(BaseModel):
@@ -147,6 +156,64 @@ class SnapshotSkill(BaseModel):
                 f"Skill resource total exceeds {MAX_SKILL_RESOURCE_TOTAL_BYTES} bytes"
             )
         return self
+
+
+@dataclass(frozen=True)
+class SkillContext:
+    system_messages: tuple[dict[str, str], ...]
+    system_prompt: str
+    context_prompt: str
+    skill_body: str
+    resource_index: tuple[dict[str, object], ...]
+
+
+def build_skill_context(
+    *,
+    system_prompt: str,
+    context_prompt: str,
+    skills: tuple[SnapshotSkill, ...],
+    resource_index: tuple[dict[str, object], ...] = (),
+) -> SkillContext:
+    """Build the immutable Skill guidance that is visible to one agent."""
+    active_skills = tuple(skill for skill in skills if skill.enabled)
+    skill_body = "\n\n".join(
+        skill.content.strip() for skill in active_skills if skill.content.strip()
+    )
+    if not skill_body:
+        skill_body = ", ".join(skill.name for skill in active_skills)
+
+    resolved_context = context_prompt.strip()
+    if skill_body:
+        resolved_context = (
+            f"{resolved_context}\n\nSkills: {skill_body}"
+            if resolved_context
+            else f"Skills: {skill_body}"
+        )
+    frozen_index = tuple(resource_index)
+    if frozen_index:
+        resource_context = (
+            "Authorized Skill resources (read-only): "
+            + json.dumps(frozen_index, ensure_ascii=False, sort_keys=True)
+        )
+        resolved_context = (
+            f"{resolved_context}\n\n{resource_context}"
+            if resolved_context
+            else resource_context
+        )
+
+    resolved_system = system_prompt.strip()
+    messages = tuple(
+        {"role": "system", "content": content}
+        for content in (resolved_system, resolved_context)
+        if content
+    )
+    return SkillContext(
+        system_messages=messages,
+        system_prompt=resolved_system,
+        context_prompt=resolved_context,
+        skill_body=skill_body,
+        resource_index=frozen_index,
+    )
 
 
 class SnapshotKnowledgeSource(BaseModel):
@@ -505,6 +572,24 @@ class ExecutionSnapshotService:
                 ) from error
         return SnapshotSkill(**fields)
 
+    def _resolve_bound_skill(self, name: str) -> SnapshotSkill:
+        skill_service = getattr(self.agent_service, "skill_service", None)
+        getter = getattr(skill_service, "get", None)
+        if not callable(getter):
+            raise SkillUnavailableError()
+        try:
+            skill = getter(name)
+        except SkillNotFoundError as error:
+            raise SkillUnavailableError() from error
+        if (
+            skill is None
+            or getattr(skill, "name", None) != name
+            or getattr(skill, "published", True) is not True
+            or getattr(skill, "enabled", False) is not True
+        ):
+            raise SkillUnavailableError()
+        return self._snapshot_skill(name, skill)
+
     @classmethod
     def _team_member_snapshot(cls, member: dict) -> SnapshotTeamMember:
         definition = member.get("agent_definition")
@@ -763,10 +848,7 @@ class ExecutionSnapshotService:
                 model=agent.model,
             )
             snapshot_skills = tuple(
-                self._snapshot_skill(name, skill)
-                for name in agent.skill_names
-                for skill in (self.agent_service.skill_service.get(name),)
-                if skill.enabled
+                self._resolve_bound_skill(name) for name in agent.skill_names
             )
             snapshot_knowledge_sources = tuple(
                 SnapshotKnowledgeSource(

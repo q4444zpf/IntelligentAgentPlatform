@@ -399,6 +399,79 @@ def test_snapshot_rejects_disabled_agents(snapshot_service):
         snapshot_service.create("run-1")
 
 
+def test_build_skill_context_returns_literal_messages_body_and_resource_index():
+    from app.runtime.execution_snapshot import build_skill_context
+
+    resource_index = (
+        {
+            "skill_name": "forecast",
+            "path": "references/rules.txt",
+            "size": 5,
+            "sha256": "a" * 64,
+        },
+    )
+
+    context = build_skill_context(
+        system_prompt="System guidance.",
+        context_prompt="Project context.",
+        skills=(SnapshotSkill(
+            name="forecast",
+            content="Use the frozen forecast method.",
+        ),),
+        resource_index=resource_index,
+    )
+
+    assert context.skill_body == "Use the frozen forecast method."
+    assert context.resource_index == resource_index
+    assert context.system_messages == (
+        {"role": "system", "content": "System guidance."},
+        {
+            "role": "system",
+            "content": (
+                "Project context.\n\n"
+                "Skills: Use the frozen forecast method.\n\n"
+                "Authorized Skill resources (read-only): "
+                "[{\"path\": \"references/rules.txt\", \"sha256\": \""
+                + "a" * 64
+                + "\", \"size\": 5, \"skill_name\": \"forecast\"}]"
+            ),
+        },
+    )
+
+
+@pytest.mark.parametrize("availability", ["missing", "unpublished", "disabled"])
+def test_snapshot_rejects_unavailable_bound_skills_with_stable_code(
+    snapshot_service, availability
+):
+    class UnavailableSkillService:
+        def get(self, name):
+            assert name == "forecast"
+            if availability == "missing":
+                from app.skills.service import SkillNotFoundError
+
+                raise SkillNotFoundError(name)
+            return type("Skill", (), {
+                "name": name,
+                "description": "Forecast guidance",
+                "version": "1",
+                "content": "Use forecast guidance.",
+                "source": "published",
+                "enabled": availability != "disabled",
+                "published": availability != "unpublished",
+                "tags": [],
+                "metadata": {},
+                "file_count": 1,
+                "updated_at": datetime(2026, 8, 14, 9, 0, tzinfo=UTC),
+                "skill_id": "skill-1",
+                "version_id": "version-1",
+            })()
+
+    snapshot_service.agent_service.skill_service = UnavailableSkillService()
+
+    with pytest.raises(SnapshotIntegrityError, match="^skill_unavailable$"):
+        snapshot_service.create("run-1")
+
+
 def test_team_snapshot_uses_only_captured_agent_definitions():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)

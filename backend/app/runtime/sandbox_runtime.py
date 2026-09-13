@@ -51,6 +51,7 @@ from .runner_gateway_client import (
     RunnerGatewayClientError,
 )
 from .skill_resources import SkillResourceMaterializationError, SkillResourceMaterializer
+from .execution_snapshot import build_skill_context
 
 logger = logging.getLogger(__name__)
 
@@ -341,30 +342,12 @@ class SandboxRuntime:
                         tool_call_count=budget.tool_call_count,
                         subagent_call_count=budget.subagent_call_count,
                     )
-                skill_context = "\n\n".join(
-                    skill.content.strip()
-                    for skill in snapshot.payload.skills
-                    if skill.enabled and skill.content.strip()
+                skill_context = build_skill_context(
+                    system_prompt=actor.system_prompt,
+                    context_prompt=actor.context_prompt,
+                    skills=snapshot.payload.skills,
+                    resource_index=resource_index,
                 )
-                if not skill_context:
-                    skill_context = ", ".join(
-                        skill.name
-                        for skill in snapshot.payload.skills
-                        if skill.enabled
-                    )
-                context_prompt = actor.context_prompt
-                if skill_context:
-                    context_prompt = (
-                        f"{context_prompt}\n\nSkills: {skill_context}"
-                        if context_prompt
-                        else f"Skills: {skill_context}"
-                    )
-                if resource_index:
-                    resource_context = (
-                        "\n\nAuthorized Skill resources (read-only): "
-                        + json.dumps(resource_index, ensure_ascii=False, sort_keys=True)
-                    )
-                    context_prompt = f"{context_prompt}{resource_context}"
                 model = GatewayChatModel(
                     self.gateway,
                     max_iterations=limits.max_iterations,
@@ -386,7 +369,8 @@ class SandboxRuntime:
                 graph = self.agent_factory.build(
                     FactoryAgentSnapshot(
                         agent_id=actor.id, name=actor.name,
-                        system_prompt=actor.system_prompt, context_prompt=context_prompt,
+                        system_prompt=skill_context.system_prompt,
+                        context_prompt=skill_context.context_prompt,
                         tools=(),
                     ),
                     model=model,

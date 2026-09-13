@@ -265,6 +265,44 @@ def test_build_messages_explicitly_disallows_unavailable_tool_claims():
     session.close()
 
 
+def test_non_sandbox_run_includes_the_bound_skill_snapshot_body_before_history():
+    from app.runtime.execution_snapshot import SnapshotSkill
+
+    class CapturedSkillSnapshotService:
+        def create(self, run_id):
+            assert run_id
+            return SimpleNamespace(payload=SimpleNamespace(
+                actor=SimpleNamespace(
+                    system_prompt="你是洪水研判智能体",
+                    context_prompt="结合当前流域上下文",
+                ),
+                skills=(SnapshotSkill(
+                    name="forecast",
+                    content="Use the frozen forecast method.",
+                ),),
+            ))
+
+    session, run_id = build_queued_run()
+    gateway = CapturingGateway()
+    agent_service = FakeAgentService()
+
+    PlatformAgentHarness(
+        ConversationRepository(session),
+        gateway,
+        agent_service,
+        execution_snapshot_service=CapturedSkillSnapshotService(),
+    ).execute(run_id)
+
+    messages, _selection = gateway.calls[0]
+    assert messages[-1] == {"role": "user", "content": "分析洪峰"}
+    assert any(
+        message["role"] == "system"
+        and "Use the frozen forecast method." in message["content"]
+        for message in messages[:-1]
+    )
+    session.close()
+
+
 def test_build_messages_reconstructs_completed_approved_tool_call_for_resume():
     session, run_id = build_queued_run()
     repository = ConversationRepository(session)
