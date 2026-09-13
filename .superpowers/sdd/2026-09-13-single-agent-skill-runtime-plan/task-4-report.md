@@ -97,3 +97,57 @@ tests/test_agents.py::test_rejects_unknown_tool_bindings[update]: 1 passed, 1 Te
 ```
 
 The local bundled Python collection remains blocked by a missing `botocore`; all repository/SkillVersion tests above use the project API Docker image. Two broad Docker invocations (`tests/test_agents.py` and the combined Task 4 list) stopped emitting a final pytest summary in the execution harness. They are intentionally not recorded as passing; isolated covering tests have complete output.
+
+## Fix Round 2
+
+This round closes the post-round-one review findings without changing Team snapshot protocols. Legacy Agent JSON is parsed through `AgentConfig` defaults before migration or copy, existing project Agents resolve their bindings in their persisted project scope, and common Agents reject project-scoped Skill bindings. Published `SkillVersion.content` is parsed with the existing `parse_skill_markdown` parser; its exact frontmatter name and description must match the immutable version, and its `metadata` is retained in the frozen snapshot. The existing script declaration validator runs against that frozen metadata before persistence.
+
+`skills.enabled` is authoritative current availability. The self-contained `20260914_29` Alembic revision depends on tracked head `20260908_27`, defaults pre-existing rows to enabled, and removes the server default after migration. The untracked control-domain `20260913_28` is an independent sibling and must be merged later by its owner; this Task 4 commit neither depends on nor includes it. Both published-name resolution and exact-version resolution filter unavailable Skills, so Agent create/update/migrate plus fresh and reused single-Agent snapshots fail closed. Reused Team snapshots are intentionally exempt because Team definitions capture name-only protocol Skills, not live SkillVersion identities. The migration route now uses the standard management error/audit wrapper.
+
+### Fix Round 2 TDD And Verification
+
+RED commands and raw results:
+
+```text
+docker run --rm -v "${PWD}:/app" -w /app/backend intelligent-agent-platform-api:local python -m pytest --basetemp=/tmp/task4-r2-red-legacy-scope -p no:cacheprovider tests/test_agent_skill_bindings.py -q
+...FF
+2 failed, 3 passed in 5.91s
+- raw persisted legacy JSON raised KeyError: 'skill_bindings' during migration
+- a unit administrator in project B resolved a project-A Agent's Skill name to project B
+
+docker run --rm -v "${PWD}:/app" -w /app/backend intelligent-agent-platform-api:local python -m pytest --basetemp=/tmp/task4-r2-red-metadata -p no:cacheprovider tests/runtime/test_agent_skill_bindings.py::test_bound_snapshot_preserves_declared_scripts_from_immutable_version -q
+1 failed in 5.42s
+- snapshot metadata omitted frontmatter metadata.scripts (KeyError: 'scripts')
+
+docker run --rm -v "${PWD}:/app" -w /app/backend intelligent-agent-platform-api:local python -m pytest --basetemp=/tmp/task4-r2-red-team-reuse -p no:cacheprovider tests/runtime/test_execution_snapshot.py::test_team_snapshot_can_be_reused_when_captured_skills_are_name_only -q
+1 failed in 4.65s
+- second Team snapshot create raised skill_unavailable for name-only captured Skill records
+
+docker run --rm -v "${PWD}:/app" -w /app/backend intelligent-agent-platform-api:local python -m pytest --basetemp=/tmp/task4-r2-red-availability -p no:cacheprovider tests/test_agent_skill_bindings.py::test_agent_skill_binding_resolution_rejects_disabled_published_skill tests/runtime/test_agent_skill_bindings.py::test_snapshot_rejects_disabled_bound_skill_on_fresh_and_reused_runs -q
+4 failed in 7.33s
+- disabled authoritative Skills were accepted at create/update and fresh snapshot resolution; migration still exposed the legacy KeyError
+```
+
+GREEN commands and raw results:
+
+```text
+docker run --rm -v "${PWD}:/app" -w /app/backend intelligent-agent-platform-api:local python -m pytest --basetemp=/tmp/task4-r2-green-bindings -p no:cacheprovider tests/test_agent_skill_bindings.py -q
+8 passed in 5.60s
+
+docker run --rm -v "${PWD}:/app" -w /app/backend intelligent-agent-platform-api:local python -m pytest --basetemp=/tmp/task4-r2-green-runtime-bindings -p no:cacheprovider tests/runtime/test_agent_skill_bindings.py -q
+4 passed in 5.32s
+
+docker run --rm -v "${PWD}:/app" -w /app/backend intelligent-agent-platform-api:local python -m pytest --basetemp=/tmp/task4-r2-green-snapshots-final -p no:cacheprovider tests/runtime/test_execution_snapshot.py -q
+23 passed in 7.21s
+
+docker run --rm -v "${PWD}:/app" -w /app/backend intelligent-agent-platform-api:local python -m pytest --basetemp=/tmp/task4-r2-green-skill-resources -p no:cacheprovider tests/runtime/test_skill_resources.py tests/runtime/test_single_agent_skill_context.py -q
+16 passed in 9.87s
+
+docker run --rm -v "${PWD}:/app" -w /app/backend intelligent-agent-platform-api:local python -m pytest --basetemp=/tmp/task4-r2-green-all-targeted -p no:cacheprovider tests/test_agent_skill_bindings.py tests/runtime/test_agent_skill_bindings.py tests/runtime/test_skill_scripts.py tests/runtime/test_runner_gateway_skill_resources.py -q
+31 passed, 1 warning in 12.08s
+
+docker run --rm -v "${PWD}/backend/.tmp-task4-alembic-self-contained:/app" -w /app/backend intelligent-agent-platform-api:local alembic heads
+20260914_29 (head)
+```
+
+The one warning is Starlette's upstream `TestClient` deprecation for AnyIO's `BlockingPortal` alias. It is emitted by the existing resource test dependency path and does not indicate a Task 4 behavior failure.

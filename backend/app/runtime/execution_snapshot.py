@@ -585,7 +585,19 @@ class ExecutionSnapshotService:
         )
         if version is None:
             raise SkillUnavailableError()
+        from app.runtime.skill_scripts import SkillScriptError, load_script_specs
+        from app.skills.service import SkillValidationError, parse_skill_markdown
+
         try:
+            frontmatter, _ = parse_skill_markdown(version.content)
+            if (
+                frontmatter.get("name") != version.name
+                or frontmatter.get("description") != version.description
+            ):
+                raise SkillUnavailableError()
+            metadata = frontmatter.get("metadata", {})
+            if not isinstance(metadata, dict):
+                raise SkillUnavailableError()
             files = tuple(
                 SnapshotSkillFile(
                     path=item["path"],
@@ -594,25 +606,29 @@ class ExecutionSnapshotService:
                 )
                 for item in version.files
             )
-        except (KeyError, TypeError, ValueError) as error:
+            snapshot = SnapshotSkill(
+                name=version.name,
+                description=version.description,
+                version=str(version.version),
+                content=version.content,
+                source="published",
+                enabled=True,
+                metadata=metadata,
+                file_count=len(files),
+                updated_at=version.published_at,
+                skill_id=binding.skill_id,
+                version_id=binding.version_id,
+                package_digest=version.package_digest,
+                object_key=version.object_key,
+                archive_sha256=version.archive_sha256,
+                size_bytes=version.size_bytes,
+                files=files,
+            )
+            # The import occurs at call time because skill_scripts imports SnapshotSkill.
+            load_script_specs(snapshot)
+        except (KeyError, TypeError, ValueError, SkillValidationError, SkillScriptError) as error:
             raise SkillUnavailableError() from error
-        return SnapshotSkill(
-            name=version.name,
-            description=version.description,
-            version=str(version.version),
-            content=version.content,
-            source="published",
-            enabled=True,
-            file_count=len(files),
-            updated_at=version.published_at,
-            skill_id=binding.skill_id,
-            version_id=binding.version_id,
-            package_digest=version.package_digest,
-            object_key=version.object_key,
-            archive_sha256=version.archive_sha256,
-            size_bytes=version.size_bytes,
-            files=files,
-        )
+        return snapshot
 
     def _validate_snapshot_skill_versions(
         self,
@@ -767,7 +783,8 @@ class ExecutionSnapshotService:
             context = self.conversation_repository.get_run_execution_context(run_id)
             if context is None:
                 raise KeyError(run_id)
-            self._validate_snapshot_skill_versions(stored.payload.skills, context)
+            if isinstance(stored.payload.actor, PublishedAgentSnapshot):
+                self._validate_snapshot_skill_versions(stored.payload.skills, context)
             return stored
 
         context = self.conversation_repository.get_run_execution_context(run_id)

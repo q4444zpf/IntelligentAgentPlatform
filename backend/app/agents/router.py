@@ -153,10 +153,18 @@ def create_router(service: AgentService | None = None) -> APIRouter:
     def migrate_agent_skill_bindings(
         agent_id: str,
         context: RequestContext = Depends(require_agent_admin),
+        request_id: str = Depends(management_request_id),
     ):
         with manager.store.session_factory() as session:
-            return manager.migrate_legacy_skill_bindings(
-                agent_id, context=context, session=session
+            return call_management(
+                lambda: manager.migrate_legacy_skill_bindings(
+                    agent_id, context=context, session=session, request_id=request_id
+                ),
+                session,
+                context,
+                request_id,
+                "resource.updated",
+                agent_id,
             )
 
     @router.patch("/{agent_id}/toggle", response_model=AgentInfo)

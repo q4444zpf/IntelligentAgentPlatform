@@ -278,10 +278,10 @@ class AgentService:
         context: RequestContext | None,
         record: dict | None = None,
     ) -> SkillScope:
-        if context is not None:
-            return SkillScope(context.unit_id, context.project_id)
         if record is not None:
             return SkillScope(str(record["unit_id"]), str(record["project_id"]))
+        if context is not None:
+            return SkillScope(context.unit_id, context.project_id)
         return SkillScope("__internal__", "__internal__")
 
     @staticmethod
@@ -319,6 +319,8 @@ class AgentService:
         session: Session | None,
         record: dict | None = None,
     ) -> list[SkillBinding]:
+        if record is not None and record["availability_scope"] == "common" and names:
+            raise AgentValidationError("Common Agents cannot bind project-scoped Skills")
         scope = self._skill_scope(context, record)
         if session is not None:
             return self._published_skill_bindings(session, scope, names)
@@ -630,6 +632,7 @@ class AgentService:
         *,
         context: RequestContext | None = None,
         session: Session | None = None,
+        request_id: str | None = None,
     ) -> AgentInfo:
         self._ensure_default_agent()
         record = self._require_mutation_scope(agent_id, context, session)
@@ -637,9 +640,11 @@ class AgentService:
             record = self.store.get(agent_id)
         if record is None:
             raise AgentNotFoundError(agent_id)
-        config = AgentConfig(
-            **{field: record[field] for field in AgentConfig.model_fields}
-        )
+        config = AgentConfig.model_validate({
+            field: record[field]
+            for field in AgentConfig.model_fields
+            if field in record
+        })
         if config.skill_bindings or not config.skill_names:
             return self._info(record)
         migrated = config.model_copy(
@@ -665,7 +670,7 @@ class AgentService:
             self._commit_management(
                 context,
                 session,
-                None,
+                request_id,
                 action="resource.updated",
                 agent_id=agent_id,
                 name=migrated.name,
@@ -750,11 +755,11 @@ class AgentService:
             source = self.store.get(source_id)
         if not source:
             raise AgentNotFoundError(source_id)
-        config = {
+        config = AgentConfig.model_validate({
             name: source[name]
             for name in AgentConfig.model_fields
-            if name != "id"
-        }
+            if name != "id" and name in source
+        }).model_dump()
         config["name"] = request.name
         config["skill_names"] = config["skill_names"] if request.copy_skills else []
         config["enabled"] = False

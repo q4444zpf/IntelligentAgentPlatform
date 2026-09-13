@@ -326,6 +326,7 @@ class SkillRepository:
             .where(
                 *self._conditions(scope, owner_ids=owner_ids),
                 Skill.id == skill_id,
+                Skill.enabled.is_(True),
                 SkillVersion.id == version_id,
             )
         )
@@ -343,6 +344,7 @@ class SkillRepository:
             .where(
                 *self._conditions(scope, owner_ids=owner_ids),
                 Skill.name == name,
+                Skill.enabled.is_(True),
                 Skill.published_version_id == SkillVersion.id,
             )
         )

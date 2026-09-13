@@ -66,7 +66,9 @@ class AgentService:
         return self.agent
 
 
-def _published_skill(session, *, skill_id, first_version_id, second_version_id):
+def _published_skill(
+    session, *, skill_id, first_version_id, second_version_id, first_content=None
+):
     skill = Skill(
         id=skill_id,
         unit_id="unit-1",
@@ -87,7 +89,7 @@ def _published_skill(session, *, skill_id, first_version_id, second_version_id):
         name="forecast",
         description="v1",
         display_version="1.0",
-        content="Use forecast version one.",
+        content=first_content or "---\nname: forecast\ndescription: v1\n---\nUse forecast version one.",
         files=[],
         package_digest="b" * 64,
         object_key=f"unit-1/project-1/{skill_id}/v1.zip",
@@ -105,7 +107,7 @@ def _published_skill(session, *, skill_id, first_version_id, second_version_id):
         name="forecast",
         description="v2",
         display_version="2.0",
-        content="Use forecast version two.",
+        content="---\nname: forecast\ndescription: v2\n---\nUse forecast version two.",
         files=[],
         package_digest="e" * 64,
         object_key=f"unit-1/project-1/{skill_id}/v2.zip",
@@ -147,7 +149,7 @@ def test_snapshot_reads_the_agent_bound_immutable_skill_version_after_newer_publ
         snapshot = service.create("run-1")
 
     assert snapshot.payload.skills[0].version_id == first_version_id
-    assert snapshot.payload.skills[0].content == "Use forecast version one."
+    assert snapshot.payload.skills[0].content.endswith("Use forecast version one.")
 
 
 def test_snapshot_rejects_name_only_legacy_agent_skill_binding():
@@ -162,3 +164,73 @@ def test_snapshot_rejects_name_only_legacy_agent_skill_binding():
 
         with pytest.raises(SkillUnavailableError, match="^skill_unavailable$"):
             service.create("run-1")
+
+
+def test_bound_snapshot_preserves_declared_scripts_from_immutable_version(tmp_path):
+    from app.runtime.gateway_tools import build_skill_script_tools
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    skill_id = "00000000-0000-0000-0000-000000000021"
+    version_id = "00000000-0000-0000-0000-000000000022"
+    content = """---
+name: forecast
+description: v1
+metadata:
+  scripts:
+    - name: normalize
+      path: scripts/normalize.py
+      input_schema: {type: object}
+      output_schema: {type: object}
+      timeout_seconds: 5
+---
+Use the immutable script.
+"""
+    with Session(engine) as session:
+        _published_skill(
+            session,
+            skill_id=skill_id,
+            first_version_id=version_id,
+            second_version_id="00000000-0000-0000-0000-000000000023",
+            first_content=content,
+        )
+        service = ExecutionSnapshotService(
+            session,
+            AgentService((SkillBinding(skill_id=skill_id, version_id=version_id, name="forecast"),), ["forecast"]),
+            ConversationRepository(),
+        )
+        snapshot = service.create("run-1")
+
+    assert snapshot.payload.skills[0].metadata["scripts"][0]["name"] == "normalize"
+    assert [tool.name for tool in build_skill_script_tools(snapshot.payload, tmp_path)] == [
+        "skill.forecast.script.normalize"
+    ]
+
+
+def test_snapshot_rejects_disabled_bound_skill_on_fresh_and_reused_runs():
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    skill_id = "00000000-0000-0000-0000-000000000031"
+    version_id = "00000000-0000-0000-0000-000000000032"
+    with Session(engine) as session:
+        _published_skill(
+            session,
+            skill_id=skill_id,
+            first_version_id=version_id,
+            second_version_id="00000000-0000-0000-0000-000000000033",
+        )
+        service = ExecutionSnapshotService(
+            session,
+            AgentService(
+                (SkillBinding(skill_id=skill_id, version_id=version_id, name="forecast"),),
+                ["forecast"],
+            ),
+            ConversationRepository(),
+        )
+        service.create("run-existing")
+        session.get(Skill, skill_id).enabled = False
+
+        with pytest.raises(SkillUnavailableError, match="^skill_unavailable$"):
+            service.create("run-fresh")
+        with pytest.raises(SkillUnavailableError, match="^skill_unavailable$"):
+            service.create("run-existing")

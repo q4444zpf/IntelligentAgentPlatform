@@ -295,7 +295,7 @@ def snapshot_service():
         name="forecast",
         description="洪峰预测",
         display_version="1.2.0",
-        content="---\\nname: forecast\\ndescription: 洪峰预测\\n---\\n使用已绑定的预测工具。",
+        content="---\nname: forecast\ndescription: 洪峰预测\n---\n使用已绑定的预测工具。",
         files=[
             {"path": "SKILL.md", "size": 8, "sha256": "a" * 64},
             {"path": "references/rules.txt", "size": 5, "sha256": "b" * 64},
@@ -491,6 +491,23 @@ def test_team_snapshot_uses_only_captured_agent_definitions():
         assert actor.members[0].model.model == "member-v1"
         assert actor.members[0].tools[0].tool_id == "review.read"
         assert stored.payload.schema_version == "5"
+
+
+def test_team_snapshot_can_be_reused_when_captured_skills_are_name_only():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        team, published = published_team_version(session)
+        service = ExecutionSnapshotService(
+            session,
+            NoLiveAgentService(),
+            TeamConversationRepository(published.id, actor_id=team.id),
+        )
+
+        first = service.create("run-team")
+        second = service.create("run-team")
+
+    assert second == first
 
 
 @pytest.mark.parametrize(
