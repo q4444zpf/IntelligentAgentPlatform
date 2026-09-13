@@ -65,6 +65,7 @@ from .execution_snapshot import (
 )
 from .model_gateway import ModelGateway, ModelRuntimeError, ModelSelection
 from .run_tokens import RunTokenClaims
+from .script_lifecycle import finish_script_invocation
 from .runner_gateway_auth import RunnerGatewayError
 from .runner_gateway_schemas import (
     ArtifactCapabilityRegistrationRequest,
@@ -359,6 +360,7 @@ class RunnerGatewayService:
     ) -> ScriptExecutionCompletionResponse:
         repository = self._require_conversation_repository()
         self._verified_snapshot(run_id, claims)
+        self._lock_run(repository, run_id)
         requests = RunnerRequestStore(repository.session)
         action = "skill.script.complete"
         digest = _canonical_digest({"lease_id": lease_id, "request": request.model_dump(mode="json")})
@@ -374,25 +376,18 @@ class RunnerGatewayService:
             raise RunnerGatewayError(409, "skill_script_already_completed", "Skill 脚本租约已结束")
         if invocation.status != "running":
             raise RunnerGatewayError(409, "skill_script_lease_invalid", "Skill 脚本租约状态无效")
-        invocation.status = request.status
-        invocation.error_code = request.error_code
-        invocation.duration_ms = request.duration_ms
-        invocation.completed_at = datetime.now(UTC)
+        if not finish_script_invocation(
+            repository,
+            self.audit_recorder,
+            invocation,
+            status=request.status,
+            error_code=request.error_code,
+            duration_ms=request.duration_ms,
+        ):
+            if invocation.status == request.status:
+                return ScriptExecutionCompletionResponse(lease_id=lease_id, status=request.status)
+            raise RunnerGatewayError(409, "skill_script_already_completed", "Skill 脚本租约已结束")
         response = ScriptExecutionCompletionResponse(lease_id=lease_id, status=request.status)
-        repository.append_event(run_id, f"skill.script.{request.status}", {"lease_id": lease_id, "script_name": invocation.tool_id, "duration_ms": request.duration_ms, **({"error_code": request.error_code} if request.error_code else {})})
-        context_data = repository.get_run_execution_context(run_id)
-        if context_data is not None:
-            metadata = {"lease_id": lease_id, "script_name": invocation.tool_id, "duration_ms": request.duration_ms}
-            self.audit_recorder.record(repository.session, AuditRecordRequest(
-                unit_id=str(context_data["unit_id"]), project_id=str(context_data["project_id"]), user_id=str(context_data["user_id"]),
-                actor_roles=tuple(context_data["actor_roles"]), authorization_scope="project", event_scope="project",
-                category="runtime", source="sandbox", action=f"skill.script.{request.status}",
-                status="succeeded" if request.status == "completed" else request.status, risk_level="medium",
-                idempotency_key=f"skill-script:{lease_id}:{request.status}", occurred_at=datetime.now(UTC), run_id=run_id,
-                resource_type="skill_script", resource_id=lease_id, resource_name=invocation.tool_id,
-                summary="Skill script execution finished", metadata=metadata, allowed_metadata_keys=frozenset(metadata),
-                error_code=request.error_code, duration_ms=request.duration_ms,
-            ))
         requests.add(run_id=run_id, action=action, idempotency_key=idempotency_key, request_digest=digest, response_json=response.model_dump(mode="json"))
         repository.session.commit()
         return response

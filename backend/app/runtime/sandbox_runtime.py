@@ -194,8 +194,16 @@ class SandboxRuntime:
         self._event_sequence = 0
         self._owned_workspace: Path | None = None
 
+    def cancel(self) -> None:
+        self._explicitly_cancelled = True
+        event = getattr(self, "_cancel_event", None)
+        if event is not None:
+            event.set()
+
     def execute(self, request: RunExecutionRequest) -> RunExecutionResult:
-        self._cancel_event = Event()
+        cancel_event = Event()
+        self._cancel_event = cancel_event
+        self._explicitly_cancelled = False
         started_at = datetime.now(timezone.utc)
         started_monotonic = self.monotonic()
         execution_timeout_seconds = max(
@@ -203,14 +211,30 @@ class SandboxRuntime:
             (request.execution_deadline_at - started_at).total_seconds(),
         )
         monotonic_execution_deadline = started_monotonic + execution_timeout_seconds
-        Thread(
-            target=lambda: self._cancel_event.set()
-            if not self._cancel_event.wait(
-                execution_timeout_seconds
-            )
-            else None,
-            daemon=True,
-        ).start()
+        watcher_stopped = Event()
+
+        def watch_deadline() -> None:
+            if not watcher_stopped.wait(execution_timeout_seconds):
+                cancel_event.set()
+
+        watcher = Thread(target=watch_deadline, daemon=True)
+        watcher.start()
+        try:
+            result = self._execute(request, started_at, started_monotonic, monotonic_execution_deadline)
+            if self._explicitly_cancelled:
+                return RunExecutionResult(status="cancelled", error_code="sandbox_cancelled")
+            return result
+        finally:
+            watcher_stopped.set()
+            watcher.join()
+
+    def _execute(
+        self,
+        request: RunExecutionRequest,
+        started_at: datetime,
+        started_monotonic: float,
+        monotonic_execution_deadline: float,
+    ) -> RunExecutionResult:
         if (
             request.deadline_at <= started_at
             or monotonic_execution_deadline <= started_monotonic
@@ -374,6 +398,9 @@ class SandboxRuntime:
                     RuntimeState(run_id=request.run_id, messages=messages, status="running"),
                     metadata=metadata,
                 )
+            if self._explicitly_cancelled:
+                self._cleanup_owned_workspace()
+                return RunExecutionResult(status="cancelled", error_code="sandbox_cancelled")
             if not isinstance(actor, PublishedTeamSnapshot):
                 self._append_event("runner.completed", {"status": result.status})
             final_checkpoint_key = (
@@ -1722,6 +1749,9 @@ class SandboxRuntime:
         )
 
     def _fail(self, error_code: str) -> RunExecutionResult:
+        if self._explicitly_cancelled:
+            self._cleanup_owned_workspace()
+            return RunExecutionResult(status="cancelled", error_code="sandbox_cancelled")
         try:
             self.gateway.complete(
                 {"status": "failed", "error_code": error_code},

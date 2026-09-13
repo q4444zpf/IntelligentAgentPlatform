@@ -137,7 +137,10 @@ class ControlledContainerLauncher:
 
     def terminate(self, run_id: str) -> dict[str, Any]:
         container = self._require(run_id)
-        if hasattr(container, "kill"):
+        if hasattr(container, "stop"):
+            # Docker sends SIGTERM, then SIGKILL after this bounded grace period.
+            container.stop(timeout=1)
+        elif hasattr(container, "kill"):
             container.kill()
         return {"run_id": run_id, "status": "terminated"}
 
