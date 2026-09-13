@@ -120,6 +120,25 @@ class ToolInvocationResponse(BaseModel):
     value: dict[str, Any]
 
 
+class ScriptExecutionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    script_name: str = Field(min_length=1, max_length=128)
+    arguments: dict[str, Any]
+    tool_call_id: str = Field(min_length=1, max_length=128)
+    invocation_sequence: int = Field(ge=0)
+    member_agent_id: str | None = None
+
+
+class ScriptExecutionLeaseResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    lease_id: str
+    script_name: str
+    status: Literal["leased", "approval_required"]
+    approval_id: str | None = None
+
+
 class ArtifactProvenance(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

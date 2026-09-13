@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import time
 import tempfile
+import shutil
+import json
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -38,7 +40,11 @@ from .team_graph import (
     validate_team_plan,
 )
 from .gateway_model import GatewayChatModel, GatewayModelBudget, RunnerGatewayModelError
-from .gateway_tools import RunnerApprovalInterruption, build_gateway_tools
+from .gateway_tools import (
+    RunnerApprovalInterruption,
+    build_gateway_tools,
+    build_skill_script_tools,
+)
 from .langgraph_runtime import LangGraphRuntimeAdapter, RuntimeResult, RuntimeState
 from .runner_gateway_client import (
     RunnerGatewayBusinessError,
@@ -186,6 +192,7 @@ class SandboxRuntime:
         self.monotonic = monotonic
         self.workspace = workspace
         self._event_sequence = 0
+        self._owned_workspace: Path | None = None
 
     def execute(self, request: RunExecutionRequest) -> RunExecutionResult:
         started_at = datetime.now(timezone.utc)
@@ -215,11 +222,15 @@ class SandboxRuntime:
                 resource_workspace = self.workspace
                 if resource_workspace is None:
                     resource_workspace = Path(tempfile.mkdtemp(prefix=f"runner-{request.run_id}-"))
+                    self._owned_workspace = resource_workspace
                 try:
                     materializer = SkillResourceMaterializer()
                     materializer.materialize(snapshot.payload, self.gateway, resource_workspace)
+                    resource_index = materializer.resource_index
                 except SkillResourceMaterializationError:
                     return self._fail("skill_resource_invalid")
+            else:
+                resource_index = ()
 
             self._event_sequence = 0
             self._approval_checkpoint_key = None
@@ -237,6 +248,7 @@ class SandboxRuntime:
                 "snapshot_id": snapshot.snapshot_id,
                 "snapshot_digest": snapshot.digest,
                 "project_id": snapshot.payload.project_id,
+                "skill_resources": list(resource_index),
             }
             if isinstance(actor, PublishedTeamSnapshot):
                 monotonic_deadline = min(
@@ -312,6 +324,12 @@ class SandboxRuntime:
                         if context_prompt
                         else f"Skills: {skill_context}"
                     )
+                if resource_index:
+                    resource_context = (
+                        "\n\nAuthorized Skill resources (read-only): "
+                        + json.dumps(resource_index, ensure_ascii=False, sort_keys=True)
+                    )
+                    context_prompt = f"{context_prompt}{resource_context}"
                 model = GatewayChatModel(
                     self.gateway,
                     max_iterations=limits.max_iterations,
@@ -320,7 +338,15 @@ class SandboxRuntime:
                     max_output_bytes=limits.max_output_bytes,
                     budget_state=model_budget,
                 )
-                tools = build_gateway_tools(snapshot.payload, self.gateway)
+                tools = [
+                    *build_gateway_tools(snapshot.payload, self.gateway),
+                    *build_skill_script_tools(
+                        snapshot.payload,
+                        resource_workspace,
+                        client=self.gateway,
+                        cancellation_event=getattr(self, "_cancel_event", None),
+                    ),
+                ]
                 graph = self.agent_factory.build(
                     FactoryAgentSnapshot(
                         agent_id=actor.id, name=actor.name,
@@ -354,6 +380,7 @@ class SandboxRuntime:
             if isinstance(actor, PublishedTeamSnapshot):
                 self._ensure_team_deadline(monotonic_deadline)
             self.gateway.complete(completion, "completion:final")
+            self._cleanup_owned_workspace()
             return RunExecutionResult(
                 status="completed",
                 artifact_refs=tuple(completion["artifact_refs"]),
@@ -418,12 +445,14 @@ class SandboxRuntime:
                 },
                 "completion:approval",
             )
+            self._cleanup_owned_workspace()
             return RunExecutionResult(
                 status="interrupted",
                 error_code="approval_required",
                 checkpoint_key=checkpoint_key,
             )
         except _TeamCancelled:
+            self._cleanup_owned_workspace()
             return RunExecutionResult(
                 status="cancelled",
                 error_code="sandbox_cancelled",
@@ -1685,4 +1714,11 @@ class SandboxRuntime:
             )
         except Exception:  # noqa: BLE001
             logger.warning("runner completion report failed")
+        self._cleanup_owned_workspace()
         return RunExecutionResult(status="failed", error_code=error_code)
+
+    def _cleanup_owned_workspace(self) -> None:
+        workspace = self._owned_workspace
+        self._owned_workspace = None
+        if workspace is not None:
+            shutil.rmtree(workspace, ignore_errors=True)

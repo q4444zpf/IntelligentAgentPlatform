@@ -83,6 +83,8 @@ from .runner_gateway_schemas import (
     ModelToolCall,
     SnapshotResponse,
     SkillFileResponse,
+    ScriptExecutionLeaseResponse,
+    ScriptExecutionRequest,
     ToolInvocationRequest,
     ToolInvocationResponse,
 )
@@ -92,6 +94,7 @@ from .team_graph import (
     TeamSchedulerState,
     validate_team_plan,
 )
+from .skill_scripts import SkillScriptError, load_script_specs
 
 logger = logging.getLogger(__name__)
 
@@ -198,7 +201,11 @@ class RunnerGatewayService:
                 data = self._read_skill_package(skill)
                 packages = parse_skill_bundle(data)
                 package = next((item for item in packages if item.name == skill.name), None)
-                if package is None or (skill.package_digest and package.digest != skill.package_digest):
+                if (
+                    package is None
+                    or (skill.package_digest and package.digest != skill.package_digest)
+                    or (skill.version and package.display_version != skill.version)
+                ):
                     raise ValueError("package digest mismatch")
                 package_file = next((item for item in package.files if item.path == path), None)
                 if package_file is None:
@@ -222,6 +229,55 @@ class RunnerGatewayService:
             sha256=manifest.sha256,
             data_base64=base64.b64encode(data).decode("ascii"),
         )
+
+    def execute_script(
+        self,
+        run_id: str,
+        request: ScriptExecutionRequest,
+        claims: RunTokenClaims,
+        idempotency_key: str,
+    ) -> ScriptExecutionLeaseResponse:
+        repository = self._require_conversation_repository()
+        snapshot = self._verified_snapshot(run_id, claims)
+        run = self._lock_run(repository, run_id)
+        self._require_active_run(run)
+        found = None
+        for skill in snapshot.payload.skills:
+            if not skill.enabled:
+                continue
+            try:
+                specs = load_script_specs(skill)
+            except SkillScriptError as error:
+                raise RunnerGatewayError(409, "skill_script_invalid", "Skill 脚本声明无效") from error
+            found = next((spec for spec in specs if spec.tool_name == request.script_name or spec.name == request.script_name), None)
+            if found is not None:
+                break
+        if found is None:
+            raise RunnerGatewayError(403, "skill_script_not_authorized", "Skill 脚本当前不可用")
+        requests = RunnerRequestStore(repository.session)
+        action = "skill.script.execute"
+        request_digest = _canonical_digest({"snapshot_digest": claims.snapshot_digest, "request": request.model_dump(mode="json")})
+        replay = self._replay_or_conflict(requests, run_id, action, idempotency_key, request_digest)
+        if replay is not None:
+            return ScriptExecutionLeaseResponse.model_validate(replay)
+        if found.requires_approval:
+            approval_id = f"script-approval:{run_id}:{found.tool_name}"
+            raise RunnerGatewayError(409, "tool_approval_required", "该工具需要人工审批后才能执行", {"approval_id": approval_id})
+        lease = ScriptExecutionLeaseResponse(
+            lease_id=f"lease:{run_id}:{request.tool_call_id}",
+            script_name=found.tool_name,
+            status="leased",
+        )
+        requests.add(
+            run_id=run_id,
+            action=action,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+            response_json=lease.model_dump(mode="json"),
+        )
+        repository.append_event(run_id, "skill.script.started", {"script_name": found.tool_name, "tool_call_id": request.tool_call_id})
+        repository.session.commit()
+        return lease
 
     def _read_skill_package(self, skill) -> bytes:
         stored = StoredSkillPackage(

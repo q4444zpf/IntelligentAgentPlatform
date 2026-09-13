@@ -8,6 +8,7 @@ from typing import Any, Protocol
 from langchain_core.tools import StructuredTool
 
 from .execution_snapshot import ExecutionSnapshotPayload, SnapshotTool
+from .skill_scripts import SkillScriptError, execute_script, load_script_specs
 
 _SAFE_MESSAGES = {
     "tool_not_authorized": "该工具当前不可用。",
@@ -34,6 +35,8 @@ class RunnerApprovalInterruption(RuntimeError):
 
 class RunnerToolClient(Protocol):
     def invoke_tool(self, **request: Any) -> dict[str, Any]: ...
+
+    def execute_script(self, **request: Any) -> dict[str, Any]: ...
 
 
 class GatewayStructuredTool(StructuredTool):
@@ -66,6 +69,54 @@ def build_gateway_tools(
         and tool.source_available
         and (allowed_tool_ids is None or tool.tool_id in allowed_tool_ids)
     ]
+
+
+def build_skill_script_tools(
+    snapshot: ExecutionSnapshotPayload,
+    workspace,
+    *,
+    client: RunnerToolClient | None = None,
+    cancellation_event: Event | None = None,
+) -> list[StructuredTool]:
+    """Build declared Skill scripts as ordinary bounded model tools."""
+    tools: list[StructuredTool] = []
+    root = workspace / "skills" if workspace is not None else None
+    if root is None:
+        return tools
+    for skill in snapshot.skills:
+        if not skill.enabled:
+            continue
+        try:
+            specs = load_script_specs(skill)
+        except SkillScriptError:
+            continue
+        for spec in specs:
+            skill_root = root / skill.name
+
+            def invoke_script(_tool_call_id: str | None = None, _spec=spec, _root=skill_root, **arguments: Any):
+                try:
+                    if client is not None and hasattr(client, "execute_script"):
+                        client.execute_script(
+                            script_name=_spec.tool_name,
+                            arguments=arguments,
+                            tool_call_id=_tool_call_id or _spec.tool_name,
+                            invocation_sequence=0,
+                            idempotency_key=f"script:{_tool_call_id or _spec.tool_name}",
+                        )
+                    return execute_script(_spec, _root, arguments, cancel_event=cancellation_event)
+                except SkillScriptError as error:
+                    raise RunnerGatewayToolError("tool_execution_failed") from error
+
+            tools.append(
+                GatewayStructuredTool.from_function(
+                    func=invoke_script,
+                    name=spec.tool_name,
+                    description=f"Execute declared Skill script {spec.name}",
+                    args_schema=spec.input_schema,
+                    infer_schema=False,
+                )
+            )
+    return tools
 
 
 def _build_tool(

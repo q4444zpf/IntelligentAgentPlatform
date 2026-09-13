@@ -27,6 +27,8 @@ from .runner_gateway_schemas import (
     ModelInvocationResponse,
     SnapshotResponse,
     SkillFileResponse,
+    ScriptExecutionLeaseResponse,
+    ScriptExecutionRequest,
     ToolInvocationResponse,
 )
 
@@ -198,6 +200,31 @@ class RunnerGatewayClient:
             "tool-invocations",
             ToolInvocationResponse,
             json=request,
+            idempotency_key=idempotency_key,
+        ).model_dump(mode="json")
+
+    def execute_script(
+        self,
+        *,
+        script_name: str,
+        arguments: dict[str, Any],
+        tool_call_id: str,
+        invocation_sequence: int,
+        idempotency_key: str,
+        member_agent_id: str | None = None,
+    ) -> dict[str, Any]:
+        request = ScriptExecutionRequest(
+            script_name=script_name,
+            arguments=arguments,
+            tool_call_id=tool_call_id,
+            invocation_sequence=invocation_sequence,
+            member_agent_id=member_agent_id,
+        )
+        return self._request(
+            "POST",
+            "script-invocations",
+            ScriptExecutionLeaseResponse,
+            json=request.model_dump(mode="json", exclude_none=True),
             idempotency_key=idempotency_key,
         ).model_dump(mode="json")
 

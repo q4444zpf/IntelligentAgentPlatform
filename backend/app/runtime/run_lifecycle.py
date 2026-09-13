@@ -38,6 +38,8 @@ _RUNNER_ACTIONS = {
     "event.append",
     "artifact.create",
     "result.complete",
+    "skill.resource.read",
+    "skill.script.execute",
 }
 _TIMEOUT_CONTROL_ALLOWANCE_SECONDS = 1.0
 
