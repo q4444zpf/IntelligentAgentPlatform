@@ -20,7 +20,7 @@ Test evidence:
 
 - Added red tests covering embedded materialization and Gateway/client resource reads.
 - `git diff --check` passes for all Task 2 files.
-- Focused pytest command could not start: no Python interpreter is installed on the host, and Docker access is denied by the local daemon permission (`//./pipe/docker_engine`).
+- Focused pytest command (uv CPython 3.12, workspace temp directories) passes: `21 passed, 1 skipped` for `test_runner_gateway_skill_resources.py` and `test_skill_resources.py`. The one skip is Windows symlink creation unavailable without SeCreateSymbolicLinkPrivilege.
 
 Concerns:
 
