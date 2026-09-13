@@ -38,6 +38,7 @@ from app.audit.models import AuditEvent
 from app.conversations.models import AgentRun, RunEvent, ToolInvocation
 from tests.runtime.test_run_lifecycle import FakeTokens, SequenceRunner, make_coordinator
 from tests.runtime.test_script_terminal_lifecycle import script_factory
+from tests.runtime.test_team_graph import snapshot as team_snapshot
 
 
 SKILL_ID = "ce905a71-a715-48d1-8706-913d91c74932"
@@ -264,6 +265,73 @@ def test_resource_read_rechecks_authority_after_storage_read(skill_run, monkeypa
     assert len(audits) == 1
     assert audits[0].action == "skill.resource.failed"
     assert audits[0].error_code == expected_code
+
+
+@pytest.mark.parametrize("disable_when", ["before_read", "during_read"])
+def test_resource_read_denies_published_skill_disabled_after_snapshot(skill_run, monkeypatch, disable_when):
+    frozen_skill = skill_run.snapshot.payload.skills[0]
+    assert frozen_skill.enabled is True
+    assert frozen_skill.skill_id == SKILL_ID
+    assert frozen_skill.version_id is not None
+
+    def disable_skill():
+        with skill_run.env.tool_store.session_factory.begin() as session:
+            SkillRepository(session).set_enabled(
+                SkillScope("unit-1", "project-1"), SKILL_ID,
+                enabled=False, expected_revision=2,
+            )
+
+    if disable_when == "before_read":
+        disable_skill()
+    else:
+        original_read = skill_run.storage.read
+
+        def read_while_skill_is_disabled(stored):
+            data = original_read(stored)
+            disable_skill()
+            return data
+
+        monkeypatch.setattr(skill_run.storage, "read", read_while_skill_is_disabled)
+
+    with pytest.raises(RunnerGatewayBusinessError) as failure:
+        skill_run.gateway.read_skill_file("forecast", "references/rules.txt")
+    assert failure.value.code == "skill_unavailable"
+    assert skill_run.snapshots.get(skill_run.snapshot.snapshot_id).payload.skills[0] == frozen_skill
+    with skill_run.env.tool_store.session_factory() as session:
+        audits = list(session.scalars(select(AuditEvent).where(
+            AuditEvent.run_id == "run-1", AuditEvent.action.like("skill.resource.%"),
+        )))
+        assert len(audits) == 1
+        assert audits[0].action == "skill.resource.failed"
+        assert audits[0].error_code == "skill_unavailable"
+        assert audits[0].resource_name == "references/rules.txt"
+
+
+def test_resource_read_preserves_legacy_team_snapshot_without_project_skill_ids(skill_run, team_snapshot):
+    session = skill_run.env.session
+    snapshot = skill_run.snapshot
+    skill = snapshot.payload.skills[0].model_copy(update={
+        "skill_id": None, "version_id": None, "version": "2.7.0",
+    })
+    payload = snapshot.payload.model_copy(update={
+        "schema_version": "5", "actor": team_snapshot, "skills": (skill,),
+    })
+    row = session.get(RuntimeExecutionSnapshot, snapshot.snapshot_id)
+    row.payload = payload.model_dump(mode="json")
+    row.digest = hashlib.sha256(canonical_snapshot_bytes(payload)).hexdigest()
+    run = session.get(AgentRun, "run-1")
+    run.actor_type = "team"
+    run.actor_id = team_snapshot.id
+    session.commit()
+    skill_run.env.snapshots["run-1"] = skill_run.snapshots.get(snapshot.snapshot_id)
+    skill_run.gateway.token = skill_run.env.issue_token(actions={"skill.resource.read"})
+
+    response = skill_run.gateway.read_skill_file("forecast", "references/rules.txt")
+    assert response["data"] == b"add-one: normalized level equals input plus one"
+    with skill_run.env.tool_store.session_factory() as audit_session:
+        assert audit_session.scalar(select(AuditEvent.action).where(
+            AuditEvent.run_id == "run-1", AuditEvent.action.like("skill.resource.%"),
+        )) == "skill.resource.read"
 
 
 def test_rejected_resource_controls_remain_database_safe_and_auditable(skill_run):

@@ -61,6 +61,7 @@ from .execution_snapshot import (
     PublishedTeamSnapshot,
     SnapshotTeamMember,
     SnapshotIntegrityError,
+    SkillUnavailableError,
     StoredExecutionSnapshot,
     team_execution_deadline,
     verify_snapshot_digest,
@@ -175,6 +176,8 @@ class RunnerGatewayService:
         self, run_id: str, skill_name: str, path: str, claims: RunTokenClaims,
         *, reauthorize: Callable[[], RunTokenClaims],
     ) -> SkillFileResponse:
+        from app.skills.repository import SkillRepository, SkillScope
+
         repository = self._require_conversation_repository()
         read_error = None
         try:
@@ -185,9 +188,21 @@ class RunnerGatewayService:
         run = self._lock_run(repository, run_id)
         try:
             self._require_active_run(run)
-            self._verified_snapshot(run_id, reauthorize())
+            snapshot = self._verified_snapshot(run_id, reauthorize())
             if read_error is not None:
                 raise read_error
+            skill = next(item for item in snapshot.payload.skills if item.name == skill_name)
+            if skill.skill_id:
+                version = None
+                if skill.skill_id and skill.version_id:
+                    version = SkillRepository(repository.session).get_version(
+                        SkillScope(snapshot.payload.unit_id, snapshot.payload.project_id),
+                        skill.skill_id, skill.version_id, available_only=True,
+                    )
+                if version is None:
+                    raise RunnerGatewayError(
+                        403, SkillUnavailableError.code, "绑定技能当前不可用",
+                    )
         except RunnerGatewayError as error:
             self._record_skill_resource_audit(run_id, skill_name, path, error_code=error.code)
             repository.session.commit()

@@ -1,6 +1,6 @@
 # Task 5: Single-Agent Skill Tool/MCP Acceptance
 
-Status: **DONE_WITH_CONCERNS**. Implementation independently reviewed and final frozen-tree regression verified. Clean-tree full-backend and browser acceptance remain explicitly pending controller execution. Base commit: `95f1235`.
+Status: **DONE_WITH_CONCERNS** after formal fix round 1. Current Skill availability at resource-read time is now rechecked; the targeted RED/GREEN and corrected-tree 131-test regression passed, with independent rereview finding no actionable issue. Clean-tree full-backend and browser acceptance remain explicitly pending controller execution. Base commit: `95f1235`.
 
 ## Implementation and boundaries
 
@@ -161,7 +161,7 @@ Final post-review frozen-tree command, recorded before launch and completed with
 docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPYCACHEPREFIX=/tmp/task5-pycache -e DATABASE_URL=sqlite:///iap_skill_control_test_20260908_a -e PYTHONPATH=/workspace/backend -v "I:\智能体平台\IntelligentAgentPlatform:/workspace" -w /tmp intelligent-agent-platform-api:local python -m pytest --basetemp=/tmp/task5-runtime-skills-reviewed -p no:cacheprovider /workspace/backend/tests/runtime /workspace/backend/tests/skills /workspace/backend/tests/test_agent_skill_bindings.py /workspace/backend/tests/integration/test_single_agent_skill_tool_mcp_e2e.py -q --tb=short -ra
 ```
 
-Exit 0: **1020 passed, 0 skipped, 2 warnings, 938.86s (15:38)**. This is the final current-tree evidence for every runtime and Skill test, Agent binding API tests, and all 31 E2E cases. The two warnings are the existing Starlette BlockingPortal and Authlib jose deprecations; neither was suppressed. Earlier mixed-tree/incorrect-environment runs are diagnostic evidence only and do not replace this result.
+Exit 0: **1020 passed, 0 skipped, 2 warnings, 938.86s (15:38)**. This is evidence for implementation commit `760b83a7`, before formal fix round 1 below, covering every runtime and Skill test, Agent binding API tests, and all 31 then-existing E2E cases. It is not final-tree evidence for the availability fix. The two warnings are the existing Starlette BlockingPortal and Authlib jose deprecations; neither was suppressed. Earlier mixed-tree/incorrect-environment runs are diagnostic evidence only and do not replace this result.
 
 An environment-only diagnostic is already complete:
 
@@ -196,4 +196,31 @@ The explicit 20-file Task 5 allowlist was verified before commit. `git diff --ca
 - Run terminal and script terminal changes share existing row-lock ordering and conditional update. Durability occurs in the same transaction before revocation, and completion idempotency prevents duplicate terminal audit.
 - Availability preserves historical versions; “unpublished” does not mean “not currently pointed to by latest.”
 - No frontend production edits, database migration, knowledge/Embedding/GIS/Team protocol or Artifact changes are part of Task 5.
-- Current-tree runtime/Skill/binding/E2E verification is complete. Clean-commit full-backend regression, live PostgreSQL deployment checks and a new visible browser answer remain explicit controller-owned acceptance steps; neither old browser history nor the initial diagnostic full-backend run is claimed as final acceptance.
+- The complete runtime/Skill/binding/E2E verification above predates fix round 1. Clean-commit full-backend regression, live PostgreSQL deployment checks and a new visible browser answer remain explicit controller-owned acceptance steps; neither old browser history nor the initial diagnostic full-backend run is claimed as final acceptance.
+
+## Formal review fix round 1: current resource availability
+
+The controller reopened Task 5 because a published Skill disabled after snapshot creation still returned resource bytes. Frozen `SnapshotSkill.enabled` is not current project availability. This fix is confined to `RunnerGatewayService.read_skill_file_audited`; no script execution or old runtime path is changed.
+
+After external object I/O finishes, the existing Run row lock, active-run check, token reauthorization and refreshed snapshot/digest check still run. Before success audit or returning content, resources with a frozen `skill_id` now resolve the frozen `(skill_id, version_id)` through `SkillRepository.get_version(SkillScope(snapshot.unit_id, snapshot.project_id), ..., available_only=True)`. Missing or currently disabled identities produce HTTP 403 with existing `SkillUnavailableError.code` (`skill_unavailable`), persist `skill.resource.failed`, and return no bytes. There is no name lookup or latest-version fallback. Existing historical version availability rules remain owned by the repository.
+
+The tests disable the real Skill using `SkillRepository.set_enabled` in an independent transaction, once before the request and once inside the storage read callback. Both assert frozen snapshot identity is unchanged and query the committed failure audit from a separate session. Failure audit identity remains the bounded public Skill name and relative resource path, with original path SHA-256; no object key, archive reference or storage identity is added to errors or audit metadata.
+
+The independent fix review found my initial extra `schema_version == "5"` guard incorrectly targeted legacy Team snapshots, not single-agent snapshots. A real schema-5 Team actor with no project Skill IDs reproduced this regression. The unnecessary schema guard was removed; the compatibility case now verifies returned bytes and persisted success audit. The final independent read-only rereview reports this P2 resolved and no new actionable findings. No Team protocol or legacy resolution behavior is added or migrated.
+
+All commands use the corrected-environment Docker prefix above with `/tmp` working directory. Exact new arguments and observed results:
+
+| Arguments | Exit / evidence |
+| --- | --- |
+| `/workspace/backend/tests/integration/test_single_agent_skill_tool_mcp_e2e.py -k disabled_after_snapshot --basetemp=/tmp/task5-fix1-availability-red -p no:cacheprovider -q --tb=short -ra` | Exit 1: 2 failed, 31 deselected, 1 warning, 15.69s. Both before-read and during-read disable cases incorrectly returned bytes: `DID NOT RAISE RunnerGatewayBusinessError`. |
+| `/workspace/backend/tests/integration/test_single_agent_skill_tool_mcp_e2e.py -k disabled_after_snapshot --basetemp=/tmp/task5-fix1-availability-green -p no:cacheprovider -q --tb=short -ra` | Exit 0: 2 passed, 31 deselected, 1 warning, 12.27s. Intermediate implementation before Team compatibility correction. |
+| `/workspace/backend/tests/integration/test_single_agent_skill_tool_mcp_e2e.py -k preserves_legacy_team --basetemp=/tmp/task5-fix1-team-compat-red -p no:cacheprovider -q --tb=short -ra` | Exit 1: 1 failed, 33 deselected, 1 warning, 14.36s. The erroneous schema-5 check rejects the existing Team resource read. |
+| `/workspace/backend/tests/integration/test_single_agent_skill_tool_mcp_e2e.py -k "disabled_after_snapshot or preserves_legacy_team" --basetemp=/tmp/task5-fix1-availability-compat-green -p no:cacheprovider -q --tb=short -ra` | Exit 0: 3 passed, 31 deselected, 1 warning, 13.21s. Final code tree, both availability denies and Team compatibility pass. |
+
+The first eight-file combination (`--basetemp=/tmp/task5-fix1-availability-regression`) exited 0 with 130 passed, 1 warning, 147.23s, but started before the compatibility correction. It is intermediate evidence only. The final corrected-tree combination was launched with no subsequent production/test edits:
+
+```powershell
+docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPYCACHEPREFIX=/tmp/task5-pycache -e DATABASE_URL=sqlite:///iap_skill_control_test_20260908_a -e PYTHONPATH=/workspace/backend -v "I:\智能体平台\IntelligentAgentPlatform:/workspace" -w /tmp intelligent-agent-platform-api:local python -m pytest /workspace/backend/tests/runtime/test_execution_snapshot.py /workspace/backend/tests/runtime/test_runner_gateway_skill_resources.py /workspace/backend/tests/runtime/test_script_terminal_lifecycle.py /workspace/backend/tests/runtime/test_run_lifecycle.py /workspace/backend/tests/integration/test_single_agent_skill_tool_mcp_e2e.py /workspace/backend/tests/skills/test_project_availability.py /workspace/backend/tests/runtime/test_agent_skill_bindings.py /workspace/backend/tests/test_agent_skill_bindings.py --basetemp=/tmp/task5-fix1-reviewed-regression -p no:cacheprovider -q --tb=short -ra
+```
+
+Final corrected-tree combination: **exit 0, 131 passed, 0 skipped, 1 warning, 147.50s (2:27)**. This includes all 34 current integration cases, snapshot/resource-route/terminal coverage and Task 4 availability/binding tests. The warning is the existing Starlette BlockingPortal deprecation; it was not suppressed. This round touches only the Gateway service, the owned integration test and this report; the shared user resource test, `db/base.py`, control migration 28 and other user changes remain unstaged and untouched. Full final-commit backend and new-image browser acceptance remain controller-owned and unresolved.
