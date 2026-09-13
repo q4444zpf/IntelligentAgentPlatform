@@ -34,6 +34,8 @@ class FakeAgentService:
         model="deepseek-chat",
         missing=False,
         tool_ids=None,
+        skill_names=None,
+        skill_bindings=None,
     ):
         self.agent = SimpleNamespace(
             enabled=enabled,
@@ -42,6 +44,8 @@ class FakeAgentService:
             provider_id=provider_id,
             model=model,
             tool_ids=tool_ids or [],
+            skill_names=skill_names or [],
+            skill_bindings=skill_bindings or [],
         )
         self.missing = missing
 
@@ -284,7 +288,9 @@ def test_non_sandbox_run_includes_the_bound_skill_snapshot_body_before_history()
 
     session, run_id = build_queued_run()
     gateway = CapturingGateway()
-    agent_service = FakeAgentService()
+    agent_service = FakeAgentService(
+        skill_names=["forecast"], skill_bindings=[object()]
+    )
 
     PlatformAgentHarness(
         ConversationRepository(session),
@@ -300,6 +306,25 @@ def test_non_sandbox_run_includes_the_bound_skill_snapshot_body_before_history()
         and "Use the frozen forecast method." in message["content"]
         for message in messages[:-1]
     )
+    session.close()
+
+
+def test_bound_agent_without_snapshot_service_fails_before_model_invocation():
+    session, run_id = build_queued_run()
+    repository = ConversationRepository(session)
+
+    PlatformAgentHarness(
+        repository,
+        SuccessfulGateway(),
+        FakeAgentService(skill_names=["forecast"], skill_bindings=[object()]),
+    ).execute(run_id)
+
+    assert repository.get_run_by_id(run_id).status == "failed"
+    error = next(
+        event for event in repository.list_events(run_id, 0)
+        if event.event_type == "run.error"
+    )
+    assert error.payload["code"] == "skill_unavailable"
     session.close()
 
 

@@ -1,13 +1,14 @@
 import hashlib
 import json
 from datetime import UTC, datetime
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine, update
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
-from app.agents.schemas import AgentInfo
+from app.agents.schemas import AgentInfo, SkillBinding
 from app.db.base import Base
 from app.collaboration.repository import TeamRepository
 from app.runtime.execution_snapshot import (
@@ -26,34 +27,17 @@ from app.runtime.execution_snapshot import (
     canonical_snapshot_bytes,
     verify_snapshot_digest,
 )
+from app.skills.models import Skill, SkillVersion
 
 
 class StaticAgentService:
     def __init__(self, agent: AgentInfo, tools, knowledge_sources=()):
         self.agent = agent
         self.tool_service = StaticToolService(tools, knowledge_sources)
-        self.skill_service = StaticSkillService()
 
     def get(self, agent_id: str) -> AgentInfo:
         assert agent_id == self.agent.id
         return self.agent
-
-
-class StaticSkillService:
-    def get(self, name: str):
-        assert name == "forecast"
-        return type("Skill", (), {
-            "name": name,
-            "description": "洪峰预测",
-            "version": "1.2.0",
-            "content": "---\\nname: forecast\\ndescription: 洪峰预测\\n---\\n使用已绑定的预测工具。",
-            "source": "created",
-            "enabled": True,
-            "tags": ["water"],
-            "metadata": {"runtime": "text"},
-            "file_count": 1,
-            "updated_at": datetime(2026, 8, 14, 9, 0, tzinfo=UTC),
-        })()
 
 
 class StaticToolService:
@@ -289,6 +273,42 @@ def snapshot_service():
         poolclass=StaticPool,
     )
     Base.metadata.create_all(engine)
+    session = Session(engine)
+    skill_id = str(uuid4())
+    version_id = str(uuid4())
+    session.add(Skill(
+        id=skill_id,
+        unit_id="unit-1",
+        project_id="project-1",
+        name="forecast",
+        created_by="user-1",
+    ))
+    session.add(SkillVersion(
+        id=version_id,
+        skill_id=skill_id,
+        version=1,
+        source_revision=1,
+        idempotency_key="forecast-v1",
+        request_digest="a" * 64,
+        published_by="user-1",
+        published_at=datetime(2026, 8, 14, 9, 0, tzinfo=UTC),
+        name="forecast",
+        description="洪峰预测",
+        display_version="1.2.0",
+        content="---\\nname: forecast\\ndescription: 洪峰预测\\n---\\n使用已绑定的预测工具。",
+        files=[
+            {"path": "SKILL.md", "size": 8, "sha256": "a" * 64},
+            {"path": "references/rules.txt", "size": 5, "sha256": "b" * 64},
+        ],
+        package_digest="c" * 64,
+        object_key=f"unit-1/project-1/{skill_id}/archive.zip",
+        archive_sha256="d" * 64,
+        size_bytes=13,
+    ))
+    session.flush()
+    skill = session.get(Skill, skill_id)
+    skill.published_version_id = version_id
+    session.commit()
     agent = AgentInfo(
         id="agent-1",
         name="Water Agent",
@@ -301,6 +321,9 @@ def snapshot_service():
         context_prompt="Use run context.",
         approval_policy="control_commands",
         skill_names=["forecast"],
+        skill_bindings=[SkillBinding(
+            skill_id=skill_id, version_id=version_id, name="forecast"
+        )],
         tool_ids=["mcp.water.level"],
         knowledge_source_ids=["knowledge.reservoir.manual"],
         enabled=True,
@@ -313,7 +336,7 @@ def snapshot_service():
         updated_at=datetime(2026, 8, 14, 9, 0, tzinfo=UTC),
     )
     yield ExecutionSnapshotService(
-        Session(engine),
+        session,
         StaticAgentService(agent, [Tool()], [KnowledgeTool()]),
         StaticConversationRepository(),
         clock=lambda: datetime(2026, 8, 14, 10, 1, tzinfo=UTC),
@@ -368,18 +391,13 @@ def test_snapshot_digest_changes_when_skill_resource_digest_changes(snapshot_ser
 
 
 def test_snapshot_captures_skill_manifest_and_attachments(snapshot_service):
-    snapshot_service.agent_service.skill_service.read_files = lambda name: (
-        ("SKILL.md", b"manifest"),
-        ("references/rules.txt", b"rules"),
-    )
-
     stored = snapshot_service.create("run-1")
 
     assert [item.path for item in stored.payload.skills[0].files] == [
         "SKILL.md",
         "references/rules.txt",
     ]
-    assert stored.payload.skills[0].files[1].size == 5
+    assert stored.payload.skills[0].files[1].sha256 == "b" * 64
 
 
 def test_snapshot_contains_no_provider_or_mcp_secrets(snapshot_service):
@@ -439,34 +457,12 @@ def test_build_skill_context_returns_literal_messages_body_and_resource_index():
     )
 
 
-@pytest.mark.parametrize("availability", ["missing", "unpublished", "disabled"])
-def test_snapshot_rejects_unavailable_bound_skills_with_stable_code(
-    snapshot_service, availability
+def test_snapshot_rejects_missing_bound_skill_version_with_stable_code(
+    snapshot_service,
 ):
-    class UnavailableSkillService:
-        def get(self, name):
-            assert name == "forecast"
-            if availability == "missing":
-                from app.skills.service import SkillNotFoundError
-
-                raise SkillNotFoundError(name)
-            return type("Skill", (), {
-                "name": name,
-                "description": "Forecast guidance",
-                "version": "1",
-                "content": "Use forecast guidance.",
-                "source": "published",
-                "enabled": availability != "disabled",
-                "published": availability != "unpublished",
-                "tags": [],
-                "metadata": {},
-                "file_count": 1,
-                "updated_at": datetime(2026, 8, 14, 9, 0, tzinfo=UTC),
-                "skill_id": "skill-1",
-                "version_id": "version-1",
-            })()
-
-    snapshot_service.agent_service.skill_service = UnavailableSkillService()
+    snapshot_service.agent_service.agent.skill_bindings = [SkillBinding(
+        skill_id=str(uuid4()), version_id=str(uuid4()), name="forecast"
+    )]
 
     with pytest.raises(SnapshotIntegrityError, match="^skill_unavailable$"):
         snapshot_service.create("run-1")

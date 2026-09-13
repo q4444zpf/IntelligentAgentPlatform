@@ -223,17 +223,10 @@ class ThreadRunDispatcher(RunDispatcher):
                 )
             )
             harness_tool_service = tool_service
-            execution_snapshot_service = None
             try:
                 preview = agent_service.get(repository.get_run_by_id(run_id).actor_id)
                 if not getattr(preview, "tool_ids", None):
                     harness_tool_service = None
-                if hasattr(preview, "skill_names"):
-                    execution_snapshot_service = ExecutionSnapshotService(
-                        session,
-                        agent_service,
-                        repository,
-                    )
             except Exception:  # noqa: BLE001, S110
                 pass
             PlatformAgentHarness(
@@ -249,7 +242,11 @@ class ThreadRunDispatcher(RunDispatcher):
                 ),
                 artifact_storage=self.artifact_storage_factory(),
                 checkpoint_store=CheckpointStore(session),
-                execution_snapshot_service=execution_snapshot_service,
+                execution_snapshot_service=ExecutionSnapshotService(
+                    session,
+                    agent_service,
+                    repository,
+                ),
             ).execute(run_id)
 
     def _resume_approval(self, approval_id: str) -> None:

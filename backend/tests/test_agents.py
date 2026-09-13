@@ -1,4 +1,7 @@
 import pytest
+from datetime import UTC, datetime
+from uuid import uuid4
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -11,8 +14,7 @@ from app.agents.service import AgentConflictError, BUILTIN_AGENT_ID, AgentServic
 from app.agents.store import AgentConcurrentUpdateError, DEFAULT_SETTING_KEY, AgentStore
 from app.db.base import Base
 from app.db.platform_models import ManagedAgentRecord, PlatformSettingRecord, RegisteredToolRecord
-from app.skills.schemas import SkillCreateRequest
-from app.skills.service import SkillService
+from app.skills.models import Skill, SkillVersion
 
 AUTH_HEADERS = {
     "X-Unit-ID": "unit-1",
@@ -104,28 +106,40 @@ class AtomicOperationSpyStore(AgentStore):
 
 @pytest.fixture
 def client(tmp_path):
-    skill_service = SkillService(tmp_path / "skills")
-    skill_service.create(
-        SkillCreateRequest(
-            name="flood-forecast",
-            description="洪水预报",
-            content="""---
-name: flood-forecast
-description: 洪水预报
-version: "1.0"
----
-# 洪水预报
-""",
-            tags=["水文"],
-        )
-    )
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'agents.db'}")
     Base.metadata.create_all(engine)
-    store = AgentStore(
-        sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
-    )
+    sessions = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    skill_id = str(uuid4())
+    version_id = str(uuid4())
+    with sessions.begin() as session:
+        session.add(Skill(
+            id=skill_id, unit_id="unit-1", project_id="p1",
+            name="flood-forecast", created_by="u1",
+        ))
+        session.add(SkillVersion(
+            id=version_id,
+            skill_id=skill_id,
+            version=1,
+            source_revision=1,
+            idempotency_key="flood-forecast-v1",
+            request_digest="a" * 64,
+            published_by="u1",
+            published_at=datetime(2026, 9, 14, tzinfo=UTC),
+            name="flood-forecast",
+            description="洪水预报",
+            display_version="1.0",
+            content="# 洪水预报\n",
+            files=[],
+            package_digest="b" * 64,
+            object_key=f"unit-1/p1/{skill_id}/archive.zip",
+            archive_sha256="c" * 64,
+            size_bytes=1,
+        ))
+        session.flush()
+        session.get(Skill, skill_id).published_version_id = version_id
+    store = AgentStore(sessions)
     service = AgentService(
-        store, skill_service=skill_service, workspace_root=tmp_path / "agent-workspaces"
+        store, workspace_root=tmp_path / "agent-workspaces"
     )
     app = FastAPI()
     app.state.allow_dev_identity = True

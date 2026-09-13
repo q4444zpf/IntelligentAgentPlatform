@@ -61,7 +61,13 @@ class PlatformAgentHarness:
             return
 
         execution_snapshot = None
-        if self.execution_snapshot_service is not None:
+        requires_skill_snapshot = bool(
+            getattr(agent, "skill_bindings", ()) or getattr(agent, "skill_names", ())
+        )
+        if requires_skill_snapshot and self.execution_snapshot_service is None:
+            self._fail(run_id, "skill_unavailable", "绑定技能不可用，请检查智能体配置")
+            return
+        if self.execution_snapshot_service is not None and requires_skill_snapshot:
             try:
                 execution_snapshot = self.execution_snapshot_service.create(run_id)
             except SkillUnavailableError:

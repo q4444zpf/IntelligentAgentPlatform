@@ -1,6 +1,7 @@
 import hashlib
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from uuid import uuid4
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -40,6 +41,8 @@ from app.runtime.execution_snapshot import (
     SnapshotTeamMember,
     canonical_snapshot_bytes,
 )
+from app.agents.schemas import SkillBinding
+from app.skills.models import Skill, SkillVersion
 from app.runtime.model_gateway import ModelResult, ModelSelection
 from app.tools.builtins import BUILTIN_TOOL_DEFINITIONS
 from app.tools.schemas import ToolCall, ToolExecutionResult, ToolRuntimeError
@@ -71,6 +74,35 @@ class RecordingGateway:
     ) -> ModelResult:
         self.calls.append((messages, selection))
         return ModelResult(content="后台研判完成")
+
+
+class BoundSkillAgentService:
+    def __init__(self, binding):
+        self.binding = binding
+        self.tool_service = SimpleNamespace(
+            resolve_bindable=lambda tool_ids: [],
+            resolve_knowledge_sources=lambda tool_ids: [],
+        )
+
+    def get(self, agent_id: str):
+        assert agent_id == "flood"
+        return SimpleNamespace(
+            id="flood",
+            name="Forecast agent",
+            description="",
+            runtime_form="common",
+            language="zh-CN",
+            system_prompt="system",
+            context_prompt="context",
+            approval_policy="never",
+            provider_id="deepseek",
+            model="deepseek-chat",
+            tool_ids=[],
+            knowledge_source_ids=[],
+            skill_names=["forecast"],
+            skill_bindings=[self.binding],
+            enabled=True,
+        )
 
 
 def test_thread_dispatcher_does_not_enable_artifact_storage_by_default(monkeypatch):
@@ -143,6 +175,87 @@ def test_dispatches_run_with_an_independent_database_session(tmp_path):
         [{"role": "user", "content": "分析洪峰"}],
         ModelSelection("deepseek", "deepseek-chat"),
     )]
+
+
+def test_dispatcher_uses_bound_skill_snapshot_before_model_invocation(tmp_path):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'bound-skill.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, class_=Session)
+    skill_id = str(uuid4())
+    version_id = str(uuid4())
+    with factory.begin() as session:
+        session.add(Skill(
+            id=skill_id,
+            unit_id="unit-1",
+            project_id="p1",
+            name="forecast",
+            created_by="u1",
+        ))
+        session.add(SkillVersion(
+            id=version_id,
+            skill_id=skill_id,
+            version=1,
+            source_revision=1,
+            idempotency_key="forecast-v1",
+            request_digest="a" * 64,
+            published_by="u1",
+            name="forecast",
+            description="Forecast",
+            display_version="1.0",
+            content="Use the frozen forecast body.",
+            files=[],
+            package_digest="b" * 64,
+            object_key=f"unit-1/p1/{skill_id}/archive.zip",
+            archive_sha256="c" * 64,
+            size_bytes=1,
+        ))
+        session.flush()
+        session.get(Skill, skill_id).published_version_id = version_id
+        conversation = Conversation(
+            unit_id="unit-1", project_id="p1", owner_id="u1", title="Forecast"
+        )
+        session.add(conversation)
+        session.flush()
+        message = Message(
+            conversation_id=conversation.id, role="user", content="forecast"
+        )
+        session.add(message)
+        session.flush()
+        run = AgentRun(
+            conversation_id=conversation.id,
+            trigger_message_id=message.id,
+            actor_type="agent",
+            actor_id="flood",
+            status="queued",
+        )
+        session.add(run)
+        session.flush()
+        session.add(RunEvent(
+            run_id=run.id, sequence=1, event_type="run.status", payload={"status": "queued"}
+        ))
+        run_id = run.id
+
+    gateway = RecordingGateway()
+    dispatcher = ThreadRunDispatcher(
+        session_factory=factory,
+        gateway_factory=lambda: gateway,
+        agent_service_factory=lambda: BoundSkillAgentService(SkillBinding(
+            skill_id=skill_id, version_id=version_id, name="forecast"
+        )),
+        max_workers=1,
+    )
+    dispatcher.dispatch(run_id)
+    dispatcher.shutdown()
+
+    with factory() as session:
+        stored = session.query(RuntimeExecutionSnapshot).filter_by(run_id=run_id).one()
+        assert stored.payload["skills"][0]["version_id"] == version_id
+        assert session.get(AgentRun, run_id).status == "completed"
+    assert any(
+        "Use the frozen forecast body." in message["content"]
+        for message in gateway.calls[0][0]
+        if message["role"] == "system"
+    )
 
 
 def test_sandbox_dispatcher_runs_coordinator_in_background():

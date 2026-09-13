@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -7,6 +8,24 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 RuntimeForm = Literal["web", "desktop", "common"]
 ApprovalPolicy = Literal["never", "control_commands", "always"]
 AvailabilityScope = Literal["project", "common"]
+
+
+class SkillBinding(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    skill_id: str
+    version_id: str
+    name: str = ""
+
+    @field_validator("skill_id", "version_id")
+    @classmethod
+    def require_canonical_uuid(cls, value: str) -> str:
+        try:
+            if str(UUID(value)) != value:
+                raise ValueError
+        except (TypeError, ValueError) as error:
+            raise ValueError("Skill binding identity must be a canonical UUID") from error
+        return value
 
 
 class AgentConfig(BaseModel):
@@ -23,6 +42,7 @@ class AgentConfig(BaseModel):
     context_prompt: str = Field(default="", max_length=20_000)
     approval_policy: ApprovalPolicy = "control_commands"
     skill_names: list[str] = Field(default_factory=list, max_length=100)
+    skill_bindings: list[SkillBinding] = Field(default_factory=list, max_length=100)
     tool_ids: list[str] = Field(default_factory=list, max_length=100)
     knowledge_source_ids: list[str] = Field(default_factory=list, max_length=100)
     enabled: bool = True

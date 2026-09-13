@@ -330,6 +330,23 @@ class SkillRepository:
             )
         )
 
+    def get_published_by_name(
+        self,
+        scope: SkillScope,
+        name: str,
+        *,
+        owner_ids: frozenset[str] | None = None,
+    ) -> SkillVersion | None:
+        return self._session.scalar(
+            select(SkillVersion)
+            .join(Skill, Skill.id == SkillVersion.skill_id)
+            .where(
+                *self._conditions(scope, owner_ids=owner_ids),
+                Skill.name == name,
+                Skill.published_version_id == SkillVersion.id,
+            )
+        )
+
     def _conditions(
         self,
         scope: SkillScope,

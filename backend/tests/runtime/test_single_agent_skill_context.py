@@ -22,6 +22,7 @@ class Gateway:
         self.snapshot = snapshot
         self.tool_calls = []
         self.completions = []
+        self.model_requests = []
 
     def get_snapshot(self):
         return self.snapshot
@@ -45,38 +46,26 @@ class Gateway:
 
     def invoke_tool(self, **request):
         self.tool_calls.append(request)
+        return {"water_level": 3.2}
+
+    def invoke_model(self, request, idempotency_key):
+        self.model_requests.append((request, idempotency_key))
+        if len(self.model_requests) == 1:
+            return {
+                "content": None,
+                "tool_calls": [{
+                    "id": "model-call-1",
+                    "name": "water.query",
+                    "arguments": {},
+                }],
+            }
+        return {"content": "final answer", "tool_calls": []}
 
     def list_artifacts(self):
         return []
 
 
 def test_sandbox_skill_context_exposes_gateway_tools_and_returns_final_answer():
-    class ToolCallingFactory:
-        def __init__(self):
-            self.snapshot = None
-            self.tools = []
-
-        def build(self, snapshot, **kwargs):
-            self.snapshot = snapshot
-            self.tools = kwargs["tools"]
-            selected_tool = next(
-                tool for tool in self.tools if tool.name == "water.query"
-            )
-
-            class ToolCallingGraph:
-                def invoke(self, state, *, config=None):
-                    selected_tool.run({}, tool_call_id="model-call-1")
-                    return {
-                        **state,
-                        "messages": [
-                            *state["messages"],
-                            {"role": "assistant", "content": "final answer"},
-                        ],
-                        "status": "completed",
-                    }
-
-            return ToolCallingGraph()
-
     payload = ExecutionSnapshotPayload(
         schema_version="3",
         snapshot_id="snapshot-1",
@@ -150,14 +139,24 @@ def test_sandbox_skill_context_exposes_gateway_tools_and_returns_final_answer():
         run_token="secret-token",
     )
     gateway = Gateway(snapshot)
-    factory = ToolCallingFactory()
 
-    result = SandboxRuntime(gateway, agent_factory=factory).execute(request)
+    result = SandboxRuntime(gateway).execute(request)
 
     assert result.status == "completed"
-    assert "Use the bound forecast tool before answering." in factory.snapshot.context_prompt
-    assert {tool.name for tool in factory.tools} == {
-        "water.query", "system.get_current_time",
+    first_request, first_key = gateway.model_requests[0]
+    assert first_key == "model-0"
+    assert any(
+        "Use the bound forecast tool before answering." in message["content"]
+        for message in first_request["messages"]
+        if message["role"] == "system"
+    )
+    model_tools = {tool["tool_id"]: tool for tool in first_request["tools"]}
+    assert {"water.query", "system.get_current_time"} <= set(model_tools)
+    assert model_tools["water.query"]["input_schema"] == {
+        "type": "object", "properties": {}
+    }
+    assert model_tools["system.get_current_time"]["input_schema"] == {
+        "type": "object", "properties": {}
     }
     assert gateway.tool_calls == [{
         "tool_id": "water.query",

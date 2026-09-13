@@ -17,7 +17,8 @@ from sqlalchemy import JSON, DateTime, Index, String, select
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from app.db.base import Base
-from app.skills.service import SkillNotFoundError
+from app.agents.schemas import SkillBinding
+from app.skills.repository import SkillRepository, SkillScope
 
 
 class SnapshotIntegrityError(ValueError):
@@ -572,23 +573,64 @@ class ExecutionSnapshotService:
                 ) from error
         return SnapshotSkill(**fields)
 
-    def _resolve_bound_skill(self, name: str) -> SnapshotSkill:
-        skill_service = getattr(self.agent_service, "skill_service", None)
-        getter = getattr(skill_service, "get", None)
-        if not callable(getter):
+    def _resolve_bound_skill(
+        self,
+        binding: SkillBinding,
+        context: dict[str, object],
+    ) -> SnapshotSkill:
+        version = SkillRepository(self.session).get_version(
+            SkillScope(str(context["unit_id"]), str(context["project_id"])),
+            binding.skill_id,
+            binding.version_id,
+        )
+        if version is None:
             raise SkillUnavailableError()
         try:
-            skill = getter(name)
-        except SkillNotFoundError as error:
+            files = tuple(
+                SnapshotSkillFile(
+                    path=item["path"],
+                    size=item["size"],
+                    sha256=item["sha256"],
+                )
+                for item in version.files
+            )
+        except (KeyError, TypeError, ValueError) as error:
             raise SkillUnavailableError() from error
-        if (
-            skill is None
-            or getattr(skill, "name", None) != name
-            or getattr(skill, "published", True) is not True
-            or getattr(skill, "enabled", False) is not True
-        ):
-            raise SkillUnavailableError()
-        return self._snapshot_skill(name, skill)
+        return SnapshotSkill(
+            name=version.name,
+            description=version.description,
+            version=str(version.version),
+            content=version.content,
+            source="published",
+            enabled=True,
+            file_count=len(files),
+            updated_at=version.published_at,
+            skill_id=binding.skill_id,
+            version_id=binding.version_id,
+            package_digest=version.package_digest,
+            object_key=version.object_key,
+            archive_sha256=version.archive_sha256,
+            size_bytes=version.size_bytes,
+            files=files,
+        )
+
+    def _validate_snapshot_skill_versions(
+        self,
+        skills: tuple[SnapshotSkill, ...],
+        context: dict[str, object],
+    ) -> None:
+        repository = SkillRepository(self.session)
+        scope = SkillScope(str(context["unit_id"]), str(context["project_id"]))
+        for skill in skills:
+            if not skill.skill_id or not skill.version_id:
+                raise SkillUnavailableError()
+            version = repository.get_version(scope, skill.skill_id, skill.version_id)
+            if (
+                version is None
+                or version.package_digest != skill.package_digest
+                or version.content != skill.content
+            ):
+                raise SkillUnavailableError()
 
     @classmethod
     def _team_member_snapshot(cls, member: dict) -> SnapshotTeamMember:
@@ -721,7 +763,12 @@ class ExecutionSnapshotService:
             )
         )
         if existing is not None:
-            return self._stored(existing)
+            stored = self._stored(existing)
+            context = self.conversation_repository.get_run_execution_context(run_id)
+            if context is None:
+                raise KeyError(run_id)
+            self._validate_snapshot_skill_versions(stored.payload.skills, context)
+            return stored
 
         context = self.conversation_repository.get_run_execution_context(run_id)
         run = self.conversation_repository.get_run_by_id(run_id)
@@ -847,8 +894,13 @@ class ExecutionSnapshotService:
                 provider_id=agent.provider_id,
                 model=agent.model,
             )
+            bindings = tuple(getattr(agent, "skill_bindings", ()))
+            if agent.skill_names and not bindings:
+                raise SkillUnavailableError()
+            if bindings and {binding.name for binding in bindings if binding.name} != set(agent.skill_names):
+                raise SkillUnavailableError()
             snapshot_skills = tuple(
-                self._resolve_bound_skill(name) for name in agent.skill_names
+                self._resolve_bound_skill(binding, context) for binding in bindings
             )
             snapshot_knowledge_sources = tuple(
                 SnapshotKnowledgeSource(
