@@ -67,7 +67,10 @@ class SkillResourceMaterializer:
         backup: Path | None = None
         index: list[dict[str, Any]] = []
         try:
-            enabled = [skill for skill in snapshot.skills if skill.enabled]
+            enabled = sorted(
+                (skill for skill in snapshot.skills if skill.enabled),
+                key=lambda item: item.name.casefold(),
+            )
             names = [_safe_skill_name(skill.name).casefold() for skill in enabled]
             if len(names) != len(set(names)):
                 raise SkillResourceMaterializationError("duplicate Skill names")
@@ -82,7 +85,7 @@ class SkillResourceMaterializer:
                 skill_stage = stage / name
                 skill_stage.mkdir()
                 seen: set[str] = set()
-                for manifest in skill.files:
+                for manifest in sorted(skill.files, key=lambda item: item.path):
                     path = _safe_path(manifest.path)
                     folded = path.as_posix().casefold()
                     if folded in seen:
