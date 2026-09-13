@@ -485,7 +485,11 @@ class ExecutionSnapshotService:
                         path=path,
                         size=len(content),
                         sha256=hashlib.sha256(content).hexdigest(),
-                        content_base64=base64.b64encode(content).decode("ascii"),
+                        content_base64=(
+                            None
+                            if fields["object_key"]
+                            else base64.b64encode(content).decode("ascii")
+                        ),
                     )
                     for path, content in resources
                 )

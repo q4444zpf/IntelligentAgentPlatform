@@ -132,9 +132,20 @@ class SkillService:
     def read_files(self, name: str) -> tuple[tuple[str, bytes], ...]:
         """Read ordinary Skill files beneath its root in deterministic order."""
         directory = self._directory(name)
-        if not directory.is_dir():
+        if directory.is_symlink() or not directory.is_dir():
+            if directory.is_symlink():
+                raise SkillValidationError(
+                    f"Skill '{name}' root must not be a symbolic link"
+                )
             raise SkillNotFoundError(name)
+        service_root = self.root.resolve()
         root = directory.resolve()
+        try:
+            root.relative_to(service_root)
+        except ValueError as error:
+            raise SkillValidationError(
+                f"Skill '{name}' root escapes the Skill service root"
+            ) from error
         files: list[tuple[str, bytes]] = []
         for path in sorted(directory.rglob("*"), key=lambda item: item.as_posix()):
             if path.is_symlink() or not path.is_file():

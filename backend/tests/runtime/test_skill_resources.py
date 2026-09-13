@@ -6,7 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.runtime.execution_snapshot import SnapshotSkill, SnapshotSkillFile
-from app.skills.service import SkillService
+from app.skills.service import SkillService, SkillValidationError
 
 
 def _file(path="SKILL.md", data=b"hello"):
@@ -79,3 +79,51 @@ def test_skill_service_read_files_returns_only_sorted_ordinary_files(tmp_path: P
     files = SkillService(root).read_files("forecast")
 
     assert files == (("SKILL.md", b"manifest"), ("references/rules.txt", b"rules"))
+
+
+def test_skill_service_rejects_skill_root_symlink(tmp_path: Path):
+    root = tmp_path / "skills"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "SKILL.md").write_bytes(b"manifest")
+    (root / "forecast").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(SkillValidationError, match="symbolic link"):
+        SkillService(root).read_files("forecast")
+
+
+def test_object_backed_skill_resources_do_not_duplicate_embedded_bytes():
+    skill = type(
+        "Skill",
+        (),
+        {
+            "name": "forecast",
+            "description": "洪峰预测",
+            "version": "1.2.0",
+            "content": "manifest",
+            "source": "project",
+            "enabled": True,
+            "tags": [],
+            "metadata": {},
+            "file_count": 1,
+            "updated_at": None,
+            "skill_id": "skill-1",
+            "version_id": "version-1",
+            "package_digest": "a" * 64,
+            "object_key": "unit/project/skill/file.zip",
+        },
+    )()
+    skill_service = type("SkillService", (), {})()
+    skill_service.read_files = lambda name: (
+        ("SKILL.md", b"manifest"),
+    )
+    skill_service.get = lambda name: skill
+    service = type("Service", (), {})()
+    service.agent_service = type("AgentService", (), {"skill_service": skill_service})()
+
+    from app.runtime.execution_snapshot import ExecutionSnapshotService
+
+    stored = ExecutionSnapshotService._snapshot_skill(service, "forecast", skill)
+
+    assert stored.files[0].content_base64 is None
