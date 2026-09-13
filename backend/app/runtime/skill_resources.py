@@ -58,11 +58,13 @@ class SkillResourceMaterializer:
         workspace: Path,
     ) -> Path:
         workspace = Path(workspace)
+        if workspace.exists() and (workspace.is_symlink() or not workspace.is_dir()):
+            raise SkillResourceMaterializationError("invalid workspace")
         workspace.mkdir(parents=True, exist_ok=True)
         skills_dir = workspace / "skills"
         stage = workspace / f".skills-tmp-{uuid.uuid4().hex}"
         stage.mkdir(mode=0o700)
-        moved: list[Path] = []
+        backup: Path | None = None
         index: list[dict[str, Any]] = []
         try:
             enabled = [skill for skill in snapshot.skills if skill.enabled]
@@ -118,27 +120,26 @@ class SkillResourceMaterializer:
                         stream.write(data)
                     index.append({"skill_name": skill.name, "path": manifest.path, "size": manifest.size, "sha256": manifest.sha256})
 
-            skills_dir.mkdir(exist_ok=True)
-            if skills_dir.is_symlink() or not skills_dir.is_dir():
-                raise SkillResourceMaterializationError("invalid skills destination")
+            staged_skills = stage / "skills"
+            staged_skills.mkdir()
             for skill in enabled:
-                final = skills_dir / _safe_skill_name(skill.name)
-                if final.exists() or final.is_symlink():
-                    raise SkillResourceMaterializationError("Skill destination already exists")
-                os.replace(stage / skill.name, final)
-                moved.append(final)
+                os.replace(stage / skill.name, staged_skills / _safe_skill_name(skill.name))
+            if skills_dir.exists() or skills_dir.is_symlink():
+                if skills_dir.is_symlink() or not skills_dir.is_dir():
+                    raise SkillResourceMaterializationError("invalid skills destination")
+                backup = workspace / f".skills-old-{uuid.uuid4().hex}"
+                os.replace(skills_dir, backup)
+            os.replace(staged_skills, skills_dir)
             self.resource_index = tuple(index)
             result = skills_dir / _safe_skill_name(enabled[0].name) if len(enabled) == 1 else skills_dir
             return result
         except Exception:
-            for path in moved:
-                if path.exists() or path.is_symlink():
-                    shutil.rmtree(path, ignore_errors=True)
+            if skills_dir.exists() or skills_dir.is_symlink():
+                shutil.rmtree(skills_dir, ignore_errors=True)
+            if backup is not None and backup.exists():
+                os.replace(backup, skills_dir)
             raise
         finally:
             shutil.rmtree(stage, ignore_errors=True)
-            if skills_dir.exists() and not any(skills_dir.iterdir()):
-                try:
-                    skills_dir.rmdir()
-                except OSError:
-                    pass
+            if backup is not None and backup.exists() and skills_dir.exists():
+                shutil.rmtree(backup, ignore_errors=True)

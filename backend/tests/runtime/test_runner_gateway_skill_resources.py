@@ -63,3 +63,20 @@ def test_client_decodes_skill_file_response():
     value = client.read_skill_file("forecast", "SKILL.md")
     assert value["data"] == b"hello"
 
+
+def test_gateway_rejects_object_skill_without_archive_metadata():
+    stored = _snapshot()
+    skill = SnapshotSkill(name="forecast", version_id="v1", object_key="u/p/s/x.zip", package_digest="a" * 64, files=(_file("SKILL.md", b"hello").model_copy(update={"content_base64": None}),))
+    payload = stored.payload.model_copy(update={"skills": (skill,)})
+    stored = stored.model_copy(update={"payload": payload, "digest": hashlib.sha256(canonical_snapshot_bytes(payload)).hexdigest()})
+    with pytest.raises(Exception) as error:
+        RunnerGatewayService(FakeSnapshotService(stored), skill_package_storage=object()).read_skill_file("run", "forecast", "SKILL.md", _claims(stored))
+    assert getattr(error.value, "code", None) == "skill_resource_unavailable"
+
+
+def test_client_rejects_response_for_different_skill_identity():
+    request = type("Request", (), {"gateway_url": "http://gateway", "run_id": "run", "run_token": "token", "snapshot_digest": "a" * 64, "deadline_at": None, "execution_deadline_at": None})()
+    client = RunnerGatewayClient.from_execution_request(request, transport=httpx.MockTransport(lambda req: httpx.Response(200, json={"skill_name":"other","path":"SKILL.md","size":5,"sha256":hashlib.sha256(b"hello").hexdigest(),"data_base64":base64.b64encode(b"hello").decode()})))
+    with pytest.raises(Exception) as error:
+        client.read_skill_file("forecast", "SKILL.md")
+    assert getattr(error.value, "code", None) == "runner_gateway_response_invalid"

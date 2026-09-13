@@ -124,6 +124,8 @@ class SnapshotSkill(BaseModel):
     version_id: str | None = None
     package_digest: str | None = None
     object_key: str | None = None
+    archive_sha256: str | None = None
+    size_bytes: int | None = Field(default=None, ge=0)
     files: tuple[SnapshotSkillFile, ...] = ()
 
     @model_validator(mode="after")
@@ -309,6 +311,8 @@ def _frozen_v4_projection(serialized: dict) -> dict:
             "version_id",
             "package_digest",
             "object_key",
+            "archive_sha256",
+            "size_bytes",
             "files",
         )
         if any(value.get(field) for field in resource_fields):
@@ -473,6 +477,8 @@ class ExecutionSnapshotService:
             "version_id": getattr(skill, "version_id", None),
             "package_digest": getattr(skill, "package_digest", None),
             "object_key": getattr(skill, "object_key", None),
+            "archive_sha256": getattr(skill, "archive_sha256", None),
+            "size_bytes": getattr(skill, "size_bytes", None),
             "files": (),
         }
         skill_service = getattr(self.agent_service, "skill_service", None)

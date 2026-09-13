@@ -81,7 +81,7 @@ class RunnerGatewayClient:
     request_deadline_at: datetime | None = None
     execution_deadline_at: datetime | None = None
     transport: httpx.BaseTransport | None = field(default=None, repr=False)
-    max_response_bytes: int = 4 * 1024 * 1024
+    max_response_bytes: int = 16 * 1024 * 1024
 
     @classmethod
     def from_execution_request(
@@ -89,7 +89,7 @@ class RunnerGatewayClient:
         request: RunExecutionRequest,
         *,
         transport: httpx.BaseTransport | None = None,
-        max_response_bytes: int = 4 * 1024 * 1024,
+        max_response_bytes: int = 16 * 1024 * 1024,
     ) -> RunnerGatewayClient:
         return cls(
             base_url=request.gateway_url,
@@ -115,6 +115,8 @@ class RunnerGatewayClient:
             data = base64.b64decode(response.data_base64, validate=True)
         except (ValueError, TypeError, binascii.Error):
             raise RunnerGatewayResponseInvalid() from None
+        if response.skill_name != skill_name or response.path != path:
+            raise RunnerGatewayResponseInvalid()
         if len(data) != response.size or hashlib.sha256(data).hexdigest() != response.sha256:
             raise RunnerGatewayResponseInvalid()
         value = response.model_dump(mode="json", exclude={"data_base64"})

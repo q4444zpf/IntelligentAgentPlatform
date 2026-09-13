@@ -145,3 +145,21 @@ def test_materializer_writes_embedded_files_under_skill_root(tmp_path):
     root = SkillResourceMaterializer().materialize(snapshot, object(), tmp_path)
     assert root == tmp_path / "skills" / "forecast"
     assert (root / "references" / "rules.txt").read_bytes() == data
+
+
+def test_materializer_retry_replaces_existing_tree_atomically(tmp_path):
+    from app.runtime.execution_snapshot import ExecutionSnapshotPayload, PublishedAgentSnapshot, SnapshotModelSelection, SnapshotRuntimeLimits
+    from datetime import datetime, UTC
+
+    data = b"rules"
+    skill = SnapshotSkill(name="forecast", files=(_file("rules.txt", data),))
+    snapshot = ExecutionSnapshotPayload(
+        snapshot_id="snap", run_id="run", unit_id="unit", project_id="project", user_id="user",
+        actor=PublishedAgentSnapshot(id="a", name="a", description="", runtime_form="common", language="zh", system_prompt="", context_prompt="", approval_policy="never"),
+        model=SnapshotModelSelection(provider_id="p", model="m"), messages=(), skills=(skill,),
+        limits=SnapshotRuntimeLimits(snapshot_max_bytes=100000), created_at=datetime.now(UTC),
+    )
+    materializer = SkillResourceMaterializer()
+    materializer.materialize(snapshot, object(), tmp_path)
+    materializer.materialize(snapshot, object(), tmp_path)
+    assert (tmp_path / "skills" / "forecast" / "rules.txt").read_bytes() == data

@@ -192,6 +192,8 @@ class RunnerGatewayService:
         else:
             if not skill.object_key or not skill.package_digest or self.skill_package_storage is None:
                 raise RunnerGatewayError(503, "skill_resource_unavailable", "Skill 资源暂不可用")
+            if not skill.archive_sha256 or skill.size_bytes is None:
+                raise RunnerGatewayError(503, "skill_resource_unavailable", "Skill 资源暂不可用")
             try:
                 data = self._read_skill_package(skill)
                 packages = parse_skill_bundle(data)
@@ -222,18 +224,13 @@ class RunnerGatewayService:
         )
 
     def _read_skill_package(self, skill) -> bytes:
-        metadata = skill.metadata if isinstance(skill.metadata, dict) else {}
         stored = StoredSkillPackage(
             object_key=skill.object_key,
-            archive_sha256=str(metadata.get("archive_sha256", metadata.get("archive-sha256", getattr(skill, "archive_sha256", "0" * 64)))),
-            package_digest=skill.package_digest or "0" * 64,
-            size_bytes=int(metadata.get("size_bytes", metadata.get("size-bytes", getattr(skill, "size_bytes", 0)))),
+            archive_sha256=skill.archive_sha256,
+            package_digest=skill.package_digest,
+            size_bytes=skill.size_bytes,
         )
-        try:
-            return self.skill_package_storage.read(stored)
-        except (SkillPackageStorageError, TypeError):
-            # Test doubles and older providers may accept the immutable snapshot reference directly.
-            return self.skill_package_storage.read(skill)
+        return self.skill_package_storage.read(stored)
 
     def _verified_snapshot(
         self, run_id: str, claims: RunTokenClaims
