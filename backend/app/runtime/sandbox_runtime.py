@@ -43,6 +43,7 @@ from .gateway_model import GatewayChatModel, GatewayModelBudget, RunnerGatewayMo
 from .gateway_tools import (
     RunnerApprovalInterruption,
     build_gateway_tools,
+    build_skill_resource_tools,
     build_skill_script_tools,
 )
 from .langgraph_runtime import LangGraphRuntimeAdapter, RuntimeResult, RuntimeState
@@ -358,6 +359,7 @@ class SandboxRuntime:
                 )
                 tools = [
                     *build_gateway_tools(snapshot.payload, self.gateway, cancellation_event=self._cancel_event),
+                    *build_skill_resource_tools(snapshot.payload, self.gateway, cancellation_event=self._cancel_event),
                     *build_skill_script_tools(
                         snapshot.payload,
                         resource_workspace,

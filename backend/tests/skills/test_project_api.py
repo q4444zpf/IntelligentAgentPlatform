@@ -480,9 +480,6 @@ def test_publish_route_returns_fixed_metadata_and_replay(sessions, storage):
         "display_version",
         "enabled",
         "package_digest",
-        "object_key",
-        "archive_sha256",
-        "size_bytes",
         "published_by",
         "published_at",
     }

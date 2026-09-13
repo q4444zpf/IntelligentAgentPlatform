@@ -202,7 +202,10 @@ def test_dispatcher_uses_bound_skill_snapshot_before_model_invocation(tmp_path):
             name="forecast",
             description="Forecast",
             display_version="1.0",
-            content="Use the frozen forecast body.",
+            content=(
+                "---\nname: forecast\ndescription: Forecast\nversion: '1.0'\n---\n"
+                "Use the frozen forecast body."
+            ),
             files=[],
             package_digest="b" * 64,
             object_key=f"unit-1/p1/{skill_id}/archive.zip",

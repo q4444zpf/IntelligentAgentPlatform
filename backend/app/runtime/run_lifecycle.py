@@ -10,9 +10,9 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
-from app.conversations.models import AgentRun, RunEvent, ToolInvocation
+from app.conversations.models import AgentRun, RunEvent
 from app.conversations.repository import ConversationRepository
-from .script_lifecycle import finish_script_invocation
+from .script_lifecycle import finish_running_script_invocations
 
 from .workflow_runner import (
     RunnerDeadlineExceededError,
@@ -427,28 +427,9 @@ class SandboxRunCoordinator:
             run = session.get(AgentRun, run_id)
             if run is None:
                 raise KeyError(run_id)
-            if status == "cancelled":
-                # The run UPDATE holds the same lock used by script callbacks.
-                # Persist cancellation before revoking credentials or stopping the worker.
-                invocations = session.scalars(
-                    select(ToolInvocation).where(
-                        ToolInvocation.run_id == run_id,
-                        ToolInvocation.status == "running",
-                        ToolInvocation.tool_id.like("skill.%.script.%"),
-                    )
-                ).all()
-                for invocation in invocations:
-                    created_at = invocation.created_at
-                    if created_at.tzinfo is None:
-                        created_at = created_at.replace(tzinfo=UTC)
-                    finish_script_invocation(
-                        repository,
-                        self.audit_recorder,
-                        invocation,
-                        status="cancelled",
-                        error_code="skill_script_cancelled",
-                        duration_ms=max(0, int((datetime.now(UTC) - created_at).total_seconds() * 1000)),
-                    )
+            finish_running_script_invocations(
+                repository, self.audit_recorder, run_id, status=status, error_code=error_code,
+            )
             repository.append_event(
                 run_id,
                 "sandbox.finished",

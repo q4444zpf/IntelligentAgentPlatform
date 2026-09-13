@@ -35,6 +35,14 @@ def test_availability_api_updates_current_state_without_mutating_published_versi
         )
         version_id = published.json()["id"]
         assert published.json()["enabled"] is True
+        assert not {"object_key", "archive_sha256", "size_bytes"} & published.json().keys()
+        with sessions() as session:
+            original_version = session.get(SkillVersion, version_id)
+            original_storage = (
+                original_version.object_key,
+                original_version.archive_sha256,
+                original_version.size_bytes,
+            )
         disabled = client.patch(
             f"/api/project-skills/{skill_id}/availability",
             json={"enabled": False, "expected_revision": 2},
@@ -59,6 +67,7 @@ def test_availability_api_updates_current_state_without_mutating_published_versi
     assert summary.json()["enabled"] is False
     assert version.status_code == 200
     assert version.json()["enabled"] is False
+    assert not {"object_key", "archive_sha256", "size_bytes"} & version.json().keys()
     assert reenabled.json()["enabled"] is True
     assert reenabled.json()["draft_revision"] == 4
     with sessions() as session:
@@ -74,7 +83,11 @@ def test_availability_api_updates_current_state_without_mutating_published_versi
     assert draft.revision == 4
     assert published_version.content == manifest("s")
     assert published_version.package_digest == published.json()["package_digest"]
-    assert published_version.object_key == published.json()["object_key"]
+    assert (
+        published_version.object_key,
+        published_version.archive_sha256,
+        published_version.size_bytes,
+    ) == original_storage
     assert len(events) == 2
     assert {event.metadata_json["enabled"] for event in events} == {False, True}
 

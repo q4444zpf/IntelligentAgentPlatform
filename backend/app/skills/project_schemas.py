@@ -124,9 +124,6 @@ class PublishedSkillInfo(StrictProjectSkillModel):
     display_version: str
     enabled: bool
     package_digest: str
-    object_key: str | None = None
-    archive_sha256: str | None = None
-    size_bytes: int | None = None
     published_by: str
     published_at: datetime
 

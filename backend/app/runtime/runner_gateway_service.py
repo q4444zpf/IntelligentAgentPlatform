@@ -6,7 +6,9 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
+from collections.abc import Callable
 from datetime import UTC, datetime
 from time import perf_counter
 
@@ -65,7 +67,7 @@ from .execution_snapshot import (
 )
 from .model_gateway import ModelGateway, ModelRuntimeError, ModelSelection
 from .run_tokens import RunTokenClaims
-from .script_lifecycle import finish_script_invocation
+from .script_lifecycle import finish_running_script_invocations, finish_script_invocation
 from .runner_gateway_auth import RunnerGatewayError
 from .runner_gateway_schemas import (
     ArtifactCapabilityRegistrationRequest,
@@ -169,6 +171,57 @@ class RunnerGatewayService:
             payload=stored.payload,
         )
 
+    def read_skill_file_audited(
+        self, run_id: str, skill_name: str, path: str, claims: RunTokenClaims,
+        *, reauthorize: Callable[[], RunTokenClaims],
+    ) -> SkillFileResponse:
+        repository = self._require_conversation_repository()
+        read_error = None
+        try:
+            response = self.read_skill_file(run_id, skill_name, path, claims)
+        except RunnerGatewayError as error:
+            read_error = error
+        # External storage must not hold the lock needed by cancellation and deadlines.
+        run = self._lock_run(repository, run_id)
+        try:
+            self._require_active_run(run)
+            self._verified_snapshot(run_id, reauthorize())
+            if read_error is not None:
+                raise read_error
+        except RunnerGatewayError as error:
+            self._record_skill_resource_audit(run_id, skill_name, path, error_code=error.code)
+            repository.session.commit()
+            raise
+        self._record_skill_resource_audit(run_id, skill_name, path)
+        repository.session.commit()
+        return response
+
+    def _record_skill_resource_audit(self, run_id, skill_name, path, *, error_code=None):
+        repository = self._require_conversation_repository()
+        context = repository.get_run_execution_context(run_id)
+        if context is None:
+            raise RunnerGatewayError(404, "run_not_found", "Run 不存在")
+        action = "skill.resource.failed" if error_code else "skill.resource.read"
+        safe_skill_name, safe_path = (
+            re.sub(r"[\x00-\x1f\x7f-\x9f]", lambda match: f"\\u{ord(match[0]):04x}", value)
+            for value in (skill_name, path)
+        )
+        metadata = {
+            "skill_name": safe_skill_name[:128], "path": safe_path[:4096],
+            "path_sha256": hashlib.sha256(path.encode("utf-8")).hexdigest(),
+        }
+        repository.append_event(run_id, action, {**metadata, **({"error_code": error_code} if error_code else {})})
+        self.audit_recorder.record(repository.session, AuditRecordRequest(
+            unit_id=str(context["unit_id"]), project_id=str(context["project_id"]),
+            user_id=str(context["user_id"]), actor_roles=tuple(context["actor_roles"]),
+            authorization_scope="project", event_scope="project", category="runtime", source="sandbox",
+            action=action, status="failed" if error_code else "succeeded", risk_level="low",
+            idempotency_key=f"skill-resource:{run_id}:{secrets.token_hex(16)}", occurred_at=datetime.now(UTC),
+            run_id=run_id, resource_type="skill_resource", resource_id=safe_skill_name[:128], resource_name=safe_path[:200],
+            summary="Skill resource access", metadata=metadata, allowed_metadata_keys=frozenset(metadata),
+            error_code=error_code,
+        ))
+
     def read_skill_file(
         self,
         run_id: str,
@@ -208,7 +261,11 @@ class RunnerGatewayService:
                 if (
                     package is None
                     or (skill.package_digest and package.digest != skill.package_digest)
-                    or (skill.version and package.display_version != skill.version)
+                    or (
+                        not skill.version_id
+                        and skill.version
+                        and package.display_version != skill.version
+                    )
                 ):
                     raise ValueError("package digest mismatch")
                 package_file = next((item for item in package.files if item.path == path), None)
@@ -1487,6 +1544,10 @@ class RunnerGatewayService:
                 run_id,
                 request.final_assistant_content,
             )
+        finish_running_script_invocations(
+            repository, self.audit_recorder, run_id,
+            status=target_status, error_code=request.error_code,
+        )
         repository.append_event(
             run_id,
             "runner.completion",
@@ -1532,6 +1593,18 @@ class RunnerGatewayService:
             response_json=response.model_dump(mode="json"),
         )
         repository.session.flush()
+        if request.status in {"completed", "failed", "cancelled"}:
+            self.audit_recorder.record(repository.session, AuditRecordRequest(
+                unit_id=snapshot.payload.unit_id, project_id=snapshot.payload.project_id,
+                user_id=snapshot.payload.user_id, actor_roles=tuple(run.actor_roles_json),
+                authorization_scope="project", event_scope="project", category="runtime", source="sandbox",
+                action=f"runner.run.{request.status}",
+                status="succeeded" if request.status == "completed" else request.status,
+                risk_level="low" if request.status == "completed" else "medium",
+                idempotency_key=f"runner-run:{run_id}:terminal", occurred_at=datetime.now(UTC),
+                run_id=run_id, resource_type="run", resource_id=run_id,
+                summary="Runner execution finished", error_code=request.error_code,
+            ))
         if (
             request.status == "completed"
             and deadline is not None

@@ -1,10 +1,35 @@
 from datetime import UTC, datetime
 
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.conversations.models import ToolInvocation
 from app.conversations.repository import ConversationRepository
+
+
+def finish_running_script_invocations(repository, audit_recorder, run_id, *, status, error_code):
+    """Close abandoned leases in the caller's locked run-terminal transaction."""
+    if status not in {"failed", "cancelled"}:
+        return
+    invocations = repository.session.scalars(select(ToolInvocation).where(
+        ToolInvocation.run_id == run_id,
+        ToolInvocation.status == "running",
+        ToolInvocation.tool_id.like("skill.%.script.%"),
+    )).all()
+    now = datetime.now(UTC)
+    for invocation in invocations:
+        created_at = invocation.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        finish_script_invocation(
+            repository, audit_recorder, invocation, status=status,
+            error_code=(
+                "skill_script_timeout" if error_code == "sandbox_timeout"
+                else "skill_script_cancelled" if status == "cancelled"
+                else "skill_script_failed"
+            ),
+            duration_ms=max(0, int((now - created_at).total_seconds() * 1000)),
+        )
 
 
 def finish_script_invocation(

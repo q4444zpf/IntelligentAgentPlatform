@@ -48,6 +48,50 @@ class GatewayStructuredTool(StructuredTool):
         return args, kwargs
 
 
+def build_skill_resource_tools(snapshot, client, *, cancellation_event=None):
+    return [
+        _build_skill_resource_tool(skill, client, cancellation_event)
+        for skill in snapshot.skills if skill.enabled and skill.files
+    ]
+
+
+def _build_skill_resource_tool(skill, client, cancellation_event):
+    manifests = {item.path: item for item in skill.files}
+
+    def read_resource(path: str, _tool_call_id: str | None = None):
+        del _tool_call_id
+        if path not in manifests:
+            raise RunnerGatewayToolError("tool_not_authorized")
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise RunnerGatewayToolError("gateway_unavailable")
+        try:
+            response = client.read_skill_file(skill.name, path)
+            data = response["data"]
+            manifest = manifests[path]
+            if (
+                response.get("skill_name") != skill.name
+                or response.get("path") != path
+                or not isinstance(data, bytes)
+                or len(data) != manifest.size
+                or hashlib.sha256(data).hexdigest() != manifest.sha256
+            ):
+                raise RunnerGatewayToolError("tool_execution_failed")
+            return {"path": path, "content": data.decode("utf-8")}
+        except (RunnerGatewayBusinessError, UnicodeDecodeError, KeyError) as error:
+            raise RunnerGatewayToolError("tool_execution_failed") from error
+
+    return GatewayStructuredTool.from_function(
+        func=read_resource,
+        name=f"skill.{skill.name}.resource.read",
+        description=f"Read an authorized text resource from Skill {skill.name}",
+        args_schema={
+            "type": "object", "properties": {"path": {"type": "string", "enum": sorted(manifests)}},
+            "required": ["path"], "additionalProperties": False,
+        },
+        infer_schema=False,
+    )
+
+
 def build_gateway_tools(
     snapshot: ExecutionSnapshotPayload,
     client: RunnerToolClient,

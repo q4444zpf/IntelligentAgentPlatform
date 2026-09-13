@@ -18,7 +18,6 @@ from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from app.db.base import Base
 from app.agents.schemas import SkillBinding
-from app.skills.repository import SkillRepository, SkillScope
 
 
 class SnapshotIntegrityError(ValueError):
@@ -508,7 +507,7 @@ class ExecutionSnapshotService:
         return stored
 
     def get(self, snapshot_id: str) -> StoredExecutionSnapshot | None:
-        row = self.session.get(RuntimeExecutionSnapshot, snapshot_id)
+        row = self.session.get(RuntimeExecutionSnapshot, snapshot_id, populate_existing=True)
         return self._stored(row) if row is not None else None
 
     def get_for_run(self, run_id: str) -> StoredExecutionSnapshot | None:
@@ -578,6 +577,8 @@ class ExecutionSnapshotService:
         binding: SkillBinding,
         context: dict[str, object],
     ) -> SnapshotSkill:
+        from app.skills.repository import SkillRepository, SkillScope
+
         version = SkillRepository(self.session).get_version(
             SkillScope(str(context["unit_id"]), str(context["project_id"])),
             binding.skill_id,
@@ -636,6 +637,8 @@ class ExecutionSnapshotService:
         skills: tuple[SnapshotSkill, ...],
         context: dict[str, object],
     ) -> None:
+        from app.skills.repository import SkillRepository, SkillScope
+
         repository = SkillRepository(self.session)
         scope = SkillScope(str(context["unit_id"]), str(context["project_id"]))
         for skill in skills:

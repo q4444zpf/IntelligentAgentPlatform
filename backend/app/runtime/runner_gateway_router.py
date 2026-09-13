@@ -172,11 +172,22 @@ def create_router(
             SkillPackageStorage,
             Depends(skill_package_storage_dependency),
         ],
+        repository: Annotated[
+            ConversationRepository, Depends(conversation_repository_dependency),
+        ],
+        audit_recorder: Annotated[AuditRecorder, Depends(audit_recorder_dependency)],
+        token_service: Annotated[RunTokenService, Depends(token_service_dependency)],
+        authorization: Annotated[str, Header()] = "",
     ) -> SkillFileResponse:
         return RunnerGatewayService(
             snapshot_service,
+            conversation_repository=repository,
+            audit_recorder=audit_recorder,
             skill_package_storage=skill_package_storage,
-        ).read_skill_file(run_id, skill_name, path, claims)
+        ).read_skill_file_audited(
+            run_id, skill_name, path, claims,
+            reauthorize=lambda: skill_resource_claims(run_id, authorization, token_service),
+        )
 
     @router.post(
         "/runs/{run_id}/script-invocations",

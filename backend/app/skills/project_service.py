@@ -253,9 +253,6 @@ class ProjectSkillService:
                 "description",
                 "display_version",
                 "package_digest",
-                "object_key",
-                "archive_sha256",
-                "size_bytes",
                 "published_by",
                 "published_at",
             )
