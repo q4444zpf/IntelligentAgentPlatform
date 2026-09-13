@@ -88,7 +88,10 @@ def test_skill_service_rejects_skill_root_symlink(tmp_path: Path):
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "SKILL.md").write_bytes(b"manifest")
-    (root / "forecast").symlink_to(outside, target_is_directory=True)
+    try:
+        (root / "forecast").symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlink creation unavailable on Windows: {error}")
 
     with pytest.raises(SkillValidationError, match="symbolic link"):
         SkillService(root).read_files("forecast")
@@ -163,3 +166,51 @@ def test_materializer_retry_replaces_existing_tree_atomically(tmp_path):
     materializer.materialize(snapshot, object(), tmp_path)
     materializer.materialize(snapshot, object(), tmp_path)
     assert (tmp_path / "skills" / "forecast" / "rules.txt").read_bytes() == data
+
+
+def test_materializer_reads_client_backed_file_and_rolls_back_old_tree(tmp_path):
+    from app.runtime.execution_snapshot import ExecutionSnapshotPayload, PublishedAgentSnapshot, SnapshotModelSelection, SnapshotRuntimeLimits
+    from datetime import datetime, UTC
+
+    first = b"new"
+    second = b"other"
+    skill = SnapshotSkill(
+        name="forecast",
+        object_key="unit/project/skill/package.zip",
+        package_digest="a" * 64,
+        archive_sha256="b" * 64,
+        size_bytes=10,
+        files=(
+            SnapshotSkillFile(path="a.txt", size=len(first), sha256=hashlib.sha256(first).hexdigest()),
+            SnapshotSkillFile(path="b.txt", size=len(second), sha256=hashlib.sha256(second).hexdigest()),
+        ),
+    )
+    snapshot = ExecutionSnapshotPayload(
+        snapshot_id="snap", run_id="run", unit_id="unit", project_id="project", user_id="user",
+        actor=PublishedAgentSnapshot(id="a", name="a", description="", runtime_form="common", language="zh", system_prompt="", context_prompt="", approval_policy="never"),
+        model=SnapshotModelSelection(provider_id="p", model="m"), messages=(), skills=(skill,),
+        limits=SnapshotRuntimeLimits(snapshot_max_bytes=100000), created_at=datetime.now(UTC),
+    )
+    old = tmp_path / "skills" / "forecast"
+    old.mkdir(parents=True)
+    (old / "old.txt").write_bytes(b"old")
+
+    class Client:
+        def read_skill_file(self, _name, path):
+            if path == "b.txt":
+                raise RuntimeError("unavailable")
+            return {"skill_name": "forecast", "path": path, "size": len(first), "sha256": hashlib.sha256(first).hexdigest(), "data": first}
+
+    with pytest.raises(Exception):
+        SkillResourceMaterializer().materialize(snapshot, Client(), tmp_path)
+    assert (old / "old.txt").read_bytes() == b"old"
+
+
+def test_materializer_rejects_traversal_manifest_without_writing(tmp_path):
+    from app.runtime.execution_snapshot import ExecutionSnapshotPayload, PublishedAgentSnapshot, SnapshotModelSelection, SnapshotRuntimeLimits
+    from datetime import datetime, UTC
+    unsafe = SnapshotSkill.model_construct(name="forecast", enabled=True, files=(SnapshotSkillFile.model_construct(path="../escape", size=1, sha256="a" * 64, content_base64=base64.b64encode(b"x").decode()),))
+    snapshot = ExecutionSnapshotPayload(snapshot_id="s", run_id="r", unit_id="u", project_id="p", user_id="u", actor=PublishedAgentSnapshot(id="a", name="a", description="", runtime_form="common", language="zh", system_prompt="", context_prompt="", approval_policy="never"), model=SnapshotModelSelection(provider_id="p", model="m"), messages=(), skills=(unsafe,), limits=__import__("app.runtime.execution_snapshot", fromlist=["SnapshotRuntimeLimits"]).SnapshotRuntimeLimits(snapshot_max_bytes=100), created_at=datetime.now(UTC))
+    with pytest.raises(Exception):
+        SkillResourceMaterializer().materialize(snapshot, object(), tmp_path)
+    assert not (tmp_path / "skills").exists()

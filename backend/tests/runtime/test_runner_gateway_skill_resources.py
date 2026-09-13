@@ -80,3 +80,23 @@ def test_client_rejects_response_for_different_skill_identity():
     with pytest.raises(Exception) as error:
         client.read_skill_file("forecast", "SKILL.md")
     assert getattr(error.value, "code", None) == "runner_gateway_response_invalid"
+
+
+@pytest.mark.parametrize(
+    ("skill_name", "path", "expected"),
+    [("missing", "SKILL.md", "skill_resource_not_found"), ("forecast", "missing.txt", "skill_resource_not_found")],
+)
+def test_gateway_rejects_unknown_skill_or_path(skill_name, path, expected):
+    stored = _snapshot()
+    with pytest.raises(Exception) as error:
+        RunnerGatewayService(FakeSnapshotService(stored)).read_skill_file("run", skill_name, path, _claims(stored))
+    assert getattr(error.value, "code", None) == expected
+
+
+def test_gateway_rejects_disabled_skill():
+    stored = _snapshot()
+    payload = stored.payload.model_copy(update={"skills": (stored.payload.skills[0].model_copy(update={"enabled": False}),)})
+    stored = stored.model_copy(update={"payload": payload, "digest": hashlib.sha256(canonical_snapshot_bytes(payload)).hexdigest()})
+    with pytest.raises(Exception) as error:
+        RunnerGatewayService(FakeSnapshotService(stored)).read_skill_file("run", "forecast", "SKILL.md", _claims(stored))
+    assert getattr(error.value, "code", None) == "skill_resource_disabled"

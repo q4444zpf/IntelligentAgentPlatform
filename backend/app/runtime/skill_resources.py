@@ -65,6 +65,7 @@ class SkillResourceMaterializer:
         stage = workspace / f".skills-tmp-{uuid.uuid4().hex}"
         stage.mkdir(mode=0o700)
         backup: Path | None = None
+        swapped = False
         index: list[dict[str, Any]] = []
         try:
             enabled = sorted(
@@ -133,11 +134,12 @@ class SkillResourceMaterializer:
                 backup = workspace / f".skills-old-{uuid.uuid4().hex}"
                 os.replace(skills_dir, backup)
             os.replace(staged_skills, skills_dir)
+            swapped = True
             self.resource_index = tuple(index)
             result = skills_dir / _safe_skill_name(enabled[0].name) if len(enabled) == 1 else skills_dir
             return result
         except Exception:
-            if skills_dir.exists() or skills_dir.is_symlink():
+            if swapped and (skills_dir.exists() or skills_dir.is_symlink()):
                 shutil.rmtree(skills_dir, ignore_errors=True)
             if backup is not None and backup.exists():
                 os.replace(backup, skills_dir)
