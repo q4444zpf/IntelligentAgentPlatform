@@ -1,6 +1,6 @@
 # Task 4 Report: Unified Single-Agent Skill Context
 
-Commit: `159ab7a` (`fix: unify single-agent skill context assembly`)
+Implementation commit: `79e0c32` (`fix: unify single-agent skill context assembly`)
 
 ## Implementation
 
