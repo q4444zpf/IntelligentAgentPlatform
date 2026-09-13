@@ -129,6 +129,27 @@ class SkillService:
             raise SkillNotFoundError(name)
         return self._info(directory)
 
+    def read_files(self, name: str) -> tuple[tuple[str, bytes], ...]:
+        """Read ordinary Skill files beneath its root in deterministic order."""
+        directory = self._directory(name)
+        if not directory.is_dir():
+            raise SkillNotFoundError(name)
+        root = directory.resolve()
+        files: list[tuple[str, bytes]] = []
+        for path in sorted(directory.rglob("*"), key=lambda item: item.as_posix()):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                resolved = path.resolve()
+                resolved.relative_to(root)
+            except (OSError, ValueError):
+                continue
+            relative = path.relative_to(directory).as_posix()
+            if relative == STATE_FILE:
+                continue
+            files.append((relative, path.read_bytes()))
+        return tuple(files)
+
     @staticmethod
     def _validate_content(name: str, content: str) -> None:
         frontmatter, _ = parse_skill_markdown(content)

@@ -20,6 +20,7 @@ from app.runtime.execution_snapshot import (
     SnapshotModelSelection,
     SnapshotRuntimeLimits,
     SnapshotSkill,
+    SnapshotSkillFile,
     SnapshotTeamMember,
     SnapshotTool,
     canonical_snapshot_bytes,
@@ -31,10 +32,28 @@ class StaticAgentService:
     def __init__(self, agent: AgentInfo, tools, knowledge_sources=()):
         self.agent = agent
         self.tool_service = StaticToolService(tools, knowledge_sources)
+        self.skill_service = StaticSkillService()
 
     def get(self, agent_id: str) -> AgentInfo:
         assert agent_id == self.agent.id
         return self.agent
+
+
+class StaticSkillService:
+    def get(self, name: str):
+        assert name == "forecast"
+        return type("Skill", (), {
+            "name": name,
+            "description": "洪峰预测",
+            "version": "1.2.0",
+            "content": "---\\nname: forecast\\ndescription: 洪峰预测\\n---\\n使用已绑定的预测工具。",
+            "source": "created",
+            "enabled": True,
+            "tags": ["water"],
+            "metadata": {"runtime": "text"},
+            "file_count": 1,
+            "updated_at": datetime(2026, 8, 14, 9, 0, tzinfo=UTC),
+        })()
 
 
 class StaticToolService:
@@ -312,6 +331,7 @@ def test_snapshot_digest_is_deterministic_and_covers_complete_payload(snapshot_s
     assert first.payload.actor.id == "agent-1"
     assert first.payload.messages[0].content == "水位是多少？"
     assert first.payload.skills[0].name == "forecast"
+    assert "使用已绑定的预测工具" in first.payload.skills[0].content
     assert first.payload.schema_version == "3"
     assert first.payload.tools[0].tool_id == "mcp.water.level"
     assert first.payload.tools[0].version == "3"
@@ -330,6 +350,36 @@ def test_snapshot_digest_is_deterministic_and_covers_complete_payload(snapshot_s
     assert first.payload.limits.max_tool_calls == 8
     assert first.payload.limits.max_subagents == 4
     assert first.payload.limits.max_output_bytes == 4 * 1024 * 1024
+
+
+def test_snapshot_digest_changes_when_skill_resource_digest_changes(snapshot_service):
+    first = snapshot_service.create("run-1")
+    skill = first.payload.skills[0]
+    changed = SnapshotSkillFile(
+        path="SKILL.md",
+        size=1,
+        sha256="f" * 64,
+    )
+    payload = first.payload.model_copy(
+        update={"skills": (skill.model_copy(update={"files": (changed,)}),)}
+    )
+
+    assert canonical_snapshot_bytes(payload) != canonical_snapshot_bytes(first.payload)
+
+
+def test_snapshot_captures_skill_manifest_and_attachments(snapshot_service):
+    snapshot_service.agent_service.skill_service.read_files = lambda name: (
+        ("SKILL.md", b"manifest"),
+        ("references/rules.txt", b"rules"),
+    )
+
+    stored = snapshot_service.create("run-1")
+
+    assert [item.path for item in stored.payload.skills[0].files] == [
+        "SKILL.md",
+        "references/rules.txt",
+    ]
+    assert stored.payload.skills[0].files[1].size == 5
 
 
 def test_snapshot_contains_no_provider_or_mcp_secrets(snapshot_service):
