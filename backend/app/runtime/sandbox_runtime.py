@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import time
+import tempfile
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import Event, Lock, Thread
@@ -42,6 +44,7 @@ from .runner_gateway_client import (
     RunnerGatewayBusinessError,
     RunnerGatewayClientError,
 )
+from .skill_resources import SkillResourceMaterializationError, SkillResourceMaterializer
 
 logger = logging.getLogger(__name__)
 
@@ -175,11 +178,13 @@ class SandboxRuntime:
         agent_factory: DeepAgentFactory | None = None,
         runtime_adapter_type=LangGraphRuntimeAdapter,
         monotonic=time.monotonic,
+        workspace: Path | None = None,
     ) -> None:
         self.gateway = gateway
         self.agent_factory = agent_factory or DeepAgentFactory()
         self.runtime_adapter_type = runtime_adapter_type
         self.monotonic = monotonic
+        self.workspace = workspace
         self._event_sequence = 0
 
     def execute(self, request: RunExecutionRequest) -> RunExecutionResult:
@@ -205,6 +210,16 @@ class SandboxRuntime:
                 or not verify_snapshot_digest(snapshot.payload, snapshot.digest)
             ):
                 return RunExecutionResult(status="failed", error_code="snapshot_invalid")
+
+            if snapshot.payload.skills:
+                resource_workspace = self.workspace
+                if resource_workspace is None:
+                    resource_workspace = Path(tempfile.mkdtemp(prefix=f"runner-{request.run_id}-"))
+                try:
+                    materializer = SkillResourceMaterializer()
+                    materializer.materialize(snapshot.payload, self.gateway, resource_workspace)
+                except SkillResourceMaterializationError:
+                    return self._fail("skill_resource_invalid")
 
             self._event_sequence = 0
             self._approval_checkpoint_key = None
@@ -279,9 +294,17 @@ class SandboxRuntime:
                         tool_call_count=budget.tool_call_count,
                         subagent_call_count=budget.subagent_call_count,
                     )
-                skill_context = ", ".join(
-                    skill.name for skill in snapshot.payload.skills
+                skill_context = "\n\n".join(
+                    skill.content.strip()
+                    for skill in snapshot.payload.skills
+                    if skill.enabled and skill.content.strip()
                 )
+                if not skill_context:
+                    skill_context = ", ".join(
+                        skill.name
+                        for skill in snapshot.payload.skills
+                        if skill.enabled
+                    )
                 context_prompt = actor.context_prompt
                 if skill_context:
                     context_prompt = (

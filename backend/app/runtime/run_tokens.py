@@ -30,6 +30,7 @@ RunnerAction = Literal[
     "event.append",
     "artifact.create",
     "result.complete",
+    "skill.resource.read",
 ]
 _ALLOWED_ACTIONS = {
     "snapshot.read",
@@ -40,6 +41,7 @@ _ALLOWED_ACTIONS = {
     "event.append",
     "artifact.create",
     "result.complete",
+    "skill.resource.read",
 }
 
 

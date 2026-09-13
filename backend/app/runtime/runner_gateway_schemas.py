@@ -16,6 +16,16 @@ class SnapshotResponse(BaseModel):
     payload: ExecutionSnapshotPayload
 
 
+class SkillFileResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    skill_name: str = Field(min_length=1, max_length=128)
+    path: str = Field(min_length=1, max_length=4096)
+    size: int = Field(ge=0)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    data_base64: str
+
+
 class CheckpointWriteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

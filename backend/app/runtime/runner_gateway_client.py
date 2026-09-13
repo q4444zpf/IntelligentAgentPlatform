@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
+import hashlib
 import json as jsonlib
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, TypeVar
+from urllib.parse import quote
 
 import httpx
 from pydantic import BaseModel, TypeAdapter, ValidationError
@@ -23,6 +26,7 @@ from .runner_gateway_schemas import (
     EventAppendResponse,
     ModelInvocationResponse,
     SnapshotResponse,
+    SkillFileResponse,
     ToolInvocationResponse,
 )
 
@@ -100,6 +104,22 @@ class RunnerGatewayClient:
 
     def get_snapshot(self) -> SnapshotResponse:
         return self._request("GET", "snapshot", SnapshotResponse)
+
+    def read_skill_file(self, skill_name: str, path: str) -> dict[str, Any]:
+        response = self._request(
+            "GET",
+            f"skills/{quote(skill_name, safe='')}/files/{quote(path, safe='/')}",
+            SkillFileResponse,
+        )
+        try:
+            data = base64.b64decode(response.data_base64, validate=True)
+        except (ValueError, TypeError, binascii.Error):
+            raise RunnerGatewayResponseInvalid() from None
+        if len(data) != response.size or hashlib.sha256(data).hexdigest() != response.sha256:
+            raise RunnerGatewayResponseInvalid()
+        value = response.model_dump(mode="json", exclude={"data_base64"})
+        value["data"] = data
+        return value
 
     def get_latest_checkpoint(self) -> dict[str, Any]:
         return self._request(

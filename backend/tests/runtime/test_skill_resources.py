@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.runtime.execution_snapshot import SnapshotSkill, SnapshotSkillFile
+from app.runtime.skill_resources import SkillResourceMaterializer
 from app.skills.service import SkillService, SkillValidationError
 
 
@@ -127,3 +128,20 @@ def test_object_backed_skill_resources_do_not_duplicate_embedded_bytes():
     stored = ExecutionSnapshotService._snapshot_skill(service, "forecast", skill)
 
     assert stored.files[0].content_base64 is None
+
+
+def test_materializer_writes_embedded_files_under_skill_root(tmp_path):
+    from app.runtime.execution_snapshot import ExecutionSnapshotPayload, PublishedAgentSnapshot, SnapshotModelSelection, SnapshotRuntimeLimits
+    from datetime import datetime, UTC
+
+    data = b"rules"
+    skill = SnapshotSkill(name="forecast", files=(_file("references/rules.txt", data),))
+    snapshot = ExecutionSnapshotPayload(
+        snapshot_id="snap", run_id="run", unit_id="unit", project_id="project", user_id="user",
+        actor=PublishedAgentSnapshot(id="a", name="a", description="", runtime_form="common", language="zh", system_prompt="", context_prompt="", approval_policy="never"),
+        model=SnapshotModelSelection(provider_id="p", model="m"), messages=(), skills=(skill,),
+        limits=SnapshotRuntimeLimits(snapshot_max_bytes=100000), created_at=datetime.now(UTC),
+    )
+    root = SkillResourceMaterializer().materialize(snapshot, object(), tmp_path)
+    assert root == tmp_path / "skills" / "forecast"
+    assert (root / "references" / "rules.txt").read_bytes() == data

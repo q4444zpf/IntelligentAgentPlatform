@@ -36,6 +36,12 @@ from app.tools.schemas import (
     ToolExecutionContext,
     ToolRuntimeError,
 )
+from app.skills.package import SkillPackageError, parse_skill_bundle
+from app.skills.package_storage import (
+    SkillPackageStorage,
+    SkillPackageStorageError,
+    StoredSkillPackage,
+)
 
 from .checkpoint_store import (
     RUNNER_GATEWAY_RESERVED_CHECKPOINT_PREFIX,
@@ -76,6 +82,7 @@ from .runner_gateway_schemas import (
     ModelInvocationResponse,
     ModelToolCall,
     SnapshotResponse,
+    SkillFileResponse,
     ToolInvocationRequest,
     ToolInvocationResponse,
 )
@@ -126,6 +133,7 @@ class RunnerGatewayService:
         artifact_service: ArtifactService | None = None,
         *,
         event_payload_max_bytes: int | None = None,
+        skill_package_storage: SkillPackageStorage | None = None,
     ) -> None:
         self.snapshot_service = snapshot_service
         self.checkpoint_store = checkpoint_store
@@ -134,6 +142,7 @@ class RunnerGatewayService:
         self.audit_recorder = audit_recorder or AuditRecorder()
         self.tool_gateway = tool_gateway
         self.artifact_service = artifact_service
+        self.skill_package_storage = skill_package_storage
         self.event_payload_max_bytes = (
             _event_payload_limit()
             if event_payload_max_bytes is None
@@ -152,6 +161,79 @@ class RunnerGatewayService:
             digest=stored.digest,
             payload=stored.payload,
         )
+
+    def read_skill_file(
+        self,
+        run_id: str,
+        skill_name: str,
+        path: str,
+        claims: RunTokenClaims,
+    ) -> SkillFileResponse:
+        stored = self._verified_snapshot(run_id, claims)
+        skill = next(
+            (item for item in stored.payload.skills if item.name == skill_name), None
+        )
+        if skill is None:
+            raise RunnerGatewayError(404, "skill_resource_not_found", "Skill 资源不存在")
+        if not skill.enabled:
+            raise RunnerGatewayError(403, "skill_resource_disabled", "Skill 资源未启用")
+        manifest = next((item for item in skill.files if item.path == path), None)
+        if manifest is None:
+            raise RunnerGatewayError(404, "skill_resource_not_found", "Skill 资源不存在")
+        if manifest.size > 10 * 1024 * 1024:
+            raise RunnerGatewayError(413, "skill_resource_too_large", "Skill 资源超过大小限制")
+
+        data: bytes
+        if manifest.content_base64 is not None:
+            try:
+                data = base64.b64decode(manifest.content_base64, validate=True)
+            except (ValueError, binascii.Error) as error:
+                raise RunnerGatewayError(409, "skill_resource_digest_mismatch", "Skill 资源校验失败") from error
+        else:
+            if not skill.object_key or not skill.package_digest or self.skill_package_storage is None:
+                raise RunnerGatewayError(503, "skill_resource_unavailable", "Skill 资源暂不可用")
+            try:
+                data = self._read_skill_package(skill)
+                packages = parse_skill_bundle(data)
+                package = next((item for item in packages if item.name == skill.name), None)
+                if package is None or (skill.package_digest and package.digest != skill.package_digest):
+                    raise ValueError("package digest mismatch")
+                package_file = next((item for item in package.files if item.path == path), None)
+                if package_file is None:
+                    raise RunnerGatewayError(404, "skill_resource_not_found", "Skill 资源不存在")
+                data = package_file.data
+            except RunnerGatewayError:
+                raise
+            except (SkillPackageStorageError, SkillPackageError, ValueError) as error:
+                code = "skill_resource_unavailable" if isinstance(error, SkillPackageStorageError) else "skill_resource_digest_mismatch"
+                status = 503 if code == "skill_resource_unavailable" else 409
+                raise RunnerGatewayError(status, code, "Skill 资源不可用" if status == 503 else "Skill 资源校验失败") from error
+        if len(data) != manifest.size or hashlib.sha256(data).hexdigest() != manifest.sha256:
+            raise RunnerGatewayError(409, "skill_resource_digest_mismatch", "Skill 资源校验失败")
+        max_bytes = 10 * 1024 * 1024
+        if len(data) > max_bytes:
+            raise RunnerGatewayError(413, "skill_resource_too_large", "Skill 资源超过大小限制")
+        return SkillFileResponse(
+            skill_name=skill.name,
+            path=manifest.path,
+            size=len(data),
+            sha256=manifest.sha256,
+            data_base64=base64.b64encode(data).decode("ascii"),
+        )
+
+    def _read_skill_package(self, skill) -> bytes:
+        metadata = skill.metadata if isinstance(skill.metadata, dict) else {}
+        stored = StoredSkillPackage(
+            object_key=skill.object_key,
+            archive_sha256=str(metadata.get("archive_sha256", metadata.get("archive-sha256", getattr(skill, "archive_sha256", "0" * 64)))),
+            package_digest=skill.package_digest or "0" * 64,
+            size_bytes=int(metadata.get("size_bytes", metadata.get("size-bytes", getattr(skill, "size_bytes", 0)))),
+        )
+        try:
+            return self.skill_package_storage.read(stored)
+        except (SkillPackageStorageError, TypeError):
+            # Test doubles and older providers may accept the immutable snapshot reference directly.
+            return self.skill_package_storage.read(skill)
 
     def _verified_snapshot(
         self, run_id: str, claims: RunTokenClaims
