@@ -109,6 +109,7 @@ def execute_script(
     arguments: dict[str, object],
     *,
     cancel_event: Event | None = None,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, object]:
     if cancel_event is not None and cancel_event.is_set():
         raise SkillScriptError("script cancelled")
@@ -127,32 +128,44 @@ def execute_script(
         "PYTHONUNBUFFERED": "1",
     }
     output_file = tempfile.TemporaryFile()
+    error_file = tempfile.TemporaryFile()
     process = subprocess.Popen(
         [sys.executable, str(script_path)], cwd=str(root_resolved), stdin=subprocess.PIPE,
-        stdout=output_file, stderr=subprocess.STDOUT, env=env, shell=False,
+        stdout=output_file, stderr=error_file, env=env, shell=False,
     )
     payload = json.dumps(arguments, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     deadline = time.monotonic() + spec.timeout_seconds
+    if deadline_monotonic is not None:
+        deadline = min(deadline, deadline_monotonic)
     cancelled = Event()
-    watcher = None
-    if cancel_event is not None:
-        def watch_cancel() -> None:
-            while process.poll() is None and not cancel_event.is_set():
-                time.sleep(0.01)
-            if cancel_event.is_set() and process.poll() is None:
+    overflow = Event()
+    def watch_process() -> None:
+        while process.poll() is None:
+            if cancel_event is not None and cancel_event.is_set():
                 cancelled.set()
                 process.kill()
-        watcher = Thread(target=watch_cancel, daemon=True)
-        watcher.start()
+                return
+            if os.fstat(output_file.fileno()).st_size > MAX_SCRIPT_OUTPUT_BYTES or os.fstat(error_file.fileno()).st_size > MAX_SCRIPT_OUTPUT_BYTES:
+                overflow.set()
+                process.kill()
+                return
+            time.sleep(0.01)
+    watcher = Thread(target=watch_process, daemon=True)
+    watcher.start()
     try:
         try:
-            process.communicate(input=payload, timeout=spec.timeout_seconds)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(str(script_path), 0)
+            process.communicate(input=payload, timeout=remaining)
         except subprocess.TimeoutExpired as error:
             process.kill()
             process.communicate()
             raise SkillScriptError("script timeout") from error
         if cancelled.is_set() or (cancel_event is not None and cancel_event.is_set()):
             raise SkillScriptError("script cancelled")
+        if overflow.is_set():
+            raise SkillScriptError("script output exceeds limit")
         output_file.seek(0, 2)
         if output_file.tell() > MAX_SCRIPT_OUTPUT_BYTES:
             raise SkillScriptError("script output exceeds limit")
@@ -173,6 +186,7 @@ def execute_script(
             process.kill()
             process.wait()
         output_file.close()
+        error_file.close()
 
 
 __all__ = ["SkillScriptError", "SkillScriptSpec", "execute_script", "load_script_specs"]

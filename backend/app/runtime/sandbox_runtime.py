@@ -347,6 +347,7 @@ class SandboxRuntime:
                         resource_workspace,
                         client=self.gateway,
                         cancellation_event=self._cancel_event,
+                        deadline_monotonic=monotonic_execution_deadline,
                     ),
                 ]
                 graph = self.agent_factory.build(

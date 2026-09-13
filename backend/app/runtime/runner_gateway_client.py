@@ -29,6 +29,8 @@ from .runner_gateway_schemas import (
     SkillFileResponse,
     ScriptExecutionLeaseResponse,
     ScriptExecutionRequest,
+    ScriptExecutionCompletionRequest,
+    ScriptExecutionCompletionResponse,
     ToolInvocationResponse,
 )
 
@@ -224,6 +226,28 @@ class RunnerGatewayClient:
             "POST",
             "script-invocations",
             ScriptExecutionLeaseResponse,
+            json=request.model_dump(mode="json", exclude_none=True),
+            idempotency_key=idempotency_key,
+        ).model_dump(mode="json")
+
+    def complete_script(
+        self,
+        *,
+        lease_id: str,
+        status: str,
+        error_code: str | None,
+        duration_ms: int,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        request = ScriptExecutionCompletionRequest(
+            status=status,
+            error_code=error_code,
+            duration_ms=duration_ms,
+        )
+        return self._request(
+            "POST",
+            f"script-invocations/{quote(lease_id, safe='')}/completion",
+            ScriptExecutionCompletionResponse,
             json=request.model_dump(mode="json", exclude_none=True),
             idempotency_key=idempotency_key,
         ).model_dump(mode="json")

@@ -139,6 +139,21 @@ class ScriptExecutionLeaseResponse(BaseModel):
     approval_id: str | None = None
 
 
+class ScriptExecutionCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["completed", "failed", "cancelled"]
+    error_code: str | None = Field(default=None, max_length=120)
+    duration_ms: int = Field(ge=0)
+
+
+class ScriptExecutionCompletionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    lease_id: str
+    status: Literal["completed", "failed", "cancelled"]
+
+
 class ArtifactProvenance(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

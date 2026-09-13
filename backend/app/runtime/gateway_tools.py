@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from itertools import count
 from threading import Event
 from typing import Any, Protocol
@@ -78,6 +79,7 @@ def build_skill_script_tools(
     *,
     client: RunnerToolClient | None = None,
     cancellation_event: Event | None = None,
+    deadline_monotonic: float | None = None,
 ) -> list[StructuredTool]:
     """Build declared Skill scripts as ordinary bounded model tools."""
     tools: list[StructuredTool] = []
@@ -97,16 +99,43 @@ def build_skill_script_tools(
 
             def invoke_script(_tool_call_id: str | None = None, _spec=spec, _root=skill_root, **arguments: Any):
                 try:
+                    lease = None
                     if client is not None and hasattr(client, "execute_script"):
                         sequence = next(sequences)
-                        client.execute_script(
+                        lease = client.execute_script(
                             script_name=_spec.tool_name,
                             arguments=arguments,
                             tool_call_id=_tool_call_id or _spec.tool_name,
                             invocation_sequence=sequence,
                             idempotency_key=f"script:{_tool_call_id or _spec.tool_name}:{sequence}",
                         )
-                    return execute_script(_spec, _root, arguments, cancel_event=cancellation_event)
+                        if (
+                            not isinstance(lease, dict)
+                            or lease.get("status") != "leased"
+                            or lease.get("script_name") != _spec.tool_name
+                            or not isinstance(lease.get("lease_id"), str)
+                            or not lease["lease_id"]
+                        ):
+                            raise RunnerGatewayToolError("tool_execution_failed")
+                    started = time.monotonic()
+                    status = "completed"
+                    error_code = None
+                    try:
+                        return execute_script(
+                            _spec, _root, arguments, cancel_event=cancellation_event,
+                            deadline_monotonic=deadline_monotonic,
+                        )
+                    except SkillScriptError as error:
+                        status = "cancelled" if "cancel" in str(error) else "failed"
+                        error_code = "skill_script_cancelled" if status == "cancelled" else "skill_script_failed"
+                        raise
+                    finally:
+                        if lease is not None and client is not None and hasattr(client, "complete_script"):
+                            client.complete_script(
+                                lease_id=lease["lease_id"], status=status, error_code=error_code,
+                                duration_ms=max(0, int((time.monotonic() - started) * 1000)),
+                                idempotency_key=f"script-complete:{lease['lease_id']}:{status}",
+                            )
                 except RunnerGatewayBusinessError as error:
                     if error.code == "tool_approval_required":
                         raise RunnerApprovalInterruption(error.details.get("approval_id", "")) from error

@@ -22,3 +22,9 @@ Scripts require strict relative declared paths, object-only JSON schemas, bounde
 Addressed review findings: initialize the resource workspace for no-Skill runs, reject drive-prefixed paths, require exact deterministic script names, add duplicate call admission keys, propagate a runtime cancellation event, map approval responses to `RunnerApprovalInterruption`, and merge bounded process output into a temporary file to cap captured stdout/stderr.
 
 Verification: `pytest --basetemp=backend/.tmp/task3-fix backend/tests/runtime/test_skill_scripts.py backend/tests/runtime/test_gateway_tools.py backend/tests/runtime/test_runner_gateway_skill_resources.py -q` => **27 passed, 1 warning**. Sandbox regression excluding the known external worker probe: `pytest --basetemp=backend/.tmp/task3-fix backend/tests/runtime/test_sandbox_runtime.py -k 'not real_worker_process' -q` => **63 passed, 3 deselected**.
+
+## Fix Round 2
+
+Implemented durable `ToolInvocation`/`Approval` persistence with matching-argument approved resume, strict lease response validation, idempotent terminal completion route/client callbacks, start/terminal runtime audit records, remaining-run-deadline enforcement, and separate stdout/stderr bounded files with overflow termination. Added regression coverage for durable approval resume, malformed lease rejection, terminal completion callbacks, stderr diagnostics, and remaining-deadline timeout.
+
+Verification: `pytest --basetemp=backend/.tmp/task3-r2f backend/tests/runtime/test_skill_scripts.py backend/tests/runtime/test_gateway_tools.py backend/tests/runtime/test_runner_gateway_skill_resources.py -q` => **29 passed, 1 Starlette deprecation warning**. Sandbox regression from round 1 remains **63 passed, 3 worker-probe tests deselected**; the worker-probe environment limitation is unchanged and unrelated to Task 3.

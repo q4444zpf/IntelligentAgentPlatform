@@ -14,7 +14,7 @@ from pydantic import ValidationError
 from sqlalchemy import func, select
 
 from app.approvals.models import Approval
-from app.approvals.service import arguments_digest
+from app.approvals.service import ApprovalService, arguments_digest
 from app.artifacts.service import (
     ArtifactAlreadyExistsError,
     ArtifactContentTypeError,
@@ -24,11 +24,12 @@ from app.artifacts.service import (
     ArtifactSizeError,
 )
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
-from app.conversations.models import AgentRun, RunEvent
+from app.conversations.models import AgentRun, RunEvent, ToolInvocation
 from app.conversations.repository import ConversationRepository
 from app.identity.authorization import AuthorizationService
 from app.identity.repository import AuthorizationRepository
 from app.identity.schemas import ResourceScope
+from app.core.request_context import RequestContext
 from app.tools.gateway import ToolGateway
 from app.tools.schemas import (
     ToolCall,
@@ -85,6 +86,8 @@ from .runner_gateway_schemas import (
     SkillFileResponse,
     ScriptExecutionLeaseResponse,
     ScriptExecutionRequest,
+    ScriptExecutionCompletionRequest,
+    ScriptExecutionCompletionResponse,
     ToolInvocationRequest,
     ToolInvocationResponse,
 )
@@ -242,6 +245,7 @@ class RunnerGatewayService:
         run = self._lock_run(repository, run_id)
         self._require_active_run(run)
         found = None
+        found_skill = None
         for skill in snapshot.payload.skills:
             if not skill.enabled:
                 continue
@@ -251,6 +255,7 @@ class RunnerGatewayService:
                 raise RunnerGatewayError(409, "skill_script_invalid", "Skill 脚本声明无效") from error
             found = next((spec for spec in specs if spec.tool_name == request.script_name), None)
             if found is not None:
+                found_skill = skill
                 break
         if found is None:
             raise RunnerGatewayError(403, "skill_script_not_authorized", "Skill 脚本当前不可用")
@@ -266,11 +271,52 @@ class RunnerGatewayService:
         replay = self._replay_or_conflict(requests, run_id, action, idempotency_key, request_digest)
         if replay is not None:
             return ScriptExecutionLeaseResponse.model_validate(replay)
+        invocation = repository.get_tool_invocation(run_id, request.tool_call_id)
+        if invocation is not None and (
+            invocation.tool_id != found.tool_name
+            or arguments_digest(invocation.arguments_summary) != arguments_digest(request.arguments)
+        ):
+            raise RunnerGatewayError(409, "tool_duplicate_call", "工具调用标识重复")
         if found.requires_approval:
-            approval_id = f"script-approval:{run_id}:{found.tool_name}"
-            raise RunnerGatewayError(409, "tool_approval_required", "该工具需要人工审批后才能执行", {"approval_id": approval_id})
+            context_data = repository.get_run_execution_context(run_id)
+            if context_data is None:
+                raise RunnerGatewayError(404, "run_not_found", "Run 不存在")
+            approval = None
+            if invocation is not None:
+                approval = repository.session.scalar(select(Approval).where(Approval.invocation_id == invocation.id))
+            if approval is not None and approval.status == "approved" and approval.arguments_digest == arguments_digest(request.arguments):
+                invocation.status = "running"
+            else:
+                if invocation is None:
+                    invocation = ToolInvocation(
+                        run_id=run_id, tool_call_id=request.tool_call_id,
+                        tool_id=found.tool_name, tool_version=(found_skill.version or "1")[:32],
+                        status="waiting_approval", arguments_summary=request.arguments,
+                    )
+                    repository.add_tool_invocation(invocation)
+                    approval = ApprovalService(repository.session).create_request(
+                        run=run,
+                        invocation=invocation,
+                        context=RequestContext(
+                            user_id=str(context_data["user_id"]), unit_id=str(context_data["unit_id"]),
+                            project_id=str(context_data["project_id"]),
+                            roles=frozenset(role for role in context_data["actor_roles"] if role in {"user", "project_admin", "unit_admin", "unit_auditor"}) or frozenset({"user"}),
+                        ),
+                    )
+                    run.status = "waiting_approval"
+                    repository.append_event(run_id, "approval.requested", {"approval_id": approval.id, "invocation_id": invocation.id, "tool_id": found.tool_name})
+                    repository.append_event(run_id, "run.status", {"status": "waiting_approval"})
+                    repository.session.commit()
+                raise RunnerGatewayError(409, "tool_approval_required", "该工具需要人工审批后才能执行", {"approval_id": str(approval.id)})
+        elif invocation is None:
+            invocation = ToolInvocation(
+                run_id=run_id, tool_call_id=request.tool_call_id, tool_id=found.tool_name,
+                tool_version=(found_skill.version or "1")[:32], status="running",
+                arguments_summary=request.arguments,
+            )
+            repository.add_tool_invocation(invocation)
         lease = ScriptExecutionLeaseResponse(
-            lease_id=f"lease:{run_id}:{request.tool_call_id}",
+            lease_id=invocation.id,
             script_name=found.tool_name,
             status="leased",
         )
@@ -289,8 +335,61 @@ class RunnerGatewayService:
             response_json=lease.model_dump(mode="json"),
         )
         repository.append_event(run_id, "skill.script.started", {"script_name": found.tool_name, "tool_call_id": request.tool_call_id})
+        context_data = repository.get_run_execution_context(run_id)
+        if context_data is not None:
+            metadata = {"lease_id": invocation.id, "script_name": found.tool_name, "tool_call_id": request.tool_call_id}
+            self.audit_recorder.record(repository.session, AuditRecordRequest(
+                unit_id=str(context_data["unit_id"]), project_id=str(context_data["project_id"]), user_id=str(context_data["user_id"]),
+                actor_roles=tuple(context_data["actor_roles"]), authorization_scope="project", event_scope="project",
+                category="runtime", source="sandbox", action="skill.script.started", status="started", risk_level="high" if found.requires_approval else "medium",
+                idempotency_key=f"skill-script:{invocation.id}:started", occurred_at=datetime.now(UTC), run_id=run_id,
+                resource_type="skill_script", resource_id=invocation.id, resource_name=found.tool_name,
+                summary="Skill script execution leased", metadata=metadata, allowed_metadata_keys=frozenset(metadata),
+            ))
         repository.session.commit()
         return lease
+
+    def complete_script(
+        self,
+        run_id: str,
+        lease_id: str,
+        request: ScriptExecutionCompletionRequest,
+        claims: RunTokenClaims,
+        idempotency_key: str,
+    ) -> ScriptExecutionCompletionResponse:
+        repository = self._require_conversation_repository()
+        self._verified_snapshot(run_id, claims)
+        requests = RunnerRequestStore(repository.session)
+        action = "skill.script.complete"
+        digest = _canonical_digest({"lease_id": lease_id, "request": request.model_dump(mode="json")})
+        replay = self._replay_or_conflict(requests, run_id, action, idempotency_key, digest)
+        if replay is not None:
+            return ScriptExecutionCompletionResponse.model_validate(replay)
+        invocation = repository.session.get(ToolInvocation, lease_id)
+        if invocation is None or invocation.run_id != run_id or not invocation.tool_id.startswith("skill."):
+            raise RunnerGatewayError(404, "skill_script_lease_invalid", "Skill 脚本租约无效")
+        invocation.status = request.status
+        invocation.error_code = request.error_code
+        invocation.duration_ms = request.duration_ms
+        invocation.completed_at = datetime.now(UTC)
+        response = ScriptExecutionCompletionResponse(lease_id=lease_id, status=request.status)
+        repository.append_event(run_id, f"skill.script.{request.status}", {"lease_id": lease_id, "script_name": invocation.tool_id, "duration_ms": request.duration_ms, **({"error_code": request.error_code} if request.error_code else {})})
+        context_data = repository.get_run_execution_context(run_id)
+        if context_data is not None:
+            metadata = {"lease_id": lease_id, "script_name": invocation.tool_id, "duration_ms": request.duration_ms}
+            self.audit_recorder.record(repository.session, AuditRecordRequest(
+                unit_id=str(context_data["unit_id"]), project_id=str(context_data["project_id"]), user_id=str(context_data["user_id"]),
+                actor_roles=tuple(context_data["actor_roles"]), authorization_scope="project", event_scope="project",
+                category="runtime", source="sandbox", action=f"skill.script.{request.status}",
+                status="succeeded" if request.status == "completed" else request.status, risk_level="medium",
+                idempotency_key=f"skill-script:{lease_id}:{request.status}", occurred_at=datetime.now(UTC), run_id=run_id,
+                resource_type="skill_script", resource_id=lease_id, resource_name=invocation.tool_id,
+                summary="Skill script execution finished", metadata=metadata, allowed_metadata_keys=frozenset(metadata),
+                error_code=request.error_code, duration_ms=request.duration_ms,
+            ))
+        requests.add(run_id=run_id, action=action, idempotency_key=idempotency_key, request_digest=digest, response_json=response.model_dump(mode="json"))
+        repository.session.commit()
+        return response
 
     def _read_skill_package(self, skill) -> bytes:
         stored = StoredSkillPackage(

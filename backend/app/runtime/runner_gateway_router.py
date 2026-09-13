@@ -38,6 +38,8 @@ from .runner_gateway_schemas import (
     SkillFileResponse,
     ScriptExecutionLeaseResponse,
     ScriptExecutionRequest,
+    ScriptExecutionCompletionRequest,
+    ScriptExecutionCompletionResponse,
     ToolInvocationRequest,
     ToolInvocationResponse,
 )
@@ -197,6 +199,25 @@ def create_router(
         return RunnerGatewayService(
             snapshot_service, conversation_repository=repository
         ).execute_script(run_id, request, claims, idempotency_key)
+
+    @router.post(
+        "/runs/{run_id}/script-invocations/{lease_id}/completion",
+        response_model=ScriptExecutionCompletionResponse,
+    )
+    def complete_script(
+        run_id: str,
+        lease_id: str,
+        request: ScriptExecutionCompletionRequest,
+        idempotency_key: Annotated[
+            str, Header(alias="Idempotency-Key", min_length=1, max_length=200)
+        ],
+        claims: Annotated[RunTokenClaims, Depends(skill_script_claims)],
+        snapshot_service: Annotated[ExecutionSnapshotService, Depends(snapshot_service_dependency)],
+        repository: Annotated[ConversationRepository, Depends(conversation_repository_dependency)],
+    ) -> ScriptExecutionCompletionResponse:
+        return RunnerGatewayService(snapshot_service, conversation_repository=repository).complete_script(
+            run_id, lease_id, request, claims, idempotency_key
+        )
 
     @router.get(
         "/runs/{run_id}/checkpoints/latest",

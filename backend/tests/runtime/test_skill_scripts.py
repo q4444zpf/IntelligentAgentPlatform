@@ -1,5 +1,6 @@
 import json
 import sys
+import time
 from pathlib import Path
 from threading import Event
 
@@ -78,6 +79,9 @@ def test_execute_script_uses_json_protocol_and_validates_input_output(tmp_path, 
     with pytest.raises(SkillScriptError, match="input"):
         execute_script(spec, tmp_path, {"value": "bad"})
 
+    _write_script(tmp_path, "scripts/normalize.py", "import json,sys; print('diagnostic', file=sys.stderr); json.dump({'value': 7}, sys.stdout)")
+    assert execute_script(spec, tmp_path, {"value": 1}) == {"value": 7}
+
 
 def test_execute_script_rejects_traversal_missing_nonzero_and_oversized_output(tmp_path):
     _write_script(tmp_path, "scripts/normalize.py", "import json,sys; json.dump({'value': 1},sys.stdout)")
@@ -106,6 +110,8 @@ def test_execute_script_supports_timeout_and_cancellation(tmp_path):
     cancel.set()
     with pytest.raises(SkillScriptError, match="cancel"):
         execute_script(spec, tmp_path, {"value": 1}, cancel_event=cancel)
+    with pytest.raises(SkillScriptError, match="timeout"):
+        execute_script(spec, tmp_path, {"value": 1}, deadline_monotonic=time.monotonic() + 0.05)
 
 
 def test_declared_script_is_exposed_as_model_tool(tmp_path):
@@ -114,6 +120,28 @@ def test_declared_script_is_exposed_as_model_tool(tmp_path):
     tools = build_skill_script_tools(snapshot, tmp_path)
     assert [tool.name for tool in tools] == ["skill.forecast.script.normalize"]
     assert tools[0].invoke({"value": 2}) == {"value": 3}
+
+
+def test_script_tool_requires_valid_lease_and_reports_completion(tmp_path):
+    _write_script(tmp_path, "skills/forecast/scripts/normalize.py", "import json,sys; json.dump({'value': 3},sys.stdout)")
+    snapshot = type("Snapshot", (), {"skills": (_skill({"scripts": [_declaration()]}),)})()
+
+    class Client:
+        def __init__(self, lease):
+            self.lease = lease
+            self.completed = []
+        def execute_script(self, **_request):
+            return self.lease
+        def complete_script(self, **request):
+            self.completed.append(request)
+
+    invalid = Client({"status": "leased", "lease_id": "lease-1", "script_name": "wrong"})
+    with pytest.raises(Exception, match="工具执行失败"):
+        build_skill_script_tools(snapshot, tmp_path, client=invalid)[0].invoke({"value": 2})
+
+    valid = Client({"status": "leased", "lease_id": "lease-1", "script_name": "skill.forecast.script.normalize"})
+    assert build_skill_script_tools(snapshot, tmp_path, client=valid)[0].invoke({"value": 2}) == {"value": 3}
+    assert valid.completed[0]["status"] == "completed"
 
 
 def test_runner_client_uses_script_execution_gateway_action():
