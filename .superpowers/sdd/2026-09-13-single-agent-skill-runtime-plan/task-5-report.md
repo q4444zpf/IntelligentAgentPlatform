@@ -1,6 +1,6 @@
 # Task 5: Single-Agent Skill Tool/MCP Acceptance
 
-Status: implementation independently reviewed and final frozen-tree regression verified. Clean-tree full-backend and browser acceptance remain explicitly pending controller execution after this task's commit. Base commit: `95f1235`.
+Status: **DONE_WITH_CONCERNS**. Implementation independently reviewed and final frozen-tree regression verified. Clean-tree full-backend and browser acceptance remain explicitly pending controller execution. Base commit: `95f1235`.
 
 ## Implementation and boundaries
 
@@ -185,7 +185,9 @@ Task 5-owned artifacts: the new integration test, `docs/deployment/single-agent-
 
 One approved worktree-only adjustment is retained in user-owned `backend/tests/runtime/test_runner_gateway_skill_resources.py`: its newly added router test now creates an isolated real SQLite ConversationRepository to satisfy required audit persistence. The original user-added test does not exist in HEAD, so its fixture-only adaptation cannot be independently staged without also staging user content. Per controller direction the entire shared file will remain unstaged; equivalent production route/audit acceptance is committed in the new integration file. All other user edits and the untracked control migration `20260913_28` remain untouched.
 
-The explicit 20-file Task 5 allowlist is staged. `git diff --cached --name-only` confirmed no shared user test, control migration, user DB registration or unrelated change is included; `git diff --cached --check` exited 0 with no whitespace errors. The report is the only force-added path from the ignored task-report directory. Final regression evidence is complete above; commit hash will be recorded immediately after commit.
+Implementation commit: `760b83a7e624fa7e59ab825c916b50b61846de48` (`test: verify single-agent skill tool mcp linkage`), exit 0; exactly 20 files, 1002 insertions and 49 deletions. It contains the final production/test tree verified by **1020 passed** in the complete runtime/Skill/binding/E2E group and **31 passed** in the standalone E2E command. This report-only follow-up does not change that verified code or test tree.
+
+The explicit 20-file Task 5 allowlist was verified before commit. `git diff --cached --name-only` confirmed no shared user test, control migration, user DB registration or unrelated change was included; `git diff --cached --check` exited 0 with no whitespace errors. The report was the only force-added path from the ignored task-report directory. `git show --format=oneline --name-only HEAD` confirmed the same 20-file commit scope after commit. The approved shared resource-router test adapter remains worktree-only and was not committed.
 
 ## Self-review
 
