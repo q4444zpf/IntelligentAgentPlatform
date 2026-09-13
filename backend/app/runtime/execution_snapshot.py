@@ -582,6 +582,7 @@ class ExecutionSnapshotService:
             SkillScope(str(context["unit_id"]), str(context["project_id"])),
             binding.skill_id,
             binding.version_id,
+            available_only=True,
         )
         if version is None:
             raise SkillUnavailableError()
@@ -592,7 +593,7 @@ class ExecutionSnapshotService:
             frontmatter, _ = parse_skill_markdown(version.content)
             if (
                 frontmatter.get("name") != version.name
-                or frontmatter.get("description") != version.description
+                or str(frontmatter.get("description", "")) != version.description
             ):
                 raise SkillUnavailableError()
             metadata = frontmatter.get("metadata", {})
@@ -640,7 +641,9 @@ class ExecutionSnapshotService:
         for skill in skills:
             if not skill.skill_id or not skill.version_id:
                 raise SkillUnavailableError()
-            version = repository.get_version(scope, skill.skill_id, skill.version_id)
+            version = repository.get_version(
+                scope, skill.skill_id, skill.version_id, available_only=True
+            )
             if (
                 version is None
                 or version.package_digest != skill.package_digest

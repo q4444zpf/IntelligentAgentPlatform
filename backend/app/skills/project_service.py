@@ -9,6 +9,11 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.audit.management import (
+    ManagementAuditIdentity,
+    management_event_id,
+    management_trace_id,
+)
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.core.request_context import RequestContext
 
@@ -33,6 +38,7 @@ from .project_packages import (
 from .project_schemas import (
     IdempotencyKey,
     ProjectSkillCreate,
+    ProjectSkillAvailabilityUpdate,
     ProjectSkillDraftUpdate,
     ProjectSkillImportCreate,
     ProjectSkillImportEntry,
@@ -151,7 +157,7 @@ class ProjectSkillService:
             with self._session_factory() as session, session.begin():
                 access = require_skill_access(session, context, "skill.manage")
                 repository = SkillRepository(session)
-                repository.lock_skill(
+                skill = repository.lock_skill(
                     access.scope, skill_id, owner_ids=access.owner_ids
                 )
                 replay = repository.find_publish_replay(
@@ -163,7 +169,9 @@ class ProjectSkillService:
                     owner_ids=access.owner_ids,
                 )
                 if replay is not None:
-                    return PublishedSkillInfo(**self._version_fields(replay))
+                    return PublishedSkillInfo(
+                        **self._version_fields(replay, enabled=skill.enabled)
+                    )
                 current = repository.get_draft(
                     access.scope, skill_id, owner_ids=access.owner_ids
                 )
@@ -187,7 +195,9 @@ class ProjectSkillService:
                     digest=version.package_digest,
                     version_id=version.id,
                 )
-                result = PublishedSkillInfo(**self._version_fields(version))
+                result = PublishedSkillInfo(
+                    **self._version_fields(version, enabled=skill.enabled)
+                )
             return result
         except (
             SkillPackageStorageError,
@@ -207,7 +217,8 @@ class ProjectSkillService:
     ) -> PublishedSkillInfo | None:
         with self._session_factory() as session:
             access = require_skill_access(session, context, "skill.manage")
-            replay = SkillRepository(session).find_publish_replay(
+            repository = SkillRepository(session)
+            replay = repository.find_publish_replay(
                 access.scope,
                 skill_id,
                 expected_revision=request.expected_revision,
@@ -215,15 +226,23 @@ class ProjectSkillService:
                 published_by=context.user_id,
                 owner_ids=access.owner_ids,
             )
+            skill = repository.get(
+                access.scope, skill_id, owner_ids=access.owner_ids
+            )
             return (
-                PublishedSkillInfo(**self._version_fields(replay))
+                PublishedSkillInfo(
+                    **self._version_fields(
+                        replay,
+                        enabled=skill.enabled,
+                    )
+                )
                 if replay is not None
                 else None
             )
 
     @staticmethod
-    def _version_fields(row: SkillVersion) -> dict[str, object]:
-        return {
+    def _version_fields(row: SkillVersion, *, enabled: bool) -> dict[str, object]:
+        fields = {
             field: getattr(row, field)
             for field in (
                 "id",
@@ -241,6 +260,8 @@ class ProjectSkillService:
                 "published_at",
             )
         }
+        fields["enabled"] = enabled
+        return fields
 
     def import_bundle(
         self, context: RequestContext, data: bytes, manifest_json: str | None
@@ -351,6 +372,51 @@ class ProjectSkillService:
             SkillResourceNotFound,
             IntegrityError,
         ) as error:
+            self._raise_known(error)
+            raise
+
+    def set_enabled(
+        self,
+        context: RequestContext,
+        skill_id: str,
+        request: ProjectSkillAvailabilityUpdate,
+        *,
+        request_id: ManagementAuditIdentity | None = None,
+    ) -> SkillSummary:
+        try:
+            with self._session_factory() as session, session.begin():
+                access = require_skill_access(session, context, "skill.manage")
+                repository = SkillRepository(session)
+                skill, draft = repository.set_enabled(
+                    access.scope,
+                    skill_id,
+                    enabled=request.enabled,
+                    expected_revision=request.expected_revision,
+                    owner_ids=access.owner_ids,
+                )
+                self._record_change(
+                    session,
+                    context,
+                    skill_id,
+                    "skill.availability.update",
+                    revision=draft.revision,
+                    digest=draft.package_digest,
+                    enabled=skill.enabled,
+                    request_id=request_id,
+                )
+                result = SkillSummary(
+                    **dict(
+                        self._found(
+                            repository.get_summary(
+                                access.scope,
+                                skill_id,
+                                owner_ids=access.owner_ids,
+                            )
+                        )
+                    )
+                )
+            return result
+        except (SkillResourceNotFound, SkillRevisionConflict) as error:
             self._raise_known(error)
             raise
 
@@ -617,14 +683,19 @@ class ProjectSkillService:
         digest: str,
         version_id: str | None = None,
         trace_id: str | None = None,
+        enabled: bool | None = None,
+        request_id: ManagementAuditIdentity | None = None,
     ) -> None:
         metadata: dict[str, object] = {"revision": revision, "digest": digest}
         if version_id is not None:
             metadata["version_id"] = version_id
+        if enabled is not None:
+            metadata["enabled"] = enabled
+        event_id = management_event_id(request_id)
         key = (
             f"skill:{skill_id}:publish:{version_id}"
             if version_id is not None
-            else f"skill:{skill_id}:{action}:{uuid4()}"
+            else f"skill:{skill_id}:{action}:{event_id}"
         )
         authorization = context.authorization_context
         (self._audit_recorder or AuditRecorder()).record(
@@ -645,10 +716,12 @@ class ProjectSkillService:
                 risk_level="medium",
                 action=action,
                 occurred_at=datetime.now(UTC),
-                trace_id=trace_id or str(uuid4()),
+                trace_id=trace_id or management_trace_id(request_id) or str(uuid4()),
                 idempotency_key=key,
                 metadata=metadata,
-                allowed_metadata_keys=frozenset({"revision", "digest", "version_id"}),
+                allowed_metadata_keys=frozenset(
+                    {"revision", "digest", "version_id", "enabled"}
+                ),
             ),
         )
 
@@ -739,7 +812,8 @@ class ProjectSkillService:
     ) -> SkillVersionInfo:
         with self._session_factory() as session:
             access = require_skill_access(session, context, "skill.read")
-            version = SkillRepository(session).get_version(
+            repository = SkillRepository(session)
+            version = repository.get_version(
                 access.scope,
                 skill_id,
                 version_id,
@@ -747,6 +821,9 @@ class ProjectSkillService:
             )
             if version is None:
                 raise ProjectSkillError("skill_not_found", 404)
+            skill = repository.get(
+                access.scope, skill_id, owner_ids=access.owner_ids
+            )
             return SkillVersionInfo(
                 id=version.id,
                 skill_id=version.skill_id,
@@ -755,6 +832,7 @@ class ProjectSkillService:
                 name=version.name,
                 description=version.description,
                 display_version=version.display_version,
+                enabled=skill.enabled,
                 package_digest=version.package_digest,
                 published_by=version.published_by,
                 published_at=version.published_at,

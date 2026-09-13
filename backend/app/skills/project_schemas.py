@@ -23,6 +23,11 @@ class ProjectSkillPublish(StrictProjectSkillModel):
     expected_revision: int = Field(strict=True, gt=0)
 
 
+class ProjectSkillAvailabilityUpdate(StrictProjectSkillModel):
+    enabled: bool
+    expected_revision: int = Field(strict=True, gt=0)
+
+
 IdempotencyKey = Annotated[
     str,
     StringConstraints(
@@ -91,6 +96,7 @@ class SkillSummary(StrictProjectSkillModel):
     description: str
     display_version: str
     draft_revision: int
+    enabled: bool
     published_version_id: str | None
     created_at: datetime
     updated_at: datetime
@@ -116,6 +122,7 @@ class PublishedSkillInfo(StrictProjectSkillModel):
     name: str
     description: str
     display_version: str
+    enabled: bool
     package_digest: str
     object_key: str | None = None
     archive_sha256: str | None = None

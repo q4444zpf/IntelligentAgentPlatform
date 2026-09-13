@@ -13,6 +13,21 @@ from app.runtime.execution_snapshot import (
     SkillUnavailableError,
 )
 from app.skills.models import Skill, SkillVersion
+from backend.tests.skills.project_support import (
+    make_context,
+    make_test_app,
+    manifest,
+)
+from backend.tests.skills.project_support import (
+    memory_s3_fixture as _memory_s3_fixture,  # noqa: F401
+)
+from backend.tests.skills.project_support import (
+    sessions_fixture as _sessions_fixture,  # noqa: F401
+)
+from backend.tests.skills.project_support import (
+    storage_fixture as _storage_fixture,  # noqa: F401
+)
+from fastapi.testclient import TestClient
 
 
 class ConversationRepository:
@@ -67,7 +82,13 @@ class AgentService:
 
 
 def _published_skill(
-    session, *, skill_id, first_version_id, second_version_id, first_content=None
+    session,
+    *,
+    skill_id,
+    first_version_id,
+    second_version_id,
+    first_content=None,
+    first_description="v1",
 ):
     skill = Skill(
         id=skill_id,
@@ -87,7 +108,7 @@ def _published_skill(
         request_digest="a" * 64,
         published_by="user-1",
         name="forecast",
-        description="v1",
+        description=first_description,
         display_version="1.0",
         content=first_content or "---\nname: forecast\ndescription: v1\n---\nUse forecast version one.",
         files=[],
@@ -234,3 +255,89 @@ def test_snapshot_rejects_disabled_bound_skill_on_fresh_and_reused_runs():
             service.create("run-fresh")
         with pytest.raises(SkillUnavailableError, match="^skill_unavailable$"):
             service.create("run-existing")
+
+
+def test_snapshot_normalizes_scalar_frontmatter_description_from_bound_version():
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    skill_id = "00000000-0000-0000-0000-000000000041"
+    version_id = "00000000-0000-0000-0000-000000000042"
+    with Session(engine) as session:
+        _published_skill(
+            session,
+            skill_id=skill_id,
+            first_version_id=version_id,
+            second_version_id="00000000-0000-0000-0000-000000000043",
+            first_content="---\nname: forecast\ndescription: 123\n---\nUse scalar metadata.\n",
+            first_description="123",
+        )
+        service = ExecutionSnapshotService(
+            session,
+            AgentService(
+                (SkillBinding(skill_id=skill_id, version_id=version_id, name="forecast"),),
+                ["forecast"],
+            ),
+            ConversationRepository(),
+        )
+
+        snapshot = service.create("run-scalar-description")
+
+    assert snapshot.payload.skills[0].description == "123"
+
+
+def test_availability_api_blocks_fresh_and_reused_snapshots_then_restores_bound_version(
+    sessions, storage
+):
+    context = make_context("skill.read", "skill.manage")
+    content = manifest("forecast")
+    with TestClient(make_test_app(sessions, lambda: storage, context=context)) as client:
+        created = client.post("/api/project-skills", json={"content": content})
+        skill_id = created.json()["id"]
+        published = client.post(
+            f"/api/project-skills/{skill_id}/publish",
+            json={"expected_revision": 1},
+            headers={"Idempotency-Key": "availability-snapshot-publish"},
+        )
+        version_id = published.json()["id"]
+
+        with sessions() as session:
+            service = ExecutionSnapshotService(
+                session,
+                AgentService(
+                    (
+                        SkillBinding(
+                            skill_id=skill_id,
+                            version_id=version_id,
+                            name="forecast",
+                        ),
+                    ),
+                    ["forecast"],
+                ),
+                ConversationRepository(),
+            )
+            existing = service.create("run-availability-existing")
+            assert existing.payload.skills[0].version_id == version_id
+
+            disabled = client.patch(
+                f"/api/project-skills/{skill_id}/availability",
+                json={"enabled": False, "expected_revision": 2},
+            )
+            assert disabled.status_code == 200
+            assert disabled.json()["enabled"] is False
+            session.expire_all()
+
+            with pytest.raises(SkillUnavailableError, match="^skill_unavailable$"):
+                service.create("run-availability-fresh")
+            with pytest.raises(SkillUnavailableError, match="^skill_unavailable$"):
+                service.create("run-availability-existing")
+
+            enabled = client.patch(
+                f"/api/project-skills/{skill_id}/availability",
+                json={"enabled": True, "expected_revision": 3},
+            )
+            assert enabled.status_code == 200
+            session.expire_all()
+            restored = service.create("run-availability-restored")
+
+    assert restored.payload.skills[0].version_id == version_id
+    assert restored.payload.skills[0].content == content

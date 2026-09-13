@@ -151,3 +151,69 @@ docker run --rm -v "${PWD}/backend/.tmp-task4-alembic-self-contained:/app" -w /a
 ```
 
 The one warning is Starlette's upstream `TestClient` deprecation for AnyIO's `BlockingPortal` alias. It is emitted by the existing resource test dependency path and does not indicate a Task 4 behavior failure.
+
+## Fix Round 3
+
+This round adds the authoritative project Skill availability contract that was
+missing from the round-two review. `PATCH /api/project-skills/{skill_id}/availability`
+requires `skill.manage`, resolves the target in the authorized scope, locks the
+Skill row, advances the current draft revision with the existing conditional
+update, and records `skill.availability.update` with the management request and
+trace identifiers. The endpoint returns the current `SkillSummary`; create,
+list, publish, version-list, and version-detail contracts now expose `enabled`.
+Changing availability never writes a `SkillVersion`.
+
+Management version reads intentionally remain observable when a Skill is
+disabled. Runtime resolution and stored single-Agent snapshot reuse explicitly
+request `available_only=True`, so both fail closed before a model invocation.
+The immutable-version frontmatter comparison now normalizes YAML descriptions
+with `str`, matching package persistence.
+
+### Fix Round 3 TDD And Verification
+
+RED:
+
+```text
+tests/skills/test_project_availability.py: 3 failed
+- publish response omitted enabled
+- authorized availability PATCH route was absent (404)
+
+tests/runtime/test_agent_skill_bindings.py::test_snapshot_normalizes_scalar_frontmatter_description_from_bound_version: 1 failed
+- YAML scalar description 123 was compared to persisted string "123" without normalization
+```
+
+GREEN:
+
+```text
+docker run --rm -v "${PWD}:/app" -w /app/backend intelligent-agent-platform-api:local python -m pytest --basetemp=/tmp/task4-r3-green-availability-rerun -p no:cacheprovider tests/skills/test_project_availability.py tests/skills/test_project_api.py::test_publish_route_returns_fixed_metadata_and_replay tests/runtime/test_agent_skill_bindings.py::test_snapshot_normalizes_scalar_frontmatter_description_from_bound_version -q
+5 passed, 1 upstream TestClient deprecation warning in 14.44s
+
+docker run --rm -v "${PWD}:/app" -w /app/backend intelligent-agent-platform-api:local python -m pytest --basetemp=/tmp/task4-r3-green-api-snapshot -p no:cacheprovider tests/runtime/test_agent_skill_bindings.py::test_availability_api_blocks_fresh_and_reused_snapshots_then_restores_bound_version -q
+1 passed, 1 upstream TestClient deprecation warning in 7.79s
+
+docker run --rm -v "${PWD}:/app" -w /app/backend intelligent-agent-platform-api:local python -m pytest --basetemp=/tmp/task4-r3-bindings-snapshots -p no:cacheprovider tests/test_agent_skill_bindings.py tests/runtime/test_agent_skill_bindings.py tests/runtime/test_execution_snapshot.py -q
+37 passed, 1 upstream TestClient deprecation warning in 18.17s
+
+docker run --rm -v "${PWD}:/app" -w /app/backend intelligent-agent-platform-api:local python -m pytest --basetemp=/tmp/task4-r3-runtime-boundaries -p no:cacheprovider tests/runtime/test_harness.py tests/runtime/test_single_agent_skill_context.py tests/runtime/test_tool_gateway_adapter.py tests/runtime/test_skill_scripts.py tests/runtime/test_runner_gateway_skill_resources.py tests/runtime/test_skill_resources.py -q
+71 passed, 1 upstream TestClient deprecation warning in 45.65s
+```
+
+Two broad collections (`tests/skills` and a combined project-contract group)
+were stopped after they continued producing progress without a final wrapper
+summary. They are not recorded as passing or failing; the focused project API,
+availability, repository-path, binding, snapshot, harness, adapter, script, and
+resource checks above have complete exit summaries.
+
+### PostgreSQL Migration Roundtrip
+
+The healthy compose PostgreSQL service was used with a dedicated database,
+`iap_task4_availability_r3`, which was removed after verification. The clean
+archived Task 4 migration view was upgraded to `20260908_27`; a legacy Skill
+row was inserted; then the archive upgraded to `20260914_29`. The database
+query returned `true:NULL`, proving both legacy backfill and removal of the
+temporary server default. An ORM insert using the current workspace model then
+returned `True`, proving its client-side `default=True` remains effective after
+the server default is removed. The archived migration view downgraded cleanly
+to `20260908_27`; a final query returned `20260908_27:false`, confirming the
+revision and absence of the `enabled` column. The dedicated database was then
+dropped.

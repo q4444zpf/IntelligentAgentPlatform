@@ -15,6 +15,7 @@ from fastapi import (
 )
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+from app.audit.management import ManagementAuditIdentity, management_request_id
 from app.core.database import SessionFactory
 from app.core.request_context import RequestContext, require_request_context
 
@@ -22,6 +23,7 @@ from .package import MAX_ZIP_BYTES
 from .project_errors import ProjectSkillError
 from .project_schemas import (
     IdempotencyKey,
+    ProjectSkillAvailabilityUpdate,
     ProjectSkillCreate,
     ProjectSkillDraftUpdate,
     ProjectSkillListQuery,
@@ -145,6 +147,24 @@ def publish_skill(
     response.headers["Cache-Control"] = "no-store"
     try:
         return service.publish(context, str(skill_id), request, idempotency_key)
+    except ProjectSkillError as error:
+        _raise_http(error)
+
+
+@router.patch("/{skill_id}/availability", response_model=SkillSummary)
+def update_skill_availability(
+    skill_id: UUID,
+    request: ProjectSkillAvailabilityUpdate,
+    response: Response,
+    context: Annotated[RequestContext, Depends(_manage_context)],
+    service: Annotated[ProjectSkillService, Depends(_service)],
+    request_id: Annotated[ManagementAuditIdentity, Depends(management_request_id)],
+):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return service.set_enabled(
+            context, str(skill_id), request, request_id=request_id
+        )
     except ProjectSkillError as error:
         _raise_http(error)
 

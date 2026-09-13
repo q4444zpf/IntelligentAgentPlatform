@@ -27,3 +27,7 @@ Task 4: fix round 1/5 (4 original Important addressed; commit c3aee9c; 4 new Imp
 Task 4: minor (deferred): verification report lacks fully reproducible broad-suite output; migration route should use established management error translation.
 
 Task 4: fix round 2/5 (legacy Agent JSON copy/migration defaults, immutable SkillVersion metadata/scripts, target-Agent project scope, Team name-only snapshot reuse, and authoritative disabled availability addressed; focused Docker regression 31 passed with 1 upstream TestClient deprecation warning; clean archived Task 4 view Alembic head 20260914_29).
+
+Task 4: fix round 2 re-review (4 Important regressions addressed; 1 Important open: authoritative project Skill API cannot observe/change enabled; 2 Minor open: description normalization and migration roundtrip evidence).
+
+Task 4: fix round 3 (authoritative scoped/audited availability API, enabled read models, runtime-only availability filtering, scalar-description normalization, API-to-snapshot regression, and PostgreSQL migration roundtrip evidence; focused verification 114 passed with upstream TestClient deprecation warnings; broad wrapper collections stopped without final summaries).

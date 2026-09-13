@@ -227,6 +227,7 @@ class SkillRepository:
                 SkillVersion.name,
                 SkillVersion.description,
                 SkillVersion.display_version,
+                Skill.enabled,
                 SkillVersion.package_digest,
                 SkillVersion.published_by,
                 SkillVersion.published_at,
@@ -251,6 +252,21 @@ class SkillRepository:
         self._lock(scope, skill_id)
         values = _snapshot(scope, skill_id, package, stored)
         return self._advance_draft(skill_id, expected_revision, values)
+
+    def set_enabled(
+        self,
+        scope: SkillScope,
+        skill_id: str,
+        *,
+        enabled: bool,
+        expected_revision: int,
+        owner_ids: frozenset[str] | None = None,
+    ) -> tuple[Skill, SkillDraft]:
+        skill = self.lock_skill(scope, skill_id, owner_ids=owner_ids)
+        draft = self._advance_draft(skill_id, expected_revision, {})
+        skill.enabled = enabled
+        self._session.flush()
+        return skill, draft
 
     def publish(
         self,
@@ -319,16 +335,19 @@ class SkillRepository:
         version_id: str,
         *,
         owner_ids: frozenset[str] | None = None,
+        available_only: bool = False,
     ) -> SkillVersion | None:
+        conditions = [
+            *self._conditions(scope, owner_ids=owner_ids),
+            Skill.id == skill_id,
+            SkillVersion.id == version_id,
+        ]
+        if available_only:
+            conditions.append(Skill.enabled.is_(True))
         return self._session.scalar(
             select(SkillVersion)
             .join(Skill, Skill.id == SkillVersion.skill_id)
-            .where(
-                *self._conditions(scope, owner_ids=owner_ids),
-                Skill.id == skill_id,
-                Skill.enabled.is_(True),
-                SkillVersion.id == version_id,
-            )
+            .where(*conditions)
         )
 
     def get_published_by_name(
@@ -379,6 +398,7 @@ class SkillRepository:
                 SkillDraft.description,
                 SkillDraft.display_version,
                 SkillDraft.revision.label("draft_revision"),
+                Skill.enabled,
                 Skill.published_version_id,
                 Skill.created_at,
                 updated_at,
