@@ -24,7 +24,7 @@ Test evidence:
 
 Concerns:
 
-- Object-backed snapshots must provide archive metadata through Skill metadata (or a compatible storage test double); the existing snapshot schema only carries object key and package digest.
+- Object-backed snapshots created from legacy providers that omit archive metadata now fail closed with `skill_resource_unavailable`; published project Skill versions carry the metadata through to snapshots.
 - Full pytest verification remains pending in an environment with Python dependencies or Docker daemon access.
 
 Review follow-up fixes:
