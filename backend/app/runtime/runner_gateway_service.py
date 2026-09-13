@@ -368,6 +368,12 @@ class RunnerGatewayService:
         invocation = repository.session.get(ToolInvocation, lease_id)
         if invocation is None or invocation.run_id != run_id or not invocation.tool_id.startswith("skill."):
             raise RunnerGatewayError(404, "skill_script_lease_invalid", "Skill 脚本租约无效")
+        if invocation.status in {"completed", "failed", "cancelled"}:
+            if invocation.status == request.status:
+                return ScriptExecutionCompletionResponse(lease_id=lease_id, status=request.status)
+            raise RunnerGatewayError(409, "skill_script_already_completed", "Skill 脚本租约已结束")
+        if invocation.status != "running":
+            raise RunnerGatewayError(409, "skill_script_lease_invalid", "Skill 脚本租约状态无效")
         invocation.status = request.status
         invocation.error_code = request.error_code
         invocation.duration_ms = request.duration_ms

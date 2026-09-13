@@ -66,6 +66,9 @@ def _execute_approved_tool(
         context_data = repository.get_run_execution_context(run_id)
         if context_data is None:
             return None
+        if invocation.tool_id.startswith("skill.") and ".script." in invocation.tool_id:
+            # The resumed sandbox re-enters script admission after approval.
+            return run_id
         gateway = ToolGateway(
             tool_store=ToolStore(session_factory),
             repository=repository,

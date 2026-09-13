@@ -198,10 +198,19 @@ class SandboxRuntime:
         self._cancel_event = Event()
         started_at = datetime.now(timezone.utc)
         started_monotonic = self.monotonic()
-        monotonic_execution_deadline = started_monotonic + max(
+        execution_timeout_seconds = max(
             0.0,
             (request.execution_deadline_at - started_at).total_seconds(),
         )
+        monotonic_execution_deadline = started_monotonic + execution_timeout_seconds
+        Thread(
+            target=lambda: self._cancel_event.set()
+            if not self._cancel_event.wait(
+                execution_timeout_seconds
+            )
+            else None,
+            daemon=True,
+        ).start()
         if (
             request.deadline_at <= started_at
             or monotonic_execution_deadline <= started_monotonic

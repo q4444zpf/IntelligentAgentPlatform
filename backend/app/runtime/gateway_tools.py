@@ -129,6 +129,10 @@ def build_skill_script_tools(
                         status = "cancelled" if "cancel" in str(error) else "failed"
                         error_code = "skill_script_cancelled" if status == "cancelled" else "skill_script_failed"
                         raise
+                    except Exception:
+                        status = "failed"
+                        error_code = "skill_script_failed"
+                        raise
                     finally:
                         if lease is not None and client is not None and hasattr(client, "complete_script"):
                             client.complete_script(
@@ -141,6 +145,10 @@ def build_skill_script_tools(
                         raise RunnerApprovalInterruption(error.details.get("approval_id", "")) from error
                     raise RunnerGatewayToolError("tool_execution_failed") from error
                 except SkillScriptError as error:
+                    raise RunnerGatewayToolError("tool_execution_failed") from error
+                except RunnerGatewayToolError:
+                    raise
+                except Exception as error:
                     raise RunnerGatewayToolError("tool_execution_failed") from error
 
             tools.append(

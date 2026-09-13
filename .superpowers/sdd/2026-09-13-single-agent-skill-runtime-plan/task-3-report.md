@@ -28,3 +28,9 @@ Verification: `pytest --basetemp=backend/.tmp/task3-fix backend/tests/runtime/te
 Implemented durable `ToolInvocation`/`Approval` persistence with matching-argument approved resume, strict lease response validation, idempotent terminal completion route/client callbacks, start/terminal runtime audit records, remaining-run-deadline enforcement, and separate stdout/stderr bounded files with overflow termination. Added regression coverage for durable approval resume, malformed lease rejection, terminal completion callbacks, stderr diagnostics, and remaining-deadline timeout.
 
 Verification: `pytest --basetemp=backend/.tmp/task3-r2f backend/tests/runtime/test_skill_scripts.py backend/tests/runtime/test_gateway_tools.py backend/tests/runtime/test_runner_gateway_skill_resources.py -q` => **29 passed, 1 Starlette deprecation warning**. Sandbox regression from round 1 remains **63 passed, 3 worker-probe tests deselected**; the worker-probe environment limitation is unchanged and unrelated to Task 3.
+
+## Fix Round 3
+
+Updated the production approval dispatcher so approved declared-script invocations resume the sandbox without entering ordinary `ToolGateway.execute_approved`. Made lease completion terminal and immutable, added final separate stderr bound checks, converted unexpected executor errors to failed terminal callbacks and safe tool errors, and added a real-time deadline watcher that sets the runner cancellation event without consuming injected monotonic clocks.
+
+Verification: focused script/Gateway/resource tests => **30 passed, 1 known Starlette deprecation warning**; approvals and dispatcher tests => **20 passed, 1 known warning**; sandbox runtime excluding the three environment-dependent real-worker probes => **63 passed, 3 deselected**. The initial sandbox run found two injected-clock regressions caused by the watcher consuming the fake clock; after fixing the watcher both focused failures passed and the 63-test sandbox regression passed.

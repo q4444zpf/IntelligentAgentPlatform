@@ -99,6 +99,11 @@ def test_execute_script_rejects_traversal_missing_nonzero_and_oversized_output(t
     with pytest.raises(SkillScriptError, match="output"):
         execute_script(huge_spec, tmp_path, {"value": 1})
 
+    _write_script(tmp_path, "scripts/huge-error.py", "import sys; sys.stderr.write('x' * 2000000); sys.stdout.write('{\"value\": 1}')")
+    huge_error_spec = load_script_specs(_skill({"scripts": [_declaration(name="huge-error", path="scripts/huge-error.py")]}))[0]
+    with pytest.raises(SkillScriptError, match="output"):
+        execute_script(huge_error_spec, tmp_path, {"value": 1})
+
 
 def test_execute_script_supports_timeout_and_cancellation(tmp_path):
     _write_script(tmp_path, "scripts/sleep.py", "import time; time.sleep(2)")
@@ -142,6 +147,23 @@ def test_script_tool_requires_valid_lease_and_reports_completion(tmp_path):
     valid = Client({"status": "leased", "lease_id": "lease-1", "script_name": "skill.forecast.script.normalize"})
     assert build_skill_script_tools(snapshot, tmp_path, client=valid)[0].invoke({"value": 2}) == {"value": 3}
     assert valid.completed[0]["status"] == "completed"
+
+
+def test_script_tool_reports_unexpected_executor_failure(tmp_path, monkeypatch):
+    import app.runtime.gateway_tools as gateway_tools
+
+    snapshot = type("Snapshot", (), {"skills": (_skill({"scripts": [_declaration()]}),)})()
+    class Client:
+        completed = []
+        def execute_script(self, **_request):
+            return {"status": "leased", "lease_id": "lease-2", "script_name": "skill.forecast.script.normalize"}
+        def complete_script(self, **request):
+            self.completed.append(request)
+    client = Client()
+    monkeypatch.setattr(gateway_tools, "execute_script", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("spawn failed")))
+    with pytest.raises(Exception, match="工具执行失败"):
+        build_skill_script_tools(snapshot, tmp_path, client=client)[0].invoke({"value": 2})
+    assert client.completed[0]["status"] == "failed"
 
 
 def test_runner_client_uses_script_execution_gateway_action():

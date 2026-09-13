@@ -169,6 +169,8 @@ def execute_script(
         output_file.seek(0, 2)
         if output_file.tell() > MAX_SCRIPT_OUTPUT_BYTES:
             raise SkillScriptError("script output exceeds limit")
+        if os.fstat(error_file.fileno()).st_size > MAX_SCRIPT_OUTPUT_BYTES:
+            raise SkillScriptError("script output exceeds limit")
         output_file.seek(0)
         stdout = output_file.read(MAX_SCRIPT_OUTPUT_BYTES + 1)
         if process.returncode != 0:
