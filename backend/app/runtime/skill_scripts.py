@@ -5,6 +5,8 @@ import os
 import subprocess
 import sys
 import time
+import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from threading import Event, Thread
@@ -50,7 +52,7 @@ def _validate_path(value: object) -> str:
     if not isinstance(value, str) or not value or "\\" in value:
         raise SkillScriptError("script path must be relative")
     path = PurePosixPath(value)
-    if path.is_absolute() or ".." in path.parts or path.as_posix() != value:
+    if path.is_absolute() or re.match(r"^[A-Za-z]:", value) or ".." in path.parts or path.as_posix() != value:
         raise SkillScriptError("script path must be relative")
     return value
 
@@ -124,14 +126,10 @@ def execute_script(
         "PYTHONIOENCODING": "utf-8",
         "PYTHONUNBUFFERED": "1",
     }
+    output_file = tempfile.TemporaryFile()
     process = subprocess.Popen(
-        [sys.executable, str(script_path)],
-        cwd=str(root_resolved),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-        shell=False,
+        [sys.executable, str(script_path)], cwd=str(root_resolved), stdin=subprocess.PIPE,
+        stdout=output_file, stderr=subprocess.STDOUT, env=env, shell=False,
     )
     payload = json.dumps(arguments, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     deadline = time.monotonic() + spec.timeout_seconds
@@ -148,15 +146,18 @@ def execute_script(
         watcher.start()
     try:
         try:
-            stdout, _stderr = process.communicate(input=payload, timeout=spec.timeout_seconds)
+            process.communicate(input=payload, timeout=spec.timeout_seconds)
         except subprocess.TimeoutExpired as error:
             process.kill()
-            stdout, _stderr = process.communicate()
+            process.communicate()
             raise SkillScriptError("script timeout") from error
         if cancelled.is_set() or (cancel_event is not None and cancel_event.is_set()):
             raise SkillScriptError("script cancelled")
-        if len(stdout) > MAX_SCRIPT_OUTPUT_BYTES:
+        output_file.seek(0, 2)
+        if output_file.tell() > MAX_SCRIPT_OUTPUT_BYTES:
             raise SkillScriptError("script output exceeds limit")
+        output_file.seek(0)
+        stdout = output_file.read(MAX_SCRIPT_OUTPUT_BYTES + 1)
         if process.returncode != 0:
             raise SkillScriptError("script exited nonzero")
         try:
@@ -171,6 +172,7 @@ def execute_script(
         if process.poll() is None:
             process.kill()
             process.wait()
+        output_file.close()
 
 
 __all__ = ["SkillScriptError", "SkillScriptSpec", "execute_script", "load_script_specs"]

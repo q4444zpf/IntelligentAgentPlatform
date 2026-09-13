@@ -195,6 +195,7 @@ class SandboxRuntime:
         self._owned_workspace: Path | None = None
 
     def execute(self, request: RunExecutionRequest) -> RunExecutionResult:
+        self._cancel_event = Event()
         started_at = datetime.now(timezone.utc)
         started_monotonic = self.monotonic()
         monotonic_execution_deadline = started_monotonic + max(
@@ -218,6 +219,7 @@ class SandboxRuntime:
             ):
                 return RunExecutionResult(status="failed", error_code="snapshot_invalid")
 
+            resource_workspace = self.workspace
             if snapshot.payload.skills:
                 resource_workspace = self.workspace
                 if resource_workspace is None:
@@ -339,12 +341,12 @@ class SandboxRuntime:
                     budget_state=model_budget,
                 )
                 tools = [
-                    *build_gateway_tools(snapshot.payload, self.gateway),
+                    *build_gateway_tools(snapshot.payload, self.gateway, cancellation_event=self._cancel_event),
                     *build_skill_script_tools(
                         snapshot.payload,
                         resource_workspace,
                         client=self.gateway,
-                        cancellation_event=getattr(self, "_cancel_event", None),
+                        cancellation_event=self._cancel_event,
                     ),
                 ]
                 graph = self.agent_factory.build(
@@ -1622,6 +1624,9 @@ class SandboxRuntime:
 
     def _ensure_team_deadline(self, deadline_at: float) -> None:
         if self.monotonic() >= deadline_at:
+            cancel_event = getattr(self, "_cancel_event", None)
+            if cancel_event is not None:
+                cancel_event.set()
             raise _TeamTimedOut()
 
     def _remaining_team_seconds(self, deadline_at: float) -> float:

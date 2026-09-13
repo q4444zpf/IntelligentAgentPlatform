@@ -46,6 +46,8 @@ def test_load_script_specs_rejects_invalid_and_duplicate_declarations():
 
     with pytest.raises(SkillScriptError, match="relative"):
         load_script_specs(_skill({"scripts": [_declaration(path="../escape.py")]}))
+    with pytest.raises(SkillScriptError, match="relative"):
+        load_script_specs(_skill({"scripts": [_declaration(path="C:/escape.py")]}))
 
     with pytest.raises(SkillScriptError, match="timeout"):
         load_script_specs(_skill({"scripts": [_declaration(timeout_seconds=121)]}))

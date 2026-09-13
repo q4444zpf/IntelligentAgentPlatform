@@ -9,6 +9,7 @@ from langchain_core.tools import StructuredTool
 
 from .execution_snapshot import ExecutionSnapshotPayload, SnapshotTool
 from .skill_scripts import SkillScriptError, execute_script, load_script_specs
+from .runner_gateway_client import RunnerGatewayBusinessError
 
 _SAFE_MESSAGES = {
     "tool_not_authorized": "该工具当前不可用。",
@@ -92,18 +93,24 @@ def build_skill_script_tools(
             continue
         for spec in specs:
             skill_root = root / skill.name
+            sequences = count()
 
             def invoke_script(_tool_call_id: str | None = None, _spec=spec, _root=skill_root, **arguments: Any):
                 try:
                     if client is not None and hasattr(client, "execute_script"):
+                        sequence = next(sequences)
                         client.execute_script(
                             script_name=_spec.tool_name,
                             arguments=arguments,
                             tool_call_id=_tool_call_id or _spec.tool_name,
-                            invocation_sequence=0,
-                            idempotency_key=f"script:{_tool_call_id or _spec.tool_name}",
+                            invocation_sequence=sequence,
+                            idempotency_key=f"script:{_tool_call_id or _spec.tool_name}:{sequence}",
                         )
                     return execute_script(_spec, _root, arguments, cancel_event=cancellation_event)
+                except RunnerGatewayBusinessError as error:
+                    if error.code == "tool_approval_required":
+                        raise RunnerApprovalInterruption(error.details.get("approval_id", "")) from error
+                    raise RunnerGatewayToolError("tool_execution_failed") from error
                 except SkillScriptError as error:
                     raise RunnerGatewayToolError("tool_execution_failed") from error
 

@@ -249,7 +249,7 @@ class RunnerGatewayService:
                 specs = load_script_specs(skill)
             except SkillScriptError as error:
                 raise RunnerGatewayError(409, "skill_script_invalid", "Skill 脚本声明无效") from error
-            found = next((spec for spec in specs if spec.tool_name == request.script_name or spec.name == request.script_name), None)
+            found = next((spec for spec in specs if spec.tool_name == request.script_name), None)
             if found is not None:
                 break
         if found is None:
@@ -257,6 +257,12 @@ class RunnerGatewayService:
         requests = RunnerRequestStore(repository.session)
         action = "skill.script.execute"
         request_digest = _canonical_digest({"snapshot_digest": claims.snapshot_digest, "request": request.model_dump(mode="json")})
+        call_key = f"script-call:{request.tool_call_id}"
+        prior_call = requests.get(run_id, action, call_key)
+        if prior_call is not None:
+            if prior_call.request_digest != request_digest:
+                raise RunnerGatewayError(409, "tool_duplicate_call", "工具调用标识重复")
+            return ScriptExecutionLeaseResponse.model_validate(prior_call.response_json)
         replay = self._replay_or_conflict(requests, run_id, action, idempotency_key, request_digest)
         if replay is not None:
             return ScriptExecutionLeaseResponse.model_validate(replay)
@@ -272,6 +278,13 @@ class RunnerGatewayService:
             run_id=run_id,
             action=action,
             idempotency_key=idempotency_key,
+            request_digest=request_digest,
+            response_json=lease.model_dump(mode="json"),
+        )
+        requests.add(
+            run_id=run_id,
+            action=action,
+            idempotency_key=call_key,
             request_digest=request_digest,
             response_json=lease.model_dump(mode="json"),
         )
