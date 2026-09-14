@@ -69,6 +69,8 @@ PERMISSION_CODES = (
     "sandbox.read",
     "integration.read",
     "integration.manage",
+    "control.read", "control.manage", "control.propose", "control.approve",
+    "control.execute", "control.feedback",
 )
 
 ROLE_PERMISSION_CODES = {
@@ -83,6 +85,7 @@ ROLE_PERMISSION_CODES = {
         "collaboration.run", "prompt.read", "prompt.manage", "resource.read",
         "resource.manage", "resource.publish", "artifact.read",
         "artifact.manage", "approval.read", "integration.read",
+        "control.read", "control.manage", "control.propose", "control.approve", "control.execute", "control.feedback",
     ),
     "business_operator": (
         "dashboard.read", "project.read", "agent.read", "agent.run",
@@ -90,7 +93,7 @@ ROLE_PERMISSION_CODES = {
         "knowledge.read", "knowledge.retrieve", "model.read", "model.run",
         "tool.read", "tool.invoke", "skill.read", "skill.invoke",
         "collaboration.read", "collaboration.run", "resource.read",
-        "artifact.read", "approval.read",
+        "artifact.read", "approval.read", "control.read", "control.propose", "control.feedback",
     ),
     "model_expert": (
         "dashboard.read", "project.read", "agent.read", "agent.run",
@@ -106,12 +109,12 @@ ROLE_PERMISSION_CODES = {
         "model.read", "tool.read", "mcp.read", "skill.read",
         "collaboration.read", "prompt.read", "resource.read", "artifact.read",
         "approval.read", "policy.read", "audit.read", "sandbox.read",
-        "integration.read", "settings.read",
+        "integration.read", "settings.read", "control.read",
     ),
     "viewer": (
         "dashboard.read", "project.read", "agent.read", "conversation.read",
         "workflow.read", "knowledge.read", "model.read", "tool.read",
-        "skill.read", "collaboration.read", "resource.read", "artifact.read",
+        "skill.read", "collaboration.read", "resource.read", "artifact.read", "control.read",
     ),
 }
 
@@ -198,6 +201,7 @@ _GROUP_ROUTES = {
         _MenuDefinition("async-tasks", "异步任务", "workflow.read", "current_project", True),
         _MenuDefinition("sandbox", "沙箱监控", "sandbox.read", "unit", False),
         _MenuDefinition("artifacts", "成果文件", "artifact.read", "current_project", True),
+        _MenuDefinition("control", "调度控制", "control.read", "current_project", True),
     ),
     "security": (
         _MenuDefinition("approvals", "待办审批", "approval.read", "current_project", True),

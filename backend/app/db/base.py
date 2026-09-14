@@ -19,6 +19,7 @@ import app.runtime.checkpoint_store  # noqa: E402,F401
 import app.runtime.execution_snapshot  # noqa: E402,F401
 import app.runtime.run_tokens  # noqa: E402,F401
 import app.skills.models  # noqa: E402,F401
+import app.control.models  # noqa: E402,F401
 
 
 def _identity_before_flush(session, flush_context, instances):

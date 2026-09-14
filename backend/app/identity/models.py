@@ -59,6 +59,7 @@ CURRENT_PROJECT_ROUTE_KEYS = (
     "runs",
     "async-tasks",
     "artifacts",
+    "control",
     "approvals",
 )
 

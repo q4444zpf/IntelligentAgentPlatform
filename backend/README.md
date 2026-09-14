@@ -117,6 +117,20 @@ Runner 的 `sandbox=true` 现在还需要六项 readiness 同时为真：可信�
 
 ## 统一审计接口
 
+## 调度控制网关
+
+Team 负责提供 Supervisor 与已发布成员的拓扑和运行快照；控制网关独立负责物理命令的策略校验、仿真证据、有效期、幂等、人工审批、执行器调用、反馈偏差和回滚记录。任何 Agent 只能提出结构化控制申请，不能直接操作闸门、泵站或其他设备。
+
+- `GET/POST /api/control/policies`
+- `GET /api/control/commands`、`GET /api/control/commands/{id}`
+- `POST /api/control/commands`
+- `POST /api/control/commands/{id}/approve`、`/reject`
+- `POST /api/control/commands/{id}/execute`（必须携带 `Idempotency-Key`）
+- `POST /api/control/commands/{id}/feedback`
+- `POST /api/control/commands/{id}/rollback`（必须携带 `Idempotency-Key`）
+
+生产执行必须关联成功的仿真 Artifact，并经过单人或双人审批；执行器异常记录为 `unknown`，不会伪造物理设备状态。控制权限按项目隔离，并通过 `control.read/manage/propose/approve/execute/feedback` 授权。
+
 - `GET /api/audit/events`
 - `GET /api/audit/events/{event_id}`
 - `GET /api/audit/events/{event_id}/related`

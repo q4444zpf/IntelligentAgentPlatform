@@ -33,6 +33,7 @@ from .runtime.runner_gateway_auth import (
 )
 from .runtime.runner_gateway_router import router as runner_gateway_router
 from .collaboration.router import router as collaboration_router
+from .control.router import router as control_router
 
 
 @asynccontextmanager
@@ -106,6 +107,7 @@ app.include_router(identity_admin_router, prefix="/api/identity", tags=["identit
 app.include_router(identity_auth_router, prefix="/api/auth", tags=["auth"])
 app.include_router(artifacts_router, prefix="/api", tags=["artifacts"])
 app.include_router(collaboration_router, prefix="/api/collaboration", tags=["collaboration"])
+app.include_router(control_router, prefix="/api/control", tags=["control"])
 app.include_router(
     runner_gateway_router,
     prefix="/internal/runner",

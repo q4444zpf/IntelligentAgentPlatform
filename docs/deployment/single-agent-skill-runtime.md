@@ -107,7 +107,7 @@ Runner 使用 `sys.executable`、`shell=False`，cwd 为该 Skill 的物化目�
 按 `run_id` 查询审计和 RunEvent，可关联 `skill.resource.read/failed`、`skill.script.started/completed/failed/cancelled`、`tool.invoke.started/succeeded/failed`、`llm.invoke.succeeded/failed`、`runner.run.completed/failed/cancelled`。Coordinator 自主管理的终态使用 `sandbox.run.*`。资源审计记录 Skill 名称和相对路径；脚本记录租约、时长和稳定错误码，不记录整个包内容。审批沿用现有 Approval/ToolInvocation 记录。
 
 1. 按 [项目 Skill 生产激活手册](project-skill-production-activation.md) 配置 PostgreSQL、对象存储和受信镜像，显式执行迁移、校验 Alembic revisions、初始化 `IAP_SKILL_BUCKET`，再启用项目 API。
-2. Skill availability 迁移为 `20260914_29`，直接依赖 `20260908_27`。若工作区同时有其他独立迁移 head，先核查 `alembic heads/current` 与部署计划，不擅自合并或修改其他业务迁移。本任务不接管控制命令迁移 `20260913_28`。
+2. Skill availability 迁移为 `20260914_29`，与控制命令迁移 `20260913_28` 由 `20260914_30` 合并为单一 head。部署前核查 `alembic heads/current`，确认目标 head 为 `20260914_30`。
 3. 使用 `IAP_PROJECT_SKILLS_API_ENABLED=true` 启用项目控制面；API 只校验 schema，不在启动时自动迁移或建桶。对象存储失败应关闭对应资源访问，不影响无关 API 健康检查。
 4. 为 API 注入 `IAP_RUNNER_TOKEN_SIGNING_KEY` 和内部 `IAP_RUNNER_GATEWAY_URL`，配置 Workflow Runner 和受控 Launcher。Runner 不持有 Docker socket，只有 Launcher 有受控生命周期权限。
 5. 在可信镜像、非 root、只读根文件系统、有界 CPU/内存/PID、专用可写临时目录、只允许 Gateway 的网络和可靠清理均验收后，才开启 `IAP_WORKFLOW_RUNNER_SANDBOX_ENABLED` 及相应安全能力开关。不要将宿主工作区、对象存储凭据或任意 host path 挂载给单次 Runner。

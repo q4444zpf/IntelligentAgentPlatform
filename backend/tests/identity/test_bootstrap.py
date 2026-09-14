@@ -47,6 +47,8 @@ PERMISSION_CODES = (
     "model.run", "tool.read", "tool.manage", "tool.invoke", "mcp.read",
     "mcp.manage", "mcp.sync", "skill.read", "skill.manage", "skill.invoke",
     "collaboration.read", "collaboration.manage", "collaboration.run",
+    "control.read", "control.manage", "control.propose", "control.approve",
+    "control.execute", "control.feedback",
     "prompt.read", "prompt.manage", "resource.read", "resource.manage",
     "resource.publish", "resource.review", "artifact.read", "artifact.manage",
     "approval.read", "approval.manage", "policy.read", "policy.manage",
@@ -64,14 +66,16 @@ EXPECTED_ROLE_PERMISSION_CODES = {
         "skill.read", "skill.manage", "skill.invoke", "collaboration.read", "collaboration.manage",
         "collaboration.run", "prompt.read", "prompt.manage", "resource.read",
         "resource.manage", "resource.publish", "artifact.read", "artifact.manage",
-        "approval.read", "integration.read",
+        "approval.read", "integration.read", "control.read", "control.manage",
+        "control.propose", "control.approve", "control.execute", "control.feedback",
     ),
     "business_operator": (
         "dashboard.read", "project.read", "agent.read", "agent.run",
         "conversation.read", "workflow.read", "workflow.run", "knowledge.read",
         "knowledge.retrieve", "model.read", "model.run", "tool.read", "tool.invoke",
         "skill.read", "skill.invoke", "collaboration.read", "collaboration.run",
-        "resource.read", "artifact.read", "approval.read",
+        "resource.read", "artifact.read", "approval.read", "control.read",
+        "control.propose", "control.feedback",
     ),
     "model_expert": (
         "dashboard.read", "project.read", "agent.read", "agent.run",
@@ -87,12 +91,12 @@ EXPECTED_ROLE_PERMISSION_CODES = {
         "model.read", "tool.read", "mcp.read", "skill.read", "collaboration.read",
         "prompt.read", "resource.read", "artifact.read", "approval.read",
         "policy.read", "audit.read", "sandbox.read", "integration.read",
-        "settings.read",
+        "settings.read", "control.read",
     ),
     "viewer": (
         "dashboard.read", "project.read", "agent.read", "conversation.read",
         "workflow.read", "knowledge.read", "model.read", "tool.read", "skill.read",
-        "collaboration.read", "resource.read", "artifact.read",
+        "collaboration.read", "resource.read", "artifact.read", "control.read",
     ),
 }
 
@@ -124,6 +128,7 @@ MENU_CONTRACT = {
     "async-tasks": ("workflow.read", "current_project", True),
     "sandbox": ("sandbox.read", "unit", False),
     "artifacts": ("artifact.read", "current_project", True),
+    "control": ("control.read", "current_project", True),
     "approvals": ("approval.read", "current_project", True),
     "policies": ("policy.read", "unit", False),
     "credentials": ("credential.read", "unit", False),
@@ -145,7 +150,7 @@ MENU_PARENTS = {
         "hydraulic-topology", "unit-resources", "public-agents", "public-mcp",
         "public-skills", "publish-review",
     ),
-    "operations": ("runs", "async-tasks", "sandbox", "artifacts"),
+    "operations": ("runs", "async-tasks", "sandbox", "artifacts", "control"),
     "security": ("approvals", "policies", "credentials", "audit"),
     "system": ("users", "unit-projects", "roles", "integration", "settings"),
 }
@@ -271,8 +276,8 @@ def test_seed_is_idempotent_and_uses_exact_role_grants(session_factory):
 
         assert _count(session, Permission) == len(PERMISSION_CODES)
         assert _count(session, Role) == 6
-        assert _count(session, Menu) == 42
-        assert _count(session, MenuPermission) == 36
+        assert _count(session, Menu) == 43
+        assert _count(session, MenuPermission) == 37
         assert set(session.scalars(select(Permission.code))) == set(PERMISSION_CODES)
 
         roles = {role.code: role for role in session.scalars(select(Role))}

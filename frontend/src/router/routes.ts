@@ -68,6 +68,7 @@ export const appMenus: AppMenuItem[] = [
       { key: 'async-tasks', title: '异步任务', path: '/async-tasks', permission: 'platform:view' },
       { key: 'sandbox', title: '沙箱监控', path: '/system/sandbox', permission: 'platform:sandbox' },
       { key: 'artifacts', title: '成果文件', path: '/artifacts', permission: 'platform:view' },
+      { key: 'control', title: '调度控制', path: '/control', permission: 'control:view' },
     ],
   },
   {
@@ -136,6 +137,7 @@ export const routes: RouteRecordRaw[] = [
       { path: 'knowledge', name: 'KnowledgeManage', component: genericView, meta: { title: '知识库管理', module: 'knowledge', permission: 'knowledge:view' } },
       { path: 'workflow', name: 'WorkflowManage', component: genericView, meta: { title: '流程编排', module: 'workflow', permission: 'workflow:view' } },
       { path: 'collaboration', name: 'CollaborationManage', component: () => import('@/views/collaboration/TeamManageView.vue'), meta: { title: '多智能体协同', permission: 'collaboration:view' } },
+      { path: 'control', name: 'ControlCommands', component: () => import('@/views/control/ControlCommandView.vue'), meta: { title: '调度控制', permission: 'control:view' } },
       { path: 'llm', name: 'LlmProviders', component: () => import('@/views/settings/ModelProviderView.vue'), meta: { title: '大模型配置', permission: 'platform:llm' } },
       { path: 'integration', name: 'Integration', component: () => import('@/views/platform/IntegrationView.vue'), meta: { title: '系统集成', permission: 'integration:view' } },
       { path: 'external-agents', name: 'ExternalAgents', component: genericView, meta: { title: '外部智能体管理', module: 'integration', permission: 'integration:view' } },

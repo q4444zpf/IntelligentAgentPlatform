@@ -1,12 +1,15 @@
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.collaboration.repository import (
     TeamDraftConflictError,
     TeamRepository,
+    TeamDefinitionValidationError,
     TeamVersionImmutableError,
 )
+from app.collaboration.models import TeamVersion
 from app.db.base import Base
 
 
@@ -85,3 +88,49 @@ def test_save_draft_rejects_stale_revision(session):
 
     with pytest.raises(TeamDraftConflictError):
         repository.save_draft(team.id, expected_revision=2, definition=valid_definition())
+
+
+def test_save_draft_rejects_unsupported_failure_strategy_before_commit(session):
+    repository = TeamRepository(session)
+    team = repository.create(unit_id="u1", project_id="p1", name="A", created_by="x")
+    definition = valid_definition()
+    definition["failure_strategy"] = "best_effort"
+
+    with pytest.raises(TeamDefinitionValidationError, match="failure_strategy"):
+        repository.save_draft(team.id, expected_revision=1, definition=definition)
+
+
+def test_team_version_orm_rejects_unsupported_failure_strategy(session):
+    team = TeamRepository(session).create(unit_id="u1", project_id="p1", name="A", created_by="x")
+    session.add(
+        TeamVersion(
+            team_id=team.id,
+            version=1,
+            status="published",
+            definition={},
+            max_steps=1,
+            max_parallel_members=1,
+            timeout_seconds=1,
+            failure_strategy="best_effort",
+            definition_digest="a" * 64,
+        )
+    )
+
+    with pytest.raises(IntegrityError):
+        session.flush()
+
+
+def test_team_version_raw_insert_rejects_unsupported_failure_strategy(session):
+    team = TeamRepository(session).create(unit_id="u1", project_id="p1", name="A", created_by="x")
+
+    with pytest.raises(IntegrityError):
+        session.execute(
+            text(
+                """INSERT INTO collaboration_team_versions
+                (id, team_id, version, status, definition, tool_ids, skill_names,
+                 knowledge_source_ids, max_steps, max_parallel_members, timeout_seconds,
+                 failure_strategy)
+                VALUES (:id, :team_id, 1, 'published', '{}', '[]', '[]', '[]', 1, 1, 1, :strategy)"""
+            ),
+            {"id": "raw-invalid", "team_id": team.id, "strategy": "best_effort"},
+        )
