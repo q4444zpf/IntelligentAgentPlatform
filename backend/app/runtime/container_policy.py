@@ -11,6 +11,8 @@ class InvalidContainerPolicyError(ValueError):
 
 RUNNER_GATEWAY_NETWORK = "intelligent-agent-platform_runner-gateway"
 RUNNER_GATEWAY_URL = "http://api:8000/internal/runner"
+RUNNER_TEMPORARY_DIRECTORY = "/tmp"
+RUNNER_TMPFS_OPTIONS = "rw,nosuid,nodev,noexec,size=64m,uid=65534,gid=65534,mode=0700"
 RUNNER_ENVIRONMENT_KEYS = {
     "IAP_RUN_EXECUTION_REQUEST",
     "IAP_RUNNER_GATEWAY_URL",
@@ -83,5 +85,6 @@ class ContainerPolicy:
             "nano_cpus": int(self.cpus * 1_000_000_000),
             "labels": {"iap.cleanup_guaranteed": "true"},
             "volumes": {str(path): {"bind": "/workspace", "mode": "rw"}},
+            "tmpfs": {RUNNER_TEMPORARY_DIRECTORY: RUNNER_TMPFS_OPTIONS},
             **({"environment": environment} if environment else {}),
         }

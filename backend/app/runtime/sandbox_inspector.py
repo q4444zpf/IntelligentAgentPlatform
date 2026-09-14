@@ -6,6 +6,8 @@ from .container_policy import (
     RUNNER_BASE_ENVIRONMENT_KEYS,
     RUNNER_ENVIRONMENT_KEYS,
     RUNNER_GATEWAY_NETWORK,
+    RUNNER_TEMPORARY_DIRECTORY,
+    RUNNER_TMPFS_OPTIONS,
 )
 from .sandbox_readiness import SandboxReadiness
 
@@ -78,4 +80,7 @@ class SandboxInspector:
                 <= RUNNER_ENVIRONMENT_KEYS | RUNNER_BASE_ENVIRONMENT_KEYS
             ),
             mounts_allowlisted=mounts_allowlisted,
+            temporary_filesystem=host.get("Tmpfs") == {
+                RUNNER_TEMPORARY_DIRECTORY: RUNNER_TMPFS_OPTIONS,
+            },
         )

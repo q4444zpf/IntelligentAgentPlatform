@@ -19,6 +19,9 @@ def test_policy_builds_non_privileged_runner_gateway_container_config():
     assert config["pids_limit"] == 128
     assert config["labels"] == {"iap.cleanup_guaranteed": "true"}
     assert config["volumes"] == {"/workspace/run-1": {"bind": "/workspace", "mode": "rw"}}
+    assert config["tmpfs"] == {
+        "/tmp": "rw,nosuid,nodev,noexec,size=64m,uid=65534,gid=65534,mode=0700",
+    }
     assert config["environment"] == {
         "IAP_RUN_EXECUTION_REQUEST": request_json,
         "IAP_RUNNER_GATEWAY_URL": "http://api:8000/internal/runner",
