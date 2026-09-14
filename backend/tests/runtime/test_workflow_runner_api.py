@@ -63,6 +63,9 @@ def test_runner_can_derive_sandbox_from_inspected_container():
                 "Memory": 1,
                 "PidsLimit": 1,
                 "NanoCpus": 1,
+                "Tmpfs": {
+                    "/tmp": "rw,nosuid,nodev,noexec,size=64m,uid=65534,gid=65534,mode=0700"
+                },
             },
             "NetworkSettings": {
                 "Networks": {"intelligent-agent-platform_runner-gateway": {}},

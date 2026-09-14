@@ -1,6 +1,6 @@
 # Task 5: Single-Agent Skill Tool/MCP Acceptance
 
-Status: **DONE_WITH_CONCERNS** after formal fix round 1. Current Skill availability at resource-read time is now rechecked; the targeted RED/GREEN and corrected-tree 131-test regression passed, with independent rereview finding no actionable issue. Clean-tree full-backend and browser acceptance remain explicitly pending controller execution. Base commit: `95f1235`.
+Status: **DONE** after formal fix round 1 and controller acceptance. Current Skill availability at resource-read time is rechecked; the targeted RED/GREEN and corrected-tree regressions passed, independent rereview found no actionable issue, and the clean isolated tree passed browser, frontend-build and complete-backend gates. Base commit: `95f1235`.
 
 ## Implementation and boundaries
 
@@ -65,7 +65,7 @@ docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "I:\智能体平台\IntelligentA
 
 The runtime/skills/bindings diagnostic finished exit 1: 55 failed, 934 passed, 0 skipped, 2 warnings, 1340.69s. Of these, 47 cookie API failures were the explicit database-name safety guard. Three worker startup failures were initially suspected to involve PYTHONPATH, but stderr later disproved that hypothesis: the deadline probe's synthetic gateway_tools module lacked both newer Skill factory exports. Five remaining failures were reproduced separately: two import cycles, two leaked public DTO storage identities, and one stale summary field allowlist.
 
-The initial full-backend diagnostic finished exit 1: 58 failed, 1680 passed, 101 skipped, 2 warnings, 2013.10s. It includes the same 55 failures plus an invalid published Skill fixture in `test_dispatcher`, a stale application route allowlist and the migration-head assertion. It began before final fixes and is not final-tree evidence. The invocation did not include `-ra`, so it did not print individual skip reasons; skipped tests are not counted as passing. The controller will repeat the full backend and browser acceptance against a clean committed worktree without the user's uncommitted sibling control migration.
+The initial full-backend diagnostic finished exit 1: 58 failed, 1680 passed, 101 skipped, 2 warnings, 2013.10s. It includes the same 55 failures plus an invalid published Skill fixture in `test_dispatcher`, a stale application route allowlist and the migration-head assertion. It began before final fixes and is not final-tree evidence. The invocation did not include `-ra`, so it did not print individual skip reasons; skipped tests are not counted as passing. At this checkpoint the controller still needed to repeat full backend and browser acceptance against a clean committed worktree; the completed evidence is recorded below.
 
 All corrected-environment commands use this exact prefix. The working directory `/tmp` ensures that the specially named SQLite database is container-local and disposable; PYTHONPATH is inherited by spawned workers. No live service database is accessed.
 
@@ -173,7 +173,7 @@ Exit 1: 1 failed, 1 warning, 11.05s. `project_support.py:180` deliberately refus
 
 Controller frontend evidence: in `frontend`, `& 'C:\Program Files\nodejs\npm.cmd' run build`, exit 0. The package command is `vue-tsc --noEmit && vite build`; no type errors, 6980 modules transformed, build 1m21s. One non-fatal Vite bundle-size warning: main `index-CKcJgKtZ.js`, 1571.75 kB / gzip 487.77 kB, above 500 kB.
 
-Browser verification is pending. Read-only checks found `/health` and `/api/health` return 200; `/chat` is usable with development identity. The deployed API currently lacks the Task 4 availability and migration routes. Docker inspection confirms API has only the `/data` named volume and Web has no mounts, so neither consumes current source automatically; old UI history is not accepted as evidence of the new runtime.
+Browser verification was pending at this checkpoint. Read-only checks found `/health` and `/api/health` return 200; `/chat` was usable with development identity. The deployed API then lacked the Task 4 availability and migration routes. Docker inspection confirmed API had only the `/data` named volume and Web had no mounts, so neither consumed current source automatically; old UI history was not accepted as evidence of the new runtime. The rebuilt-image acceptance is recorded below.
 
 ## Files and commit hygiene
 
@@ -196,7 +196,7 @@ The explicit 20-file Task 5 allowlist was verified before commit. `git diff --ca
 - Run terminal and script terminal changes share existing row-lock ordering and conditional update. Durability occurs in the same transaction before revocation, and completion idempotency prevents duplicate terminal audit.
 - Availability preserves historical versions; “unpublished” does not mean “not currently pointed to by latest.”
 - No frontend production edits, database migration, knowledge/Embedding/GIS/Team protocol or Artifact changes are part of Task 5.
-- The complete runtime/Skill/binding/E2E verification above predates fix round 1. Clean-commit full-backend regression, live PostgreSQL deployment checks and a new visible browser answer remain explicit controller-owned acceptance steps; neither old browser history nor the initial diagnostic full-backend run is claimed as final acceptance.
+- The complete runtime/Skill/binding/E2E verification above predates fix round 1. At this checkpoint, clean-commit full-backend regression and a new visible browser answer remained controller-owned acceptance steps; neither old browser history nor the initial diagnostic full-backend run was claimed as final acceptance. The completed controller evidence is recorded below. Live PostgreSQL-only suites remain explicitly environment-gated in the final local run.
 
 ## Formal review fix round 1: current resource availability
 
@@ -223,4 +223,20 @@ The first eight-file combination (`--basetemp=/tmp/task5-fix1-availability-regre
 docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPYCACHEPREFIX=/tmp/task5-pycache -e DATABASE_URL=sqlite:///iap_skill_control_test_20260908_a -e PYTHONPATH=/workspace/backend -v "I:\智能体平台\IntelligentAgentPlatform:/workspace" -w /tmp intelligent-agent-platform-api:local python -m pytest /workspace/backend/tests/runtime/test_execution_snapshot.py /workspace/backend/tests/runtime/test_runner_gateway_skill_resources.py /workspace/backend/tests/runtime/test_script_terminal_lifecycle.py /workspace/backend/tests/runtime/test_run_lifecycle.py /workspace/backend/tests/integration/test_single_agent_skill_tool_mcp_e2e.py /workspace/backend/tests/skills/test_project_availability.py /workspace/backend/tests/runtime/test_agent_skill_bindings.py /workspace/backend/tests/test_agent_skill_bindings.py --basetemp=/tmp/task5-fix1-reviewed-regression -p no:cacheprovider -q --tb=short -ra
 ```
 
-Final corrected-tree combination: **exit 0, 131 passed, 0 skipped, 1 warning, 147.50s (2:27)**. This includes all 34 current integration cases, snapshot/resource-route/terminal coverage and Task 4 availability/binding tests. The warning is the existing Starlette BlockingPortal deprecation; it was not suppressed. This round touches only the Gateway service, the owned integration test and this report; the shared user resource test, `db/base.py`, control migration 28 and other user changes remain unstaged and untouched. Full final-commit backend and new-image browser acceptance remain controller-owned and unresolved.
+Final corrected-tree combination: **exit 0, 131 passed, 0 skipped, 1 warning, 147.50s (2:27)**. This includes all 34 current integration cases, snapshot/resource-route/terminal coverage and Task 4 availability/binding tests. The warning is the existing Starlette BlockingPortal deprecation; it was not suppressed. This round touches only the Gateway service, the owned integration test and this report; the shared user resource test, `db/base.py`, control migration 28 and other user changes remain unstaged and untouched. Full final-commit backend and new-image browser acceptance were controller-owned at this checkpoint and are resolved below.
+
+## Controller final acceptance
+
+The browser-only remediation is commit `3d56425` (`fix: add secure runner temporary filesystem`). It provides the non-root, read-only Worker with an exact, Inspector-enforced `/tmp` tmpfs and does not widen host mounts, environment, capabilities or networks. The remediation's focused controller rerun passed **41 tests**.
+
+The rebuilt Launcher and Worker completed real browser Run `d0d15a3e-84e4-417d-b8ce-cc40ca66d243`. `/chat` displayed `TASK5-BROWSER-VERIFIED: Skill正文、reference、template、声明脚本、内置工具和MCP工具已在同一单智能体运行中贯通。`, both visible tool steps completed, the Run status was completed, and the browser console recorded zero errors. The same Run persisted successful calls for `skill.task5_browser.script.normalize`, `system.get_current_time` and `mcp.task5_mcp.water_level_f9afabd0`; reads of `SKILL.md`, `references/rules.txt`, `scripts/normalize.py` and `templates/result.json`; model, script, built-in tool, MCP tool, terminal and cleanup events/audits under one Run identity.
+
+The isolated frontend command `vue-tsc --noEmit && vite build` exited `0`, transformed 6976 modules and built in 2m36s. Its only issue was the existing non-fatal Vite chunk-size warning.
+
+The first complete-backend run found three transient real-worker readiness timeouts plus one stale workflow-runner Docker-inspection fixture. All three worker parameters passed in an immediate focused rerun. The fixture was missing the newly mandatory `HostConfig.Tmpfs` value; adding the real Launcher mapping made the focused group pass **4 passed**. A bare follow-up command intentionally demonstrated the existing dedicated-database guard (`47` Cookie API failures) and is not product evidence. The final command used the documented container-local SQLite name, `/tmp` working directory and backend PYTHONPATH:
+
+```powershell
+docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPYCACHEPREFIX=/tmp/task5-pycache-final -e DATABASE_URL=sqlite:///iap_skill_control_test_20260908_a -e PYTHONPATH=/workspace/backend -v "I:\\智能体平台\\IntelligentAgentPlatform\\.worktrees\\single-agent-skill-runtime-acceptance:/workspace" -w /tmp intelligent-agent-platform-api:local python -m pytest --basetemp=/tmp/task5-full-corrected-final -p no:cacheprovider /workspace/backend/tests -q -rs --tb=short
+```
+
+Final result: **exit 0, 1726 passed, 101 skipped, 2 warnings in 1683.80s (28:03)**. Skips are explicitly environment-gated PostgreSQL/MinIO/Windows tests; the two warnings are the pre-existing Starlette BlockingPortal and Authlib jose deprecations. No warning or failure was suppressed.
