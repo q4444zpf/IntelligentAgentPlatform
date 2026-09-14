@@ -43,7 +43,7 @@ from app.runtime.runner_gateway_client import (
 )
 from app.runtime.runner_gateway_schemas import SnapshotResponse
 from app.runtime.sandbox_runtime import SandboxRuntime, _TeamTimedOut
-from app.runtime.langgraph_runtime import LangGraphRuntimeAdapter, RuntimeState
+from app.runtime.langgraph_runtime import LangGraphRuntimeAdapter, RuntimeResult, RuntimeState
 from app.runtime.team_graph import (
     TeamBudgetState,
     TeamPlan,
@@ -343,6 +343,54 @@ class TeamPlanGraph:
             ],
             "status": "completed",
         }
+
+
+@pytest.mark.parametrize("recover", [False, True])
+def test_team_runtime_attests_completed_simulation_artifacts(recover):
+    snapshot = _schema_v5_team_snapshot()
+    plan = {"tasks": [{"id": "simulation", "member_id": "member-1", "objective": "simulate", "position": 0, "output_contract": {"artifact_kind": "simulation"}}]}
+    attested = []
+    member_calls = []
+    class Crash(BaseException):
+        pass
+    class Gateway(DurableApprovalGateway):
+        def create_artifact(self, **request):
+            assert "simulation_attestation" not in request["provenance"]
+            return {"path": request["path"], "artifact_id": "simulation-artifact", "size_bytes": len(request["data"]), "sha256": request["sha256"], "content_type": request["content_type"]}
+        def attest_simulation_artifacts(self, **request):
+            assert any(item["event_type"] == "team.task.completed" for item in self.events)
+            state = self.saved_checkpoints[-1][1]
+            assert state["completed_results"][0]["artifact_ids"] == ["simulation-artifact"]
+            assert state["active_invocations"][0]["checkpoint_status"] == "completed"
+            attested.append(request)
+            if recover and len(attested) == 1:
+                raise Crash()
+            return []
+    class Factory:
+        def __init__(self):
+            self.supervisor_calls = 0
+        def build(self, member, **kwargs):
+            if member.agent_id == "supervisor":
+                self.supervisor_calls += 1
+                return TeamPlanGraph(plan) if self.supervisor_calls == 1 else TextGraph("summary")
+            backend = kwargs["backend"]
+            member_calls.append(member.agent_id)
+            class Graph(TextGraph):
+                def invoke(self, state, *, config=None):
+                    assert backend.write("simulation.json", "{}").error is None
+                    return super().invoke(state, config=config)
+            return Graph("completed simulation")
+    gateway = Gateway(snapshot)
+    factory = Factory()
+    if recover:
+        with pytest.raises(Crash):
+            SandboxRuntime(gateway, agent_factory=factory).execute(_request(snapshot))
+    result = SandboxRuntime(gateway, agent_factory=factory).execute(_request(snapshot))
+    assert result.status == "completed"
+    assert len(attested) == (2 if recover else 1)
+    assert len(member_calls) == 1
+    assert attested[-1] == attested[0]
+    assert attested[0]["artifact_ids"] == ("simulation-artifact",)
 
 
 class TextGraph:
@@ -2209,7 +2257,7 @@ def test_team_deadline_expiry_before_wait_sets_late_checkpoint_fence(
                     {"stage": self.graph.stage},
                 )
                 stage_finished.set()
-            return SimpleNamespace(content=f"{self.graph.stage} result")
+            return RuntimeResult(status="completed", content=f"{self.graph.stage} result", state={})
 
     class ExpiringBeforeWaitRuntime(SandboxRuntime):
         def __init__(self, *args, **kwargs):

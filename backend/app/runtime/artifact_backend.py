@@ -66,6 +66,7 @@ class ArtifactBackend(BackendProtocol):
         capability: str | None = None,
     ) -> None:
         self.client = client
+        self._artifact_ids: list[str] = []
         self.capability = capability
         allowed = {
             "team_version_id",
@@ -97,7 +98,14 @@ class ArtifactBackend(BackendProtocol):
             capability=self.capability,
             idempotency_key=f"artifact:{hashlib.sha256(normalized.encode()).hexdigest()}:{digest}",
         )
-        return _artifact_file(response)
+        artifact = _artifact_file(response)
+        if artifact.artifact_id not in self._artifact_ids:
+            self._artifact_ids.append(artifact.artifact_id)
+        return artifact
+
+    @property
+    def artifact_ids(self) -> tuple[str, ...]:
+        return tuple(self._artifact_ids)
 
     def write(self, file_path: str, content: str) -> WriteResult:
         try:

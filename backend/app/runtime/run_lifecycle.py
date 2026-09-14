@@ -238,7 +238,7 @@ class SandboxRunCoordinator:
             snapshot = self.snapshot_service_factory(session).create(run_id)
             token = self.token_service_factory(session).issue(
                 snapshot,
-                _RUNNER_ACTIONS,
+                _RUNNER_ACTIONS | ({"artifact.attest"} if snapshot.payload.actor.kind == "team" else set()),
                 deadline_at,
             )
             session.commit()

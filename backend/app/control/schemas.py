@@ -24,6 +24,7 @@ class ControlPolicyInfo(ControlPolicyCreateRequest):
 
 
 class ControlCommandProposeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     policy_id: str
     target: dict[str, Any]
     parameters: dict[str, Any]
@@ -34,7 +35,7 @@ class ControlCommandProposeRequest(BaseModel):
     expected_state: dict[str, Any] | None = None
     idempotency_key: str = Field(min_length=1, max_length=180)
     run_id: str | None = None
-    team_version: str | None = None
+    team_version_id: str | None = None
 
 
 class ControlFeedbackRequest(BaseModel):

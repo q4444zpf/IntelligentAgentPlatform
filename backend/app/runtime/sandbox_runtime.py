@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import time
 import tempfile
 import shutil
@@ -613,6 +614,8 @@ class SandboxRuntime:
         )
         if recovered:
             for result in recovered:
+                if result.task_id in completed:
+                    continue
                 completed[result.task_id] = result
                 self._append_event(
                     "team.task.completed",
@@ -623,6 +626,12 @@ class SandboxRuntime:
                         "position": result.position,
                     },
                 )
+            state = self._state_with_results(
+                state, completed, failed, started, stage="executing",
+                active_invocations=state.active_invocations,
+            )
+            state = self._save_team_state(state, model_budget)
+            self._attest_completed_team_simulations(state)
             state = self._state_with_results(
                 state,
                 completed,
@@ -743,7 +752,7 @@ class SandboxRuntime:
                 if legacy_cancellation_event_ref is not None:
                     legacy_cancellation_event_ref.bind(batch_timed_out)
 
-                def save_member_runtime_state(task, checkpoint_key, runtime_state):
+                def save_member_runtime_state(task, checkpoint_key, runtime_state, artifact_ids=()):
                     nonlocal state
                     if batch_timed_out.is_set():
                         return
@@ -760,6 +769,9 @@ class SandboxRuntime:
                                 update={
                                     "runtime_state": runtime_state,
                                     "checkpoint_status": checkpoint_status,
+                                    "artifact_ids": artifact_ids,
+                                    "artifact_capability": artifact_capabilities[task.id],
+                                    "completed_at": datetime.now(timezone.utc) if checkpoint_status == "completed" else None,
                                 }
                             )
                             if item.task_id == task.id
@@ -797,8 +809,8 @@ class SandboxRuntime:
                         invocation=invocation,
                         artifact_capability=artifact_capabilities[task.id],
                         cancellation_event=batch_timed_out,
-                        checkpoint_callback=lambda key, runtime_state: (
-                            save_member_runtime_state(task, key, runtime_state)
+                        checkpoint_callback=lambda key, runtime_state, artifact_ids: (
+                            save_member_runtime_state(task, key, runtime_state, artifact_ids)
                         ),
                     )
 
@@ -913,6 +925,7 @@ class SandboxRuntime:
                             member_agent_id=task.member_id,
                             position=task.position,
                             content=member_result.content,
+                            artifact_ids=tuple(member_result.state.get("__artifact_ids__", ())),
                         )
                         self._append_event(
                             "team.task.completed",
@@ -923,7 +936,13 @@ class SandboxRuntime:
                                 "position": task.position,
                             },
                         )
-                        active_by_task.pop(task.id, None)
+                state = self._state_with_results(
+                    state, completed, failed, started, stage="executing",
+                    active_invocations=tuple(active_by_task.values()),
+                )
+                state = self._save_team_state(state, model_budget)
+                self._attest_completed_team_simulations(state)
+                active_by_task = {key: value for key, value in active_by_task.items() if key not in completed}
 
                 if first_failure is not None and actor.failure_strategy == "fail_fast":
                     state = self._state_with_results(
@@ -1264,7 +1283,8 @@ class SandboxRuntime:
                     "object matching {\"tasks\":[{\"id\":string,"
                     "\"member_id\":string,\"objective\":string,"
                     "\"depends_on\":[string],\"position\":integer,"
-                    "\"output_contract\":{\"max_output_bytes\":integer}}]}. "
+                    "\"output_contract\":{\"max_output_bytes\":integer,"
+                    "\"artifact_kind\":\"generic\"|\"simulation\"}}]}. "
                     f"Use at most {actor.max_steps} tasks and only these members:\n"
                     f"{member_lines}"
                 ),
@@ -1320,21 +1340,22 @@ class SandboxRuntime:
             invocation_namespace=invocation.invocation_id,
             cancellation_event=cancellation_event,
         )
+        backend = ArtifactBackend(
+            self.gateway,
+            provenance={
+                "team_version_id": actor.version_id,
+                "member_agent_id": task.member_id,
+                "task_id": task.id,
+                "invocation_id": invocation.invocation_id,
+            },
+            capability=artifact_capability,
+        )
         graph = self.agent_factory.build(
             member_agent_snapshot(actor, task.member_id),
             model=model,
             tools=tools,
             checkpointer=create_in_memory_checkpointer(),
-            backend=ArtifactBackend(
-                self.gateway,
-                provenance={
-                    "team_version_id": actor.version_id,
-                    "member_agent_id": task.member_id,
-                    "task_id": task.id,
-                    "invocation_id": invocation.invocation_id,
-                },
-                capability=artifact_capability,
-            ),
+            backend=backend,
         )
         dependency_content = "\n".join(
             f"{dependency}: {completed[dependency].content}"
@@ -1357,9 +1378,11 @@ class SandboxRuntime:
         ]
         checkpoint_store = _TeamMemberCheckpointStore(
             runtime_state,
-            checkpoint_callback,
+            lambda key, value: checkpoint_callback(
+                key, value, tuple(dict.fromkeys((*invocation.artifact_ids, *backend.artifact_ids))),
+            ),
         )
-        return self.runtime_adapter_type(graph, checkpoint_store=checkpoint_store).invoke(
+        result = self.runtime_adapter_type(graph, checkpoint_store=checkpoint_store).invoke(
             RuntimeState(
                 run_id=request.run_id,
                 messages=task_messages,
@@ -1373,6 +1396,34 @@ class SandboxRuntime:
             ),
             metadata=metadata,
         )
+        return RuntimeResult(
+            status=result.status,
+            content=result.content,
+            state={
+                **result.state,
+                "__artifact_ids__": tuple(dict.fromkeys((*invocation.artifact_ids, *backend.artifact_ids))),
+            },
+        )
+
+    def _attest_completed_team_simulations(self, state: TeamSchedulerState) -> None:
+        tasks = {task.id: task for task in state.plan.tasks}
+        completed = {result.task_id: result for result in state.completed_results}
+        for invocation in state.active_invocations:
+            task = tasks.get(invocation.task_id)
+            result = completed.get(invocation.task_id)
+            if (task is None or result is None or task.output_contract.artifact_kind != "simulation"
+                    or not result.artifact_ids):
+                continue
+            if (invocation.checkpoint_status != "completed" or invocation.completed_at is None
+                    or invocation.artifact_capability is None or invocation.artifact_ids != result.artifact_ids):
+                raise _TeamRecoveryRequired()
+            self.gateway.attest_simulation_artifacts(
+                team_version_id=state.team_version_id, member_agent_id=invocation.member_agent_id,
+                task_id=task.id, invocation_id=invocation.invocation_id,
+                artifact_ids=result.artifact_ids, completed_at=invocation.completed_at,
+                capability=invocation.artifact_capability,
+                idempotency_key=f"simulation-attest:{hashlib.sha256(invocation.invocation_id.encode()).hexdigest()}",
+            )
 
     def _member_runtime_dependencies(
         self,
@@ -1481,7 +1532,7 @@ class SandboxRuntime:
         elif (
             not set(active_task_ids) <= task_ids
             or not set(active_task_ids) <= set(state.started_task_ids)
-            or set(active_task_ids) & settled_ids
+            or any(item.task_id in settled_ids and item.checkpoint_status != "completed" for item in state.active_invocations)
         ):
             raise _TeamRecoveryRequired()
         return state
@@ -1587,6 +1638,7 @@ class SandboxRuntime:
                     member_agent_id=task.member_id,
                     position=task.position,
                     content=content,
+                    artifact_ids=invocation.artifact_ids,
                 )
             )
         return tuple(recovered)

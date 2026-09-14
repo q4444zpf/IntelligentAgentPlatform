@@ -10,8 +10,12 @@ from typing import Any, Protocol
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from pydantic import ValidationError
 
 from app.artifacts.models import ArtifactRecord
+from app.conversations.models import AgentRun, Conversation
+from app.collaboration.models import Team, TeamVersion
+from app.runtime.runner_gateway_schemas import ArtifactProvenance, SimulationAttestation
 from app.audit.recorder import AuditRecordRequest, AuditRecorder
 from app.core.request_context import RequestContext
 
@@ -165,7 +169,7 @@ class ControlService:
         if policy is None or not policy.enabled:
             raise ControlForbiddenError("control policy not found")
         existing = self.session.scalar(select(ControlCommand).where(ControlCommand.unit_id == context.unit_id, ControlCommand.project_id == context.project_id, ControlCommand.idempotency_key == request.idempotency_key))
-        parameter_digest = _digest({"target": request.target, "parameters": request.parameters, "policy_id": request.policy_id, "simulation_artifact_id": request.simulation_artifact_id, "valid_from": request.valid_from.isoformat(), "valid_until": request.valid_until.isoformat(), "rollback_plan": request.rollback_plan, "expected_state": request.expected_state, "run_id": request.run_id, "team_version": request.team_version})
+        parameter_digest = _digest({"target": request.target, "parameters": request.parameters, "policy_id": request.policy_id, "simulation_artifact_id": request.simulation_artifact_id, "valid_from": request.valid_from.isoformat(), "valid_until": request.valid_until.isoformat(), "rollback_plan": request.rollback_plan, "expected_state": request.expected_state, "run_id": request.run_id, "team_version_id": request.team_version_id})
         if existing is not None:
             if existing.parameter_digest != parameter_digest or existing.policy_id != policy.id:
                 raise ControlIdempotencyConflict("idempotency key is already used")
@@ -184,17 +188,20 @@ class ControlService:
         if valid_until <= valid_from or (valid_until - valid_from).total_seconds() > policy.max_command_lifetime_seconds:
             raise ControlValidationError("validity window exceeds policy")
         artifact = self.session.scalar(select(ArtifactRecord).where(ArtifactRecord.id == request.simulation_artifact_id, ArtifactRecord.unit_id == context.unit_id, ArtifactRecord.project_id == context.project_id, ArtifactRecord.status == "active"))
-        provenance = artifact.provenance if artifact is not None else {}
-        simulation_kind = provenance.get("kind") or provenance.get("type") or provenance.get("artifact_type")
-        simulation_status = provenance.get("status") or provenance.get("simulation_status")
-        if artifact is None or simulation_status != "succeeded" or simulation_kind != "simulation":
+        if artifact is None or artifact.run_id is None:
             raise ControlValidationError("simulation artifact is not a successful simulation")
-        if request.run_id is not None and artifact.run_id != request.run_id:
-            raise ControlValidationError("simulation artifact run mismatch")
+        try:
+            provenance = ArtifactProvenance.model_validate(artifact.provenance)
+            attestation = SimulationAttestation.model_validate(provenance.simulation_attestation)
+        except ValidationError as error:
+            raise ControlValidationError("simulation artifact is not a successful simulation") from error
+        if artifact.sha256 != attestation.artifact_sha256:
+            raise ControlValidationError("simulation artifact digest mismatch")
+        self._validated_run_binding(context, request.run_id, request.team_version_id, artifact)
         target_type = request.target.get("asset_type")
         if target_type != policy.asset_type:
             raise ControlValidationError("target asset type does not match policy")
-        command = ControlCommand(unit_id=context.unit_id, project_id=context.project_id, policy_id=policy.id, requester_id=context.user_id, run_id=request.run_id, team_version=request.team_version, target=request.target, parameters=request.parameters, parameter_digest=parameter_digest, simulation_artifact_id=artifact.id, simulation_digest=artifact.sha256, valid_from=valid_from, valid_until=valid_until, required_approvals=1 if policy.approval_mode == "single" else 2, rollback_plan=request.rollback_plan, expected_state=request.expected_state, idempotency_key=request.idempotency_key, status="pending_approval")
+        command = ControlCommand(unit_id=context.unit_id, project_id=context.project_id, policy_id=policy.id, requester_id=context.user_id, run_id=request.run_id, team_version=request.team_version_id, target=request.target, parameters=request.parameters, parameter_digest=parameter_digest, simulation_artifact_id=artifact.id, simulation_digest=artifact.sha256, valid_from=valid_from, valid_until=valid_until, required_approvals=1 if policy.approval_mode == "single" else 2, rollback_plan=request.rollback_plan, expected_state=request.expected_state, idempotency_key=request.idempotency_key, status="pending_approval")
         self.session.add(command)
         try:
             self.session.commit()
@@ -210,6 +217,32 @@ class ControlService:
         self._audit(context, "control_command.proposed", "control_command", command.id)
         self.session.commit()
         return ControlCommandInfo.model_validate(command)
+
+    def _validated_run_binding(
+        self, context: RequestContext, run_id: str | None,
+        team_version_id: str | None, artifact: ArtifactRecord,
+    ) -> AgentRun | None:
+        if (run_id is None) != (team_version_id is None):
+            raise ControlValidationError("run_id and team_version_id must be supplied together")
+        try:
+            provenance = ArtifactProvenance.model_validate(artifact.provenance)
+        except ValidationError as error:
+            raise ControlValidationError("simulation artifact provenance invalid") from error
+        bound_run_id = run_id or artifact.run_id
+        bound_version_id = team_version_id or provenance.team_version_id
+        run = self.session.scalar(select(AgentRun).join(Conversation, Conversation.id == AgentRun.conversation_id).where(
+            AgentRun.id == bound_run_id, Conversation.unit_id == context.unit_id,
+            Conversation.project_id == context.project_id,
+        ))
+        version = self.session.scalar(select(TeamVersion).join(Team, Team.id == TeamVersion.team_id).where(
+            TeamVersion.id == bound_version_id, TeamVersion.status == "published",
+            Team.unit_id == context.unit_id, Team.project_id == context.project_id,
+        ))
+        if (run is None or version is None or run.actor_type != "team"
+                or run.actor_id != version.team_id or run.actor_version_id != bound_version_id
+                or artifact.run_id != bound_run_id or provenance.team_version_id != bound_version_id):
+            raise ControlValidationError("simulation artifact published Team Run binding mismatch")
+        return run
 
     def _command(self, command_id: str, context: RequestContext) -> ControlCommand:
         command = self.session.scalar(select(ControlCommand).where(ControlCommand.id == command_id, ControlCommand.unit_id == context.unit_id, ControlCommand.project_id == context.project_id))

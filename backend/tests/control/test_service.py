@@ -61,6 +61,15 @@ def session(tmp_path):
 
 
 def _artifact(session, *, project_id="project-1", run_id=None, success=True):
+    from app.collaboration.models import Team, TeamVersion
+    from app.conversations.models import AgentRun, Conversation, Message
+    run_id = run_id or "simulation-run"
+    team = Team(id="simulation-team", unit_id="unit-1", project_id=project_id, name="Simulation")
+    version = TeamVersion(id="simulation-version", team_id=team.id, version=1, status="published", definition_digest="d" * 64)
+    conversation = Conversation(id="simulation-conversation", unit_id="unit-1", project_id=project_id, owner_id="operator", title="simulation")
+    message = Message(id="simulation-message", conversation_id=conversation.id, sequence=1, role="user", content="simulate")
+    run = AgentRun(id=run_id, conversation_id=conversation.id, trigger_message_id=message.id, actor_type="team", actor_id=team.id, actor_version_id=version.id, status="completed")
+    session.add_all([team, version, conversation, message, run])
     artifact = ArtifactRecord(
         id="artifact-1" if project_id == "project-1" else "artifact-2",
         unit_id="unit-1",
@@ -73,12 +82,62 @@ def _artifact(session, *, project_id="project-1", run_id=None, success=True):
         content_type="application/json",
         size_bytes=2,
         sha256="a" * 64,
-        provenance={"kind": "simulation", "status": "succeeded" if success else "failed"},
+        provenance={"team_version_id": version.id, "member_agent_id": "simulator", "task_id": "simulation", "invocation_id": "simulation-invocation", "simulation_attestation": {"kind": "simulation", "status": "succeeded" if success else "failed", "completed_at": "2026-09-15T10:00:00Z", "artifact_sha256": "a" * 64}},
         status="active",
     )
     session.add(artifact)
     session.commit()
     return artifact
+
+
+@pytest.mark.parametrize("forgery", ["loose", "digest", "upload", "missing_invocation", "failed"])
+def test_propose_rejects_forged_simulation_metadata(session, forgery):
+    service = ControlService(session)
+    policy = service.create_policy(_context("admin", roles=("project_admin",)), _policy_request())
+    artifact = _artifact(session)
+    if forgery == "loose":
+        artifact.provenance = {"kind": "simulation", "status": "succeeded"}
+    elif forgery == "digest":
+        artifact.sha256 = "b" * 64
+    elif forgery == "upload":
+        artifact.run_id = None
+    elif forgery == "missing_invocation":
+        artifact.provenance = {k: v for k, v in artifact.provenance.items() if k != "invocation_id"}
+    else:
+        artifact.provenance = {**artifact.provenance, "simulation_attestation": {**artifact.provenance["simulation_attestation"], "status": "failed"}}
+    session.commit()
+    with pytest.raises(ControlValidationError):
+        service.propose(_context(), _propose_request(policy.id))
+
+
+def test_propose_accepts_gateway_attestation_bound_to_same_run_and_digest(session):
+    from app.artifacts.service import ArtifactService
+    service = ControlService(session)
+    policy = service.create_policy(_context("admin", roles=("project_admin",)), _policy_request())
+    artifact = _artifact(session)
+    artifact.provenance = {k: v for k, v in artifact.provenance.items() if k != "simulation_attestation"}
+    session.commit()
+    ArtifactService(session, None).attest_completed_simulation(artifact.run_id, {"run_id": artifact.run_id, **artifact.provenance}, (artifact.id,), datetime.now(timezone.utc))
+    command = service.propose(_context(), _propose_request(policy.id, run_id=artifact.run_id, team_version_id="simulation-version"))
+    assert command.status == "pending_approval"
+    assert command.simulation_digest == artifact.sha256
+
+
+@pytest.mark.parametrize("binding", [{"run_id": "simulation-run"}, {"team_version_id": "simulation-version"}, {"run_id": "other-run", "team_version_id": "simulation-version"}, {"run_id": "simulation-run", "team_version_id": "other-version"}, {"run_id": "simulation-run", "team_version_id": "draft-version"}])
+def test_propose_rejects_mismatched_or_unpublished_team_version_id(session, binding):
+    from app.collaboration.models import TeamVersion
+    from app.conversations.models import AgentRun
+    service = ControlService(session)
+    policy = service.create_policy(_context("admin", roles=("project_admin",)), _policy_request())
+    _artifact(session)
+    if binding.get("team_version_id") == "draft-version":
+        session.add(TeamVersion(id="draft-version", team_id="simulation-team", version=0, status="draft"))
+        session.get(AgentRun, "simulation-run").actor_version_id = "draft-version"
+        artifact = session.get(ArtifactRecord, "artifact-1")
+        artifact.provenance = {**artifact.provenance, "team_version_id": "draft-version"}
+        session.commit()
+    with pytest.raises(ControlValidationError):
+        service.propose(_context(), _propose_request(policy.id, **binding))
 
 
 def _policy_request(**overrides):

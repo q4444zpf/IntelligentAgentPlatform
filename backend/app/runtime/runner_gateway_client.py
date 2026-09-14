@@ -22,6 +22,7 @@ from .runner_gateway_schemas import (
     ArtifactContentResponse,
     ArtifactCreateRequest,
     ArtifactFileResponse,
+    SimulationAttestationRequest,
     CheckpointResponse,
     EventAppendResponse,
     ModelInvocationResponse,
@@ -308,6 +309,22 @@ class RunnerGatewayClient:
             TypeAdapter(list[ArtifactFileResponse]),
         )
         return [value.model_dump(mode="json") for value in values]
+
+    def attest_simulation_artifacts(
+        self, *, team_version_id: str, member_agent_id: str, task_id: str,
+        invocation_id: str, artifact_ids: tuple[str, ...], completed_at: datetime,
+        capability: str, idempotency_key: str,
+    ) -> list[ArtifactFileResponse]:
+        request = SimulationAttestationRequest(
+            team_version_id=team_version_id, member_agent_id=member_agent_id,
+            task_id=task_id, invocation_id=invocation_id, artifact_ids=artifact_ids,
+            completed_at=completed_at, capability=capability,
+        )
+        return self._request_adapter(
+            "POST", "artifact-attestations/simulation",
+            TypeAdapter(list[ArtifactFileResponse]),
+            json=request.model_dump(mode="json"), idempotency_key=idempotency_key,
+        )
 
     def read_artifact(self, artifact_id: str) -> dict[str, Any]:
         response = self._request(
