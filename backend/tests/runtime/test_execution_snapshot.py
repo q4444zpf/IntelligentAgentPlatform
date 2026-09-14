@@ -1,13 +1,14 @@
 import hashlib
 import json
 from datetime import UTC, datetime
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine, update
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
-from app.agents.schemas import AgentInfo
+from app.agents.schemas import AgentInfo, SkillBinding
 from app.db.base import Base
 from app.collaboration.repository import TeamRepository
 from app.runtime.execution_snapshot import (
@@ -20,11 +21,13 @@ from app.runtime.execution_snapshot import (
     SnapshotModelSelection,
     SnapshotRuntimeLimits,
     SnapshotSkill,
+    SnapshotSkillFile,
     SnapshotTeamMember,
     SnapshotTool,
     canonical_snapshot_bytes,
     verify_snapshot_digest,
 )
+from app.skills.models import Skill, SkillVersion
 
 
 class StaticAgentService:
@@ -270,6 +273,42 @@ def snapshot_service():
         poolclass=StaticPool,
     )
     Base.metadata.create_all(engine)
+    session = Session(engine)
+    skill_id = str(uuid4())
+    version_id = str(uuid4())
+    session.add(Skill(
+        id=skill_id,
+        unit_id="unit-1",
+        project_id="project-1",
+        name="forecast",
+        created_by="user-1",
+    ))
+    session.add(SkillVersion(
+        id=version_id,
+        skill_id=skill_id,
+        version=1,
+        source_revision=1,
+        idempotency_key="forecast-v1",
+        request_digest="a" * 64,
+        published_by="user-1",
+        published_at=datetime(2026, 8, 14, 9, 0, tzinfo=UTC),
+        name="forecast",
+        description="洪峰预测",
+        display_version="1.2.0",
+        content="---\nname: forecast\ndescription: 洪峰预测\n---\n使用已绑定的预测工具。",
+        files=[
+            {"path": "SKILL.md", "size": 8, "sha256": "a" * 64},
+            {"path": "references/rules.txt", "size": 5, "sha256": "b" * 64},
+        ],
+        package_digest="c" * 64,
+        object_key=f"unit-1/project-1/{skill_id}/archive.zip",
+        archive_sha256="d" * 64,
+        size_bytes=13,
+    ))
+    session.flush()
+    skill = session.get(Skill, skill_id)
+    skill.published_version_id = version_id
+    session.commit()
     agent = AgentInfo(
         id="agent-1",
         name="Water Agent",
@@ -282,6 +321,9 @@ def snapshot_service():
         context_prompt="Use run context.",
         approval_policy="control_commands",
         skill_names=["forecast"],
+        skill_bindings=[SkillBinding(
+            skill_id=skill_id, version_id=version_id, name="forecast"
+        )],
         tool_ids=["mcp.water.level"],
         knowledge_source_ids=["knowledge.reservoir.manual"],
         enabled=True,
@@ -294,7 +336,7 @@ def snapshot_service():
         updated_at=datetime(2026, 8, 14, 9, 0, tzinfo=UTC),
     )
     yield ExecutionSnapshotService(
-        Session(engine),
+        session,
         StaticAgentService(agent, [Tool()], [KnowledgeTool()]),
         StaticConversationRepository(),
         clock=lambda: datetime(2026, 8, 14, 10, 1, tzinfo=UTC),
@@ -312,6 +354,7 @@ def test_snapshot_digest_is_deterministic_and_covers_complete_payload(snapshot_s
     assert first.payload.actor.id == "agent-1"
     assert first.payload.messages[0].content == "水位是多少？"
     assert first.payload.skills[0].name == "forecast"
+    assert "使用已绑定的预测工具" in first.payload.skills[0].content
     assert first.payload.schema_version == "3"
     assert first.payload.tools[0].tool_id == "mcp.water.level"
     assert first.payload.tools[0].version == "3"
@@ -332,6 +375,31 @@ def test_snapshot_digest_is_deterministic_and_covers_complete_payload(snapshot_s
     assert first.payload.limits.max_output_bytes == 4 * 1024 * 1024
 
 
+def test_snapshot_digest_changes_when_skill_resource_digest_changes(snapshot_service):
+    first = snapshot_service.create("run-1")
+    skill = first.payload.skills[0]
+    changed = SnapshotSkillFile(
+        path="SKILL.md",
+        size=1,
+        sha256="f" * 64,
+    )
+    payload = first.payload.model_copy(
+        update={"skills": (skill.model_copy(update={"files": (changed,)}),)}
+    )
+
+    assert canonical_snapshot_bytes(payload) != canonical_snapshot_bytes(first.payload)
+
+
+def test_snapshot_captures_skill_manifest_and_attachments(snapshot_service):
+    stored = snapshot_service.create("run-1")
+
+    assert [item.path for item in stored.payload.skills[0].files] == [
+        "SKILL.md",
+        "references/rules.txt",
+    ]
+    assert stored.payload.skills[0].files[1].sha256 == "b" * 64
+
+
 def test_snapshot_contains_no_provider_or_mcp_secrets(snapshot_service):
     stored = snapshot_service.create("run-1")
     serialized = canonical_snapshot_bytes(stored.payload).decode("utf-8")
@@ -346,6 +414,57 @@ def test_snapshot_rejects_disabled_agents(snapshot_service):
     snapshot_service.agent_service.agent.enabled = False
 
     with pytest.raises(ValueError, match="Agent 'agent-1' is disabled"):
+        snapshot_service.create("run-1")
+
+
+def test_build_skill_context_returns_literal_messages_body_and_resource_index():
+    from app.runtime.execution_snapshot import build_skill_context
+
+    resource_index = (
+        {
+            "skill_name": "forecast",
+            "path": "references/rules.txt",
+            "size": 5,
+            "sha256": "a" * 64,
+        },
+    )
+
+    context = build_skill_context(
+        system_prompt="System guidance.",
+        context_prompt="Project context.",
+        skills=(SnapshotSkill(
+            name="forecast",
+            content="Use the frozen forecast method.",
+        ),),
+        resource_index=resource_index,
+    )
+
+    assert context.skill_body == "Use the frozen forecast method."
+    assert context.resource_index == resource_index
+    assert context.system_messages == (
+        {"role": "system", "content": "System guidance."},
+        {
+            "role": "system",
+            "content": (
+                "Project context.\n\n"
+                "Skills: Use the frozen forecast method.\n\n"
+                "Authorized Skill resources (read-only): "
+                "[{\"path\": \"references/rules.txt\", \"sha256\": \""
+                + "a" * 64
+                + "\", \"size\": 5, \"skill_name\": \"forecast\"}]"
+            ),
+        },
+    )
+
+
+def test_snapshot_rejects_missing_bound_skill_version_with_stable_code(
+    snapshot_service,
+):
+    snapshot_service.agent_service.agent.skill_bindings = [SkillBinding(
+        skill_id=str(uuid4()), version_id=str(uuid4()), name="forecast"
+    )]
+
+    with pytest.raises(SnapshotIntegrityError, match="^skill_unavailable$"):
         snapshot_service.create("run-1")
 
 
@@ -372,6 +491,23 @@ def test_team_snapshot_uses_only_captured_agent_definitions():
         assert actor.members[0].model.model == "member-v1"
         assert actor.members[0].tools[0].tool_id == "review.read"
         assert stored.payload.schema_version == "5"
+
+
+def test_team_snapshot_can_be_reused_when_captured_skills_are_name_only():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        team, published = published_team_version(session)
+        service = ExecutionSnapshotService(
+            session,
+            NoLiveAgentService(),
+            TeamConversationRepository(published.id, actor_id=team.id),
+        )
+
+        first = service.create("run-team")
+        second = service.create("run-team")
+
+    assert second == first
 
 
 @pytest.mark.parametrize(

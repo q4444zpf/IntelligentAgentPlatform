@@ -15,6 +15,7 @@ PROJECT_METHODS = {
     "/api/project-skills": {"get", "post"},
     "/api/project-skills/import": {"post"},
     "/api/project-skills/{skill_id}": {"get"},
+    "/api/project-skills/{skill_id}/availability": {"patch"},
     "/api/project-skills/{skill_id}/draft": {"get", "put"},
     "/api/project-skills/{skill_id}/publish": {"post"},
     "/api/project-skills/{skill_id}/versions": {"get"},
@@ -26,7 +27,9 @@ def _enabled_main_behavior() -> dict:
     backend_directory = Path(__file__).resolve().parents[1]
     environment = os.environ.copy()
     environment["IAP_PROJECT_SKILLS_API_ENABLED"] = "true"
-    environment["PYTHONPATH"] = str(backend_directory)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (str(backend_directory), str(backend_directory.parent))
+    )
     result = subprocess.run(
         [
             sys.executable,

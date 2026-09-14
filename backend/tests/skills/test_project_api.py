@@ -478,6 +478,7 @@ def test_publish_route_returns_fixed_metadata_and_replay(sessions, storage):
         "name",
         "description",
         "display_version",
+        "enabled",
         "package_digest",
         "published_by",
         "published_at",

@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
+import hashlib
 import json as jsonlib
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, TypeVar
+from urllib.parse import quote
 
 import httpx
 from pydantic import BaseModel, TypeAdapter, ValidationError
@@ -23,6 +26,11 @@ from .runner_gateway_schemas import (
     EventAppendResponse,
     ModelInvocationResponse,
     SnapshotResponse,
+    SkillFileResponse,
+    ScriptExecutionLeaseResponse,
+    ScriptExecutionRequest,
+    ScriptExecutionCompletionRequest,
+    ScriptExecutionCompletionResponse,
     ToolInvocationResponse,
 )
 
@@ -77,7 +85,7 @@ class RunnerGatewayClient:
     request_deadline_at: datetime | None = None
     execution_deadline_at: datetime | None = None
     transport: httpx.BaseTransport | None = field(default=None, repr=False)
-    max_response_bytes: int = 4 * 1024 * 1024
+    max_response_bytes: int = 16 * 1024 * 1024
 
     @classmethod
     def from_execution_request(
@@ -85,7 +93,7 @@ class RunnerGatewayClient:
         request: RunExecutionRequest,
         *,
         transport: httpx.BaseTransport | None = None,
-        max_response_bytes: int = 4 * 1024 * 1024,
+        max_response_bytes: int = 16 * 1024 * 1024,
     ) -> RunnerGatewayClient:
         return cls(
             base_url=request.gateway_url,
@@ -100,6 +108,24 @@ class RunnerGatewayClient:
 
     def get_snapshot(self) -> SnapshotResponse:
         return self._request("GET", "snapshot", SnapshotResponse)
+
+    def read_skill_file(self, skill_name: str, path: str) -> dict[str, Any]:
+        response = self._request(
+            "GET",
+            f"skills/{quote(skill_name, safe='')}/files/{quote(path, safe='/')}",
+            SkillFileResponse,
+        )
+        try:
+            data = base64.b64decode(response.data_base64, validate=True)
+        except (ValueError, TypeError, binascii.Error):
+            raise RunnerGatewayResponseInvalid() from None
+        if response.skill_name != skill_name or response.path != path:
+            raise RunnerGatewayResponseInvalid()
+        if len(data) != response.size or hashlib.sha256(data).hexdigest() != response.sha256:
+            raise RunnerGatewayResponseInvalid()
+        value = response.model_dump(mode="json", exclude={"data_base64"})
+        value["data"] = data
+        return value
 
     def get_latest_checkpoint(self) -> dict[str, Any]:
         return self._request(
@@ -176,6 +202,53 @@ class RunnerGatewayClient:
             "tool-invocations",
             ToolInvocationResponse,
             json=request,
+            idempotency_key=idempotency_key,
+        ).model_dump(mode="json")
+
+    def execute_script(
+        self,
+        *,
+        script_name: str,
+        arguments: dict[str, Any],
+        tool_call_id: str,
+        invocation_sequence: int,
+        idempotency_key: str,
+        member_agent_id: str | None = None,
+    ) -> dict[str, Any]:
+        request = ScriptExecutionRequest(
+            script_name=script_name,
+            arguments=arguments,
+            tool_call_id=tool_call_id,
+            invocation_sequence=invocation_sequence,
+            member_agent_id=member_agent_id,
+        )
+        return self._request(
+            "POST",
+            "script-invocations",
+            ScriptExecutionLeaseResponse,
+            json=request.model_dump(mode="json", exclude_none=True),
+            idempotency_key=idempotency_key,
+        ).model_dump(mode="json")
+
+    def complete_script(
+        self,
+        *,
+        lease_id: str,
+        status: str,
+        error_code: str | None,
+        duration_ms: int,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        request = ScriptExecutionCompletionRequest(
+            status=status,
+            error_code=error_code,
+            duration_ms=duration_ms,
+        )
+        return self._request(
+            "POST",
+            f"script-invocations/{quote(lease_id, safe='')}/completion",
+            ScriptExecutionCompletionResponse,
+            json=request.model_dump(mode="json", exclude_none=True),
             idempotency_key=idempotency_key,
         ).model_dump(mode="json")
 

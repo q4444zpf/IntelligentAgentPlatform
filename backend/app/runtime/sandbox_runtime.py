@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import logging
 import time
+import tempfile
+import shutil
+import json
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import Event, Lock, Thread
@@ -36,12 +40,19 @@ from .team_graph import (
     validate_team_plan,
 )
 from .gateway_model import GatewayChatModel, GatewayModelBudget, RunnerGatewayModelError
-from .gateway_tools import RunnerApprovalInterruption, build_gateway_tools
+from .gateway_tools import (
+    RunnerApprovalInterruption,
+    build_gateway_tools,
+    build_skill_resource_tools,
+    build_skill_script_tools,
+)
 from .langgraph_runtime import LangGraphRuntimeAdapter, RuntimeResult, RuntimeState
 from .runner_gateway_client import (
     RunnerGatewayBusinessError,
     RunnerGatewayClientError,
 )
+from .skill_resources import SkillResourceMaterializationError, SkillResourceMaterializer
+from .execution_snapshot import build_skill_context
 
 logger = logging.getLogger(__name__)
 
@@ -175,20 +186,57 @@ class SandboxRuntime:
         agent_factory: DeepAgentFactory | None = None,
         runtime_adapter_type=LangGraphRuntimeAdapter,
         monotonic=time.monotonic,
+        workspace: Path | None = None,
     ) -> None:
         self.gateway = gateway
         self.agent_factory = agent_factory or DeepAgentFactory()
         self.runtime_adapter_type = runtime_adapter_type
         self.monotonic = monotonic
+        self.workspace = workspace
         self._event_sequence = 0
+        self._owned_workspace: Path | None = None
+
+    def cancel(self) -> None:
+        self._explicitly_cancelled = True
+        event = getattr(self, "_cancel_event", None)
+        if event is not None:
+            event.set()
 
     def execute(self, request: RunExecutionRequest) -> RunExecutionResult:
+        cancel_event = Event()
+        self._cancel_event = cancel_event
+        self._explicitly_cancelled = False
         started_at = datetime.now(timezone.utc)
         started_monotonic = self.monotonic()
-        monotonic_execution_deadline = started_monotonic + max(
+        execution_timeout_seconds = max(
             0.0,
             (request.execution_deadline_at - started_at).total_seconds(),
         )
+        monotonic_execution_deadline = started_monotonic + execution_timeout_seconds
+        watcher_stopped = Event()
+
+        def watch_deadline() -> None:
+            if not watcher_stopped.wait(execution_timeout_seconds):
+                cancel_event.set()
+
+        watcher = Thread(target=watch_deadline, daemon=True)
+        watcher.start()
+        try:
+            result = self._execute(request, started_at, started_monotonic, monotonic_execution_deadline)
+            if self._explicitly_cancelled:
+                return RunExecutionResult(status="cancelled", error_code="sandbox_cancelled")
+            return result
+        finally:
+            watcher_stopped.set()
+            watcher.join()
+
+    def _execute(
+        self,
+        request: RunExecutionRequest,
+        started_at: datetime,
+        started_monotonic: float,
+        monotonic_execution_deadline: float,
+    ) -> RunExecutionResult:
         if (
             request.deadline_at <= started_at
             or monotonic_execution_deadline <= started_monotonic
@@ -206,6 +254,21 @@ class SandboxRuntime:
             ):
                 return RunExecutionResult(status="failed", error_code="snapshot_invalid")
 
+            resource_workspace = self.workspace
+            if snapshot.payload.skills:
+                resource_workspace = self.workspace
+                if resource_workspace is None:
+                    resource_workspace = Path(tempfile.mkdtemp(prefix=f"runner-{request.run_id}-"))
+                    self._owned_workspace = resource_workspace
+                try:
+                    materializer = SkillResourceMaterializer()
+                    materializer.materialize(snapshot.payload, self.gateway, resource_workspace)
+                    resource_index = materializer.resource_index
+                except SkillResourceMaterializationError:
+                    return self._fail("skill_resource_invalid")
+            else:
+                resource_index = ()
+
             self._event_sequence = 0
             self._approval_checkpoint_key = None
             checkpoint_store = _GatewayCheckpointStore(
@@ -222,6 +285,7 @@ class SandboxRuntime:
                 "snapshot_id": snapshot.snapshot_id,
                 "snapshot_digest": snapshot.digest,
                 "project_id": snapshot.payload.project_id,
+                "skill_resources": list(resource_index),
             }
             if isinstance(actor, PublishedTeamSnapshot):
                 monotonic_deadline = min(
@@ -279,16 +343,12 @@ class SandboxRuntime:
                         tool_call_count=budget.tool_call_count,
                         subagent_call_count=budget.subagent_call_count,
                     )
-                skill_context = ", ".join(
-                    skill.name for skill in snapshot.payload.skills
+                skill_context = build_skill_context(
+                    system_prompt=actor.system_prompt,
+                    context_prompt=actor.context_prompt,
+                    skills=snapshot.payload.skills,
+                    resource_index=resource_index,
                 )
-                context_prompt = actor.context_prompt
-                if skill_context:
-                    context_prompt = (
-                        f"{context_prompt}\n\nSkills: {skill_context}"
-                        if context_prompt
-                        else f"Skills: {skill_context}"
-                    )
                 model = GatewayChatModel(
                     self.gateway,
                     max_iterations=limits.max_iterations,
@@ -297,11 +357,22 @@ class SandboxRuntime:
                     max_output_bytes=limits.max_output_bytes,
                     budget_state=model_budget,
                 )
-                tools = build_gateway_tools(snapshot.payload, self.gateway)
+                tools = [
+                    *build_gateway_tools(snapshot.payload, self.gateway, cancellation_event=self._cancel_event),
+                    *build_skill_resource_tools(snapshot.payload, self.gateway, cancellation_event=self._cancel_event),
+                    *build_skill_script_tools(
+                        snapshot.payload,
+                        resource_workspace,
+                        client=self.gateway,
+                        cancellation_event=self._cancel_event,
+                        deadline_monotonic=monotonic_execution_deadline,
+                    ),
+                ]
                 graph = self.agent_factory.build(
                     FactoryAgentSnapshot(
                         agent_id=actor.id, name=actor.name,
-                        system_prompt=actor.system_prompt, context_prompt=context_prompt,
+                        system_prompt=skill_context.system_prompt,
+                        context_prompt=skill_context.context_prompt,
                         tools=(),
                     ),
                     model=model,
@@ -313,6 +384,9 @@ class SandboxRuntime:
                     RuntimeState(run_id=request.run_id, messages=messages, status="running"),
                     metadata=metadata,
                 )
+            if self._explicitly_cancelled:
+                self._cleanup_owned_workspace()
+                return RunExecutionResult(status="cancelled", error_code="sandbox_cancelled")
             if not isinstance(actor, PublishedTeamSnapshot):
                 self._append_event("runner.completed", {"status": result.status})
             final_checkpoint_key = (
@@ -331,6 +405,7 @@ class SandboxRuntime:
             if isinstance(actor, PublishedTeamSnapshot):
                 self._ensure_team_deadline(monotonic_deadline)
             self.gateway.complete(completion, "completion:final")
+            self._cleanup_owned_workspace()
             return RunExecutionResult(
                 status="completed",
                 artifact_refs=tuple(completion["artifact_refs"]),
@@ -395,12 +470,14 @@ class SandboxRuntime:
                 },
                 "completion:approval",
             )
+            self._cleanup_owned_workspace()
             return RunExecutionResult(
                 status="interrupted",
                 error_code="approval_required",
                 checkpoint_key=checkpoint_key,
             )
         except _TeamCancelled:
+            self._cleanup_owned_workspace()
             return RunExecutionResult(
                 status="cancelled",
                 error_code="sandbox_cancelled",
@@ -1570,6 +1647,9 @@ class SandboxRuntime:
 
     def _ensure_team_deadline(self, deadline_at: float) -> None:
         if self.monotonic() >= deadline_at:
+            cancel_event = getattr(self, "_cancel_event", None)
+            if cancel_event is not None:
+                cancel_event.set()
             raise _TeamTimedOut()
 
     def _remaining_team_seconds(self, deadline_at: float) -> float:
@@ -1655,6 +1735,9 @@ class SandboxRuntime:
         )
 
     def _fail(self, error_code: str) -> RunExecutionResult:
+        if self._explicitly_cancelled:
+            self._cleanup_owned_workspace()
+            return RunExecutionResult(status="cancelled", error_code="sandbox_cancelled")
         try:
             self.gateway.complete(
                 {"status": "failed", "error_code": error_code},
@@ -1662,4 +1745,11 @@ class SandboxRuntime:
             )
         except Exception:  # noqa: BLE001
             logger.warning("runner completion report failed")
+        self._cleanup_owned_workspace()
         return RunExecutionResult(status="failed", error_code=error_code)
+
+    def _cleanup_owned_workspace(self) -> None:
+        workspace = self._owned_workspace
+        self._owned_workspace = None
+        if workspace is not None:
+            shutil.rmtree(workspace, ignore_errors=True)

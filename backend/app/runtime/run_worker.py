@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 
 from pydantic import ValidationError
@@ -23,9 +24,14 @@ def main() -> int:
         request = load_execution_request()
     except (KeyError, json.JSONDecodeError, ValidationError):
         return 2
-    result = SandboxRuntime(
+    runtime = SandboxRuntime(
         RunnerGatewayClient.from_execution_request(request)
-    ).execute(request)
+    )
+    previous_handler = signal.signal(signal.SIGTERM, lambda *_: runtime.cancel())
+    try:
+        result = runtime.execute(request)
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
     if result.status in {"completed", "interrupted"}:
         return 0
     if result.status == "cancelled":

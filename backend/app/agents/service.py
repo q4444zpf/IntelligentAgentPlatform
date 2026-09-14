@@ -13,11 +13,18 @@ from sqlalchemy.orm import Session
 from app.audit.management import management_event_id, management_trace_id
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.core.request_context import RequestContext
-from app.skills.service import SkillNotFoundError, SkillService
+from app.skills.repository import SkillRepository, SkillScope
+from app.skills.service import SkillService
 from app.tools.service import ToolNotFoundError, ToolService, ToolValidationError
 from app.tools.store import ToolStore
 
-from .schemas import AgentConfig, AgentCopyRequest, AgentCreateRequest, AgentInfo
+from .schemas import (
+    AgentConfig,
+    AgentCopyRequest,
+    AgentCreateRequest,
+    AgentInfo,
+    SkillBinding,
+)
 from .store import (
     AgentConcurrentUpdateError,
     AgentStore,
@@ -266,15 +273,59 @@ class AgentService:
                 "Default agent changed concurrently; retry the request"
             )
 
-    def _validate_skills(self, names: list[str]) -> None:
+    @staticmethod
+    def _skill_scope(
+        context: RequestContext | None,
+        record: dict | None = None,
+    ) -> SkillScope:
+        if record is not None:
+            return SkillScope(str(record["unit_id"]), str(record["project_id"]))
+        if context is not None:
+            return SkillScope(context.unit_id, context.project_id)
+        return SkillScope("__internal__", "__internal__")
+
+    @staticmethod
+    def _published_skill_bindings(
+        session: Session,
+        scope: SkillScope,
+        names: list[str],
+    ) -> list[SkillBinding]:
+        repository = SkillRepository(session)
+        bindings = []
         missing = []
         for name in names:
-            try:
-                self.skill_service.get(name)
-            except SkillNotFoundError:
+            version = repository.get_published_by_name(scope, name)
+            if version is None:
                 missing.append(name)
+                continue
+            bindings.append(
+                SkillBinding(
+                    skill_id=version.skill_id,
+                    version_id=version.id,
+                    name=version.name,
+                )
+            )
         if missing:
-            raise AgentValidationError(f"Unknown skills: {', '.join(missing)}")
+            raise AgentValidationError(
+                f"Published skills are unavailable: {', '.join(missing)}"
+            )
+        return bindings
+
+    def _resolve_skill_bindings(
+        self,
+        names: list[str],
+        *,
+        context: RequestContext | None,
+        session: Session | None,
+        record: dict | None = None,
+    ) -> list[SkillBinding]:
+        if record is not None and record["availability_scope"] == "common" and names:
+            raise AgentValidationError("Common Agents cannot bind project-scoped Skills")
+        scope = self._skill_scope(context, record)
+        if session is not None:
+            return self._published_skill_bindings(session, scope, names)
+        with self.store.session_factory() as resolution_session:
+            return self._published_skill_bindings(resolution_session, scope, names)
 
     def _validate_tools(self, tool_ids: list[str]) -> None:
         try:
@@ -425,10 +476,16 @@ class AgentService:
         self._ensure_default_agent()
         if self.store.get(request.id):
             raise AgentConflictError(f"Agent '{request.id}' already exists")
-        self._validate_skills(request.skill_names)
         self._validate_tools(request.tool_ids)
         self._validate_knowledge_sources(request.knowledge_source_ids)
         config = AgentConfig(**request.model_dump(exclude={"id"}))
+        config = config.model_copy(
+            update={
+                "skill_bindings": self._resolve_skill_bindings(
+                    config.skill_names, context=context, session=session
+                )
+            }
+        )
         workspace = self._initialize_workspace(request.id, config)
         if context is None or session is None:
             try:
@@ -507,25 +564,38 @@ class AgentService:
         request_id: str | None = None,
     ) -> AgentInfo:
         self._ensure_default_agent()
-        self._require_mutation_scope(agent_id, context, session)
-        self._validate_skills(request.skill_names)
+        existing = self._require_mutation_scope(agent_id, context, session)
+        if existing is None:
+            existing = self.store.get(agent_id)
+        if existing is None:
+            raise AgentNotFoundError(agent_id)
         self._validate_tools(request.tool_ids)
         self._validate_knowledge_sources(request.knowledge_source_ids)
+        config = request.model_copy(
+            update={
+                "skill_bindings": self._resolve_skill_bindings(
+                    request.skill_names,
+                    context=context,
+                    session=session,
+                    record=existing,
+                )
+            }
+        )
         if context is None or session is None:
             record = self._call_store_mutation(
-                lambda: self.store.update_agent(agent_id, request.model_dump())
+                lambda: self.store.update_agent(agent_id, config.model_dump())
             )
         else:
             record = self._call_store_mutation(
                 lambda: self.store.update_agent_in_session(
-                    session, agent_id, request.model_dump()
+                    session, agent_id, config.model_dump()
                 )
             )
         workspace, agents_file = self._validated_workspace(record["workspace_dir"])
         previous = agents_file.read_bytes() if agents_file.is_file() else None
         try:
             self._atomic_write(
-                agents_file, self._workspace_content(request).encode("utf-8")
+                agents_file, self._workspace_content(config).encode("utf-8")
                 )
             if context is not None and session is not None:
                 self._commit_management(
@@ -534,10 +604,10 @@ class AgentService:
                     request_id,
                     action="resource.updated",
                     agent_id=agent_id,
-                    name=request.name,
+                    name=config.name,
                     metadata={
-                        "runtime_form": request.runtime_form,
-                        "enabled": request.enabled,
+                        "runtime_form": config.runtime_form,
+                        "enabled": config.enabled,
                     },
                 )
         except Exception:
@@ -555,6 +625,58 @@ class AgentService:
                 )
             raise
         return self._info(record)
+
+    def migrate_legacy_skill_bindings(
+        self,
+        agent_id: str,
+        *,
+        context: RequestContext | None = None,
+        session: Session | None = None,
+        request_id: str | None = None,
+    ) -> AgentInfo:
+        self._ensure_default_agent()
+        record = self._require_mutation_scope(agent_id, context, session)
+        if record is None:
+            record = self.store.get(agent_id)
+        if record is None:
+            raise AgentNotFoundError(agent_id)
+        config = AgentConfig.model_validate({
+            field: record[field]
+            for field in AgentConfig.model_fields
+            if field in record
+        })
+        if config.skill_bindings or not config.skill_names:
+            return self._info(record)
+        migrated = config.model_copy(
+            update={
+                "skill_bindings": self._resolve_skill_bindings(
+                    config.skill_names,
+                    context=context,
+                    session=session,
+                    record=record,
+                )
+            }
+        )
+        if context is None or session is None:
+            updated = self._call_store_mutation(
+                lambda: self.store.update_agent(agent_id, migrated.model_dump())
+            )
+        else:
+            updated = self._call_store_mutation(
+                lambda: self.store.update_agent_in_session(
+                    session, agent_id, migrated.model_dump()
+                )
+            )
+            self._commit_management(
+                context,
+                session,
+                request_id,
+                action="resource.updated",
+                agent_id=agent_id,
+                name=migrated.name,
+                metadata={"skill_bindings_migrated": True},
+            )
+        return self._info(updated)
 
     def set_enabled(
         self,
@@ -633,11 +755,11 @@ class AgentService:
             source = self.store.get(source_id)
         if not source:
             raise AgentNotFoundError(source_id)
-        config = {
+        config = AgentConfig.model_validate({
             name: source[name]
             for name in AgentConfig.model_fields
-            if name != "id"
-        }
+            if name != "id" and name in source
+        }).model_dump()
         config["name"] = request.name
         config["skill_names"] = config["skill_names"] if request.copy_skills else []
         config["enabled"] = False

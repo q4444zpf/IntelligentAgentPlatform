@@ -6,7 +6,9 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
+from collections.abc import Callable
 from datetime import UTC, datetime
 from time import perf_counter
 
@@ -14,7 +16,7 @@ from pydantic import ValidationError
 from sqlalchemy import func, select
 
 from app.approvals.models import Approval
-from app.approvals.service import arguments_digest
+from app.approvals.service import ApprovalService, arguments_digest
 from app.artifacts.service import (
     ArtifactAlreadyExistsError,
     ArtifactContentTypeError,
@@ -24,17 +26,24 @@ from app.artifacts.service import (
     ArtifactSizeError,
 )
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
-from app.conversations.models import AgentRun, RunEvent
+from app.conversations.models import AgentRun, RunEvent, ToolInvocation
 from app.conversations.repository import ConversationRepository
 from app.identity.authorization import AuthorizationService
 from app.identity.repository import AuthorizationRepository
 from app.identity.schemas import ResourceScope
+from app.core.request_context import RequestContext
 from app.tools.gateway import ToolGateway
 from app.tools.schemas import (
     ToolCall,
     ToolDefinition,
     ToolExecutionContext,
     ToolRuntimeError,
+)
+from app.skills.package import SkillPackageError, parse_skill_bundle
+from app.skills.package_storage import (
+    SkillPackageStorage,
+    SkillPackageStorageError,
+    StoredSkillPackage,
 )
 
 from .checkpoint_store import (
@@ -52,12 +61,14 @@ from .execution_snapshot import (
     PublishedTeamSnapshot,
     SnapshotTeamMember,
     SnapshotIntegrityError,
+    SkillUnavailableError,
     StoredExecutionSnapshot,
     team_execution_deadline,
     verify_snapshot_digest,
 )
 from .model_gateway import ModelGateway, ModelRuntimeError, ModelSelection
 from .run_tokens import RunTokenClaims
+from .script_lifecycle import finish_running_script_invocations, finish_script_invocation
 from .runner_gateway_auth import RunnerGatewayError
 from .runner_gateway_schemas import (
     ArtifactCapabilityRegistrationRequest,
@@ -76,6 +87,11 @@ from .runner_gateway_schemas import (
     ModelInvocationResponse,
     ModelToolCall,
     SnapshotResponse,
+    SkillFileResponse,
+    ScriptExecutionLeaseResponse,
+    ScriptExecutionRequest,
+    ScriptExecutionCompletionRequest,
+    ScriptExecutionCompletionResponse,
     ToolInvocationRequest,
     ToolInvocationResponse,
 )
@@ -85,6 +101,7 @@ from .team_graph import (
     TeamSchedulerState,
     validate_team_plan,
 )
+from .skill_scripts import SkillScriptError, load_script_specs
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +143,7 @@ class RunnerGatewayService:
         artifact_service: ArtifactService | None = None,
         *,
         event_payload_max_bytes: int | None = None,
+        skill_package_storage: SkillPackageStorage | None = None,
     ) -> None:
         self.snapshot_service = snapshot_service
         self.checkpoint_store = checkpoint_store
@@ -134,6 +152,7 @@ class RunnerGatewayService:
         self.audit_recorder = audit_recorder or AuditRecorder()
         self.tool_gateway = tool_gateway
         self.artifact_service = artifact_service
+        self.skill_package_storage = skill_package_storage
         self.event_payload_max_bytes = (
             _event_payload_limit()
             if event_payload_max_bytes is None
@@ -152,6 +171,307 @@ class RunnerGatewayService:
             digest=stored.digest,
             payload=stored.payload,
         )
+
+    def read_skill_file_audited(
+        self, run_id: str, skill_name: str, path: str, claims: RunTokenClaims,
+        *, reauthorize: Callable[[], RunTokenClaims],
+    ) -> SkillFileResponse:
+        from app.skills.repository import SkillRepository, SkillScope
+
+        repository = self._require_conversation_repository()
+        read_error = None
+        try:
+            response = self.read_skill_file(run_id, skill_name, path, claims)
+        except RunnerGatewayError as error:
+            read_error = error
+        # External storage must not hold the lock needed by cancellation and deadlines.
+        run = self._lock_run(repository, run_id)
+        try:
+            self._require_active_run(run)
+            snapshot = self._verified_snapshot(run_id, reauthorize())
+            if read_error is not None:
+                raise read_error
+            skill = next(item for item in snapshot.payload.skills if item.name == skill_name)
+            if skill.skill_id:
+                version = None
+                if skill.skill_id and skill.version_id:
+                    version = SkillRepository(repository.session).get_version(
+                        SkillScope(snapshot.payload.unit_id, snapshot.payload.project_id),
+                        skill.skill_id, skill.version_id, available_only=True,
+                    )
+                if version is None:
+                    raise RunnerGatewayError(
+                        403, SkillUnavailableError.code, "绑定技能当前不可用",
+                    )
+        except RunnerGatewayError as error:
+            self._record_skill_resource_audit(run_id, skill_name, path, error_code=error.code)
+            repository.session.commit()
+            raise
+        self._record_skill_resource_audit(run_id, skill_name, path)
+        repository.session.commit()
+        return response
+
+    def _record_skill_resource_audit(self, run_id, skill_name, path, *, error_code=None):
+        repository = self._require_conversation_repository()
+        context = repository.get_run_execution_context(run_id)
+        if context is None:
+            raise RunnerGatewayError(404, "run_not_found", "Run 不存在")
+        action = "skill.resource.failed" if error_code else "skill.resource.read"
+        safe_skill_name, safe_path = (
+            re.sub(r"[\x00-\x1f\x7f-\x9f]", lambda match: f"\\u{ord(match[0]):04x}", value)
+            for value in (skill_name, path)
+        )
+        metadata = {
+            "skill_name": safe_skill_name[:128], "path": safe_path[:4096],
+            "path_sha256": hashlib.sha256(path.encode("utf-8")).hexdigest(),
+        }
+        repository.append_event(run_id, action, {**metadata, **({"error_code": error_code} if error_code else {})})
+        self.audit_recorder.record(repository.session, AuditRecordRequest(
+            unit_id=str(context["unit_id"]), project_id=str(context["project_id"]),
+            user_id=str(context["user_id"]), actor_roles=tuple(context["actor_roles"]),
+            authorization_scope="project", event_scope="project", category="runtime", source="sandbox",
+            action=action, status="failed" if error_code else "succeeded", risk_level="low",
+            idempotency_key=f"skill-resource:{run_id}:{secrets.token_hex(16)}", occurred_at=datetime.now(UTC),
+            run_id=run_id, resource_type="skill_resource", resource_id=safe_skill_name[:128], resource_name=safe_path[:200],
+            summary="Skill resource access", metadata=metadata, allowed_metadata_keys=frozenset(metadata),
+            error_code=error_code,
+        ))
+
+    def read_skill_file(
+        self,
+        run_id: str,
+        skill_name: str,
+        path: str,
+        claims: RunTokenClaims,
+    ) -> SkillFileResponse:
+        stored = self._verified_snapshot(run_id, claims)
+        skill = next(
+            (item for item in stored.payload.skills if item.name == skill_name), None
+        )
+        if skill is None:
+            raise RunnerGatewayError(404, "skill_resource_not_found", "Skill 资源不存在")
+        if not skill.enabled:
+            raise RunnerGatewayError(403, "skill_resource_disabled", "Skill 资源未启用")
+        manifest = next((item for item in skill.files if item.path == path), None)
+        if manifest is None:
+            raise RunnerGatewayError(404, "skill_resource_not_found", "Skill 资源不存在")
+        if manifest.size > 10 * 1024 * 1024:
+            raise RunnerGatewayError(413, "skill_resource_too_large", "Skill 资源超过大小限制")
+
+        data: bytes
+        if manifest.content_base64 is not None:
+            try:
+                data = base64.b64decode(manifest.content_base64, validate=True)
+            except (ValueError, binascii.Error) as error:
+                raise RunnerGatewayError(409, "skill_resource_digest_mismatch", "Skill 资源校验失败") from error
+        else:
+            if not skill.object_key or not skill.package_digest or self.skill_package_storage is None:
+                raise RunnerGatewayError(503, "skill_resource_unavailable", "Skill 资源暂不可用")
+            if not skill.archive_sha256 or skill.size_bytes is None:
+                raise RunnerGatewayError(503, "skill_resource_unavailable", "Skill 资源暂不可用")
+            try:
+                data = self._read_skill_package(skill)
+                packages = parse_skill_bundle(data)
+                package = next((item for item in packages if item.name == skill.name), None)
+                if (
+                    package is None
+                    or (skill.package_digest and package.digest != skill.package_digest)
+                    or (
+                        not skill.version_id
+                        and skill.version
+                        and package.display_version != skill.version
+                    )
+                ):
+                    raise ValueError("package digest mismatch")
+                package_file = next((item for item in package.files if item.path == path), None)
+                if package_file is None:
+                    raise RunnerGatewayError(404, "skill_resource_not_found", "Skill 资源不存在")
+                data = package_file.data
+            except RunnerGatewayError:
+                raise
+            except (SkillPackageStorageError, SkillPackageError, ValueError) as error:
+                code = "skill_resource_unavailable" if isinstance(error, SkillPackageStorageError) else "skill_resource_digest_mismatch"
+                status = 503 if code == "skill_resource_unavailable" else 409
+                raise RunnerGatewayError(status, code, "Skill 资源不可用" if status == 503 else "Skill 资源校验失败") from error
+        if len(data) != manifest.size or hashlib.sha256(data).hexdigest() != manifest.sha256:
+            raise RunnerGatewayError(409, "skill_resource_digest_mismatch", "Skill 资源校验失败")
+        max_bytes = 10 * 1024 * 1024
+        if len(data) > max_bytes:
+            raise RunnerGatewayError(413, "skill_resource_too_large", "Skill 资源超过大小限制")
+        return SkillFileResponse(
+            skill_name=skill.name,
+            path=manifest.path,
+            size=len(data),
+            sha256=manifest.sha256,
+            data_base64=base64.b64encode(data).decode("ascii"),
+        )
+
+    def execute_script(
+        self,
+        run_id: str,
+        request: ScriptExecutionRequest,
+        claims: RunTokenClaims,
+        idempotency_key: str,
+    ) -> ScriptExecutionLeaseResponse:
+        repository = self._require_conversation_repository()
+        snapshot = self._verified_snapshot(run_id, claims)
+        run = self._lock_run(repository, run_id)
+        self._require_active_run(run)
+        found = None
+        found_skill = None
+        for skill in snapshot.payload.skills:
+            if not skill.enabled:
+                continue
+            try:
+                specs = load_script_specs(skill)
+            except SkillScriptError as error:
+                raise RunnerGatewayError(409, "skill_script_invalid", "Skill 脚本声明无效") from error
+            found = next((spec for spec in specs if spec.tool_name == request.script_name), None)
+            if found is not None:
+                found_skill = skill
+                break
+        if found is None:
+            raise RunnerGatewayError(403, "skill_script_not_authorized", "Skill 脚本当前不可用")
+        requests = RunnerRequestStore(repository.session)
+        action = "skill.script.execute"
+        request_digest = _canonical_digest({"snapshot_digest": claims.snapshot_digest, "request": request.model_dump(mode="json")})
+        call_key = f"script-call:{request.tool_call_id}"
+        prior_call = requests.get(run_id, action, call_key)
+        if prior_call is not None:
+            if prior_call.request_digest != request_digest:
+                raise RunnerGatewayError(409, "tool_duplicate_call", "工具调用标识重复")
+            return ScriptExecutionLeaseResponse.model_validate(prior_call.response_json)
+        replay = self._replay_or_conflict(requests, run_id, action, idempotency_key, request_digest)
+        if replay is not None:
+            return ScriptExecutionLeaseResponse.model_validate(replay)
+        invocation = repository.get_tool_invocation(run_id, request.tool_call_id)
+        if invocation is not None and (
+            invocation.tool_id != found.tool_name
+            or arguments_digest(invocation.arguments_summary) != arguments_digest(request.arguments)
+        ):
+            raise RunnerGatewayError(409, "tool_duplicate_call", "工具调用标识重复")
+        if found.requires_approval:
+            context_data = repository.get_run_execution_context(run_id)
+            if context_data is None:
+                raise RunnerGatewayError(404, "run_not_found", "Run 不存在")
+            approval = None
+            if invocation is not None:
+                approval = repository.session.scalar(select(Approval).where(Approval.invocation_id == invocation.id))
+            if approval is not None and approval.status == "approved" and approval.arguments_digest == arguments_digest(request.arguments):
+                invocation.status = "running"
+            else:
+                if invocation is None:
+                    invocation = ToolInvocation(
+                        run_id=run_id, tool_call_id=request.tool_call_id,
+                        tool_id=found.tool_name, tool_version=(found_skill.version or "1")[:32],
+                        status="waiting_approval", arguments_summary=request.arguments,
+                    )
+                    repository.add_tool_invocation(invocation)
+                    approval = ApprovalService(repository.session).create_request(
+                        run=run,
+                        invocation=invocation,
+                        context=RequestContext(
+                            user_id=str(context_data["user_id"]), unit_id=str(context_data["unit_id"]),
+                            project_id=str(context_data["project_id"]),
+                            roles=frozenset(role for role in context_data["actor_roles"] if role in {"user", "project_admin", "unit_admin", "unit_auditor"}) or frozenset({"user"}),
+                        ),
+                    )
+                    run.status = "waiting_approval"
+                    repository.append_event(run_id, "approval.requested", {"approval_id": approval.id, "invocation_id": invocation.id, "tool_id": found.tool_name})
+                    repository.append_event(run_id, "run.status", {"status": "waiting_approval"})
+                    repository.session.commit()
+                raise RunnerGatewayError(409, "tool_approval_required", "该工具需要人工审批后才能执行", {"approval_id": str(approval.id)})
+        elif invocation is None:
+            invocation = ToolInvocation(
+                run_id=run_id, tool_call_id=request.tool_call_id, tool_id=found.tool_name,
+                tool_version=(found_skill.version or "1")[:32], status="running",
+                arguments_summary=request.arguments,
+            )
+            repository.add_tool_invocation(invocation)
+        lease = ScriptExecutionLeaseResponse(
+            lease_id=invocation.id,
+            script_name=found.tool_name,
+            status="leased",
+        )
+        requests.add(
+            run_id=run_id,
+            action=action,
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+            response_json=lease.model_dump(mode="json"),
+        )
+        requests.add(
+            run_id=run_id,
+            action=action,
+            idempotency_key=call_key,
+            request_digest=request_digest,
+            response_json=lease.model_dump(mode="json"),
+        )
+        repository.append_event(run_id, "skill.script.started", {"script_name": found.tool_name, "tool_call_id": request.tool_call_id})
+        context_data = repository.get_run_execution_context(run_id)
+        if context_data is not None:
+            metadata = {"lease_id": invocation.id, "script_name": found.tool_name, "tool_call_id": request.tool_call_id}
+            self.audit_recorder.record(repository.session, AuditRecordRequest(
+                unit_id=str(context_data["unit_id"]), project_id=str(context_data["project_id"]), user_id=str(context_data["user_id"]),
+                actor_roles=tuple(context_data["actor_roles"]), authorization_scope="project", event_scope="project",
+                category="runtime", source="sandbox", action="skill.script.started", status="started", risk_level="high" if found.requires_approval else "medium",
+                idempotency_key=f"skill-script:{invocation.id}:started", occurred_at=datetime.now(UTC), run_id=run_id,
+                resource_type="skill_script", resource_id=invocation.id, resource_name=found.tool_name,
+                summary="Skill script execution leased", metadata=metadata, allowed_metadata_keys=frozenset(metadata),
+            ))
+        repository.session.commit()
+        return lease
+
+    def complete_script(
+        self,
+        run_id: str,
+        lease_id: str,
+        request: ScriptExecutionCompletionRequest,
+        claims: RunTokenClaims,
+        idempotency_key: str,
+    ) -> ScriptExecutionCompletionResponse:
+        repository = self._require_conversation_repository()
+        self._verified_snapshot(run_id, claims)
+        self._lock_run(repository, run_id)
+        requests = RunnerRequestStore(repository.session)
+        action = "skill.script.complete"
+        digest = _canonical_digest({"lease_id": lease_id, "request": request.model_dump(mode="json")})
+        replay = self._replay_or_conflict(requests, run_id, action, idempotency_key, digest)
+        if replay is not None:
+            return ScriptExecutionCompletionResponse.model_validate(replay)
+        invocation = repository.session.get(ToolInvocation, lease_id)
+        if invocation is None or invocation.run_id != run_id or not invocation.tool_id.startswith("skill."):
+            raise RunnerGatewayError(404, "skill_script_lease_invalid", "Skill 脚本租约无效")
+        if invocation.status in {"completed", "failed", "cancelled"}:
+            if invocation.status == request.status:
+                return ScriptExecutionCompletionResponse(lease_id=lease_id, status=request.status)
+            raise RunnerGatewayError(409, "skill_script_already_completed", "Skill 脚本租约已结束")
+        if invocation.status != "running":
+            raise RunnerGatewayError(409, "skill_script_lease_invalid", "Skill 脚本租约状态无效")
+        if not finish_script_invocation(
+            repository,
+            self.audit_recorder,
+            invocation,
+            status=request.status,
+            error_code=request.error_code,
+            duration_ms=request.duration_ms,
+        ):
+            if invocation.status == request.status:
+                return ScriptExecutionCompletionResponse(lease_id=lease_id, status=request.status)
+            raise RunnerGatewayError(409, "skill_script_already_completed", "Skill 脚本租约已结束")
+        response = ScriptExecutionCompletionResponse(lease_id=lease_id, status=request.status)
+        requests.add(run_id=run_id, action=action, idempotency_key=idempotency_key, request_digest=digest, response_json=response.model_dump(mode="json"))
+        repository.session.commit()
+        return response
+
+    def _read_skill_package(self, skill) -> bytes:
+        stored = StoredSkillPackage(
+            object_key=skill.object_key,
+            archive_sha256=skill.archive_sha256,
+            package_digest=skill.package_digest,
+            size_bytes=skill.size_bytes,
+        )
+        return self.skill_package_storage.read(stored)
 
     def _verified_snapshot(
         self, run_id: str, claims: RunTokenClaims
@@ -1239,6 +1559,10 @@ class RunnerGatewayService:
                 run_id,
                 request.final_assistant_content,
             )
+        finish_running_script_invocations(
+            repository, self.audit_recorder, run_id,
+            status=target_status, error_code=request.error_code,
+        )
         repository.append_event(
             run_id,
             "runner.completion",
@@ -1284,6 +1608,18 @@ class RunnerGatewayService:
             response_json=response.model_dump(mode="json"),
         )
         repository.session.flush()
+        if request.status in {"completed", "failed", "cancelled"}:
+            self.audit_recorder.record(repository.session, AuditRecordRequest(
+                unit_id=snapshot.payload.unit_id, project_id=snapshot.payload.project_id,
+                user_id=snapshot.payload.user_id, actor_roles=tuple(run.actor_roles_json),
+                authorization_scope="project", event_scope="project", category="runtime", source="sandbox",
+                action=f"runner.run.{request.status}",
+                status="succeeded" if request.status == "completed" else request.status,
+                risk_level="low" if request.status == "completed" else "medium",
+                idempotency_key=f"runner-run:{run_id}:terminal", occurred_at=datetime.now(UTC),
+                run_id=run_id, resource_type="run", resource_id=run_id,
+                summary="Runner execution finished", error_code=request.error_code,
+            ))
         if (
             request.status == "completed"
             and deadline is not None

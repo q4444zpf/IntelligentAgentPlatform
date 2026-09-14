@@ -16,6 +16,16 @@ class SnapshotResponse(BaseModel):
     payload: ExecutionSnapshotPayload
 
 
+class SkillFileResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    skill_name: str = Field(min_length=1, max_length=128)
+    path: str = Field(min_length=1, max_length=4096)
+    size: int = Field(ge=0)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    data_base64: str
+
+
 class CheckpointWriteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -108,6 +118,40 @@ class ToolInvocationResponse(BaseModel):
 
     invocation_id: str
     value: dict[str, Any]
+
+
+class ScriptExecutionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    script_name: str = Field(min_length=1, max_length=128)
+    arguments: dict[str, Any]
+    tool_call_id: str = Field(min_length=1, max_length=128)
+    invocation_sequence: int = Field(ge=0)
+    member_agent_id: str | None = None
+
+
+class ScriptExecutionLeaseResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    lease_id: str
+    script_name: str
+    status: Literal["leased", "approval_required"]
+    approval_id: str | None = None
+
+
+class ScriptExecutionCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["completed", "failed", "cancelled"]
+    error_code: str | None = Field(default=None, max_length=120)
+    duration_ms: int = Field(ge=0)
+
+
+class ScriptExecutionCompletionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    lease_id: str
+    status: Literal["completed", "failed", "cancelled"]
 
 
 class ArtifactProvenance(BaseModel):

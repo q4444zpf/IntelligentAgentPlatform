@@ -13,6 +13,7 @@ from app.mcp.protocol import McpProtocolClient
 from app.mcp.store import McpStore
 from app.tools.gateway import ToolGateway
 from app.tools.store import ToolStore
+from app.skills.package_storage import SkillPackageStorage, create_default_skill_package_storage
 
 from .checkpoint_store import CheckpointStore
 from .execution_snapshot import ExecutionSnapshotService
@@ -34,6 +35,11 @@ from .runner_gateway_schemas import (
     ModelInvocationRequest,
     ModelInvocationResponse,
     SnapshotResponse,
+    SkillFileResponse,
+    ScriptExecutionLeaseResponse,
+    ScriptExecutionRequest,
+    ScriptExecutionCompletionRequest,
+    ScriptExecutionCompletionResponse,
     ToolInvocationRequest,
     ToolInvocationResponse,
 )
@@ -86,6 +92,10 @@ def default_tool_gateway(
     )
 
 
+def default_skill_package_storage() -> SkillPackageStorage:
+    return create_default_skill_package_storage()
+
+
 def create_router(
     *,
     token_service_dependency: Callable[..., RunTokenService] = default_token_service,
@@ -96,6 +106,7 @@ def create_router(
     audit_recorder_dependency: Callable[..., AuditRecorder] = default_audit_recorder,
     tool_gateway_dependency: Callable[..., ToolGateway] = default_tool_gateway,
     artifact_service_dependency: Callable[..., ArtifactService] = default_artifact_service,
+    skill_package_storage_dependency: Callable[..., SkillPackageStorage] = default_skill_package_storage,
     event_payload_max_bytes: int | None = None,
 ) -> APIRouter:
     router = APIRouter()
@@ -123,6 +134,12 @@ def create_router(
     completion_claims = require_runner_action(
         "result.complete", token_service_dependency
     )
+    skill_resource_claims = require_runner_action(
+        "skill.resource.read", token_service_dependency
+    )
+    skill_script_claims = require_runner_action(
+        "skill.script.execute", token_service_dependency
+    )
 
     @router.get(
         "/runs/{run_id}/snapshot",
@@ -137,6 +154,81 @@ def create_router(
         ],
     ) -> SnapshotResponse:
         return RunnerGatewayService(snapshot_service).get_snapshot(run_id, claims)
+
+    @router.get(
+        "/runs/{run_id}/skills/{skill_name}/files/{path:path}",
+        response_model=SkillFileResponse,
+    )
+    def read_skill_file(
+        run_id: str,
+        skill_name: str,
+        path: str,
+        claims: Annotated[RunTokenClaims, Depends(skill_resource_claims)],
+        snapshot_service: Annotated[
+            ExecutionSnapshotService,
+            Depends(snapshot_service_dependency),
+        ],
+        skill_package_storage: Annotated[
+            SkillPackageStorage,
+            Depends(skill_package_storage_dependency),
+        ],
+        repository: Annotated[
+            ConversationRepository, Depends(conversation_repository_dependency),
+        ],
+        audit_recorder: Annotated[AuditRecorder, Depends(audit_recorder_dependency)],
+        token_service: Annotated[RunTokenService, Depends(token_service_dependency)],
+        authorization: Annotated[str, Header()] = "",
+    ) -> SkillFileResponse:
+        return RunnerGatewayService(
+            snapshot_service,
+            conversation_repository=repository,
+            audit_recorder=audit_recorder,
+            skill_package_storage=skill_package_storage,
+        ).read_skill_file_audited(
+            run_id, skill_name, path, claims,
+            reauthorize=lambda: skill_resource_claims(run_id, authorization, token_service),
+        )
+
+    @router.post(
+        "/runs/{run_id}/script-invocations",
+        response_model=ScriptExecutionLeaseResponse,
+    )
+    def execute_script(
+        run_id: str,
+        request: ScriptExecutionRequest,
+        idempotency_key: Annotated[
+            str, Header(alias="Idempotency-Key", min_length=1, max_length=200)
+        ],
+        claims: Annotated[RunTokenClaims, Depends(skill_script_claims)],
+        snapshot_service: Annotated[
+            ExecutionSnapshotService, Depends(snapshot_service_dependency)
+        ],
+        repository: Annotated[
+            ConversationRepository, Depends(conversation_repository_dependency)
+        ],
+    ) -> ScriptExecutionLeaseResponse:
+        return RunnerGatewayService(
+            snapshot_service, conversation_repository=repository
+        ).execute_script(run_id, request, claims, idempotency_key)
+
+    @router.post(
+        "/runs/{run_id}/script-invocations/{lease_id}/completion",
+        response_model=ScriptExecutionCompletionResponse,
+    )
+    def complete_script(
+        run_id: str,
+        lease_id: str,
+        request: ScriptExecutionCompletionRequest,
+        idempotency_key: Annotated[
+            str, Header(alias="Idempotency-Key", min_length=1, max_length=200)
+        ],
+        claims: Annotated[RunTokenClaims, Depends(skill_script_claims)],
+        snapshot_service: Annotated[ExecutionSnapshotService, Depends(snapshot_service_dependency)],
+        repository: Annotated[ConversationRepository, Depends(conversation_repository_dependency)],
+    ) -> ScriptExecutionCompletionResponse:
+        return RunnerGatewayService(snapshot_service, conversation_repository=repository).complete_script(
+            run_id, lease_id, request, claims, idempotency_key
+        )
 
     @router.get(
         "/runs/{run_id}/checkpoints/latest",

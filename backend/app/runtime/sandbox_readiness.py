@@ -16,6 +16,7 @@ class SandboxReadiness:
     docker_socket_absent: bool = True
     environment_allowlisted: bool = True
     mounts_allowlisted: bool = True
+    temporary_filesystem: bool = True
 
     def missing(self) -> list[str]:
         return [
@@ -31,6 +32,7 @@ class SandboxReadiness:
                 ("docker_socket_absent", self.docker_socket_absent),
                 ("environment_allowlisted", self.environment_allowlisted),
                 ("mounts_allowlisted", self.mounts_allowlisted),
+                ("temporary_filesystem", self.temporary_filesystem),
             ) if not value
         ]
 

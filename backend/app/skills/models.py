@@ -5,6 +5,7 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import (
+    Boolean,
     JSON,
     CheckConstraint,
     DateTime,
@@ -40,6 +41,7 @@ class Skill(Base):
     unit_id: Mapped[str] = mapped_column(String(128), nullable=False)
     project_id: Mapped[str] = mapped_column(String(128), nullable=False)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     published_version_id: Mapped[str | None] = mapped_column(Uuid(as_uuid=False), nullable=True)
     created_by: Mapped[str] = mapped_column(String(128), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -96,6 +96,8 @@ gateway_model.RunnerGatewayModelError = _ProbeGatewayModelError
 gateway_tools = ModuleType("app.runtime.gateway_tools")
 gateway_tools.RunnerApprovalInterruption = _ProbeApprovalInterruption
 gateway_tools.build_gateway_tools = _build_no_gateway_tools
+gateway_tools.build_skill_resource_tools = _build_no_gateway_tools
+gateway_tools.build_skill_script_tools = _build_no_gateway_tools
 sys.modules["app.runtime.gateway_model"] = gateway_model
 sys.modules["app.runtime.gateway_tools"] = gateway_tools
 

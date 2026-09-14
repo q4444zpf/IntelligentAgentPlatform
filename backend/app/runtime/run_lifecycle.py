@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.audit.recorder import AuditRecorder, AuditRecordRequest
 from app.conversations.models import AgentRun, RunEvent
 from app.conversations.repository import ConversationRepository
+from .script_lifecycle import finish_running_script_invocations
 
 from .workflow_runner import (
     RunnerDeadlineExceededError,
@@ -38,6 +39,8 @@ _RUNNER_ACTIONS = {
     "event.append",
     "artifact.create",
     "result.complete",
+    "skill.resource.read",
+    "skill.script.execute",
 }
 _TIMEOUT_CONTROL_ALLOWANCE_SECONDS = 1.0
 
@@ -424,6 +427,9 @@ class SandboxRunCoordinator:
             run = session.get(AgentRun, run_id)
             if run is None:
                 raise KeyError(run_id)
+            finish_running_script_invocations(
+                repository, self.audit_recorder, run_id, status=status, error_code=error_code,
+            )
             repository.append_event(
                 run_id,
                 "sandbox.finished",

@@ -66,6 +66,9 @@ def _execute_approved_tool(
         context_data = repository.get_run_execution_context(run_id)
         if context_data is None:
             return None
+        if invocation.tool_id.startswith("skill.") and ".script." in invocation.tool_id:
+            # The resumed sandbox re-enters script admission after approval.
+            return run_id
         gateway = ToolGateway(
             tool_store=ToolStore(session_factory),
             repository=repository,
@@ -239,6 +242,11 @@ class ThreadRunDispatcher(RunDispatcher):
                 ),
                 artifact_storage=self.artifact_storage_factory(),
                 checkpoint_store=CheckpointStore(session),
+                execution_snapshot_service=ExecutionSnapshotService(
+                    session,
+                    agent_service,
+                    repository,
+                ),
             ).execute(run_id)
 
     def _resume_approval(self, approval_id: str) -> None:

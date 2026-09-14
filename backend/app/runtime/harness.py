@@ -13,6 +13,7 @@ from app.tools.service import ToolService
 from app.artifacts.models import ArtifactRecord
 
 from .model_gateway import ModelGateway, ModelRuntimeError, ModelSelection
+from .execution_snapshot import SkillUnavailableError, build_skill_context
 
 MAX_CONVERSATION_MESSAGES = 100
 MAX_MODEL_ITERATIONS = 4
@@ -31,6 +32,7 @@ class PlatformAgentHarness:
         artifact_storage=None,
         checkpoint_store=None,
         audit_recorder: AuditRecorder | None = None,
+        execution_snapshot_service=None,
     ):
         self.repository = repository
         self.model_gateway = model_gateway
@@ -40,6 +42,7 @@ class PlatformAgentHarness:
         self.artifact_storage = artifact_storage
         self.checkpoint_store = checkpoint_store
         self.audit_recorder = audit_recorder or AuditRecorder()
+        self.execution_snapshot_service = execution_snapshot_service
 
     def execute(self, run_id: str) -> None:
         run = self.repository.get_run_by_id(run_id)
@@ -57,6 +60,20 @@ class PlatformAgentHarness:
             self._fail(run_id, "agent_unavailable", "智能体不可用，请检查智能体配置")
             return
 
+        execution_snapshot = None
+        requires_skill_snapshot = bool(
+            getattr(agent, "skill_bindings", ()) or getattr(agent, "skill_names", ())
+        )
+        if requires_skill_snapshot and self.execution_snapshot_service is None:
+            self._fail(run_id, "skill_unavailable", "绑定技能不可用，请检查智能体配置")
+            return
+        if self.execution_snapshot_service is not None and requires_skill_snapshot:
+            try:
+                execution_snapshot = self.execution_snapshot_service.create(run_id)
+            except SkillUnavailableError:
+                self._fail(run_id, "skill_unavailable", "绑定技能不可用，请检查智能体配置")
+                return
+
         execution_context = self.repository.get_run_execution_context(run_id)
         if execution_context is None:
             raise KeyError(run_id)
@@ -72,7 +89,7 @@ class PlatformAgentHarness:
         llm_started = 0.0
         selection = ModelSelection(agent.provider_id, agent.model)
         try:
-            messages = self._build_messages(run_id, agent)
+            messages = self._build_messages(run_id, agent, execution_snapshot)
             definitions = self._resolve_tool_definitions(agent.tool_ids)
             authorized_tool_ids = set(agent.tool_ids)
             context = self._execution_context(run_id)
@@ -222,17 +239,26 @@ class PlatformAgentHarness:
                 run_id, "runtime_failed", "智能体运行失败，请稍后重试", rollback=False
             )
 
-    def _build_messages(self, run_id, agent):
+    def _build_messages(self, run_id, agent, execution_snapshot=None):
+        if execution_snapshot is None:
+            skill_context = build_skill_context(
+                system_prompt=agent.system_prompt,
+                context_prompt=agent.context_prompt,
+                skills=(),
+            )
+        else:
+            payload = execution_snapshot.payload
+            skill_context = build_skill_context(
+                system_prompt=payload.actor.system_prompt,
+                context_prompt=payload.actor.context_prompt,
+                skills=payload.skills,
+            )
         conversation_messages = [
             {"role": message.role, "content": message.content}
             for message in self.repository.get_run_messages(run_id)
             if message.role in {"user", "assistant", "system"}
         ][-MAX_CONVERSATION_MESSAGES:]
-        messages = [
-            *([{"role": "system", "content": agent.system_prompt}] if agent.system_prompt.strip() else []),
-            *([{"role": "system", "content": agent.context_prompt}] if agent.context_prompt.strip() else []),
-            *conversation_messages,
-        ]
+        messages = [*skill_context.system_messages, *conversation_messages]
         for invocation in self.repository.list_tool_invocations(run_id):
             if invocation.status != "completed" or invocation.result_summary is None:
                 continue

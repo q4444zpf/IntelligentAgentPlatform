@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from langchain_core.messages import ToolMessage
 from sqlalchemy import create_engine, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.conversations.models import AgentRun, Conversation, Message
@@ -17,6 +17,7 @@ from app.runtime.execution_snapshot import (
     PublishedAgentSnapshot,
     SnapshotModelSelection,
     SnapshotRuntimeLimits,
+    SnapshotSkill,
     SnapshotTool,
     StoredExecutionSnapshot,
     canonical_snapshot_bytes,
@@ -81,6 +82,16 @@ def build_snapshot():
                 source_available=True,
             ),
         ),
+        skills=(SnapshotSkill(
+            name="forecast",
+            version="1",
+            metadata={"scripts": [{
+                "name": "normalize", "path": "scripts/normalize.py",
+                "input_schema": {"type": "object", "properties": {"value": {"type": "integer"}}, "required": ["value"]},
+                "output_schema": {"type": "object", "properties": {"value": {"type": "integer"}}, "required": ["value"]},
+                "timeout_seconds": 5, "requires_approval": True,
+            }]},
+        ),),
         limits=SnapshotRuntimeLimits(snapshot_max_bytes=1048576),
         created_at=datetime(2026, 8, 14, 10, 0, tzinfo=UTC),
     )
@@ -233,6 +244,58 @@ def invoke_tool(client, tool_id, *, version="3", key="tool-1"):
             "invocation_sequence": 0,
         },
     )
+
+
+def test_script_approval_is_durable_and_resume_returns_lease():
+    from app.approvals.models import Approval
+    from app.conversations.dispatcher import _execute_approved_tool
+
+    client, repository = build_client(FakeToolGateway())
+    payload = {
+        "script_name": "skill.forecast.script.normalize",
+        "tool_call_id": "script-call-1",
+        "arguments": {"value": 2},
+        "invocation_sequence": 0,
+    }
+    pending = client.post(
+        "/internal/runner/runs/run-1/script-invocations",
+        headers=headers("script-1"), json=payload,
+    )
+    assert pending.status_code == 409
+    approval = repository.session.scalar(select(Approval))
+    assert approval is not None and approval.id == pending.json()["approval_id"]
+
+    approval.status = "approved"
+    repository.get_run_by_id("run-1").status = "queued"
+    repository.session.commit()
+    factory = sessionmaker(bind=repository.session.bind, expire_on_commit=False)
+    assert _execute_approved_tool(factory, approval.id) == "run-1"
+    repository.get_run_by_id("run-1").status = "running"
+    repository.session.commit()
+    leased = client.post(
+        "/internal/runner/runs/run-1/script-invocations",
+        headers=headers("script-2"), json=payload,
+    )
+    assert leased.status_code == 200
+    assert leased.json()["status"] == "leased"
+    lease_id = leased.json()["lease_id"]
+    completed = client.post(
+        f"/internal/runner/runs/run-1/script-invocations/{lease_id}/completion",
+        headers=headers("script-complete-1"),
+        json={"status": "completed", "duration_ms": 10},
+    )
+    replay = client.post(
+        f"/internal/runner/runs/run-1/script-invocations/{lease_id}/completion",
+        headers=headers("script-complete-2"),
+        json={"status": "completed", "duration_ms": 10},
+    )
+    conflict = client.post(
+        f"/internal/runner/runs/run-1/script-invocations/{lease_id}/completion",
+        headers=headers("script-complete-3"),
+        json={"status": "failed", "duration_ms": 11, "error_code": "failed"},
+    )
+    assert completed.status_code == replay.status_code == 200
+    assert conflict.status_code == 409
 
 
 def test_tool_must_be_in_snapshot_and_currently_enabled():

@@ -1,22 +1,34 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
 import os
+import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import PurePosixPath
 from typing import Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import JSON, DateTime, Index, String, select
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from app.db.base import Base
+from app.agents.schemas import SkillBinding
 
 
 class SnapshotIntegrityError(ValueError):
     pass
+
+
+class SkillUnavailableError(SnapshotIntegrityError):
+    code = "skill_unavailable"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
 
 
 class PublishedAgentSnapshot(BaseModel):
@@ -50,6 +62,60 @@ class SnapshotMessage(BaseModel):
     created_at: datetime
 
 
+MAX_SKILL_RESOURCE_FILES = 500
+MAX_SKILL_RESOURCE_SINGLE_FILE_BYTES = 10 * 1024 * 1024
+MAX_SKILL_RESOURCE_TOTAL_BYTES = 20 * 1024 * 1024
+# Short aliases for callers that prefer the budget terminology.
+MAX_SKILL_FILE_COUNT = MAX_SKILL_RESOURCE_FILES
+MAX_SKILL_FILE_BYTES = MAX_SKILL_RESOURCE_SINGLE_FILE_BYTES
+MAX_SKILL_TOTAL_BYTES = MAX_SKILL_RESOURCE_TOTAL_BYTES
+SKILL_RESOURCE_MAX_FILES = MAX_SKILL_RESOURCE_FILES
+SKILL_RESOURCE_MAX_FILE_BYTES = MAX_SKILL_RESOURCE_SINGLE_FILE_BYTES
+SKILL_RESOURCE_MAX_TOTAL_BYTES = MAX_SKILL_RESOURCE_TOTAL_BYTES
+
+
+class SnapshotSkillFile(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    path: str
+    size: int = Field(ge=0)
+    sha256: str
+    content_base64: str | None = None
+
+    @field_validator("path")
+    @classmethod
+    def _canonical_path(cls, value: str) -> str:
+        if not value or "\\" in value:
+            raise ValueError("Skill resource path must be a canonical relative POSIX path")
+        if value.startswith("/") or re.match(r"^[A-Za-z]:", value):
+            raise ValueError("Skill resource path must be relative")
+        path = PurePosixPath(value)
+        if path == PurePosixPath(".") or ".." in path.parts or path.as_posix() != value:
+            raise ValueError("Skill resource path must be a canonical relative POSIX path")
+        return value
+
+    @field_validator("sha256")
+    @classmethod
+    def _sha256(cls, value: str) -> str:
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError("Skill resource sha256 must be lowercase SHA-256")
+        return value
+
+    @model_validator(mode="after")
+    def _verify_embedded_content(self):
+        if self.content_base64 is None:
+            return self
+        try:
+            content = base64.b64decode(self.content_base64, validate=True)
+        except Exception as error:
+            raise ValueError("Skill resource content_base64 is invalid") from error
+        if len(content) != self.size:
+            raise ValueError("Skill resource embedded content size mismatch")
+        if hashlib.sha256(content).hexdigest() != self.sha256:
+            raise ValueError("Skill resource embedded content digest mismatch")
+        return self
+
+
 class SnapshotSkill(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -63,6 +129,91 @@ class SnapshotSkill(BaseModel):
     metadata: dict[str, object] = Field(default_factory=dict)
     file_count: int = 1
     updated_at: datetime | None = None
+    skill_id: str | None = None
+    version_id: str | None = None
+    package_digest: str | None = None
+    object_key: str | None = None
+    archive_sha256: str | None = None
+    size_bytes: int | None = Field(default=None, ge=0)
+    files: tuple[SnapshotSkillFile, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_resources(self):
+        if len(self.files) > MAX_SKILL_RESOURCE_FILES:
+            raise ValueError(
+                f"Skill resource file count exceeds {MAX_SKILL_RESOURCE_FILES}"
+            )
+        paths = [item.path.casefold() for item in self.files]
+        if len(paths) != len(set(paths)):
+            raise ValueError("duplicate Skill resource paths")
+        if any(item.size > MAX_SKILL_RESOURCE_SINGLE_FILE_BYTES for item in self.files):
+            raise ValueError(
+                f"Skill resource file exceeds {MAX_SKILL_RESOURCE_SINGLE_FILE_BYTES} bytes"
+            )
+        total = sum(item.size for item in self.files)
+        if total > MAX_SKILL_RESOURCE_TOTAL_BYTES:
+            raise ValueError(
+                f"Skill resource total exceeds {MAX_SKILL_RESOURCE_TOTAL_BYTES} bytes"
+            )
+        return self
+
+
+@dataclass(frozen=True)
+class SkillContext:
+    system_messages: tuple[dict[str, str], ...]
+    system_prompt: str
+    context_prompt: str
+    skill_body: str
+    resource_index: tuple[dict[str, object], ...]
+
+
+def build_skill_context(
+    *,
+    system_prompt: str,
+    context_prompt: str,
+    skills: tuple[SnapshotSkill, ...],
+    resource_index: tuple[dict[str, object], ...] = (),
+) -> SkillContext:
+    """Build the immutable Skill guidance that is visible to one agent."""
+    active_skills = tuple(skill for skill in skills if skill.enabled)
+    skill_body = "\n\n".join(
+        skill.content.strip() for skill in active_skills if skill.content.strip()
+    )
+    if not skill_body:
+        skill_body = ", ".join(skill.name for skill in active_skills)
+
+    resolved_context = context_prompt.strip()
+    if skill_body:
+        resolved_context = (
+            f"{resolved_context}\n\nSkills: {skill_body}"
+            if resolved_context
+            else f"Skills: {skill_body}"
+        )
+    frozen_index = tuple(resource_index)
+    if frozen_index:
+        resource_context = (
+            "Authorized Skill resources (read-only): "
+            + json.dumps(frozen_index, ensure_ascii=False, sort_keys=True)
+        )
+        resolved_context = (
+            f"{resolved_context}\n\n{resource_context}"
+            if resolved_context
+            else resource_context
+        )
+
+    resolved_system = system_prompt.strip()
+    messages = tuple(
+        {"role": "system", "content": content}
+        for content in (resolved_system, resolved_context)
+        if content
+    )
+    return SkillContext(
+        system_messages=messages,
+        system_prompt=resolved_system,
+        context_prompt=resolved_context,
+        skill_body=skill_body,
+        resource_index=frozen_index,
+    )
 
 
 class SnapshotKnowledgeSource(BaseModel):
@@ -221,7 +372,19 @@ _V4_TOOL_FIELDS = (
 
 def _frozen_v4_projection(serialized: dict) -> dict:
     def skill(value: dict) -> dict:
-        return {"name": value["name"]}
+        projected = {"name": value.get("name", "")}
+        resource_fields = (
+            "skill_id",
+            "version_id",
+            "package_digest",
+            "object_key",
+            "archive_sha256",
+            "size_bytes",
+            "files",
+        )
+        if any(value.get(field) for field in resource_fields):
+            projected.update({field: value.get(field) for field in resource_fields})
+        return projected
 
     def knowledge(value: dict) -> dict:
         return {"tool_id": value["tool_id"]}
@@ -344,7 +507,7 @@ class ExecutionSnapshotService:
         return stored
 
     def get(self, snapshot_id: str) -> StoredExecutionSnapshot | None:
-        row = self.session.get(RuntimeExecutionSnapshot, snapshot_id)
+        row = self.session.get(RuntimeExecutionSnapshot, snapshot_id, populate_existing=True)
         return self._stored(row) if row is not None else None
 
     def get_for_run(self, run_id: str) -> StoredExecutionSnapshot | None:
@@ -364,6 +527,132 @@ class ExecutionSnapshotService:
             separators=(",", ":"),
         ).encode("utf-8")
         return hashlib.sha256(serialized).hexdigest()
+
+    def _snapshot_skill(self, name: str, skill) -> SnapshotSkill:
+        fields = {
+            "name": skill.name,
+            "description": skill.description,
+            "version": skill.version,
+            "content": skill.content,
+            "source": skill.source,
+            "enabled": skill.enabled,
+            "tags": tuple(skill.tags),
+            "metadata": skill.metadata,
+            "file_count": skill.file_count,
+            "updated_at": skill.updated_at,
+            "skill_id": getattr(skill, "skill_id", None),
+            "version_id": getattr(skill, "version_id", None),
+            "package_digest": getattr(skill, "package_digest", None),
+            "object_key": getattr(skill, "object_key", None),
+            "archive_sha256": getattr(skill, "archive_sha256", None),
+            "size_bytes": getattr(skill, "size_bytes", None),
+            "files": (),
+        }
+        skill_service = getattr(self.agent_service, "skill_service", None)
+        reader = getattr(skill_service, "read_files", None)
+        if callable(reader):
+            try:
+                resources = reader(name)
+                fields["files"] = tuple(
+                    SnapshotSkillFile(
+                        path=path,
+                        size=len(content),
+                        sha256=hashlib.sha256(content).hexdigest(),
+                        content_base64=(
+                            None
+                            if fields["object_key"]
+                            else base64.b64encode(content).decode("ascii")
+                        ),
+                    )
+                    for path, content in resources
+                )
+            except Exception as error:
+                raise SnapshotIntegrityError(
+                    f"Unable to read resources for Skill '{name}'"
+                ) from error
+        return SnapshotSkill(**fields)
+
+    def _resolve_bound_skill(
+        self,
+        binding: SkillBinding,
+        context: dict[str, object],
+    ) -> SnapshotSkill:
+        from app.skills.repository import SkillRepository, SkillScope
+
+        version = SkillRepository(self.session).get_version(
+            SkillScope(str(context["unit_id"]), str(context["project_id"])),
+            binding.skill_id,
+            binding.version_id,
+            available_only=True,
+        )
+        if version is None:
+            raise SkillUnavailableError()
+        from app.runtime.skill_scripts import SkillScriptError, load_script_specs
+        from app.skills.service import SkillValidationError, parse_skill_markdown
+
+        try:
+            frontmatter, _ = parse_skill_markdown(version.content)
+            if (
+                frontmatter.get("name") != version.name
+                or str(frontmatter.get("description", "")) != version.description
+            ):
+                raise SkillUnavailableError()
+            metadata = frontmatter.get("metadata", {})
+            if not isinstance(metadata, dict):
+                raise SkillUnavailableError()
+            files = tuple(
+                SnapshotSkillFile(
+                    path=item["path"],
+                    size=item["size"],
+                    sha256=item["sha256"],
+                )
+                for item in version.files
+            )
+            snapshot = SnapshotSkill(
+                name=version.name,
+                description=version.description,
+                version=str(version.version),
+                content=version.content,
+                source="published",
+                enabled=True,
+                metadata=metadata,
+                file_count=len(files),
+                updated_at=version.published_at,
+                skill_id=binding.skill_id,
+                version_id=binding.version_id,
+                package_digest=version.package_digest,
+                object_key=version.object_key,
+                archive_sha256=version.archive_sha256,
+                size_bytes=version.size_bytes,
+                files=files,
+            )
+            # The import occurs at call time because skill_scripts imports SnapshotSkill.
+            load_script_specs(snapshot)
+        except (KeyError, TypeError, ValueError, SkillValidationError, SkillScriptError) as error:
+            raise SkillUnavailableError() from error
+        return snapshot
+
+    def _validate_snapshot_skill_versions(
+        self,
+        skills: tuple[SnapshotSkill, ...],
+        context: dict[str, object],
+    ) -> None:
+        from app.skills.repository import SkillRepository, SkillScope
+
+        repository = SkillRepository(self.session)
+        scope = SkillScope(str(context["unit_id"]), str(context["project_id"]))
+        for skill in skills:
+            if not skill.skill_id or not skill.version_id:
+                raise SkillUnavailableError()
+            version = repository.get_version(
+                scope, skill.skill_id, skill.version_id, available_only=True
+            )
+            if (
+                version is None
+                or version.package_digest != skill.package_digest
+                or version.content != skill.content
+            ):
+                raise SkillUnavailableError()
 
     @classmethod
     def _team_member_snapshot(cls, member: dict) -> SnapshotTeamMember:
@@ -496,7 +785,13 @@ class ExecutionSnapshotService:
             )
         )
         if existing is not None:
-            return self._stored(existing)
+            stored = self._stored(existing)
+            context = self.conversation_repository.get_run_execution_context(run_id)
+            if context is None:
+                raise KeyError(run_id)
+            if isinstance(stored.payload.actor, PublishedAgentSnapshot):
+                self._validate_snapshot_skill_versions(stored.payload.skills, context)
+            return stored
 
         context = self.conversation_repository.get_run_execution_context(run_id)
         run = self.conversation_repository.get_run_by_id(run_id)
@@ -622,8 +917,13 @@ class ExecutionSnapshotService:
                 provider_id=agent.provider_id,
                 model=agent.model,
             )
+            bindings = tuple(getattr(agent, "skill_bindings", ()))
+            if agent.skill_names and not bindings:
+                raise SkillUnavailableError()
+            if bindings and {binding.name for binding in bindings if binding.name} != set(agent.skill_names):
+                raise SkillUnavailableError()
             snapshot_skills = tuple(
-                SnapshotSkill(name=name) for name in agent.skill_names
+                self._resolve_bound_skill(binding, context) for binding in bindings
             )
             snapshot_knowledge_sources = tuple(
                 SnapshotKnowledgeSource(

@@ -69,6 +69,7 @@ def test_list_projects_only_explicit_summary_and_uses_literal_search(sessions, s
         "description",
         "display_version",
         "draft_revision",
+        "enabled",
         "published_version_id",
         "created_at",
         "updated_at",

@@ -1,0 +1,343 @@
+from datetime import UTC, datetime
+from types import SimpleNamespace
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
+
+from app.agents.schemas import AgentInfo, SkillBinding
+from app.db.base import Base
+from app.runtime.execution_snapshot import (
+    ExecutionSnapshotService,
+    SkillUnavailableError,
+)
+from app.skills.models import Skill, SkillVersion
+from backend.tests.skills.project_support import (
+    make_context,
+    make_test_app,
+    manifest,
+)
+from backend.tests.skills.project_support import (
+    memory_s3_fixture as _memory_s3_fixture,  # noqa: F401
+)
+from backend.tests.skills.project_support import (
+    sessions_fixture as _sessions_fixture,  # noqa: F401
+)
+from backend.tests.skills.project_support import (
+    storage_fixture as _storage_fixture,  # noqa: F401
+)
+from fastapi.testclient import TestClient
+
+
+class ConversationRepository:
+    def get_run_execution_context(self, run_id):
+        return {
+            "unit_id": "unit-1",
+            "project_id": "project-1",
+            "user_id": "user-1",
+            "actor_roles": (),
+        }
+
+    def get_run_by_id(self, run_id):
+        return SimpleNamespace(actor_id="agent-1", actor_type="agent")
+
+    def get_run_messages(self, run_id):
+        return []
+
+
+class AgentService:
+    def __init__(self, bindings, names):
+        self.agent = AgentInfo(
+            id="agent-1",
+            name="Agent",
+            description="",
+            runtime_form="common",
+            language="zh-CN",
+            provider_id="provider",
+            model="model",
+            system_prompt="system",
+            context_prompt="context",
+            approval_policy="never",
+            skill_names=names,
+            skill_bindings=bindings,
+            tool_ids=[],
+            knowledge_source_ids=[],
+            enabled=True,
+            pinned=False,
+            is_builtin=False,
+            is_default=False,
+            startup_status="ready",
+            workspace_dir="/workspace/agent-1",
+            created_at=datetime(2026, 9, 13, tzinfo=UTC),
+            updated_at=datetime(2026, 9, 13, tzinfo=UTC),
+        )
+        self.tool_service = SimpleNamespace(
+            resolve_bindable=lambda ids: [],
+            resolve_knowledge_sources=lambda ids: [],
+        )
+
+    def get(self, agent_id):
+        return self.agent
+
+
+def _published_skill(
+    session,
+    *,
+    skill_id,
+    first_version_id,
+    second_version_id,
+    first_content=None,
+    first_description="v1",
+):
+    skill = Skill(
+        id=skill_id,
+        unit_id="unit-1",
+        project_id="project-1",
+        name="forecast",
+        created_by="user-1",
+    )
+    session.add(skill)
+    session.flush()
+    first = SkillVersion(
+        id=first_version_id,
+        skill_id=skill_id,
+        version=1,
+        source_revision=1,
+        idempotency_key="publish-v1",
+        request_digest="a" * 64,
+        published_by="user-1",
+        name="forecast",
+        description=first_description,
+        display_version="1.0",
+        content=first_content or "---\nname: forecast\ndescription: v1\n---\nUse forecast version one.",
+        files=[],
+        package_digest="b" * 64,
+        object_key=f"unit-1/project-1/{skill_id}/v1.zip",
+        archive_sha256="c" * 64,
+        size_bytes=1,
+    )
+    second = SkillVersion(
+        id=second_version_id,
+        skill_id=skill_id,
+        version=2,
+        source_revision=2,
+        idempotency_key="publish-v2",
+        request_digest="d" * 64,
+        published_by="user-1",
+        name="forecast",
+        description="v2",
+        display_version="2.0",
+        content="---\nname: forecast\ndescription: v2\n---\nUse forecast version two.",
+        files=[],
+        package_digest="e" * 64,
+        object_key=f"unit-1/project-1/{skill_id}/v2.zip",
+        archive_sha256="f" * 64,
+        size_bytes=1,
+    )
+    session.add_all((first, second))
+    session.flush()
+    skill.published_version_id = second_version_id
+    session.commit()
+
+
+def test_snapshot_reads_the_agent_bound_immutable_skill_version_after_newer_publish():
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    skill_id = "00000000-0000-0000-0000-000000000001"
+    first_version_id = "00000000-0000-0000-0000-000000000011"
+    second_version_id = "00000000-0000-0000-0000-000000000012"
+    with Session(engine) as session:
+        _published_skill(
+            session,
+            skill_id=skill_id,
+            first_version_id=first_version_id,
+            second_version_id=second_version_id,
+        )
+        service = ExecutionSnapshotService(
+            session,
+            AgentService(
+                (SkillBinding(
+                    skill_id=skill_id,
+                    version_id=first_version_id,
+                    name="forecast",
+                ),),
+                ["forecast"],
+            ),
+            ConversationRepository(),
+        )
+
+        snapshot = service.create("run-1")
+
+    assert snapshot.payload.skills[0].version_id == first_version_id
+    assert snapshot.payload.skills[0].content.endswith("Use forecast version one.")
+
+
+def test_snapshot_rejects_name_only_legacy_agent_skill_binding():
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        service = ExecutionSnapshotService(
+            session,
+            AgentService((), ["forecast"]),
+            ConversationRepository(),
+        )
+
+        with pytest.raises(SkillUnavailableError, match="^skill_unavailable$"):
+            service.create("run-1")
+
+
+def test_bound_snapshot_preserves_declared_scripts_from_immutable_version(tmp_path):
+    from app.runtime.gateway_tools import build_skill_script_tools
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    skill_id = "00000000-0000-0000-0000-000000000021"
+    version_id = "00000000-0000-0000-0000-000000000022"
+    content = """---
+name: forecast
+description: v1
+metadata:
+  scripts:
+    - name: normalize
+      path: scripts/normalize.py
+      input_schema: {type: object}
+      output_schema: {type: object}
+      timeout_seconds: 5
+---
+Use the immutable script.
+"""
+    with Session(engine) as session:
+        _published_skill(
+            session,
+            skill_id=skill_id,
+            first_version_id=version_id,
+            second_version_id="00000000-0000-0000-0000-000000000023",
+            first_content=content,
+        )
+        service = ExecutionSnapshotService(
+            session,
+            AgentService((SkillBinding(skill_id=skill_id, version_id=version_id, name="forecast"),), ["forecast"]),
+            ConversationRepository(),
+        )
+        snapshot = service.create("run-1")
+
+    assert snapshot.payload.skills[0].metadata["scripts"][0]["name"] == "normalize"
+    assert [tool.name for tool in build_skill_script_tools(snapshot.payload, tmp_path)] == [
+        "skill.forecast.script.normalize"
+    ]
+
+
+def test_snapshot_rejects_disabled_bound_skill_on_fresh_and_reused_runs():
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    skill_id = "00000000-0000-0000-0000-000000000031"
+    version_id = "00000000-0000-0000-0000-000000000032"
+    with Session(engine) as session:
+        _published_skill(
+            session,
+            skill_id=skill_id,
+            first_version_id=version_id,
+            second_version_id="00000000-0000-0000-0000-000000000033",
+        )
+        service = ExecutionSnapshotService(
+            session,
+            AgentService(
+                (SkillBinding(skill_id=skill_id, version_id=version_id, name="forecast"),),
+                ["forecast"],
+            ),
+            ConversationRepository(),
+        )
+        service.create("run-existing")
+        session.get(Skill, skill_id).enabled = False
+
+        with pytest.raises(SkillUnavailableError, match="^skill_unavailable$"):
+            service.create("run-fresh")
+        with pytest.raises(SkillUnavailableError, match="^skill_unavailable$"):
+            service.create("run-existing")
+
+
+def test_snapshot_normalizes_scalar_frontmatter_description_from_bound_version():
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    skill_id = "00000000-0000-0000-0000-000000000041"
+    version_id = "00000000-0000-0000-0000-000000000042"
+    with Session(engine) as session:
+        _published_skill(
+            session,
+            skill_id=skill_id,
+            first_version_id=version_id,
+            second_version_id="00000000-0000-0000-0000-000000000043",
+            first_content="---\nname: forecast\ndescription: 123\n---\nUse scalar metadata.\n",
+            first_description="123",
+        )
+        service = ExecutionSnapshotService(
+            session,
+            AgentService(
+                (SkillBinding(skill_id=skill_id, version_id=version_id, name="forecast"),),
+                ["forecast"],
+            ),
+            ConversationRepository(),
+        )
+
+        snapshot = service.create("run-scalar-description")
+
+    assert snapshot.payload.skills[0].description == "123"
+
+
+def test_availability_api_blocks_fresh_and_reused_snapshots_then_restores_bound_version(
+    sessions, storage
+):
+    context = make_context("skill.read", "skill.manage")
+    content = manifest("forecast")
+    with TestClient(make_test_app(sessions, lambda: storage, context=context)) as client:
+        created = client.post("/api/project-skills", json={"content": content})
+        skill_id = created.json()["id"]
+        published = client.post(
+            f"/api/project-skills/{skill_id}/publish",
+            json={"expected_revision": 1},
+            headers={"Idempotency-Key": "availability-snapshot-publish"},
+        )
+        version_id = published.json()["id"]
+
+        with sessions() as session:
+            service = ExecutionSnapshotService(
+                session,
+                AgentService(
+                    (
+                        SkillBinding(
+                            skill_id=skill_id,
+                            version_id=version_id,
+                            name="forecast",
+                        ),
+                    ),
+                    ["forecast"],
+                ),
+                ConversationRepository(),
+            )
+            existing = service.create("run-availability-existing")
+            assert existing.payload.skills[0].version_id == version_id
+
+            disabled = client.patch(
+                f"/api/project-skills/{skill_id}/availability",
+                json={"enabled": False, "expected_revision": 2},
+            )
+            assert disabled.status_code == 200
+            assert disabled.json()["enabled"] is False
+            session.expire_all()
+
+            with pytest.raises(SkillUnavailableError, match="^skill_unavailable$"):
+                service.create("run-availability-fresh")
+            with pytest.raises(SkillUnavailableError, match="^skill_unavailable$"):
+                service.create("run-availability-existing")
+
+            enabled = client.patch(
+                f"/api/project-skills/{skill_id}/availability",
+                json={"enabled": True, "expected_revision": 3},
+            )
+            assert enabled.status_code == 200
+            session.expire_all()
+            restored = service.create("run-availability-restored")
+
+    assert restored.payload.skills[0].version_id == version_id
+    assert restored.payload.skills[0].content == content

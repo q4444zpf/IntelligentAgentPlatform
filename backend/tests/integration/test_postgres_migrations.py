@@ -31,7 +31,7 @@ def test_migration_graph_has_single_integration_head():
     config = Config(Path(__file__).resolve().parents[3] / "backend" / "alembic.ini")
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["20260908_27"]
+    assert script.get_heads() == ["20260914_29"]
 
 
 @pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="requires PostgreSQL")
@@ -41,7 +41,7 @@ def test_upgrade_head_creates_conversation_tables():
     engine = create_engine(env["DATABASE_URL"])
     inspector = inspect(engine)
     with engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260908_27"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260914_29"
     tables = set(inspector.get_table_names())
     assert {
         "conversations",
