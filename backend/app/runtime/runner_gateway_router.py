@@ -435,6 +435,9 @@ def create_router(
     def attest_simulation_artifacts(
         run_id: str,
         request: SimulationAttestationRequest,
+        idempotency_key: Annotated[
+            str, Header(alias="Idempotency-Key", min_length=1, max_length=200),
+        ],
         claims: Annotated[RunTokenClaims, Depends(attestation_claims)],
         snapshot_service: Annotated[ExecutionSnapshotService, Depends(snapshot_service_dependency)],
         repository: Annotated[ConversationRepository, Depends(conversation_repository_dependency)],
@@ -443,7 +446,7 @@ def create_router(
     ) -> list[ArtifactFileResponse]:
         service = RunnerGatewayService(snapshot_service, checkpoint_store=checkpoint_store,
             conversation_repository=repository, artifact_service=artifacts)
-        return [service._artifact_response(record) for record in service.attest_simulation_artifacts(run_id, claims, request)]
+        return service.attest_simulation_artifacts(run_id, claims, request, idempotency_key)
 
     @router.post(
         "/runs/{run_id}/artifacts",

@@ -152,6 +152,7 @@ class ArtifactService:
     def attest_completed_simulation(
         self, run_id: str, binding: dict[str, str],
         artifact_ids: tuple[str, ...], completed_at: datetime,
+        *, commit: bool = True,
     ) -> list[ArtifactRecord]:
         from app.runtime.runner_gateway_schemas import ArtifactProvenance, SimulationAttestation
         from pydantic import ValidationError
@@ -178,7 +179,8 @@ class ArtifactService:
             updates.append({**record.provenance, "simulation_attestation": attestation.model_dump(mode="json")})
         for record, provenance in zip(records, updates, strict=True):
             record.provenance = provenance
-        self.session.commit()
+        if commit:
+            self.session.commit()
         return records
 
     def create_for_run(

@@ -17,7 +17,6 @@ from sqlalchemy import func, select
 
 from app.approvals.models import Approval
 from app.approvals.service import ApprovalService, arguments_digest
-from app.artifacts.models import ArtifactRecord
 from app.artifacts.service import (
     ArtifactAlreadyExistsError,
     ArtifactContentTypeError,
@@ -1369,16 +1368,29 @@ class RunnerGatewayService:
 
     def attest_simulation_artifacts(
         self, run_id: str, claims: RunTokenClaims, request: SimulationAttestationRequest,
-    ) -> list[ArtifactRecord]:
+        idempotency_key: str,
+    ) -> list[ArtifactFileResponse]:
         snapshot = self._verified_snapshot(run_id, claims)
         repository = self._require_conversation_repository()
-        run = self._lock_run(repository, run_id)
-        self._require_active_run(run)
         actor = snapshot.payload.actor
         if (claims.run_id != run_id or claims.unit_id != snapshot.payload.unit_id
                 or claims.project_id != snapshot.payload.project_id
-                or not isinstance(actor, PublishedTeamSnapshot)
-                or run.actor_type != "team" or run.actor_id != actor.id
+                or not isinstance(actor, PublishedTeamSnapshot)):
+            raise RunnerGatewayError(403, "artifact_provenance_invalid", "Simulation run binding invalid")
+        run = self._lock_run(repository, run_id)
+        requests = RunnerRequestStore(repository.session)
+        action = "artifact.attest"
+        request_digest = _canonical_digest({
+            "snapshot_digest": claims.snapshot_digest,
+            "request": request.model_dump(mode="json"),
+        })
+        replay = self._replay_or_conflict(
+            requests, run_id, action, idempotency_key, request_digest,
+        )
+        if replay is not None:
+            return [ArtifactFileResponse.model_validate(item) for item in replay["artifacts"]]
+        self._require_active_run(run)
+        if (run.actor_type != "team" or run.actor_id != actor.id
                 or run.actor_version_id != actor.version_id):
             raise RunnerGatewayError(403, "artifact_provenance_invalid", "Simulation run binding invalid")
         provenance = self._validated_artifact_provenance(
@@ -1396,6 +1408,9 @@ class RunnerGatewayService:
             and item.member_agent_id == request.member_agent_id), None)
         if active is None or active.checkpoint_status != "completed" or result is None:
             raise RunnerGatewayError(409, "team_task_not_completed", "Simulation task is not completed")
+        if (active.completed_at is None or active.completed_at.utcoffset() is None
+                or active.completed_at != request.completed_at):
+            raise RunnerGatewayError(409, "simulation_completion_time_invalid", "Simulation completion time does not match persisted evidence")
         if task is None or task.output_contract.artifact_kind != "simulation":
             raise RunnerGatewayError(403, "simulation_task_required", "Task is not designated for simulation")
         if tuple(request.artifact_ids) != result.artifact_ids:
@@ -1409,11 +1424,24 @@ class RunnerGatewayService:
             if artifact.unit_id != claims.unit_id or artifact.project_id != claims.project_id:
                 raise RunnerGatewayError(403, "artifact_provenance_invalid", "Simulation artifact scope invalid")
         try:
-            return artifacts.attest_completed_simulation(
-                run_id, {"run_id": run_id, **provenance}, request.artifact_ids, request.completed_at,
+            records = artifacts.attest_completed_simulation(
+                run_id, {"run_id": run_id, **provenance}, request.artifact_ids,
+                active.completed_at, commit=False,
             )
+            response = [self._artifact_response(record) for record in records]
+            requests.add(
+                run_id=run_id, action=action, idempotency_key=idempotency_key,
+                request_digest=request_digest,
+                response_json={"artifacts": [item.model_dump(mode="json") for item in response]},
+            )
+            repository.session.commit()
+            return response
         except (ArtifactIntegrityError, ArtifactNotFoundError) as error:
+            repository.session.rollback()
             raise RunnerGatewayError(409, "artifact_provenance_invalid", "Simulation artifact binding invalid") from error
+        except Exception as error:
+            repository.session.rollback()
+            raise RunnerGatewayError(502, "simulation_attestation_failed", "Simulation attestation could not be persisted") from error
 
     def _validated_team_invocation(
         self,

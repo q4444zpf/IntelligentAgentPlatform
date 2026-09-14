@@ -548,7 +548,7 @@ def _simulation_setup(*, completed=True, kind="simulation"):
     assert created.status_code == 201
     artifact_id = created.json()["artifact_id"]
     state["plan"]["tasks"][0]["output_contract"] = {"artifact_kind": kind}
-    state["active_invocations"] = [{"task_id": binding["task_id"], "member_agent_id": "forecast", "invocation_id": binding["invocation_id"], "checkpoint_status": "completed" if completed else "running"}]
+    state["active_invocations"] = [{"task_id": binding["task_id"], "member_agent_id": "forecast", "invocation_id": binding["invocation_id"], "checkpoint_status": "completed" if completed else "running", "completed_at": "2026-09-15T10:00:00Z" if completed else None}]
     if completed:
         state["completed_results"] = [{"task_id": binding["task_id"], "member_agent_id": "forecast", "position": 0, "content": "simulation complete", "artifact_ids": [artifact_id]}]
     CheckpointStore(session).save("run-1", "team-scheduler", state, snapshot.digest, "checkpoint:completed")
@@ -561,6 +561,99 @@ def test_runner_rejects_simulation_attestation_before_task_completion():
     response = client.post("/internal/runner/runs/run-1/artifact-attestations/simulation", headers=_headers(key="attest"), json=request)
     assert response.status_code == 409
     assert response.json()["code"] == "team_task_not_completed"
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_simulation_attestation_replays_after_checkpoint_advances(terminal):
+    from app.conversations.models import AgentRun
+    from app.runtime.checkpoint_store import CheckpointStore, RunnerRequestStore
+    client, session, _, request = _simulation_setup()
+    url = "/internal/runner/runs/run-1/artifact-attestations/simulation"
+    response = client.post(url, headers=_headers(key="attest-replay"), json=request)
+    assert response.status_code == 200
+    store = CheckpointStore(session)
+    record = store.load_latest_record("run-1")
+    advanced = {**record.state, "active_invocations": [], "active_task_id": None, "active_member_agent_id": None, "active_invocation_id": None}
+    store.save("run-1", "team-scheduler", advanced, record.snapshot_digest, "checkpoint:advanced")
+    if terminal:
+        session.get(AgentRun, "run-1").status = "completed"
+        session.commit()
+    replay = client.post(url, headers=_headers(key="attest-replay"), json=request)
+    assert replay.status_code == 200
+    assert replay.json() == response.json()
+    recorded = RunnerRequestStore(session).get("run-1", "artifact.attest", "attest-replay")
+    assert recorded is not None
+    assert recorded.response_json["artifacts"] == response.json()
+
+
+def test_simulation_attestation_rejects_conflicting_idempotency_key_after_checkpoint_advances():
+    from app.runtime.checkpoint_store import CheckpointStore
+    client, session, _, request = _simulation_setup()
+    url = "/internal/runner/runs/run-1/artifact-attestations/simulation"
+    assert client.post(url, headers=_headers(key="attest-conflict"), json=request).status_code == 200
+    store = CheckpointStore(session)
+    record = store.load_latest_record("run-1")
+    store.save("run-1", "team-scheduler", {**record.state, "active_invocations": [], "active_task_id": None}, record.snapshot_digest, "checkpoint:advanced")
+    response = client.post(url, headers=_headers(key="attest-conflict"), json={**request, "completed_at": "2026-09-15T10:00:01Z"})
+    assert response.status_code == 409
+    assert response.json()["code"] == "idempotency_conflict"
+
+
+@pytest.mark.parametrize("completed_at", [None, "2026-09-15T09:59:59Z"])
+def test_simulation_attestation_requires_matching_persisted_completion_time(completed_at):
+    from app.artifacts.models import ArtifactRecord
+    from app.runtime.checkpoint_store import CheckpointStore
+    client, session, _, request = _simulation_setup()
+    store = CheckpointStore(session)
+    record = store.load_latest_record("run-1")
+    state = record.state
+    state["active_invocations"][0]["completed_at"] = completed_at
+    store.save("run-1", "team-scheduler", state, record.snapshot_digest, "checkpoint:completion-time")
+    response = client.post("/internal/runner/runs/run-1/artifact-attestations/simulation", headers=_headers(key="attest-time"), json=request)
+    assert response.status_code == 409
+    assert response.json()["code"] == "simulation_completion_time_invalid"
+    assert "simulation_attestation" not in session.get(ArtifactRecord, request["artifact_ids"][0]).provenance
+
+
+def test_simulation_attestation_and_request_record_commit_atomically():
+    from sqlalchemy import event
+    from app.artifacts.models import ArtifactRecord
+    from app.runtime.checkpoint_store import RuntimeRunnerRequest, RunnerRequestStore
+    client, session, _, request = _simulation_setup()
+    def fail_request_record(_mapper, _connection, target):
+        if target.action == "artifact.attest":
+            raise RuntimeError("request record persistence failed")
+    event.listen(RuntimeRunnerRequest, "before_insert", fail_request_record)
+    try:
+        response = client.post("/internal/runner/runs/run-1/artifact-attestations/simulation", headers=_headers(key="attest-atomic"), json=request)
+    finally:
+        event.remove(RuntimeRunnerRequest, "before_insert", fail_request_record)
+    assert response.status_code == 502
+    session.expire_all()
+    assert "simulation_attestation" not in session.get(ArtifactRecord, request["artifact_ids"][0]).provenance
+    assert RunnerRequestStore(session).get("run-1", "artifact.attest", "attest-atomic") is None
+
+
+def test_simulation_attestation_uses_persisted_timestamp_representation():
+    from app.artifacts.models import ArtifactRecord
+    client, session, _, request = _simulation_setup()
+    response = client.post(
+        "/internal/runner/runs/run-1/artifact-attestations/simulation",
+        headers=_headers(key="attest-timezone"),
+        json={**request, "completed_at": "2026-09-15T11:00:00+01:00"},
+    )
+    assert response.status_code == 200
+    artifact = session.get(ArtifactRecord, request["artifact_ids"][0])
+    assert artifact.provenance["simulation_attestation"]["completed_at"] == "2026-09-15T10:00:00Z"
+
+
+def test_simulation_attestation_requires_idempotency_header():
+    client, _, _, request = _simulation_setup()
+    response = client.post(
+        "/internal/runner/runs/run-1/artifact-attestations/simulation",
+        headers=_headers(), json=request,
+    )
+    assert response.status_code == 422
 
 
 @pytest.mark.parametrize("mismatch", [None, "project", "run", "invocation", "generic", "capability", "checkpoint"])
