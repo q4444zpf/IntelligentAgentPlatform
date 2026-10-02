@@ -1,5 +1,3 @@
-import json
-import hashlib
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -202,41 +200,3 @@ def test_expiry_and_execution_start_audit_failures_leave_domain_state_unchanged(
     with Session(session.bind) as fresh:
         assert fresh.get(ControlCommand, command.id).status == "approved"
         assert fresh.scalar(select(func.count(AuditEvent.id)).where(AuditEvent.action == "control_command.expired")) == 0
-
-
-def test_policy_snapshot_migration_backfills_existing_commands():
-    import importlib.util
-    from pathlib import Path
-
-    import sqlalchemy as sa
-    from alembic.migration import MigrationContext
-    from alembic.operations import Operations
-
-    engine = sa.create_engine("sqlite://")
-    metadata = sa.MetaData()
-    policies = sa.Table("control_policies", metadata,
-        sa.Column("id", sa.String, primary_key=True), sa.Column("asset_type", sa.String),
-        sa.Column("command_type", sa.String), sa.Column("parameter_schema", sa.JSON),
-        sa.Column("max_command_lifetime_seconds", sa.Integer), sa.Column("approval_mode", sa.String),
-        sa.Column("deviation_thresholds", sa.JSON), sa.Column("enabled", sa.Boolean))
-    commands = sa.Table("control_commands", metadata, sa.Column("id", sa.String, primary_key=True), sa.Column("policy_id", sa.String), sa.Column("policy_digest", sa.String))
-    with engine.begin() as connection:
-        metadata.create_all(connection)
-        connection.execute(policies.insert().values(id="policy", asset_type="gate", command_type="set",
-            parameter_schema={"type": "object"}, max_command_lifetime_seconds=60,
-            approval_mode="dual", deviation_thresholds={"opening": 2}, enabled=True))
-        original_snapshot = {"asset_type": "gate", "command_type": "set", "parameter_schema": {"type": "object"}, "max_command_lifetime_seconds": 60, "approval_mode": "dual", "deviation_thresholds": {"opening": 2}, "enabled": True}
-        original_digest = hashlib.sha256(json.dumps(original_snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
-        connection.execute(commands.insert().values(id="command", policy_id="policy", policy_digest=original_digest))
-        path = Path(__file__).resolve().parents[2] / "alembic" / "versions" / "20261002_32_control_policy_snapshot.py"
-        spec = importlib.util.spec_from_file_location("control_policy_snapshot_migration", path)
-        migration = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(migration)
-        with Operations.context(MigrationContext.configure(connection)):
-            migration.upgrade()
-        assert connection.scalar(sa.text("SELECT revision FROM control_policies WHERE id = 'policy'")) == 1
-        row = connection.execute(sa.text("SELECT policy_snapshot, policy_digest FROM control_commands WHERE id = 'command'")).one()
-        snapshot = json.loads(row.policy_snapshot)
-        assert snapshot["enabled"] is True
-        assert hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest() == row.policy_digest
-    engine.dispose()

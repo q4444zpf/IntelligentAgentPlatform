@@ -1,3 +1,5 @@
+import hashlib
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -211,6 +213,10 @@ def test_migration_backfills_unevaluated_success_and_preserves_evaluated_success
         assert rows["unevaluated"].team_version_id == "version-1"
         assert rows["unevaluated"].deviation_thresholds_snapshot == {"amount": 5}
         assert len(rows["unevaluated"].policy_digest) == 64
+        assert rows["unevaluated"].policy_snapshot == _policy_request().model_dump()
+        assert rows["unevaluated"].policy_snapshot["enabled"] is True
+        assert hashlib.sha256(json.dumps(rows["unevaluated"].policy_snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest() == rows["unevaluated"].policy_digest
+        assert connection.scalar(sa.text("SELECT revision FROM control_policies")) == 1
         constraints = sa.inspect(connection).get_unique_constraints("control_execution_attempts")
         assert next(item["column_names"] for item in constraints if item["name"] == "uq_control_execution_request") == ["command_id", "kind", "request_key"]
         assert "control_feedback_records" in sa.inspect(connection).get_table_names()
@@ -387,4 +393,28 @@ def test_migration_recovers_legacy_executing_without_attempt_and_downgrades_safe
             assert connection.execute(sa.select(attempts)).mappings().all() == [original_attempt]
             assert connection.execute(sa.select(approvals)).mappings().all() == [original_approval]
             assert "control_feedback_records" not in sa.inspect(connection).get_table_names()
+    engine.dispose()
+
+
+def test_control_migration_rejects_invalid_legacy_strategy_before_schema_changes():
+    import importlib.util
+    from pathlib import Path
+    import sqlalchemy as sa
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    path = Path(__file__).resolve().parents[2] / "alembic/versions/20260913_28_control_commands.py"
+    spec = importlib.util.spec_from_file_location("control_migration_preflight", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    engine = sa.create_engine("sqlite://")
+    with engine.begin() as connection:
+        connection.execute(sa.text("CREATE TABLE collaboration_team_versions (id TEXT PRIMARY KEY, failure_strategy TEXT)"))
+        connection.execute(sa.text("INSERT INTO collaboration_team_versions VALUES ('legacy', 'ignore')"))
+        with Operations.context(MigrationContext.configure(connection)):
+            with pytest.raises(RuntimeError, match="1 invalid") as error:
+                migration.upgrade()
+        assert "SELECT id, failure_strategy FROM collaboration_team_versions WHERE failure_strategy NOT IN ('fail_fast','continue_then_synthesize')" in str(error.value)
+        assert "control_policies" not in sa.inspect(connection).get_table_names()
+        assert connection.scalar(sa.text("SELECT failure_strategy FROM collaboration_team_versions")) == "ignore"
     engine.dispose()

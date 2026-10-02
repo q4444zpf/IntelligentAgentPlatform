@@ -20,9 +20,12 @@ _OLD_STATUSES = "'pending_approval','approved','rejected','expired','executing',
 
 
 def upgrade() -> None:
+    with op.batch_alter_table("control_policies") as batch:
+        batch.add_column(sa.Column("revision", sa.Integer(), nullable=False, server_default="1"))
     with op.batch_alter_table("control_commands") as batch:
         batch.alter_column("team_version", new_column_name="team_version_id", existing_type=sa.String(64))
         batch.add_column(sa.Column("policy_digest", sa.String(64), nullable=True))
+        batch.add_column(sa.Column("policy_snapshot", sa.JSON(), nullable=True))
         batch.add_column(sa.Column("deviation_thresholds_snapshot", sa.JSON(), nullable=True))
         batch.add_column(sa.Column("feedback_observed_at", sa.DateTime(timezone=True), nullable=True))
         batch.drop_constraint("ck_control_command_status", type_="check")
@@ -52,7 +55,8 @@ def upgrade() -> None:
         snapshot = {key: policy[key] for key in snapshot_fields}
         digest = hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
         connection.execute(commands.update().where(commands.c.policy_id == policy["id"]).values(
-            policy_digest=digest, deviation_thresholds_snapshot=policy["deviation_thresholds"],
+            policy_digest=digest, policy_snapshot=snapshot,
+            deviation_thresholds_snapshot=policy["deviation_thresholds"],
         ))
     for command in connection.execute(sa.select(commands)).mappings():
         if command["status"] == "succeeded" and command["actual_state"] is None:
@@ -67,6 +71,7 @@ def upgrade() -> None:
             ))
     with op.batch_alter_table("control_commands") as batch:
         batch.alter_column("policy_digest", existing_type=sa.String(64), nullable=False)
+        batch.alter_column("policy_snapshot", existing_type=sa.JSON(), nullable=False)
         batch.alter_column("deviation_thresholds_snapshot", existing_type=sa.JSON(), nullable=False)
 
     op.create_table(
@@ -105,5 +110,8 @@ def downgrade() -> None:
         batch.create_check_constraint("ck_control_command_status", f"status IN ({_OLD_STATUSES})")
         batch.alter_column("team_version_id", new_column_name="team_version", existing_type=sa.String(64))
         batch.drop_column("policy_digest")
+        batch.drop_column("policy_snapshot")
         batch.drop_column("deviation_thresholds_snapshot")
         batch.drop_column("feedback_observed_at")
+    with op.batch_alter_table("control_policies") as batch:
+        batch.drop_column("revision")

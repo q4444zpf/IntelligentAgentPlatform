@@ -131,6 +131,66 @@ Team 负责提供 Supervisor 与已发布成员的拓扑和运行快照；控制
 
 生产执行必须关联成功的仿真 Artifact，并经过单人或双人审批；执行器异常记录为 `unknown`，不会伪造物理设备状态。控制权限按项目隔离，并通过 `control.read/manage/propose/approve/execute/feedback` 授权。
 
+### 控制执行器部署契约
+
+`IAP_CONTROL_GATEWAY_ENABLED=true` 时必须配置执行器；缺少配置会阻止启动。`IAP_CONTROL_EXECUTORS_JSON` 的精确格式如下，每个资源类型只能出现一次，端点对象不接受额外字段：
+
+```json
+{"reservoir":{"base_url":"https://control.example/api","token_env":"IAP_CONTROL_EXECUTOR_RESERVOIR_TOKEN","timeout_seconds":10}}
+```
+
+资源类型使用小写字母开头的字母、数字、下划线。`timeout_seconds` 范围为 1 到 30 秒。生产环境要求 HTTPS；URL 不得包含用户名、密码、查询参数、片段或末尾斜杠。令牌通过 `token_env` 指定的环境变量，或同名加 `_FILE` 的秘密文件提供，两者不可同时配置。示例中的令牌必须在部署时替换，禁止提交真实凭据。
+
+平台就绪检查调用各执行器的 `GET {base_url}/health`，携带 Bearer 令牌，超时 2 秒；只有 HTTP 200 视为健康，不要求响应体。重定向不会被跟随。执行器不可用时控制就绪检查失败。
+
+执行调用 `POST {base_url}/commands/execute`，回滚调用 `POST {base_url}/commands/rollback`。两者携带 `Authorization: Bearer ...`、`Content-Type: application/json` 以及平台持久化的 `Idempotency-Key`。执行请求示例：
+
+```json
+{
+  "command_id":"command-1",
+  "project_id":"project-1",
+  "policy_digest":"<64位SHA256>",
+  "parameter_digest":"<64位SHA256>",
+  "target":{"asset_type":"reservoir","id":"reservoir-1"},
+  "parameters":{"opening":20},
+  "simulation_digest":"<64位SHA256>",
+  "valid_until":"2026-10-02T12:00:00+00:00"
+}
+```
+
+回滚请求保留相同公共字段，将 `parameters` 替换为 `rollback_plan`。请求和响应均限制为 64 KiB。响应必须为 HTTP 200 和封闭 JSON 对象：`{"outcome":"succeeded","external_id":"device-command-1","summary":{"state":"open"}}`。`outcome` 必填且只能是 `succeeded`、`failed`、`unknown`；`external_id` 可空，`summary` 可空，不接受其他顶层字段。摘要只保留 `status/state/code/reason_code` 中符合格式限制的字符串；禁止依赖响应摘要传输秘密或完整设备数据。
+
+控制 API 的已知业务错误使用稳定对象 `{"code":"control_invalid_state","message":"Control command is in an invalid state","details":{}}`。客户端按 `code` 处理，不能匹配提示字符串。权限失败为 403 `control_forbidden`，资源缺失或跨项目访问为 404 `control_not_found`，幂等冲突为 409 `control_idempotency_conflict`，执行中为 409 `control_execution_in_progress`，过期为 410 `control_command_expired`，输入不合法为 422 `control_validation_failed`，执行器不可用为 503 `control_executor_unavailable`。框架请求校验错误遵循 FastAPI 校验格式，未知内部错误只返回通用 500。
+
+执行器返回成功只表示命令已执行，平台进入 `awaiting_feedback`。只有采集真实设备状态并按命令创建时冻结的策略阈值评估后才进入 `succeeded` 或 `deviation`。反馈 `observed_at` 必须不早于本次执行完成（尚未完成时为尝试创建）时间，晚于上一条反馈，且不超过服务器当前时间 5 分钟；未提供时采用服务器时间。偏差需要人工核查并按已保存方案回滚。
+
+超时或网络中断后，先读取命令详情和执行尝试，保留原请求键。对尚未完成且仍可执行的尝试，用同一个键重试原操作；平台复用已持久化的外部键，执行器必须对该键提供物理幂等与结果查询语义。已完成尝试的同键重放直接返回持久化结果。执行和回滚分别计数，即使客户端使用相同请求键也不会互相覆盖。禁止为绕过不确定结果生成新键；有效期结束或状态不允许重试时必须人工核实设备状态。
+
+### 控制迁移与发布门禁
+
+本次未发布迁移的唯一 Alembic head 是 `20260915_31`；`20260913_28` 与技能可用性分支 `20260914_29` 在不含 DDL 的 `20260914_30` 合并。临时 revision 32 已折回 31，包括策略 revision 和完整 policy snapshot 回填。升级路径覆盖 `20260908_27 -> 20260915_31` 及 `20260914_29 -> 20260915_31`。从临时 32 检查库升级前应重建专用测试库，不能把 revision 32 当作已部署公开版本。
+
+升级前执行以下只读查询：
+
+```sql
+SELECT id, failure_strategy FROM collaboration_team_versions WHERE failure_strategy NOT IN ('fail_fast','continue_then_synthesize');
+```
+
+存在非法值时 revision 28 在添加约束前停止，错误含行数与上述查询，不自动改写已发布 Team 或 digest。运维人员逐行检查：草稿通过 Team 服务迁移到合法策略；已发布非法值映射到保守 `fail_fast` 前必须明确获得操作批准，并制定维护方案，保持发布定义、镜像字段、成员定义和摘要一致。不能只改一列或绕过不可变保护后直接继续。未完成处理前保持升级暂停。
+
+revision 31 对旧命令冻结迁移时可见的策略（历史策略无法恢复）；未收到反馈的旧 `succeeded` 改为 `awaiting_feedback`，已有实际状态的成功命令保留状态；缺少执行尝试的旧 `executing` 改为 `unknown`。降级会拒绝存在反馈历史、待反馈命令或跨操作重复请求键的数据，避免悄悄丢失新语义。应先由运维处理这些状态再降级。
+
+PostgreSQL 迁移测试只接受显式 `TEST_DATABASE_URL`，数据库名必须含 `test`，且不得指向服务或开发数据库。测试在随机专用 schema 内运行 Alembic 子进程，在 `finally` 删除该 schema，使数据库恢复原有状态；账号需要建删 schema 权限。缺少变量时 14 个 PostgreSQL 集成测试明确跳过，不能据此宣称 PostgreSQL 发布门禁已通过。以下命令可在仓库根目录运行：
+
+```powershell
+python -m pytest backend/tests/integration/test_control_migrations_postgres.py backend/tests/integration/test_postgres_migrations.py -q -p no:cacheprovider
+python -m alembic -c backend/alembic.ini heads
+```
+
+完整真实 Team 控制 E2E 还需要专用、支持工具调用的 OpenAI 兼容模型服务与 S3 兼容对象存储；生产代码没有本地确定性模型或文件存储实现。仅物理执行器端点可使用 `httpx.MockTransport`。缺少这些基础设施时，不能以伪造运行图、仿真摘要或 Artifact 替代真实链路来声称发布通过。
+
+控制 API 在此版本前尚未公开发布，因此 `team_version` 改为 `team_version_id` 不构成公开兼容性破坏。普通 Artifact 契约与已有 Team API 保持兼容，控制仿真额外要求运行时可信证明。
+
 - `GET /api/audit/events`
 - `GET /api/audit/events/{event_id}`
 - `GET /api/audit/events/{event_id}/related`

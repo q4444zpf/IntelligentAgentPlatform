@@ -15,6 +15,15 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    preflight_sql = "SELECT id, failure_strategy FROM collaboration_team_versions WHERE failure_strategy NOT IN ('fail_fast','continue_then_synthesize')"
+    invalid_count = op.get_bind().scalar(sa.text(f"SELECT COUNT(*) FROM ({preflight_sql}) AS invalid_strategies"))
+    if invalid_count:
+        raise RuntimeError(
+            f"Control migration aborted: {invalid_count} invalid legacy failure_strategy rows. "
+            f"Inspect with: {preflight_sql}. "
+            "Migrate drafts through TeamService. Published snapshots require explicit operator "
+            "approval and a digest-consistent maintenance procedure before mapping to fail_fast."
+        )
     with op.batch_alter_table("collaboration_team_versions") as batch_op:
         batch_op.create_check_constraint(
             "ck_collaboration_team_versions_failure_strategy",
