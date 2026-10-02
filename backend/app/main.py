@@ -44,7 +44,8 @@ control_registry = ControlExecutorRegistry()
 
 
 def control_service_factory(session):
-    return ControlService(session, executors=control_registry.executors)
+    executors = control_registry.executors if control_registry.enabled else {}
+    return ControlService(session, executors=executors)
 
 
 @asynccontextmanager

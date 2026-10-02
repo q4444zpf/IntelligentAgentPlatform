@@ -85,6 +85,23 @@ def test_health_remains_200_when_control_gateway_is_disabled(monkeypatch):
     assert response.json() == {"status": "ok", "service": "intelligent-agent-platform-api", "version": "0.2.0"}
 
 
+def test_disabled_control_with_configured_endpoint_does_not_inject_executor(monkeypatch):
+    outbound_requests = []
+
+    def handler(request):
+        outbound_requests.append(request)
+        return httpx.Response(200, json={"status": "ok"})
+
+    registry = configured_registry(handler, enabled=False)
+    monkeypatch.setattr(main_module, "control_registry", registry)
+    service = main_module.control_service_factory(object())
+    assert service.executors == {}
+    response = TestClient(app).get("/api/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "service": "intelligent-agent-platform-api", "version": "0.2.0"}
+    assert outbound_requests == []
+
+
 def test_enabled_control_without_executor_configuration_fails_startup(monkeypatch):
     registry = ControlExecutorRegistry.from_json(None, lambda _name: None, "production", enabled=True)
     with pytest.raises(ValueError, match="control gateway requires executor configuration"):
