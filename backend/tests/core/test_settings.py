@@ -69,6 +69,14 @@ def test_project_skills_api_is_disabled_by_default(monkeypatch):
     assert Settings.from_env().project_skills_api_enabled is False
 
 
+def test_production_rejects_enabled_control_without_executor_configuration(monkeypatch):
+    _configure_production(monkeypatch)
+    monkeypatch.setenv("IAP_CONTROL_GATEWAY_ENABLED", "true")
+    monkeypatch.delenv("IAP_CONTROL_EXECUTORS_JSON", raising=False)
+    with pytest.raises(ValueError, match="control gateway requires executor configuration"):
+        Settings.from_env().validate_startup()
+
+
 @pytest.mark.parametrize("value", ["1", "true", "yes", "TRUE"])
 def test_project_skills_api_accepts_supported_true_values(monkeypatch, value):
     monkeypatch.setenv("IAP_PROJECT_SKILLS_API_ENABLED", value)

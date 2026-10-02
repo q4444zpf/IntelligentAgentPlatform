@@ -56,13 +56,18 @@ def _service(session: Session = Depends(get_session)) -> ControlService:
     return ControlService(session)
 
 
-def create_router(session_factory: Callable[[Session], Session] | None = None) -> APIRouter:
+def create_router(
+    session_factory: Callable[[Session], Session] | None = None,
+    *, service_factory: Callable[[Session], ControlService] | None = None,
+) -> APIRouter:
     router = APIRouter()
 
     def service(session: Session = Depends(get_session)) -> ControlService:
+        if service_factory is not None:
+            return service_factory(session)
         return ControlService(session_factory(session) if session_factory else session)
 
-    dependency = _service if session_factory is None else service
+    dependency = _service if session_factory is None and service_factory is None else service
 
     def require_read(context: RequestContext) -> None:
         authorization = context.authorization_context
