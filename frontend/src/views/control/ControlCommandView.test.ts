@@ -4,7 +4,8 @@ import { flushPromises, mount } from '@vue/test-utils';
 import { createPinia } from 'pinia';
 import Antd from 'ant-design-vue';
 import ControlCommandView from './ControlCommandView.vue';
-import { controlApi, type ControlCommandDetail, type ControlCommandListItem } from '@/api/control';
+import ControlCommandProposalModal from './components/ControlCommandProposalModal.vue';
+import { controlApi, type ControlCommandDetail, type ControlCommandListItem, type ControlProposal } from '@/api/control';
 import { usePermissionStore } from '@/stores/permission';
 import { ApiError } from '@/api/client';
 
@@ -105,6 +106,7 @@ describe('ControlCommandView', () => {
     const submit = Array.from(document.body.querySelectorAll('.ant-modal-footer button')).find(button => button.textContent?.includes('提交反馈')) as HTMLButtonElement;
     submit.click(); await flushPromises();
     expect(document.body.textContent).toContain('JSON 必须为对象');
+    expect(document.body.textContent).not.toContain('not json');
     expect(controlApi.feedback).not.toHaveBeenCalled();
     wrapper.unmount();
   });
@@ -132,6 +134,105 @@ describe('ControlCommandView', () => {
     rollbackView.unmount();
   });
 
+  it('retains action identity through auth, network, server and in-progress failures until terminal conflict', async () => {
+    vi.mocked(controlApi.listCommands).mockResolvedValue([{ ...command, id: 'identity-sequence', status: 'approved' }]);
+    vi.mocked(controlApi.execute)
+      .mockRejectedValueOnce(new ApiError('unauthenticated', 401))
+      .mockRejectedValueOnce(new ApiError('forbidden', 403))
+      .mockRejectedValueOnce(new ApiError('offline', 0))
+      .mockRejectedValueOnce(new ApiError('unavailable', 503))
+      .mockRejectedValueOnce(new ApiError('in progress', 409, 'control_execution_in_progress'))
+      .mockRejectedValueOnce(new ApiError('terminal conflict', 409, 'control_invalid_state'))
+      .mockResolvedValueOnce(command)
+      .mockResolvedValueOnce(command);
+    const wrapper = mountView(['control:view', 'control:execute']); await flushPromises();
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      await wrapper.find('[aria-label="执行命令"]').trigger('click'); await flushPromises();
+      (document.body.querySelector('[aria-label="确认执行命令"]') as HTMLButtonElement).click(); await flushPromises();
+    }
+    const keys = vi.mocked(controlApi.execute).mock.calls.map(([, key]) => key);
+    expect(new Set(keys.slice(0, 6)).size).toBe(1);
+    expect(keys[6]).not.toBe(keys[5]);
+    expect(keys[7]).not.toBe(keys[6]);
+    wrapper.unmount();
+  });
+
+  it('retains proposal identity across uncertain retry and changes it for new material inputs', async () => {
+    const draft: ControlProposal = {
+      policy_id: 'policy-1', target: { id: 'gate-1' }, parameters: { opening: 20 },
+      simulation_artifact_id: 'simulation-1', valid_from: '2026-09-15T12:00:00Z', valid_until: '2026-09-15T12:10:00Z',
+      rollback_plan: {}, expected_state: { opening: 20 }, idempotency_key: 'modal-key-1',
+    };
+    vi.mocked(controlApi.propose)
+      .mockRejectedValueOnce(new ApiError('offline', 0))
+      .mockRejectedValueOnce(new ApiError('unauthenticated', 401))
+      .mockRejectedValueOnce(new ApiError('offline', 0))
+      .mockResolvedValueOnce(command)
+      .mockResolvedValueOnce(command);
+    const wrapper = mountView(['control:view', 'control:propose']); await flushPromises();
+    const modal = wrapper.findComponent(ControlCommandProposalModal);
+    modal.vm.$emit('submit', draft); await flushPromises();
+    modal.vm.$emit('submit', { ...draft, idempotency_key: 'modal-key-2' }); await flushPromises();
+    modal.vm.$emit('submit', { ...draft, parameters: { opening: 30 }, idempotency_key: 'modal-key-3' }); await flushPromises();
+    modal.vm.$emit('submit', { ...draft, parameters: { opening: 30 }, idempotency_key: 'modal-key-4' }); await flushPromises();
+    modal.vm.$emit('submit', { ...draft, parameters: { opening: 30 }, idempotency_key: 'modal-key-5' }); await flushPromises();
+    const bodies = vi.mocked(controlApi.propose).mock.calls.map(([body]) => body);
+    expect(bodies[0].idempotency_key).toBe(bodies[1].idempotency_key);
+    expect(bodies[2].idempotency_key).not.toBe(bodies[1].idempotency_key);
+    expect(bodies[2].idempotency_key).toBe(bodies[3].idempotency_key);
+    expect(bodies[4].idempotency_key).not.toBe(bodies[3].idempotency_key);
+    wrapper.unmount();
+  });
+
+  it('establishes a new proposal identity after a terminal idempotency conflict', async () => {
+    const draft: ControlProposal = {
+      policy_id: 'policy-1', target: { id: 'gate-1' }, parameters: { opening: 20 },
+      simulation_artifact_id: 'simulation-1', valid_from: '2026-09-15T12:00:00Z', valid_until: '2026-09-15T12:10:00Z',
+      rollback_plan: {}, expected_state: null, idempotency_key: 'modal-key-1',
+    };
+    vi.mocked(controlApi.propose).mockRejectedValueOnce(new ApiError('conflict', 409, 'control_idempotency_conflict')).mockResolvedValueOnce(command);
+    const wrapper = mountView(['control:view', 'control:propose']); await flushPromises();
+    const modal = wrapper.findComponent(ControlCommandProposalModal);
+    modal.vm.$emit('submit', draft); await flushPromises();
+    modal.vm.$emit('submit', { ...draft, idempotency_key: 'modal-key-2' }); await flushPromises();
+    const keys = vi.mocked(controlApi.propose).mock.calls.map(([body]) => body.idempotency_key);
+    expect(keys[1]).not.toBe(keys[0]);
+    wrapper.unmount();
+  });
+
+  it('reuses proposal identity when JSON object keys are reordered without changing values', async () => {
+    const draft: ControlProposal = {
+      policy_id: 'policy-1', target: { asset_type: 'gate', id: 'gate-1' }, parameters: { opening: 20, duration: 30 },
+      simulation_artifact_id: 'simulation-1', valid_from: '2026-09-15T12:00:00Z', valid_until: '2026-09-15T12:10:00Z',
+      rollback_plan: {}, expected_state: null, idempotency_key: 'modal-1',
+    };
+    vi.mocked(controlApi.propose).mockRejectedValue(new ApiError('offline', 0));
+    const wrapper = mountView(['control:view', 'control:propose']); await flushPromises();
+    const modal = wrapper.findComponent(ControlCommandProposalModal);
+    modal.vm.$emit('submit', draft); await flushPromises();
+    modal.vm.$emit('submit', { ...draft, target: { id: 'gate-1', asset_type: 'gate' }, parameters: { duration: 30, opening: 20 }, idempotency_key: 'modal-2' }); await flushPromises();
+    const keys = vi.mocked(controlApi.propose).mock.calls.map(([body]) => body.idempotency_key);
+    expect(keys[0]).toBe(keys[1]);
+    wrapper.unmount();
+  });
+
+  it('keeps an uncertain proposal key when the console is remounted', async () => {
+    const draft: ControlProposal = {
+      policy_id: 'policy-1', target: { id: 'gate-remount' }, parameters: { opening: 42 },
+      simulation_artifact_id: 'simulation-remount', valid_from: '2026-09-15T12:00:00Z', valid_until: '2026-09-15T12:10:00Z',
+      rollback_plan: {}, expected_state: null, idempotency_key: 'modal-1',
+    };
+    vi.mocked(controlApi.propose).mockRejectedValue(new ApiError('offline', 0));
+    const first = mountView(['control:view', 'control:propose']); await flushPromises();
+    first.findComponent(ControlCommandProposalModal).vm.$emit('submit', draft); await flushPromises();
+    first.unmount();
+    const second = mountView(['control:view', 'control:propose']); await flushPromises();
+    second.findComponent(ControlCommandProposalModal).vm.$emit('submit', { ...draft, idempotency_key: 'modal-2' }); await flushPromises();
+    const keys = vi.mocked(controlApi.propose).mock.calls.map(([body]) => body.idempotency_key);
+    expect(keys[0]).toBe(keys[1]);
+    second.unmount();
+  });
+
   it('renders stable safe error messages and preserves current list data on action failure', async () => {
     vi.mocked(controlApi.listCommands).mockResolvedValue([{ ...command, status: 'pending_approval' }]);
     vi.mocked(controlApi.approve).mockRejectedValue(new ApiError('Control request is invalid', 422, 'control_validation_failed'));
@@ -150,7 +251,7 @@ describe('ControlCommandView', () => {
     wrapper.unmount();
   });
 
-  it('renders a single-column non-overlapping workflow at 390px width', async () => {
+  it('renders command and policy sections for a narrow viewport', async () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
     const wrapper = mountView(); await flushPromises();
     expect(wrapper.find('.control-page').exists()).toBe(true);

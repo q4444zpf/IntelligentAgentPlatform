@@ -10,6 +10,8 @@
 npm install
 npm run dev
 npm run build
+npx playwright install chromium
+npm run test:layout
 ```
 
 本地开发身份需要同时设置 `VITE_DEV_UNIT_ID`、`VITE_DEV_PROJECT_ID`、`VITE_DEV_USER_ID` 和 `VITE_DEV_USER_ROLES`；角色变量可使用逗号分隔的 `user`、`project_admin`、`unit_auditor`。这些值仅用于后端显式开启开发身份时的非敏感测试数据，不是生产认证配置。

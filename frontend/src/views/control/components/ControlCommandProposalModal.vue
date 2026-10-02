@@ -14,20 +14,26 @@
 </template>
 <script setup lang="ts">
 import { ref, watch } from 'vue';
-import type { ControlPolicy, ControlProposal, JsonObject } from '@/api/control';
+import type { ControlPolicy, ControlProposalDraft, JsonObject } from '@/api/control';
 const props = defineProps<{ open: boolean; policies: ControlPolicy[]; saving: boolean; error: string }>();
-const emit = defineEmits<{ close: []; submit: [value: ControlProposal] }>();
+const emit = defineEmits<{ close: []; submit: [value: ControlProposalDraft] }>();
 const policyId = ref(''); const target = ref('{}'); const parameters = ref('{}'); const simulationArtifactId = ref('');
 const validFrom = ref(''); const validUntil = ref(''); const expectedState = ref('{}'); const rollbackPlan = ref('{}'); const validationError = ref('');
 watch(() => props.open, (open) => { if (open) { policyId.value = ''; target.value = '{}'; parameters.value = '{}'; simulationArtifactId.value = ''; validFrom.value = ''; validUntil.value = ''; expectedState.value = '{}'; rollbackPlan.value = '{}'; validationError.value = ''; } });
-function object(text: string): JsonObject { const value: unknown = JSON.parse(text); if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('JSON 必须为对象'); return value as JsonObject; }
+function object(text: string): JsonObject {
+  try {
+    const value: unknown = JSON.parse(text);
+    if (value && typeof value === 'object' && !Array.isArray(value)) return value as JsonObject;
+  } catch { /* Show a fixed validation message below. */ }
+  throw new Error('JSON 必须为对象');
+}
 function submit() {
   try {
     if (!policyId.value || !simulationArtifactId.value.trim() || !validFrom.value || !validUntil.value) throw new Error('请填写必填项');
     if (new Date(validUntil.value) <= new Date(validFrom.value)) throw new Error('失效时间必须晚于生效时间');
     validationError.value = '';
-    emit('submit', { policy_id: policyId.value, target: object(target.value), parameters: object(parameters.value), simulation_artifact_id: simulationArtifactId.value.trim(), valid_from: new Date(validFrom.value).toISOString(), valid_until: new Date(validUntil.value).toISOString(), expected_state: object(expectedState.value), rollback_plan: object(rollbackPlan.value), idempotency_key: crypto.randomUUID() });
-  } catch (error) { validationError.value = error instanceof Error ? error.message : '表单无效'; }
+    emit('submit', { policy_id: policyId.value, target: object(target.value), parameters: object(parameters.value), simulation_artifact_id: simulationArtifactId.value.trim(), valid_from: new Date(validFrom.value).toISOString(), valid_until: new Date(validUntil.value).toISOString(), expected_state: object(expectedState.value), rollback_plan: object(rollbackPlan.value) });
+  } catch (error) { validationError.value = error instanceof Error && ['请填写必填项', '失效时间必须晚于生效时间', 'JSON 必须为对象'].includes(error.message) ? error.message : '表单无效'; }
 }
 </script>
 <style scoped>.modal-alert{margin-bottom:16px}.form-pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}@media(max-width:600px){.form-pair{grid-template-columns:1fr}}</style>

@@ -39,9 +39,10 @@
 import { computed, onMounted, ref } from 'vue';
 import { FileSearchOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons-vue';
 import { ApiError } from '@/api/client';
-import { controlApi, type ControlCommandDetail, type ControlCommandListItem, type ControlFeedback, type ControlPolicy, type ControlPolicyInput, type ControlProposal, type ControlStatus } from '@/api/control';
+import { controlApi, type ControlCommandDetail, type ControlCommandListItem, type ControlFeedback, type ControlPolicy, type ControlPolicyInput, type ControlProposalDraft, type ControlStatus } from '@/api/control';
 import { usePermissionStore } from '@/stores/permission';
 import { controlActionKeys, type ControlActionKind } from './controlActionKeys';
+import { controlProposalKeys } from './controlProposalKeys';
 import ControlPolicyPanel from './components/ControlPolicyPanel.vue';
 import ControlCommandProposalModal from './components/ControlCommandProposalModal.vue';
 import ControlCommandDetailDrawer from './components/ControlCommandDetailDrawer.vue';
@@ -74,7 +75,7 @@ async function loadPolicies() { policiesLoading.value = true; policyError.value 
 async function openDetail(command: ControlCommandListItem) { detailOpen.value = true; detailLoading.value = true; detailError.value = ''; detail.value = null; try { detail.value = await controlApi.getCommand(command.id); } catch (cause) { detailError.value = safeError(cause); } finally { detailLoading.value = false; } }
 async function runDecision(command: ControlCommandListItem, kind: 'approve' | 'reject') { if (!canApprove.value || busyId.value) return; busyId.value = command.id; error.value = ''; try { if (kind === 'approve') await controlApi.approve(command.id); else await controlApi.reject(command.id); await loadCommands(); } catch (cause) { error.value = safeError(cause); } finally { busyId.value = ''; } }
 function requestConfirmation(command: ControlCommandListItem, kind: ControlActionKind) { if (!canExecute.value || busyId.value) return; confirmTarget.value = command; confirmKind.value = kind; }
-function terminalHttpResponse(cause: unknown) { return cause instanceof ApiError && cause.status >= 400 && cause.status < 500 && cause.status !== 408 && cause.status !== 429 && cause.code !== 'control_execution_in_progress'; }
+function terminalControlConflict(cause: unknown) { return cause instanceof ApiError && cause.status === 409 && ['control_idempotency_conflict', 'control_invalid_state'].includes(cause.code || ''); }
 async function confirmAction() {
   const command = confirmTarget.value; const kind = confirmKind.value;
   if (!command || !canExecute.value || busyId.value) return;
@@ -85,13 +86,34 @@ async function confirmAction() {
     controlActionKeys.clear(command.id, kind);
     await loadCommands();
   } catch (cause) {
-    if (terminalHttpResponse(cause)) controlActionKeys.clear(command.id, kind);
+    if (terminalControlConflict(cause)) controlActionKeys.clear(command.id, kind);
     error.value = safeError(cause);
   } finally { busyId.value = ''; }
 }
 function openFeedback(command: ControlCommandListItem) { if (!canFeedback.value || busyId.value) return; feedbackTarget.value = command; feedbackError.value = ''; feedbackOpen.value = true; }
 async function submitFeedback(value: ControlFeedback) { const command = feedbackTarget.value; if (!command || !canFeedback.value) return; feedbackSaving.value = true; busyId.value = command.id; feedbackError.value = ''; try { await controlApi.feedback(command.id, value); feedbackOpen.value = false; await loadCommands(); } catch (cause) { feedbackError.value = safeError(cause); } finally { busyId.value = ''; feedbackSaving.value = false; } }
-async function submitProposal(value: ControlProposal) { if (!canPropose.value) return; proposalSaving.value = true; proposalError.value = ''; try { await controlApi.propose(value); proposalOpen.value = false; await loadCommands(); } catch (cause) { proposalError.value = safeError(cause); } finally { proposalSaving.value = false; } }
+async function submitProposal(value: ControlProposalDraft) {
+  if (!canPropose.value || proposalSaving.value) return;
+  const material = { policy_id: value.policy_id, target: value.target, parameters: value.parameters, simulation_artifact_id: value.simulation_artifact_id, valid_from: value.valid_from, valid_until: value.valid_until, rollback_plan: value.rollback_plan, expected_state: value.expected_state, run_id: value.run_id, team_version_id: value.team_version_id };
+  const scope = permission.authContext
+    ? `${permission.authContext.unit_id}:${permission.authContext.current_project_id}:${permission.authContext.user.id}`
+    : `demo:${permission.userName}`;
+  const signature = JSON.stringify({ scope, material }, (_key, item: unknown) =>
+    item && typeof item === 'object' && !Array.isArray(item)
+      ? Object.fromEntries(Object.entries(item).sort(([left], [right]) => left.localeCompare(right)))
+      : item);
+  const key = controlProposalKeys.keyFor(signature);
+  proposalSaving.value = true; proposalError.value = '';
+  try {
+    await controlApi.propose({ ...material, idempotency_key: key });
+    controlProposalKeys.clear(signature);
+    proposalOpen.value = false;
+    await loadCommands();
+  } catch (cause) {
+    if (terminalControlConflict(cause)) controlProposalKeys.clear(signature);
+    proposalError.value = safeError(cause);
+  } finally { proposalSaving.value = false; }
+}
 async function savePolicy(id: string | null, value: ControlPolicyInput) { if (!canManage.value) return; policySaving.value = true; policyError.value = ''; try { if (id) await controlApi.updatePolicy(id, { parameter_schema: value.parameter_schema, max_command_lifetime_seconds: value.max_command_lifetime_seconds, approval_mode: value.approval_mode, deviation_thresholds: value.deviation_thresholds, enabled: value.enabled }); else await controlApi.createPolicy(value); policyPanel.value?.closeEditor(); await loadPolicies(); } catch (cause) { policyError.value = safeError(cause); } finally { policySaving.value = false; } }
 onMounted(() => { void loadCommands(); void loadPolicies(); });
 </script>

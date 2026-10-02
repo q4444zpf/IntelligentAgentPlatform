@@ -20,6 +20,7 @@ export interface ControlProposal {
   valid_from: string; valid_until: string; rollback_plan: JsonObject; expected_state: JsonObject | null;
   idempotency_key: string; run_id?: string | null; team_version_id?: string | null;
 }
+export type ControlProposalDraft = Omit<ControlProposal, 'idempotency_key'>;
 export interface ControlFeedback { actual_state: JsonObject; observed_at?: string | null }
 export interface ControlCommand {
   id: string; unit_id: string; project_id: string; policy_id: string; requester_id: string;

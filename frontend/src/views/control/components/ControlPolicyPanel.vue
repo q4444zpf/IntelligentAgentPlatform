@@ -33,12 +33,18 @@ const form = reactive(empty()); const editorOpen = ref(false); const editing = r
 function reset(value: ReturnType<typeof empty>) { Object.assign(form, value); validationError.value = ''; editorOpen.value = true; }
 function openCreate() { editing.value = null; reset(empty()); }
 function openEdit(policy: ControlPolicy) { editing.value = policy.id; reset({ asset_type: policy.asset_type, command_type: policy.command_type, parameter_schema: JSON.stringify(policy.parameter_schema, null, 2), max_command_lifetime_seconds: policy.max_command_lifetime_seconds, approval_mode: policy.approval_mode, deviation_thresholds: JSON.stringify(policy.deviation_thresholds, null, 2), enabled: policy.enabled }); }
-function object(text: string): JsonObject { const value: unknown = JSON.parse(text); if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('JSON 必须为对象'); return value as JsonObject; }
+function object(text: string): JsonObject {
+  try {
+    const value: unknown = JSON.parse(text);
+    if (value && typeof value === 'object' && !Array.isArray(value)) return value as JsonObject;
+  } catch { /* Show a fixed validation message below. */ }
+  throw new Error('JSON 必须为对象');
+}
 function submit() {
   try {
     if (!form.asset_type.trim() || !form.command_type.trim()) throw new Error('请填写资产和命令类型');
     emit('save', editing.value, { asset_type: form.asset_type.trim(), command_type: form.command_type.trim(), parameter_schema: object(form.parameter_schema), max_command_lifetime_seconds: form.max_command_lifetime_seconds, approval_mode: form.approval_mode, deviation_thresholds: object(form.deviation_thresholds), enabled: form.enabled });
-  } catch (error) { validationError.value = error instanceof Error ? error.message : '表单无效'; }
+  } catch (error) { validationError.value = error instanceof Error && ['请填写资产和命令类型', 'JSON 必须为对象'].includes(error.message) ? error.message : '表单无效'; }
 }
 function closeEditor() { editorOpen.value = false; }
 defineExpose({ closeEditor });
