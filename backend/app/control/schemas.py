@@ -21,12 +21,22 @@ class ControlPolicyCreateRequest(BaseModel):
     enabled: bool = True
 
 
+class ControlPolicyUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    parameter_schema: dict[str, Any] | None = None
+    max_command_lifetime_seconds: int | None = Field(default=None, gt=0, le=31_536_000)
+    approval_mode: Literal["single", "dual"] | None = None
+    deviation_thresholds: dict[str, Any] | None = None
+    enabled: bool | None = None
+
+
 class ControlPolicyInfo(ControlPolicyCreateRequest):
     model_config = ConfigDict(from_attributes=True)
     id: str
     unit_id: str
     project_id: str
     owner_id: str
+    revision: int
     created_at: datetime
     updated_at: datetime
 
@@ -61,6 +71,7 @@ class ControlCommandInfo(BaseModel):
     run_id: str | None
     team_version_id: str | None
     policy_digest: str
+    policy_snapshot: dict[str, Any]
     deviation_thresholds_snapshot: dict[str, Any]
     feedback_observed_at: datetime | None
     target: dict[str, Any]
@@ -78,3 +89,39 @@ class ControlCommandInfo(BaseModel):
     external_command_ref: str | None
     idempotency_key: str
     status: ControlCommandStatus
+
+
+class ControlCommandListItem(ControlCommandInfo):
+    approval_count: int
+
+
+class ControlApprovalDecision(BaseModel):
+    approver_id: str
+    decision: Literal["approve", "reject"]
+    reason: str | None
+    decided_at: datetime
+
+
+class ControlAttemptInfo(BaseModel):
+    id: str
+    kind: Literal["execute", "rollback"]
+    outcome: Literal["pending", "succeeded", "failed", "unknown"]
+    external_id: str | None
+    created_at: datetime
+    completed_at: datetime | None
+
+
+class ControlFeedbackInfo(BaseModel):
+    id: str
+    recorder_id: str
+    observed_at: datetime
+    actual_state: dict[str, Any]
+    deviation_result: dict[str, Any]
+
+
+class ControlCommandDetail(ControlCommandListItem):
+    approval_decisions: list[ControlApprovalDecision]
+    attempts: list[ControlAttemptInfo]
+    feedback_records: list[ControlFeedbackInfo]
+    simulation_attestation: dict[str, Any]
+    rollback_provenance: dict[str, Any] | None

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import uuid
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
@@ -19,33 +18,17 @@ from app.runtime.runner_gateway_schemas import ArtifactProvenance, SimulationAtt
 from app.audit.recorder import AuditRecordRequest, AuditRecorder
 from app.core.request_context import RequestContext
 
-from .models import ControlCommand, ControlCommandApproval, ControlExecutionAttempt, ControlFeedbackRecord, ControlPolicy
-from .schemas import ControlCommandInfo, ControlCommandProposeRequest, ControlExecutionOutcome, ControlFeedbackRequest, ControlPolicyCreateRequest, ControlPolicyInfo
+from .errors import (ControlCommandExpired, ControlExecutionError, ControlExecutionInProgress, ControlExecutorUnavailable,
+                     ControlForbiddenError, ControlIdempotencyConflict, ControlNotFoundError, ControlValidationError)
+from .models import ControlCommand, ControlCommandApproval, ControlExecutionAttempt, ControlFeedbackRecord, ControlPolicy, new_id
+from .schemas import (ControlCommandDetail, ControlCommandInfo, ControlCommandListItem, ControlCommandProposeRequest,
+                      ControlExecutionOutcome, ControlFeedbackRequest, ControlPolicyCreateRequest, ControlPolicyInfo,
+                      ControlPolicyUpdateRequest)
 
 try:
     from jsonschema import Draft202012Validator
 except ImportError:  # pragma: no cover - minimal runtime fallback
     Draft202012Validator = None
-
-
-class ControlError(ValueError):
-    pass
-
-
-class ControlForbiddenError(ControlError):
-    pass
-
-
-class ControlValidationError(ControlError):
-    pass
-
-
-class ControlIdempotencyConflict(ControlError):
-    pass
-
-
-class ControlExecutionError(ControlError):
-    pass
 
 
 class ControlExecutorResult(BaseModel):
@@ -128,7 +111,7 @@ class ControlService:
         return bool(set(context.roles) & {"unit_admin", "project_admin"})
 
     def _require(self, context: RequestContext, action: str) -> None:
-        permission = {"manage": "control.manage", "propose": "control.propose", "approve": "control.approve", "execute": "control.execute", "feedback": "control.feedback"}[action]
+        permission = {"read": "control.read", "manage": "control.manage", "propose": "control.propose", "approve": "control.approve", "execute": "control.execute", "feedback": "control.feedback"}[action]
         authorization = context.authorization_context
         if authorization is None:
             raise ControlForbiddenError("control permission denied")
@@ -138,36 +121,81 @@ class ControlService:
         if not AuthorizationService().allows(authorization, permission, resource):
             raise ControlForbiddenError("control permission denied")
 
-    def _audit(self, context: RequestContext, action: str, resource_type: str, resource_id: str, status: str = "succeeded") -> None:
+    def _audit(self, context: RequestContext, action: str, resource_type: str, resource_id: str, operation_id: str, status: str = "succeeded") -> None:
         self.audit.record(self.session, AuditRecordRequest(
             unit_id=context.unit_id, project_id=context.project_id, user_id=context.user_id,
             actor_roles=tuple(sorted(context.roles)), authorization_scope="project", event_scope="project",
             category="management", source="system", action=action, status=status, risk_level="high",
-            idempotency_key=f"control:{resource_type}:{resource_id}:{action}:{context.user_id}:{uuid.uuid4()}", occurred_at=self.clock(),
+            idempotency_key=f"control:{resource_id}:{operation_id}", occurred_at=self.clock(),
             resource_type=resource_type, resource_id=resource_id, summary=action,
         ))
 
     def create_policy(self, context: RequestContext, request: ControlPolicyCreateRequest) -> ControlPolicyInfo:
         self._require(context, "manage")
-        if request.parameter_schema.get("type") != "object":
-            raise ControlValidationError("parameter_schema must describe an object")
+        self._check_policy_schema(request.parameter_schema)
         policy = ControlPolicy(unit_id=context.unit_id, project_id=context.project_id, owner_id=context.user_id, **request.model_dump())
+        policy.id = new_id()
         self.session.add(policy)
         try:
+            self._audit(context, "control_policy.created", "control_policy", policy.id, "created")
             self.session.commit()
         except IntegrityError as error:
             self.session.rollback()
             raise ControlValidationError("policy already exists") from error
         self.session.refresh(policy)
-        self._audit(context, "control_policy.created", "control_policy", policy.id)
-        self.session.commit()
+        return ControlPolicyInfo.model_validate(policy)
+
+    @staticmethod
+    def _check_policy_schema(schema: dict[str, Any]) -> None:
+        if schema.get("type") != "object":
+            raise ControlValidationError("parameter_schema must describe an object")
+        if Draft202012Validator is not None:
+            try:
+                Draft202012Validator.check_schema(schema)
+            except Exception as error:
+                raise ControlValidationError("invalid parameter schema") from error
+
+    def get_policy(self, context: RequestContext, policy_id: str) -> ControlPolicyInfo:
+        self._require(context, "read")
+        policy = self.session.scalar(select(ControlPolicy).where(ControlPolicy.id == policy_id, ControlPolicy.unit_id == context.unit_id, ControlPolicy.project_id == context.project_id))
+        if policy is None:
+            raise ControlNotFoundError()
+        return ControlPolicyInfo.model_validate(policy)
+
+    def list_policies(self, context: RequestContext, *, enabled: bool | None = None, asset_type: str | None = None, command_type: str | None = None) -> list[ControlPolicyInfo]:
+        self._require(context, "read")
+        query = select(ControlPolicy).where(ControlPolicy.unit_id == context.unit_id, ControlPolicy.project_id == context.project_id)
+        if enabled is not None:
+            query = query.where(ControlPolicy.enabled == enabled)
+        if asset_type is not None:
+            query = query.where(ControlPolicy.asset_type == asset_type)
+        if command_type is not None:
+            query = query.where(ControlPolicy.command_type == command_type)
+        return [ControlPolicyInfo.model_validate(row) for row in self.session.scalars(query.order_by(ControlPolicy.created_at, ControlPolicy.id))]
+
+    def update_policy(self, context: RequestContext, policy_id: str, request: ControlPolicyUpdateRequest) -> ControlPolicyInfo:
+        self._require(context, "manage")
+        policy = self.session.scalar(select(ControlPolicy).where(ControlPolicy.id == policy_id, ControlPolicy.unit_id == context.unit_id, ControlPolicy.project_id == context.project_id).with_for_update())
+        if policy is None:
+            raise ControlNotFoundError()
+        changes = request.model_dump(exclude_unset=True)
+        if any(value is None for value in changes.values()):
+            raise ControlValidationError("policy fields cannot be null")
+        if "parameter_schema" in changes:
+            self._check_policy_schema(changes["parameter_schema"])
+        if changes and any(getattr(policy, key) != value for key, value in changes.items()):
+            for key, value in changes.items():
+                setattr(policy, key, value)
+            policy.revision += 1
+            self._audit(context, "control_policy.updated", "control_policy", policy.id, f"update:{policy.revision}")
+            self.session.commit()
         return ControlPolicyInfo.model_validate(policy)
 
     def propose(self, context: RequestContext, request: ControlCommandProposeRequest) -> ControlCommandInfo:
         self._require(context, "propose")
         policy = self.session.scalar(select(ControlPolicy).where(ControlPolicy.id == request.policy_id, ControlPolicy.unit_id == context.unit_id, ControlPolicy.project_id == context.project_id))
         if policy is None or not policy.enabled:
-            raise ControlForbiddenError("control policy not found")
+            raise ControlNotFoundError()
         existing = self.session.scalar(select(ControlCommand).where(ControlCommand.unit_id == context.unit_id, ControlCommand.project_id == context.project_id, ControlCommand.idempotency_key == request.idempotency_key))
         parameter_digest = _digest({"target": request.target, "parameters": request.parameters, "policy_id": request.policy_id, "simulation_artifact_id": request.simulation_artifact_id, "valid_from": request.valid_from.isoformat(), "valid_until": request.valid_until.isoformat(), "rollback_plan": request.rollback_plan, "expected_state": request.expected_state, "run_id": request.run_id, "team_version_id": request.team_version_id})
         if existing is not None:
@@ -202,9 +230,10 @@ class ControlService:
         if target_type != policy.asset_type:
             raise ControlValidationError("target asset type does not match policy")
         policy_snapshot = {key: getattr(policy, key) for key in ControlPolicyCreateRequest.model_fields}
-        command = ControlCommand(unit_id=context.unit_id, project_id=context.project_id, policy_id=policy.id, requester_id=context.user_id, run_id=request.run_id, team_version_id=request.team_version_id, policy_digest=_digest(policy_snapshot), deviation_thresholds_snapshot=deepcopy(policy.deviation_thresholds), target=request.target, parameters=request.parameters, parameter_digest=parameter_digest, simulation_artifact_id=artifact.id, simulation_digest=artifact.sha256, valid_from=valid_from, valid_until=valid_until, required_approvals=1 if policy.approval_mode == "single" else 2, rollback_plan=request.rollback_plan, expected_state=request.expected_state, idempotency_key=request.idempotency_key, status="pending_approval")
+        command = ControlCommand(id=new_id(), unit_id=context.unit_id, project_id=context.project_id, policy_id=policy.id, requester_id=context.user_id, run_id=request.run_id, team_version_id=request.team_version_id, policy_digest=_digest(policy_snapshot), policy_snapshot=deepcopy(policy_snapshot), deviation_thresholds_snapshot=deepcopy(policy.deviation_thresholds), target=request.target, parameters=request.parameters, parameter_digest=parameter_digest, simulation_artifact_id=artifact.id, simulation_digest=artifact.sha256, valid_from=valid_from, valid_until=valid_until, required_approvals=1 if policy.approval_mode == "single" else 2, rollback_plan=request.rollback_plan, expected_state=request.expected_state, idempotency_key=request.idempotency_key, status="pending_approval")
         self.session.add(command)
         try:
+            self._audit(context, "control_command.proposed", "control_command", command.id, "propose")
             self.session.commit()
         except IntegrityError as error:
             self.session.rollback()
@@ -215,8 +244,6 @@ class ControlService:
                 return ControlCommandInfo.model_validate(existing)
             raise ControlIdempotencyConflict("idempotency key is already used") from error
         self.session.refresh(command)
-        self._audit(context, "control_command.proposed", "control_command", command.id)
-        self.session.commit()
         return ControlCommandInfo.model_validate(command)
 
     def _validated_run_binding(
@@ -248,21 +275,60 @@ class ControlService:
     def _command(self, command_id: str, context: RequestContext) -> ControlCommand:
         command = self.session.scalar(select(ControlCommand).where(ControlCommand.id == command_id, ControlCommand.unit_id == context.unit_id, ControlCommand.project_id == context.project_id))
         if command is None:
-            raise ControlForbiddenError("control command not found")
+            raise ControlNotFoundError()
         return command
+
+    def _approval_count(self, command_id: str) -> int:
+        return self.session.scalar(select(func.count(ControlCommandApproval.id)).where(
+            ControlCommandApproval.command_id == command_id, ControlCommandApproval.decision == "approve",
+        )) or 0
+
+    def list_commands(self, context: RequestContext, *, status: str | None = None, policy_id: str | None = None,
+                      created_after: datetime | None = None, created_before: datetime | None = None) -> list[ControlCommandListItem]:
+        self._require(context, "read")
+        query = select(ControlCommand).where(ControlCommand.unit_id == context.unit_id, ControlCommand.project_id == context.project_id)
+        if status is not None:
+            query = query.where(ControlCommand.status == status)
+        if policy_id is not None:
+            query = query.where(ControlCommand.policy_id == policy_id)
+        if created_after is not None:
+            query = query.where(ControlCommand.created_at >= _aware(created_after))
+        if created_before is not None:
+            query = query.where(ControlCommand.created_at <= _aware(created_before))
+        return [ControlCommandListItem(**ControlCommandInfo.model_validate(row).model_dump(), approval_count=self._approval_count(row.id))
+                for row in self.session.scalars(query.order_by(ControlCommand.created_at, ControlCommand.id))]
+
+    def get_command_detail(self, context: RequestContext, command_id: str) -> ControlCommandDetail:
+        self._require(context, "read")
+        command = self._command(command_id, context)
+        approvals = self.session.scalars(select(ControlCommandApproval).where(ControlCommandApproval.command_id == command.id).order_by(ControlCommandApproval.decided_at, ControlCommandApproval.id)).all()
+        attempts = self.session.scalars(select(ControlExecutionAttempt).where(ControlExecutionAttempt.command_id == command.id).order_by(ControlExecutionAttempt.created_at, ControlExecutionAttempt.id)).all()
+        feedback = self.session.scalars(select(ControlFeedbackRecord).where(ControlFeedbackRecord.command_id == command.id).order_by(ControlFeedbackRecord.observed_at, ControlFeedbackRecord.id)).all()
+        artifact = self.session.get(ArtifactRecord, command.simulation_artifact_id)
+        attestation = (artifact.provenance or {}).get("simulation_attestation", {}) if artifact is not None else {}
+        rollback = next(({"attempt_id": attempt.id, "outcome": attempt.outcome, "external_id": attempt.external_id}
+                         for attempt in attempts if attempt.kind == "rollback"), None)
+        return ControlCommandDetail(
+            **ControlCommandInfo.model_validate(command).model_dump(), approval_count=self._approval_count(command.id),
+            approval_decisions=[{"approver_id": row.approver_id, "decision": row.decision, "reason": row.reason, "decided_at": row.decided_at} for row in approvals],
+            attempts=[{"id": row.id, "kind": row.kind, "outcome": row.outcome, "external_id": row.external_id, "created_at": row.created_at, "completed_at": row.completed_at} for row in attempts],
+            feedback_records=[{"id": row.id, "recorder_id": row.recorder_id, "observed_at": row.observed_at, "actual_state": row.actual_state, "deviation_result": row.deviation_result} for row in feedback],
+            simulation_attestation=attestation, rollback_provenance=rollback,
+        )
 
     def decide(self, command_id: str, context: RequestContext, decision: str, reason: str | None = None) -> ControlCommandInfo:
         self._require(context, "approve")
         command = self.session.scalar(select(ControlCommand).where(ControlCommand.id == command_id, ControlCommand.unit_id == context.unit_id, ControlCommand.project_id == context.project_id).with_for_update())
         if command is None:
-            raise ControlForbiddenError("control command not found")
+            raise ControlNotFoundError()
         if context.user_id == command.requester_id:
             raise ControlForbiddenError("requester cannot approve own command")
         now = self.clock()
         if _stored_aware(command.valid_until) <= _stored_aware(now) and command.status == "pending_approval":
             command.status = "expired"
+            self._audit(context, "control_command.expired", "control_command", command.id, "expired")
             self.session.commit()
-            raise ControlValidationError("command expired")
+            raise ControlCommandExpired()
         if command.status != "pending_approval" or decision not in {"approve", "reject"}:
             raise ControlValidationError("command is not awaiting approval")
         if self.session.scalar(select(ControlCommandApproval).where(ControlCommandApproval.command_id == command.id, ControlCommandApproval.approver_id == context.user_id).with_for_update()):
@@ -274,8 +340,7 @@ class ControlService:
             count = self.session.scalar(select(func.count(ControlCommandApproval.id)).where(ControlCommandApproval.command_id == command.id, ControlCommandApproval.decision == "approve"))
             if (count or 0) >= command.required_approvals:
                 command.status = "approved"
-        self.session.commit()
-        self._audit(context, f"control_command.{ 'approved' if decision == 'approve' else 'rejected' }", "control_command", command.id)
+        self._audit(context, f"control_command.{ 'approved' if decision == 'approve' else 'rejected' }", "control_command", command.id, f"{decision}:{context.user_id}")
         self.session.commit()
         return ControlCommandInfo.model_validate(command)
 
@@ -295,12 +360,13 @@ class ControlService:
             if existing.request_key == request_key:
                 return existing
             if existing.completed_at is None:
-                raise ControlExecutionError("control_execution_in_progress")
+                raise ControlExecutionInProgress()
             raise ControlExecutionError("control operation already attempted")
         allowed = {"approved"} if kind == "execute" else {"failed", "unknown", "deviation", "rollback_pending"}
         if command.status not in allowed:
             raise ControlExecutionError("command is not approved" if kind == "execute" else "rollback is not allowed for command state")
         attempt = ControlExecutionAttempt(
+            id=new_id(),
             command_id=command.id, kind=kind, request_key=request_key,
             external_idempotency_key=f"control:{command.id}:{kind}",
             outcome="pending", result_summary={}, created_at=self.clock(),
@@ -346,7 +412,7 @@ class ControlService:
             ControlCommand.project_id == context.project_id,
         ).with_for_update().execution_options(populate_existing=True))
         if command is None:
-            raise ControlForbiddenError("control command not found")
+            raise ControlNotFoundError()
         existing = self.session.scalar(select(ControlExecutionAttempt).where(
             ControlExecutionAttempt.command_id == command.id,
             ControlExecutionAttempt.kind == kind,
@@ -356,7 +422,7 @@ class ControlService:
             if attempt.completed_at is not None:
                 return ControlCommandInfo.model_validate(command)
             if kind == "execute" and not _stored_aware(command.valid_from) <= _stored_aware(self.clock()) < _stored_aware(command.valid_until):
-                raise ControlExecutionError("command is outside validity window")
+                raise ControlCommandExpired()
             if kind == "execute" and self.session.scalar(select(ControlExecutionAttempt.id).where(
                 ControlExecutionAttempt.command_id == command.id, ControlExecutionAttempt.kind == "rollback",
             )):
@@ -365,15 +431,17 @@ class ControlService:
             now = _stored_aware(self.clock())
             if now < _stored_aware(command.valid_from) or now >= _stored_aware(command.valid_until):
                 command.status = "expired"
-                self._audit(context, "control_command.expired", "control_command", command.id)
+                self._audit(context, "control_command.expired", "control_command", command.id, "expired")
                 self.session.commit()
-                return ControlCommandInfo.model_validate(command)
+                raise ControlCommandExpired()
+        elif command.status not in {"failed", "unknown", "deviation", "rollback_pending"}:
+            raise ControlExecutionError("rollback is not allowed for command state")
         executor = self.executors.get(self.session.get(ControlPolicy, command.policy_id).asset_type)
         if executor is None:
-            raise ControlExecutionError("no executor registered")
+            raise ControlExecutorUnavailable()
         attempt = self._begin_attempt(command, kind, request_key)
         attempt_id, external_key = attempt.id, attempt.external_idempotency_key
-        self._audit(context, f"control_command.{kind}_started", "control_command", command.id, status="started")
+        self._audit(context, f"control_command.{kind}_started", "control_command", command.id, f"{kind}:{attempt_id}:started", status="started")
         self.session.commit()
         transport_error = None
         try:
@@ -387,11 +455,12 @@ class ControlService:
             except (ValueError, TypeError):
                 result = None
         self._complete_attempt(command_id, attempt_id, result)
-        self._audit(context, f"control_command.{kind}_completed", "control_command", command_id,
+        completed_action = f"control_command.{kind}_completed" if result is not None and result.outcome != "unknown" else f"control_command.{kind}_unknown"
+        self._audit(context, completed_action, "control_command", command_id, f"{kind}:{attempt_id}:completed",
                     status="succeeded" if result is not None and result.outcome == "succeeded" else "failed")
         self.session.commit()
         if transport_error is not None:
-            raise ControlExecutionError("executor failed") from transport_error
+            raise ControlExecutorUnavailable() from transport_error
         return ControlCommandInfo.model_validate(command)
 
     def execute(self, command_id: str, context: RequestContext, request_key: str) -> ControlCommandInfo:
@@ -401,7 +470,7 @@ class ControlService:
         self._require(context, "feedback")
         command = self.session.scalar(select(ControlCommand).where(ControlCommand.id == command_id, ControlCommand.unit_id == context.unit_id, ControlCommand.project_id == context.project_id).with_for_update().execution_options(populate_existing=True))
         if command is None:
-            raise ControlForbiddenError("control command not found")
+            raise ControlNotFoundError()
         now = _stored_aware(self.clock())
         observed_at = _aware(request.observed_at) if request.observed_at is not None else now
         if command.status not in {"awaiting_feedback", "unknown", "succeeded", "deviation", "rollback_pending"}:
@@ -426,13 +495,14 @@ class ControlService:
                 deviations[key] = {"expected": expected, "actual": actual, "threshold": threshold}
         command.deviation_result = {"deviations": deviations, "within_threshold": not deviations}
         command.feedback_observed_at = observed_at
-        self.session.add(ControlFeedbackRecord(
+        feedback = ControlFeedbackRecord(id=new_id(),
             command_id=command.id, recorder_id=context.user_id, observed_at=observed_at,
             actual_state=deepcopy(request.actual_state), deviation_result=deepcopy(command.deviation_result),
-        ))
+        )
+        self.session.add(feedback)
         if command.status == "awaiting_feedback":
             command.status = "deviation" if deviations else "succeeded"
-        self._audit(context, "control_command.feedback", "control_command", command.id)
+        self._audit(context, "control_command.feedback", "control_command", command.id, f"feedback:{feedback.id}")
         self.session.commit()
         return ControlCommandInfo.model_validate(command)
 

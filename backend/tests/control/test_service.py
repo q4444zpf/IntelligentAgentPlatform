@@ -8,10 +8,12 @@ from app.artifacts.models import ArtifactRecord
 from app.core.request_context import RequestContext
 from app.identity.schemas import AuthorizationContext, PermissionGrant
 from app.db.base import Base
+from app.control.models import ControlCommand
 from app.control.schemas import (
     ControlCommandProposeRequest,
     ControlFeedbackRequest,
     ControlPolicyCreateRequest,
+    ControlPolicyUpdateRequest,
 )
 from app.control.service import (
     ControlExecutionError,
@@ -257,7 +259,10 @@ def test_execute_rejects_before_valid_from_and_target_asset_mismatch(session):
     policy = service.create_policy(admin, _policy_request())
     command = service.propose(_context(), _propose_request(policy.id, valid_from=now + timedelta(minutes=1), valid_until=now + timedelta(minutes=11)))
     service.decide(command.id, _context("reviewer", roles=("project_admin",)), "approve", "ok")
-    assert service.execute(command.id, admin, "before-window").status == "expired"
+    with pytest.raises(ControlValidationError) as expired:
+        service.execute(command.id, admin, "before-window")
+    assert expired.value.status_code == 410
+    assert session.get(ControlCommand, command.id).status == "expired"
     with pytest.raises(ControlValidationError):
         service.propose(_context(), _propose_request(policy.id, idempotency_key="bad-target", target={"asset_type": "gate"}))
 
@@ -304,6 +309,24 @@ def test_idempotency_digest_includes_immutable_request_fields(session):
     command = service.propose(_context(), _propose_request(policy.id))
     with pytest.raises(ControlIdempotencyConflict):
         service.propose(_context(), _propose_request(policy.id, target={"asset_id": "other", "asset_type": "reservoir"}))
+
+
+def test_policy_edit_keeps_existing_command_snapshot_and_validates_schema(session):
+    service = ControlService(session)
+    admin = _context("admin", roles=("project_admin",))
+    _artifact(session)
+    policy = service.create_policy(admin, _policy_request())
+    first = service.propose(_context(), _propose_request(policy.id))
+    with pytest.raises(ControlValidationError):
+        service.update_policy(admin, policy.id, ControlPolicyUpdateRequest(parameter_schema={"type": "object", "properties": {"amount": {"type": "not-a-type"}}}))
+    updated = service.update_policy(admin, policy.id, ControlPolicyUpdateRequest(deviation_thresholds={"amount": 2}, approval_mode="dual"))
+    second = service.propose(_context(), _propose_request(policy.id, idempotency_key="proposal-2"))
+    assert updated.revision == 2
+    assert first.policy_snapshot["deviation_thresholds"] == {"amount": 5}
+    assert first.required_approvals == 1
+    assert second.policy_snapshot["deviation_thresholds"] == {"amount": 2}
+    assert second.required_approvals == 2
+    assert first.policy_digest != second.policy_digest
 
 
 def test_rollback_cannot_be_replayed_with_new_request_key(session):

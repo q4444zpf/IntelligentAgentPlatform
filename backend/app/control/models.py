@@ -31,6 +31,7 @@ class ControlPolicy(Base):
     deviation_thresholds: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     owner_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -52,6 +53,7 @@ class ControlCommand(Base):
     run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     team_version_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     policy_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    policy_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     deviation_thresholds_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     feedback_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     target: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)

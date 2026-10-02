@@ -75,8 +75,9 @@ def test_execute_rejects_different_key_while_attempt_is_pending(session):
     service, command, admin = prepared(session, executor)
     with pytest.raises(ControlExecutionError):
         service.execute(command.id, admin, "execute-1")
-    with pytest.raises(ControlExecutionError, match="control_execution_in_progress"):
+    with pytest.raises(ControlExecutionError) as in_progress:
         service.execute(command.id, admin, "execute-2")
+    assert (in_progress.value.status_code, in_progress.value.code) == (409, "control_execution_in_progress")
     assert len(executor.calls) == 1
     attempt = session.scalar(select(models.ControlExecutionAttempt))
     assert attempt.outcome == "unknown"
@@ -263,8 +264,9 @@ def test_unresolved_reconciliation_after_window_expires_does_not_call_executor(s
     with pytest.raises(ControlExecutionError):
         service.execute(command.id, admin, "execute-1")
     service.clock = lambda: command.valid_until.replace(tzinfo=timezone.utc) + timedelta(seconds=1)
-    with pytest.raises(ControlExecutionError, match="outside validity window"):
+    with pytest.raises(ControlValidationError) as expired:
         service.execute(command.id, admin, "execute-1")
+    assert (expired.value.status_code, expired.value.code) == (410, "control_command_expired")
     assert len(executor.calls) == 1
     assert session.get(models.ControlCommand, command.id).status == "unknown"
 
@@ -298,10 +300,11 @@ def test_feedback_rejects_observation_before_completion_in_another_session(sessi
     assert held_attempt.completed_at is None
     service.clock = lambda: completed_at
 
-    with pytest.raises(ControlValidationError, match="stale"):
+    with pytest.raises(ControlValidationError) as stale:
         service.record_feedback(command.id, admin, ControlFeedbackRequest(
             actual_state={"amount": 20}, observed_at=started_at + timedelta(seconds=5),
         ))
+    assert (stale.value.status_code, stale.value.code) == (422, "control_validation_failed")
 
     assert session.get(models.ControlCommand, command.id).status == "awaiting_feedback"
     assert session.scalar(select(models.ControlFeedbackRecord)) is None

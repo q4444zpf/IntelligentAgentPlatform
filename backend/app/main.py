@@ -35,6 +35,7 @@ from .runtime.runner_gateway_auth import (
 from .runtime.runner_gateway_router import router as runner_gateway_router
 from .collaboration.router import router as collaboration_router
 from .control.executors import ControlExecutorRegistry
+from .control.errors import ControlError, control_error_handler, unexpected_error_handler
 from .control.router import create_router as create_control_router
 from .control.service import ControlService
 from .core.settings import read_secret
@@ -78,6 +79,8 @@ app = FastAPI(
 )
 app.state.allow_dev_identity = settings.allow_dev_identity
 app.add_exception_handler(RunnerGatewayError, runner_gateway_error_handler)
+app.add_exception_handler(ControlError, control_error_handler)
+app.add_exception_handler(Exception, unexpected_error_handler)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
