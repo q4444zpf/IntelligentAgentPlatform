@@ -408,7 +408,7 @@ class ControlService:
             raise ControlValidationError("feedback is not allowed for command state")
         attempt = self.session.scalar(select(ControlExecutionAttempt).where(
             ControlExecutionAttempt.command_id == command.id, ControlExecutionAttempt.kind == "execute",
-        ))
+        ).execution_options(populate_existing=True))
         if attempt is None:
             raise ControlValidationError("feedback requires an execution attempt")
         lower_bound = attempt.completed_at or attempt.created_at

@@ -280,3 +280,108 @@ def test_completed_replay_refreshes_attempt_completed_by_another_session(session
     assert held_attempt.completed_at is None
     assert service.execute(command.id, admin, "execute-1").status == "awaiting_feedback"
     assert len(executor.calls) == 2
+
+
+def test_feedback_rejects_observation_before_completion_in_another_session(session):
+    executor = TimeoutExecutor()
+    service, command, admin = prepared(session, executor)
+    started_at = datetime.now(timezone.utc)
+    completed_at = started_at + timedelta(seconds=10)
+    service.clock = lambda: started_at
+    with pytest.raises(ControlExecutionError):
+        service.execute(command.id, admin, "execute-1")
+    held_attempt = session.scalar(select(models.ControlExecutionAttempt))
+    with Session(session.bind) as other:
+        recovered = ControlService(other, executors={"reservoir": executor})
+        recovered.clock = lambda: completed_at
+        assert recovered.execute(command.id, admin, "execute-1").status == "awaiting_feedback"
+    assert held_attempt.completed_at is None
+    service.clock = lambda: completed_at
+
+    with pytest.raises(ControlValidationError, match="stale"):
+        service.record_feedback(command.id, admin, ControlFeedbackRequest(
+            actual_state={"amount": 20}, observed_at=started_at + timedelta(seconds=5),
+        ))
+
+    assert session.get(models.ControlCommand, command.id).status == "awaiting_feedback"
+    assert session.scalar(select(models.ControlFeedbackRecord)) is None
+    assert service.record_feedback(command.id, admin, ControlFeedbackRequest(
+        actual_state={"amount": 20}, observed_at=completed_at,
+    )).status == "succeeded"
+
+
+def test_migration_recovers_legacy_executing_without_attempt_and_downgrades_safely():
+    import importlib.util
+    from pathlib import Path
+
+    import sqlalchemy as sa
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    versions = Path(__file__).resolve().parents[2] / "alembic" / "versions"
+
+    def load(name):
+        spec = importlib.util.spec_from_file_location(name, versions / name)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    engine = sa.create_engine("sqlite://")
+    with engine.begin() as connection:
+        metadata = sa.MetaData()
+        sa.Table("collaboration_team_versions", metadata, sa.Column("id", sa.String, primary_key=True), sa.Column("failure_strategy", sa.String))
+        sa.Table("artifacts", metadata, sa.Column("id", sa.String, primary_key=True))
+        metadata.create_all(connection)
+        with Operations.context(MigrationContext.configure(connection)):
+            # Revision 30 only merges heads; its control schema is created by 28.
+            load("20260913_28_control_commands.py").upgrade()
+            load("20260914_30_merge_control_skill_heads.py").upgrade()
+            metadata.reflect(connection)
+            commands = metadata.tables["control_commands"]
+            attempts = metadata.tables["control_execution_attempts"]
+            approvals = metadata.tables["control_command_approvals"]
+            connection.execute(metadata.tables["control_policies"].insert().values(
+                id="policy", unit_id="unit-1", project_id="project-1", owner_id="operator",
+                **_policy_request().model_dump(),
+            ))
+            now = datetime.now(timezone.utc)
+            for command_id in ("orphaned", "tracked"):
+                connection.execute(commands.insert().values(
+                    id=command_id, unit_id="unit-1", project_id="project-1", policy_id="policy",
+                    requester_id="operator", team_version="version-1", target={"id": "reservoir-1"},
+                    parameters={"amount": 20}, parameter_digest="a" * 64,
+                    simulation_artifact_id="artifact", simulation_digest="b" * 64,
+                    valid_from=now, valid_until=now + timedelta(minutes=1), required_approvals=1,
+                    rollback_plan={"amount": 10}, expected_state={"amount": 20},
+                    idempotency_key=command_id, status="executing",
+                ))
+            connection.execute(attempts.insert().values(
+                id="attempt", command_id="tracked", kind="execute", request_key="execute-1",
+                external_idempotency_key="existing-external-key", outcome="pending",
+            ))
+            connection.execute(approvals.insert().values(
+                id="approval", command_id="orphaned", approver_id="admin", decision="approve",
+            ))
+            original_commands = {row["id"]: dict(row) for row in connection.execute(sa.select(commands)).mappings()}
+            original_attempt = dict(connection.execute(sa.select(attempts)).mappings().one())
+            original_approval = dict(connection.execute(sa.select(approvals)).mappings().one())
+            migration = load("20260915_31_control_execution_hardening.py")
+            assert migration.down_revision == "20260914_30"
+            migration.upgrade()
+
+            upgraded = sa.Table("control_commands", sa.MetaData(), autoload_with=connection)
+            rows = {row.id: row for row in connection.execute(sa.select(upgraded))}
+            assert rows["orphaned"].status == "unknown"
+            assert rows["tracked"].status == "executing"
+            assert rows["orphaned"].external_command_ref is None
+            assert connection.execute(sa.select(attempts)).mappings().all() == [original_attempt]
+            assert connection.execute(sa.select(approvals)).mappings().all() == [original_approval]
+            assert connection.scalar(sa.text("SELECT COUNT(*) FROM control_feedback_records")) == 0
+
+            migration.downgrade()
+            original_commands["orphaned"]["status"] = "unknown"
+            assert {row["id"]: dict(row) for row in connection.execute(sa.select(commands)).mappings()} == original_commands
+            assert connection.execute(sa.select(attempts)).mappings().all() == [original_attempt]
+            assert connection.execute(sa.select(approvals)).mappings().all() == [original_approval]
+            assert "control_feedback_records" not in sa.inspect(connection).get_table_names()
+    engine.dispose()

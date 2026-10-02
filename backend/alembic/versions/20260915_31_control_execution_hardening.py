@@ -38,6 +38,11 @@ def upgrade() -> None:
     commands = sa.Table("control_commands", metadata, autoload_with=connection)
     policies = sa.Table("control_policies", metadata, autoload_with=connection)
     attempts = sa.Table("control_execution_attempts", metadata, autoload_with=connection)
+    # Legacy execution may have reached hardware without persisting replay evidence.
+    connection.execute(commands.update().where(
+        commands.c.status == "executing",
+        ~sa.exists(sa.select(attempts.c.id).where(attempts.c.command_id == commands.c.id)),
+    ).values(status="unknown"))
     snapshot_fields = (
         "asset_type", "command_type", "parameter_schema", "max_command_lifetime_seconds",
         "approval_mode", "deviation_thresholds", "enabled",
