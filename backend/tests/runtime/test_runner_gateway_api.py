@@ -62,6 +62,8 @@ class FakeTokenService:
             raise RunTokenNotFound(run_id)
         if token == "model-only":
             raise RunTokenForbidden("forbidden")
+        if token == "artifact-create-only" and action != "artifact.create":
+            raise RunTokenForbidden("forbidden")
         return RunTokenClaims(
             iss="iap-api",
             aud="iap-runner-gateway",
@@ -124,6 +126,31 @@ def test_cross_run_is_404_and_missing_action_is_403():
     assert client.get(
         "/internal/runner/runs/run-1/snapshot", headers=bearer("model-only")
     ).status_code == 403
+
+
+def test_simulation_attestation_requires_separate_runner_action():
+    response = make_client().post(
+        "/internal/runner/runs/run-1/artifact-attestations/simulation",
+        headers=bearer("artifact-create-only"),
+        json={"team_version_id": "version", "member_agent_id": "member", "task_id": "task", "invocation_id": "invocation", "artifact_ids": ["artifact"], "completed_at": "2026-09-15T10:00:00Z", "capability": "c" * 43},
+    )
+    assert response.status_code == 403
+
+
+def test_runner_client_serializes_simulation_attestation_with_idempotency_key():
+    import json
+    import httpx
+    from app.runtime.runner_gateway_client import RunnerGatewayClient
+    received = []
+    def handle(request):
+        received.append(request)
+        return httpx.Response(200, json=[{"path": "/artifacts/simulation.json", "artifact_id": "artifact", "size_bytes": 2, "sha256": "a" * 64, "content_type": "application/json"}])
+    client = RunnerGatewayClient("http://runner/internal/runner", "run-1", "token", transport=httpx.MockTransport(handle))
+    result = client.attest_simulation_artifacts(team_version_id="version", member_agent_id="member", task_id="task", invocation_id="invocation", artifact_ids=("artifact",), completed_at=datetime(2026, 9, 15, 10, tzinfo=UTC), capability="c" * 43, idempotency_key="attest-task")
+    assert result[0].artifact_id == "artifact"
+    assert received[0].url.path == "/internal/runner/runs/run-1/artifact-attestations/simulation"
+    assert received[0].headers["Idempotency-Key"] == "attest-task"
+    assert json.loads(received[0].content)["artifact_ids"] == ["artifact"]
 
 
 def test_snapshot_digest_mismatch_is_409():

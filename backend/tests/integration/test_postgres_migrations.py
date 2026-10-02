@@ -11,27 +11,41 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 
 from app.collaboration.repository import TeamRepository
+from backend.tests.integration.postgres_migration_helpers import isolated_migration_database
+
+ROOT = Path(__file__).resolve().parents[3]
+
+
+@pytest.fixture(autouse=True)
+def isolated_postgres_schema(request, monkeypatch):
+    if "skipif" not in request.keywords or not os.getenv("TEST_DATABASE_URL"):
+        yield
+        return
+    with isolated_migration_database() as database_url:
+        monkeypatch.setenv("TEST_DATABASE_URL", database_url)
+        yield
+
 
 ALEMBIC_UPGRADE_COMMAND = (
     sys.executable,
     "-m",
     "alembic",
     "-c",
-    "backend/alembic.ini",
+    str(ROOT / "backend/alembic.ini"),
     "upgrade",
     "head",
 )
 
 
 def test_upgrade_command_uses_backend_alembic_config():
-    assert ALEMBIC_UPGRADE_COMMAND[3:5] == ("-c", "backend/alembic.ini")
+    assert ALEMBIC_UPGRADE_COMMAND[3:5] == ("-c", str(ROOT / "backend/alembic.ini"))
 
 
 def test_migration_graph_has_single_integration_head():
     config = Config(Path(__file__).resolve().parents[3] / "backend" / "alembic.ini")
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["20260914_29"]
+    assert script.get_heads() == ["20260915_31"]
 
 
 @pytest.mark.skipif(not os.getenv("TEST_DATABASE_URL"), reason="requires PostgreSQL")
@@ -41,7 +55,7 @@ def test_upgrade_head_creates_conversation_tables():
     engine = create_engine(env["DATABASE_URL"])
     inspector = inspect(engine)
     with engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260914_29"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260915_31"
     tables = set(inspector.get_table_names())
     assert {
         "conversations",
@@ -174,6 +188,7 @@ def test_upgrade_head_creates_conversation_tables():
 def test_agent_availability_migration_marks_legacy_agents_common_wildcard():
     database_url = os.environ["TEST_DATABASE_URL"]
     env = os.environ | {"DATABASE_URL": database_url}
+    subprocess.run(ALEMBIC_UPGRADE_COMMAND, check=True, env=env)
     downgrade = (*ALEMBIC_UPGRADE_COMMAND[:-2], "downgrade", "20260901_24")
     upgrade = (*ALEMBIC_UPGRADE_COMMAND[:-1], "20260902_25")
     engine = create_engine(database_url)
@@ -591,6 +606,7 @@ def test_runner_idempotency_migration_cycles():
 def test_message_run_link_migration_backfills_completed_assistant_message():
     database_url = os.environ["TEST_DATABASE_URL"]
     env = os.environ | {"DATABASE_URL": database_url}
+    subprocess.run(ALEMBIC_UPGRADE_COMMAND, check=True, env=env)
     downgrade = (*ALEMBIC_UPGRADE_COMMAND[:-2], "downgrade", "20260814_20")
     conversation_id = "message-run-link-conversation"
     user_message_id = "message-run-link-user"
@@ -677,6 +693,7 @@ def test_mcp_tool_registry_migration_downgrade_removes_source_columns():
 def test_audit_auth_contract_migration_cycles_legacy_snapshots_and_scope_constraints():
     database_url = os.environ["TEST_DATABASE_URL"]
     env = os.environ | {"DATABASE_URL": database_url}
+    subprocess.run(ALEMBIC_UPGRADE_COMMAND, check=True, env=env)
     downgrade = (*ALEMBIC_UPGRADE_COMMAND[:-2], "downgrade", "20260804_09")
     subprocess.run(downgrade, check=True, env=env)
     engine = create_engine(database_url)

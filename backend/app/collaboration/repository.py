@@ -348,8 +348,8 @@ class TeamRepository:
             "timeout_seconds": cls._positive_int(
                 definition.get("timeout_seconds"), "timeout_seconds"
             ),
-            "failure_strategy": cls._non_empty_string(
-                definition.get("failure_strategy", "fail_fast"), "failure_strategy"
+            "failure_strategy": cls._failure_strategy(
+                definition.get("failure_strategy", "fail_fast")
             ),
             "approval_policy_id": cls._optional_string(
                 definition.get("approval_policy_id"), "approval_policy_id"
@@ -363,6 +363,13 @@ class TeamRepository:
                 raise TeamDefinitionValidationError("description must be a string")
             normalized["description"] = description
         return normalized
+
+    @staticmethod
+    def _failure_strategy(value: Any) -> str:
+        value = TeamRepository._non_empty_string(value, "failure_strategy")
+        if value not in {"fail_fast", "continue_then_synthesize"}:
+            raise TeamDefinitionValidationError("failure_strategy must be fail_fast or continue_then_synthesize")
+        return value
 
     @classmethod
     def _normalize_member(cls, member: Any, role: str) -> dict[str, Any]:

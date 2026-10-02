@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -33,10 +34,30 @@ from .runtime.runner_gateway_auth import (
 )
 from .runtime.runner_gateway_router import router as runner_gateway_router
 from .collaboration.router import router as collaboration_router
+from .control.executors import ControlExecutorRegistry
+from .control.errors import ControlError, control_error_handler, unexpected_error_handler
+from .control.router import create_router as create_control_router
+from .control.service import ControlService
+from .core.settings import read_secret
+
+
+control_registry = ControlExecutorRegistry()
+
+
+def control_service_factory(session):
+    executors = control_registry.executors if control_registry.enabled else {}
+    return ControlService(session, executors=executors)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    global control_registry
+    registry = ControlExecutorRegistry.from_json(
+        settings.control_executors_json, read_secret, settings.environment,
+        enabled=settings.control_gateway_enabled,
+    )
+    registry.validate_startup()
+    control_registry = registry
     validate_runner_gateway_startup()
     validate_project_skills_startup(
         settings.project_skills_api_enabled,
@@ -58,6 +79,8 @@ app = FastAPI(
 )
 app.state.allow_dev_identity = settings.allow_dev_identity
 app.add_exception_handler(RunnerGatewayError, runner_gateway_error_handler)
+app.add_exception_handler(ControlError, control_error_handler)
+app.add_exception_handler(Exception, unexpected_error_handler)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -106,6 +129,7 @@ app.include_router(identity_admin_router, prefix="/api/identity", tags=["identit
 app.include_router(identity_auth_router, prefix="/api/auth", tags=["auth"])
 app.include_router(artifacts_router, prefix="/api", tags=["artifacts"])
 app.include_router(collaboration_router, prefix="/api/collaboration", tags=["collaboration"])
+app.include_router(create_control_router(service_factory=control_service_factory), prefix="/api/control", tags=["control"])
 app.include_router(
     runner_gateway_router,
     prefix="/internal/runner",
@@ -114,5 +138,11 @@ app.include_router(
 
 
 @app.get("/api/health")
-def health() -> dict[str, str]:
+def health():
+    readiness = control_registry.readiness()
+    if not readiness.ready:
+        return JSONResponse(
+            {"status": "not_ready", "control": {"ready": False, "unavailable_asset_types": list(readiness.unavailable_asset_types)}},
+            status_code=503,
+        )
     return {"status": "ok", "service": "intelligent-agent-platform-api", "version": "0.2.0"}

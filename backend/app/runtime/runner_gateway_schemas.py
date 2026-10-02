@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Literal
+from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -154,13 +155,38 @@ class ScriptExecutionCompletionResponse(BaseModel):
     status: Literal["completed", "failed", "cancelled"]
 
 
-class ArtifactProvenance(BaseModel):
+class SimulationAttestation(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["simulation"] = "simulation"
+    status: Literal["succeeded"] = "succeeded"
+    completed_at: datetime
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class SimulationAttestationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    team_version_id: str = Field(min_length=1, max_length=128)
+    member_agent_id: str = Field(min_length=1, max_length=128)
+    task_id: str = Field(min_length=1, max_length=128)
+    invocation_id: str = Field(min_length=1, max_length=256)
+    artifact_ids: tuple[str, ...] = Field(min_length=1, max_length=100)
+    completed_at: datetime
+    capability: str = Field(min_length=32, max_length=256)
+
+
+class ArtifactCreateProvenance(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     team_version_id: str | None = Field(default=None, min_length=1, max_length=128)
     member_agent_id: str = Field(min_length=1, max_length=128)
     task_id: str = Field(min_length=1, max_length=128)
     invocation_id: str = Field(min_length=1, max_length=256)
+
+
+class ArtifactProvenance(ArtifactCreateProvenance):
+    simulation_attestation: SimulationAttestation | None = None
 
 
 class ArtifactCapabilityRegistrationRequest(BaseModel):
@@ -186,7 +212,7 @@ class ArtifactCreateRequest(BaseModel):
     size_bytes: int = Field(ge=0)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     data_base64: str
-    provenance: ArtifactProvenance | None = None
+    provenance: ArtifactCreateProvenance | None = None
     capability: str | None = Field(default=None, min_length=32, max_length=256)
 
 

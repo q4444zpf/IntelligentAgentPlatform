@@ -7,6 +7,7 @@
     "dev": "vite --host 0.0.0.0",
     "build": "vue-tsc --noEmit && vite build",
     "test": "vitest run --maxWorkers=4",
+    "test:layout": "playwright test e2e/control-mobile-layout.pw.ts",
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {
@@ -24,6 +25,7 @@
     "vue-router": "^4.5.1"
   },
   "devDependencies": {
+    "@playwright/test": "1.63.0",
     "@types/markdown-it": "^14.1.2",
     "@vue/test-utils": "^2.4.11",
     "happy-dom": "^20.11.1",

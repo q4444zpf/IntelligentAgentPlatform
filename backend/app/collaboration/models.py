@@ -74,6 +74,10 @@ class TeamVersion(Base):
         UniqueConstraint("team_id", "version", name="uq_collaboration_team_versions_team_version"),
         CheckConstraint("status IN ('draft', 'published')", name="ck_collaboration_team_versions_status"),
         CheckConstraint(
+            "failure_strategy IN ('fail_fast', 'continue_then_synthesize')",
+            name="ck_collaboration_team_versions_failure_strategy",
+        ),
+        CheckConstraint(
             "(status = 'draft' AND version = 0) OR (status = 'published' AND version > 0)",
             name="ck_collaboration_team_versions_status_version",
         ),

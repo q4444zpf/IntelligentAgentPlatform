@@ -1,4 +1,5 @@
 import hashlib
+import pytest
 from datetime import UTC, datetime, timedelta
 
 from fastapi import FastAPI
@@ -32,6 +33,18 @@ from app.runtime.runner_gateway_auth import (
     runner_gateway_error_handler,
 )
 from app.runtime.runner_gateway_router import create_router
+
+
+def test_team_plan_simulation_designation_is_closed_and_old_plans_remain_valid():
+    from app.runtime.team_graph import TeamPlanError, parse_supervisor_plan
+    actor = build_team_snapshot().payload.actor
+    task = {"id": "simulate", "member_id": "member-1", "objective": "simulate", "position": 0}
+    old = parse_supervisor_plan({"tasks": [task]}, actor, runner_max_subagents=1)
+    assert old.tasks[0].output_contract.artifact_kind == "generic"
+    simulation = parse_supervisor_plan({"tasks": [{**task, "output_contract": {"artifact_kind": "simulation"}}]}, actor, runner_max_subagents=1)
+    assert simulation.tasks[0].output_contract.artifact_kind == "simulation"
+    with pytest.raises(TeamPlanError):
+        parse_supervisor_plan({"tasks": [{**task, "output_contract": {"artifact_kind": "physical-control"}}]}, actor, runner_max_subagents=1)
 
 
 def build_snapshot(digest_override=None):

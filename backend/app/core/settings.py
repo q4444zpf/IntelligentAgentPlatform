@@ -119,6 +119,8 @@ class Settings:
     trusted_proxy_cidrs: tuple[str, ...]
     dev_identity_trusted_cidrs: tuple[str, ...]
     project_skills_api_enabled: bool = False
+    control_gateway_enabled: bool = False
+    control_executors_json: str | None = field(default=None, repr=False)
 
     @property
     def current_encryption_key_id(self) -> str | None:
@@ -173,9 +175,13 @@ class Settings:
             trusted_proxy_cidrs=trusted_proxy_cidrs,
             dev_identity_trusted_cidrs=dev_identity_trusted_cidrs,
             project_skills_api_enabled=_read_bool("IAP_PROJECT_SKILLS_API_ENABLED", False),
+            control_gateway_enabled=_read_bool("IAP_CONTROL_GATEWAY_ENABLED", False),
+            control_executors_json=os.getenv("IAP_CONTROL_EXECUTORS_JSON"),
         )
 
     def validate_startup(self) -> None:
+        if self.control_gateway_enabled and not (self.control_executors_json or "").strip():
+            raise ValueError("control gateway requires executor configuration")
         if self.environment != "production":
             return
         if self.allow_dev_identity:

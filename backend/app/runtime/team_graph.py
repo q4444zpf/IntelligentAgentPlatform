@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from collections import defaultdict, deque
 from typing import Any, Literal
 
@@ -26,6 +27,7 @@ class TeamTaskOutputContract(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     max_output_bytes: int = Field(default=65_536, gt=0, le=4 * 1024 * 1024)
+    artifact_kind: Literal["generic", "simulation"] = "generic"
 
 
 class TeamTask(BaseModel):
@@ -54,6 +56,7 @@ class TeamTaskResult(BaseModel):
     member_agent_id: str
     position: int = Field(ge=0)
     content: str
+    artifact_ids: tuple[str, ...] = ()
 
 
 class TeamTaskFailure(BaseModel):
@@ -82,6 +85,9 @@ class TeamActiveInvocation(BaseModel):
     runtime_state: dict[str, Any] | None = None
     checkpoint_status: Literal["running", "interrupted", "completed"]
     approval_id: str | None = None
+    artifact_ids: tuple[str, ...] = ()
+    artifact_capability: str | None = None
+    completed_at: datetime | None = None
 
 
 class TeamSchedulerState(BaseModel):

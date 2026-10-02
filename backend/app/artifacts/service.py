@@ -149,6 +149,40 @@ class ArtifactService:
         self.session.refresh(record)
         return record
 
+    def attest_completed_simulation(
+        self, run_id: str, binding: dict[str, str],
+        artifact_ids: tuple[str, ...], completed_at: datetime,
+        *, commit: bool = True,
+    ) -> list[ArtifactRecord]:
+        from app.runtime.runner_gateway_schemas import ArtifactProvenance, SimulationAttestation
+        from pydantic import ValidationError
+
+        context = self._run_context(run_id)
+        records = []
+        updates = []
+        if not artifact_ids or len(artifact_ids) != len(set(artifact_ids)) or binding.get("run_id") != run_id:
+            raise ArtifactIntegrityError("simulation artifact binding invalid")
+        for artifact_id in artifact_ids:
+            record = self.get_for_run(run_id, artifact_id)
+            try:
+                provenance = ArtifactProvenance.model_validate(record.provenance)
+            except ValidationError as error:
+                raise ArtifactIntegrityError("simulation artifact provenance invalid") from error
+            if (record.unit_id != context["unit_id"] or record.project_id != context["project_id"]
+                    or any(getattr(provenance, key) != binding.get(key) for key in (
+                        "team_version_id", "member_agent_id", "task_id", "invocation_id"))):
+                raise ArtifactIntegrityError("simulation artifact binding invalid")
+            attestation = SimulationAttestation(completed_at=completed_at, artifact_sha256=record.sha256)
+            if provenance.simulation_attestation is not None and provenance.simulation_attestation != attestation:
+                raise ArtifactIntegrityError("simulation attestation already exists")
+            records.append(record)
+            updates.append({**record.provenance, "simulation_attestation": attestation.model_dump(mode="json")})
+        for record, provenance in zip(records, updates, strict=True):
+            record.provenance = provenance
+        if commit:
+            self.session.commit()
+        return records
+
     def create_for_run(
         self,
         *,
