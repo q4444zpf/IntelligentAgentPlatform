@@ -21,7 +21,7 @@ def upgrade() -> None:
         batch.add_column(sa.Column("policy_snapshot", sa.JSON(), nullable=True))
     connection = op.get_bind()
     commands = sa.table("control_commands", sa.column("id"), sa.column("policy_id"), sa.column("policy_snapshot", sa.JSON()))
-    policies = sa.table("control_policies", sa.column("id"), sa.column("asset_type"), sa.column("command_type"), sa.column("parameter_schema", sa.JSON()), sa.column("max_command_lifetime_seconds"), sa.column("approval_mode"), sa.column("deviation_thresholds", sa.JSON()), sa.column("enabled"))
+    policies = sa.table("control_policies", sa.column("id"), sa.column("asset_type"), sa.column("command_type"), sa.column("parameter_schema", sa.JSON()), sa.column("max_command_lifetime_seconds"), sa.column("approval_mode"), sa.column("deviation_thresholds", sa.JSON()), sa.column("enabled", sa.Boolean()))
     for policy in connection.execute(sa.select(policies)).mappings():
         snapshot = {key: policy[key] for key in ("asset_type", "command_type", "parameter_schema", "max_command_lifetime_seconds", "approval_mode", "deviation_thresholds", "enabled")}
         connection.execute(commands.update().where(commands.c.policy_id == policy["id"]).values(policy_snapshot=snapshot))

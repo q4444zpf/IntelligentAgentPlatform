@@ -4,7 +4,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
@@ -197,3 +197,42 @@ def test_unexpected_database_error_is_logged_and_returns_500(client, caplog):
     assert response.status_code == 500
     assert "private database token" not in response.text
     assert "private database token" in caplog.text
+
+
+@pytest.mark.parametrize("operation", ["policy", "proposal"])
+def test_unexpected_audit_integrity_error_is_logged_and_returns_500(client, caplog, monkeypatch, operation):
+    session = client.app.dependency_overrides[get_session]()
+    manager = ControlService(session)
+    if operation == "proposal":
+        _artifact(session)
+        policy = manager.create_policy(service_context("admin", roles=("project_admin",)), _policy_request())
+        path = "/api/control/commands"
+        body = _propose_request(policy.id).model_dump(mode="json")
+    else:
+        path = "/api/control/policies"
+        body = _policy_request().model_dump(mode="json")
+
+    def fail_audit(*_args, **_kwargs):
+        raise IntegrityError("INSERT audit_events", {}, RuntimeError("private audit constraint"))
+    monkeypatch.setattr(manager.audit, "record", fail_audit)
+    client.app.dependency_overrides[_service] = lambda: manager
+    with TestClient(client.app, raise_server_exceptions=False) as safe_client:
+        response = safe_client.post(path, json=body)
+    assert response.status_code == 500
+    assert "private audit constraint" not in response.text
+    assert "private audit constraint" in caplog.text
+
+
+def test_domain_uniqueness_keeps_stable_422_and_409_codes(client):
+    session = client.app.dependency_overrides[get_session]()
+    policy_body = _policy_request().model_dump(mode="json")
+    first = client.post("/api/control/policies", json=policy_body)
+    assert first.status_code == 201
+    duplicate = client.post("/api/control/policies", json=policy_body)
+    assert (duplicate.status_code, duplicate.json()["code"]) == (422, "control_validation_failed")
+    _artifact(session)
+    request = _propose_request(first.json()["id"]).model_dump(mode="json")
+    assert client.post("/api/control/commands", json=request).status_code == 201
+    request["parameters"] = {"amount": 21}
+    conflict = client.post("/api/control/commands", json=request)
+    assert (conflict.status_code, conflict.json()["code"]) == (409, "control_idempotency_conflict")

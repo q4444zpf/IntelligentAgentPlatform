@@ -1,4 +1,5 @@
 import json
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -7,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.audit.models import AuditEvent
 from app.control.models import ControlCommand, ControlCommandApproval, ControlExecutionAttempt, ControlFeedbackRecord, ControlPolicy
+from app.control.errors import ControlExecutorUnavailable
 from app.control.schemas import ControlFeedbackRequest
 from app.control.service import ControlService
 
@@ -123,6 +125,56 @@ def test_completion_audit_failure_leaves_reconcilable_pending_attempt(session, m
     assert executor.calls[0][2] == executor.calls[1][2]
 
 
+@pytest.mark.parametrize("kind,expected_status", [("execute", "awaiting_feedback"), ("rollback", "rolled_back")])
+def test_timeout_reconciliation_audits_unknown_and_completed_once(session, kind, expected_status):
+    class TimeoutOnceExecutor(FakeExecutor):
+        def __init__(self):
+            super().__init__()
+            self.seen = set()
+
+        def _call(self, operation, command, external_key):
+            self.calls.append((operation, command.id, external_key))
+            if (operation, external_key) not in self.seen:
+                self.seen.add((operation, external_key))
+                raise TimeoutError("response lost")
+            return self.result
+
+        def execute(self, command, external_key):
+            return self._call("execute", command, external_key)
+
+        def rollback(self, command, _plan, external_key):
+            return self._call("rollback", command, external_key)
+
+    executor = TimeoutOnceExecutor()
+    service = ControlService(session, executors={"reservoir": executor})
+    admin = _context("admin", roles=("project_admin",))
+    _artifact(session)
+    policy = service.create_policy(admin, _policy_request())
+    command = service.propose(_context(), _propose_request(policy.id))
+    service.decide(command.id, _context("reviewer", roles=("project_admin",)), "approve")
+    if kind == "rollback":
+        service.executors["reservoir"] = FakeExecutor({"outcome": "failed"})
+        assert service.execute(command.id, admin, "setup-execute").status == "failed"
+        service.executors["reservoir"] = executor
+    operation = service.execute if kind == "execute" else service.rollback
+    with pytest.raises(ControlExecutorUnavailable):
+        operation(command.id, admin, "request-1")
+    session.close()
+    with Session(session.bind) as recovered:
+        service = ControlService(recovered, executors={"reservoir": executor})
+        operation = service.execute if kind == "execute" else service.rollback
+        assert operation(command.id, admin, "request-1").status == expected_status
+        assert operation(command.id, admin, "request-1").status == expected_status
+        events = recovered.scalars(select(AuditEvent).where(
+            AuditEvent.resource_id == command.id,
+            AuditEvent.action.in_([f"control_command.{kind}_unknown", f"control_command.{kind}_completed"]),
+        )).all()
+        assert sorted(event.action for event in events) == [f"control_command.{kind}_completed", f"control_command.{kind}_unknown"]
+        assert len({event.idempotency_key for event in events}) == 2
+    assert len(executor.calls) == 2
+    assert executor.calls[0][2] == executor.calls[1][2]
+
+
 def test_expiry_and_execution_start_audit_failures_leave_domain_state_unchanged(session, monkeypatch):
     executor = FakeExecutor()
     now = datetime.now(timezone.utc)
@@ -167,13 +219,15 @@ def test_policy_snapshot_migration_backfills_existing_commands():
         sa.Column("command_type", sa.String), sa.Column("parameter_schema", sa.JSON),
         sa.Column("max_command_lifetime_seconds", sa.Integer), sa.Column("approval_mode", sa.String),
         sa.Column("deviation_thresholds", sa.JSON), sa.Column("enabled", sa.Boolean))
-    commands = sa.Table("control_commands", metadata, sa.Column("id", sa.String, primary_key=True), sa.Column("policy_id", sa.String))
+    commands = sa.Table("control_commands", metadata, sa.Column("id", sa.String, primary_key=True), sa.Column("policy_id", sa.String), sa.Column("policy_digest", sa.String))
     with engine.begin() as connection:
         metadata.create_all(connection)
         connection.execute(policies.insert().values(id="policy", asset_type="gate", command_type="set",
             parameter_schema={"type": "object"}, max_command_lifetime_seconds=60,
             approval_mode="dual", deviation_thresholds={"opening": 2}, enabled=True))
-        connection.execute(commands.insert().values(id="command", policy_id="policy"))
+        original_snapshot = {"asset_type": "gate", "command_type": "set", "parameter_schema": {"type": "object"}, "max_command_lifetime_seconds": 60, "approval_mode": "dual", "deviation_thresholds": {"opening": 2}, "enabled": True}
+        original_digest = hashlib.sha256(json.dumps(original_snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+        connection.execute(commands.insert().values(id="command", policy_id="policy", policy_digest=original_digest))
         path = Path(__file__).resolve().parents[2] / "alembic" / "versions" / "20261002_32_control_policy_snapshot.py"
         spec = importlib.util.spec_from_file_location("control_policy_snapshot_migration", path)
         migration = importlib.util.module_from_spec(spec)
@@ -181,6 +235,8 @@ def test_policy_snapshot_migration_backfills_existing_commands():
         with Operations.context(MigrationContext.configure(connection)):
             migration.upgrade()
         assert connection.scalar(sa.text("SELECT revision FROM control_policies WHERE id = 'policy'")) == 1
-        snapshot = connection.scalar(sa.text("SELECT policy_snapshot FROM control_commands WHERE id = 'command'"))
-        assert json.loads(snapshot) == {"asset_type": "gate", "command_type": "set", "parameter_schema": {"type": "object"}, "max_command_lifetime_seconds": 60, "approval_mode": "dual", "deviation_thresholds": {"opening": 2}, "enabled": True}
+        row = connection.execute(sa.text("SELECT policy_snapshot, policy_digest FROM control_commands WHERE id = 'command'")).one()
+        snapshot = json.loads(row.policy_snapshot)
+        assert snapshot["enabled"] is True
+        assert hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest() == row.policy_digest
     engine.dispose()

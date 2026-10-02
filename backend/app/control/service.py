@@ -47,6 +47,13 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
 
 
+def _is_domain_unique_violation(error: IntegrityError, constraint: str, columns: tuple[str, ...]) -> bool:
+    diagnostic = getattr(error.orig, "diag", None)
+    if getattr(diagnostic, "constraint_name", None) == constraint:
+        return True
+    return str(error.orig).casefold() == f"unique constraint failed: {', '.join(columns)}"
+
+
 def _aware(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ControlValidationError("datetime must include timezone information")
@@ -141,6 +148,11 @@ class ControlService:
             self.session.commit()
         except IntegrityError as error:
             self.session.rollback()
+            if not _is_domain_unique_violation(error, "uq_control_policy_pair", (
+                "control_policies.unit_id", "control_policies.project_id",
+                "control_policies.asset_type", "control_policies.command_type",
+            )):
+                raise
             raise ControlValidationError("policy already exists") from error
         self.session.refresh(policy)
         return ControlPolicyInfo.model_validate(policy)
@@ -237,6 +249,10 @@ class ControlService:
             self.session.commit()
         except IntegrityError as error:
             self.session.rollback()
+            if not _is_domain_unique_violation(error, "uq_control_command_idempotency", (
+                "control_commands.unit_id", "control_commands.project_id", "control_commands.idempotency_key",
+            )):
+                raise
             existing = self.session.scalar(select(ControlCommand).where(ControlCommand.unit_id == context.unit_id, ControlCommand.project_id == context.project_id, ControlCommand.idempotency_key == request.idempotency_key))
             if existing is not None:
                 if existing.parameter_digest != parameter_digest or existing.policy_id != policy.id:
@@ -456,7 +472,8 @@ class ControlService:
                 result = None
         self._complete_attempt(command_id, attempt_id, result)
         completed_action = f"control_command.{kind}_completed" if result is not None and result.outcome != "unknown" else f"control_command.{kind}_unknown"
-        self._audit(context, completed_action, "control_command", command_id, f"{kind}:{attempt_id}:completed",
+        transition = "completed" if result is not None and result.outcome != "unknown" else "unknown"
+        self._audit(context, completed_action, "control_command", command_id, f"{kind}:{attempt_id}:{transition}",
                     status="succeeded" if result is not None and result.outcome == "succeeded" else "failed")
         self.session.commit()
         if transport_error is not None:
