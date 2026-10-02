@@ -11,6 +11,23 @@ describe('permission store auth context', () => {
     setActivePinia(createPinia());
   });
 
+  it('keeps each control capability independent', () => {
+    const store = usePermissionStore();
+    const base: AuthContext = {
+      user: { id: 'operator', display_name: '操作员' }, unit_id: 'unit-1', current_project_id: 'project-1',
+      current_project: { id: 'project-1', name: '项目' }, projects: [{ id: 'project-1', name: '项目' }],
+      auth_method: 'oidc', authorization_version: 1, roles: ['operator'], menus: [], csrf_token: 'csrf',
+      session: { idle_expires_at: '2026-09-15T10:00:00Z', absolute_expires_at: '2026-09-15T18:00:00Z' },
+      permissions: [{ code: 'control.feedback', target: 'current_project' }],
+    };
+    store.applyAuthContext(base);
+    expect(store.hasPermission('control:feedback')).toBe(true);
+    expect(store.hasPermission('control:approve')).toBe(false);
+    expect(store.hasPermission('control:execute')).toBe(false);
+    expect(store.hasPermission('control:propose')).toBe(false);
+    expect(store.hasPermission('control:manage')).toBe(false);
+  });
+
   it('maps backend session capabilities to current route permissions', () => {
     const store = usePermissionStore();
     const context: AuthContext = {

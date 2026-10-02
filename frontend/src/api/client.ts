@@ -18,7 +18,7 @@ let csrfToken = '';
 export function setCsrfToken(token: string) { csrfToken = token; }
 
 export class ApiError extends Error {
-  constructor(message: string, public readonly status: number) {
+  constructor(message: string, public readonly status: number, public readonly code?: string, public readonly details?: unknown) {
     super(message);
     this.name = 'ApiError';
   }
@@ -52,13 +52,15 @@ export async function request<T>(path: string, init: RequestInit = {}, timeoutMs
       credentials: init.credentials ?? 'include',
     });
     if (!response.ok) {
-      const payload = await response.json().catch(() => ({}));
-      const detail = payload.detail || `请求失败（HTTP ${response.status}）`;
+      const payload: unknown = await response.json().catch(() => ({}));
+      const body = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
+      const detail = typeof body.message === 'string' ? body.message
+        : typeof body.detail === 'string' ? body.detail : `请求失败（HTTP ${response.status}）`;
       if (response.status === 401 && !path.startsWith('/auth/')) {
         csrfToken = '';
         window.dispatchEvent(new CustomEvent('iap:session-invalid', { detail }));
       }
-      throw new ApiError(detail, response.status);
+      throw new ApiError(detail, response.status, typeof body.code === 'string' ? body.code : undefined, body.details);
     }
     return (await response.json()) as T;
   } catch (error) {
