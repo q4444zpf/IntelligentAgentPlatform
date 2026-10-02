@@ -189,6 +189,10 @@ python -m alembic -c backend/alembic.ini heads
 
 完整真实 Team 控制 E2E 还需要专用、支持工具调用的 OpenAI 兼容模型服务与 S3 兼容对象存储；生产代码没有本地确定性模型或文件存储实现。仅物理执行器端点可使用 `httpx.MockTransport`。缺少这些基础设施时，不能以伪造运行图、仿真摘要或 Artifact 替代真实链路来声称发布通过。
 
+真实测试 `tests/e2e/test_published_team_run.py::test_team_simulation_dual_approval_execute_feedback_deviation_and_rollback` 读取 `TEST_MODEL_PROVIDER_STATE_JSON`（ProviderStore 导出的配置，仅在进程内传递）、`TEST_OBJECT_STORAGE_ENDPOINT`、`TEST_OBJECT_STORAGE_ACCESS_KEY` 和 `TEST_OBJECT_STORAGE_SECRET_KEY`。测试将提供方配置放在隔离的内存 SQLite 中，启动真实本地 HTTP runner gateway，创建随机 S3 桶，并在 `finally` 清理成果、桶、HTTP 服务和数据库。只有显式缺少这些测试变量才跳过；生产发布验收必须设置变量并得到 PASS。凭据不能写进仓库配置、命令日志或报告。
+
+Team 模型调用只允许运行时规范的成果文件工具与状态待办工具，网关逐项验证内置工具参数 schema 并使用可信描述；业务工具仍受已发布成员快照约束。Team 模型不会声明默认嵌套 `task`、Shell `execute` 或 `delete` 工具，避免绕过 Team 调度和成果权限。API 与 runner 应使用相同的 Deep Agents 依赖版本，以保持运行时工具 schema 一致。
+
 控制 API 在此版本前尚未公开发布，因此 `team_version` 改为 `team_version_id` 不构成公开兼容性破坏。普通 Artifact 契约与已有 Team API 保持兼容，控制仿真额外要求运行时可信证明。
 
 - `GET /api/audit/events`

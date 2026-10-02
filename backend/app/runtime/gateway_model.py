@@ -13,6 +13,7 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import ConfigDict, Field, PrivateAttr
 
 from .runner_gateway_schemas import ModelInvocationResponse
+from .local_tools import TEAM_DISALLOWED_LOCAL_TOOLS
 
 _SAFE_MESSAGES = {
     "model_request_failed": "模型调用失败",
@@ -166,6 +167,9 @@ class GatewayChatModel(BaseChatModel):
         del stop, run_manager
         sequence = self._budget.reserve_invocation()
         tools = [_normalize_tool(tool) for tool in kwargs.get("tools", [])]
+        if self.member_agent_id is not None:
+            # Team scheduling owns delegation; ArtifactBackend does not expose a shell.
+            tools = [tool for tool in tools if tool["tool_id"] not in TEAM_DISALLOWED_LOCAL_TOOLS]
         request = {
             "messages": [_normalize_message(message) for message in messages],
             "tools": tools,

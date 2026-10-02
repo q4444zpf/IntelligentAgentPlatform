@@ -67,6 +67,7 @@ from .execution_snapshot import (
     verify_snapshot_digest,
 )
 from .model_gateway import ModelGateway, ModelRuntimeError, ModelSelection
+from .local_tools import team_local_tool_definitions
 from .run_tokens import RunTokenClaims
 from .script_lifecycle import finish_running_script_invocations, finish_script_invocation
 from .runner_gateway_auth import RunnerGatewayError
@@ -721,6 +722,12 @@ class RunnerGatewayService:
             )
             requested_tools = []
             for requested in request.tools:
+                local_tool = team_local_tool_definitions().get(requested.tool_id)
+                if local_tool is not None:
+                    if requested.input_schema != local_tool.input_schema:
+                        raise RunnerGatewayError(403, "model_not_authorized", "运行时工具定义不匹配")
+                    requested_tools.append(local_tool)
+                    continue
                 captured = captured_tools.get(requested.tool_id)
                 if requested.tool_id not in allowed_tool_ids or captured is None:
                     raise RunnerGatewayError(

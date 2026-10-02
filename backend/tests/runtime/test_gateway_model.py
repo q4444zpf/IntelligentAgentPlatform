@@ -126,8 +126,9 @@ def build_model_client(
     audit_recorder_dependency=AuditRecorder,
     *,
     raise_server_exceptions=True,
+    snapshot=None,
 ):
-    snapshot = build_snapshot()
+    snapshot = snapshot or build_snapshot()
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -489,6 +490,58 @@ def test_gateway_chat_model_normalizes_tool_calls():
     assert "model" not in request
     assert "member_agent_id" not in request
     assert idempotency_key == "model-0"
+
+
+def test_team_model_omits_unplanned_nested_agents_shell_and_delete_tools():
+    transport = FakeModelTransport(response={"content": "done"})
+    model = GatewayChatModel(transport, member_agent_id="simulator")
+    model.bind_tools([
+        {"tool_id": name, "description": name, "input_schema": {"type": "object"}}
+        for name in ("write_file", "task", "execute", "delete", "water.query")
+    ]).invoke([HumanMessage(content="simulate")])
+    assert [item["tool_id"] for item in transport.requests[0][0]["tools"]] == ["write_file", "water.query"]
+
+
+@pytest.mark.parametrize("alteration", [None, "schema", "unpublished", "task", "execute", "delete"])
+def test_team_gateway_accepts_only_canonical_artifact_tools(alteration):
+    import hashlib
+    from deepagents.middleware.filesystem import FilesystemMiddleware
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+    from app.runtime.execution_snapshot import PublishedTeamSnapshot, SnapshotTeamMember
+
+    snapshot = build_snapshot()
+    member = SnapshotTeamMember(agent_id="simulator", role="member", responsibility="simulate",
+        agent=snapshot.payload.actor.model_copy(update={"id": "simulator"}), model=snapshot.payload.model)
+    actor = PublishedTeamSnapshot(id="team", version_id="version", version=1, definition_digest="d" * 64,
+        supervisor=member.model_copy(update={"agent_id": "supervisor", "role": "supervisor"}), members=(member,),
+        max_steps=2, max_parallel_members=1, timeout_seconds=300, failure_strategy="fail_fast",
+        name="Team", description="", runtime_form="common", language="zh-CN", system_prompt="", context_prompt="", approval_policy="never")
+    payload = snapshot.payload.model_copy(update={"schema_version": "5", "actor": actor, "created_at": datetime.now(UTC)})
+    snapshot = snapshot.model_copy(update={"payload": payload, "digest": hashlib.sha256(canonical_snapshot_bytes(payload)).hexdigest()})
+    write_tool = next(tool for tool in FilesystemMiddleware().tools if tool.name == "write_file")
+    canonical = convert_to_openai_tool(write_tool)["function"]
+    declaration = {"tool_id": "write_file", "description": "untrusted description", "input_schema": canonical["parameters"]}
+    if alteration == "schema":
+        declaration["input_schema"] = {"type": "object", "properties": {"shell": {"type": "string"}}}
+    elif alteration is not None:
+        declaration["tool_id"] = "unpublished.command" if alteration == "unpublished" else alteration
+    gateway = FakeModelGateway()
+    client, session = build_model_client(gateway, snapshot=snapshot)
+    try:
+        response = client.post("/internal/runner/runs/run-1/model-invocations", headers=headers(), json={
+            "provider_id": "approved-provider", "model": "approved-model", "member_agent_id": "simulator",
+            "messages": [{"role": "user", "content": "simulate"}], "tools": [declaration], "invocation_sequence": 0,
+        })
+        assert response.status_code == (200 if alteration is None else 403)
+        if alteration is None:
+            assert gateway.tools[0][0].input_schema == canonical["parameters"]
+            assert gateway.tools[0][0].description == canonical["description"]
+        else:
+            assert response.json()["code"] == "model_not_authorized"
+            assert gateway.selections == []
+    finally:
+        client.close()
+        session.close()
 
 
 def test_gateway_chat_model_supports_langchain_bind_tools():
