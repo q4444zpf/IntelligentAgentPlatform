@@ -75,7 +75,7 @@ async function loadPolicies() { policiesLoading.value = true; policyError.value 
 async function openDetail(command: ControlCommandListItem) { detailOpen.value = true; detailLoading.value = true; detailError.value = ''; detail.value = null; try { detail.value = await controlApi.getCommand(command.id); } catch (cause) { detailError.value = safeError(cause); } finally { detailLoading.value = false; } }
 async function runDecision(command: ControlCommandListItem, kind: 'approve' | 'reject') { if (!canApprove.value || busyId.value) return; busyId.value = command.id; error.value = ''; try { if (kind === 'approve') await controlApi.approve(command.id); else await controlApi.reject(command.id); await loadCommands(); } catch (cause) { error.value = safeError(cause); } finally { busyId.value = ''; } }
 function requestConfirmation(command: ControlCommandListItem, kind: ControlActionKind) { if (!canExecute.value || busyId.value) return; confirmTarget.value = command; confirmKind.value = kind; }
-function terminalControlConflict(cause: unknown) { return cause instanceof ApiError && cause.status === 409 && ['control_idempotency_conflict', 'control_invalid_state'].includes(cause.code || ''); }
+function terminalIdempotencyConflict(cause: unknown) { return cause instanceof ApiError && cause.status === 409 && cause.code === 'control_idempotency_conflict'; }
 async function confirmAction() {
   const command = confirmTarget.value; const kind = confirmKind.value;
   if (!command || !canExecute.value || busyId.value) return;
@@ -86,7 +86,7 @@ async function confirmAction() {
     controlActionKeys.clear(command.id, kind);
     await loadCommands();
   } catch (cause) {
-    if (terminalControlConflict(cause)) controlActionKeys.clear(command.id, kind);
+    if (terminalIdempotencyConflict(cause)) controlActionKeys.clear(command.id, kind);
     error.value = safeError(cause);
   } finally { busyId.value = ''; }
 }
@@ -96,21 +96,21 @@ async function submitProposal(value: ControlProposalDraft) {
   if (!canPropose.value || proposalSaving.value) return;
   const material = { policy_id: value.policy_id, target: value.target, parameters: value.parameters, simulation_artifact_id: value.simulation_artifact_id, valid_from: value.valid_from, valid_until: value.valid_until, rollback_plan: value.rollback_plan, expected_state: value.expected_state, run_id: value.run_id, team_version_id: value.team_version_id };
   const scope = permission.authContext
-    ? `${permission.authContext.unit_id}:${permission.authContext.current_project_id}:${permission.authContext.user.id}`
-    : `demo:${permission.userName}`;
-  const signature = JSON.stringify({ scope, material }, (_key, item: unknown) =>
+    ? JSON.stringify([permission.authContext.unit_id, permission.authContext.current_project_id, permission.authContext.user.id])
+    : JSON.stringify(['demo', permission.userName]);
+  const signature = JSON.stringify(material, (_key, item: unknown) =>
     item && typeof item === 'object' && !Array.isArray(item)
       ? Object.fromEntries(Object.entries(item).sort(([left], [right]) => left.localeCompare(right)))
       : item);
-  const key = controlProposalKeys.keyFor(signature);
+  const key = controlProposalKeys.keyFor(scope, signature);
   proposalSaving.value = true; proposalError.value = '';
   try {
     await controlApi.propose({ ...material, idempotency_key: key });
-    controlProposalKeys.clear(signature);
+    controlProposalKeys.clear(scope, signature);
     proposalOpen.value = false;
     await loadCommands();
   } catch (cause) {
-    if (terminalControlConflict(cause)) controlProposalKeys.clear(signature);
+    if (terminalIdempotencyConflict(cause)) controlProposalKeys.clear(scope, signature);
     proposalError.value = safeError(cause);
   } finally { proposalSaving.value = false; }
 }

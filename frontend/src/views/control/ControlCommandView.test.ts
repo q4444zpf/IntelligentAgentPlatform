@@ -6,6 +6,7 @@ import Antd from 'ant-design-vue';
 import ControlCommandView from './ControlCommandView.vue';
 import ControlCommandProposalModal from './components/ControlCommandProposalModal.vue';
 import { controlApi, type ControlCommandDetail, type ControlCommandListItem, type ControlProposal } from '@/api/control';
+import type { AuthContext } from '@/api/auth';
 import { usePermissionStore } from '@/stores/permission';
 import { ApiError } from '@/api/client';
 
@@ -31,12 +32,22 @@ const detail: ControlCommandDetail = {
   simulation_attestation: { digest: 'attested-digest' }, rollback_provenance: { source: 'approved-plan' },
 };
 
-function mountView(permissions: string[] = ['control:view']) {
+function mountView(permissions: string[] = ['control:view'], authContext: AuthContext | null = null) {
   const pinia = createPinia();
   const wrapper = mount(ControlCommandView, { attachTo: document.body, global: { plugins: [pinia, Antd] } });
   const store = usePermissionStore(pinia);
   store.permissions = permissions;
+  store.authContext = authContext;
   return wrapper;
+}
+
+function authContext(userId: string, projectId: string): AuthContext {
+  return {
+    user: { id: userId, display_name: userId }, unit_id: 'unit-1', current_project_id: projectId,
+    current_project: { id: projectId, name: projectId }, projects: [{ id: projectId, name: projectId }],
+    auth_method: 'dev_test', authorization_version: 1, roles: [], permissions: [], menus: [], csrf_token: 'test-token',
+    session: { idle_expires_at: '2099-01-01T00:00:00Z', absolute_expires_at: '2099-01-02T00:00:00Z' },
+  };
 }
 
 describe('ControlCommandView', () => {
@@ -142,7 +153,7 @@ describe('ControlCommandView', () => {
       .mockRejectedValueOnce(new ApiError('offline', 0))
       .mockRejectedValueOnce(new ApiError('unavailable', 503))
       .mockRejectedValueOnce(new ApiError('in progress', 409, 'control_execution_in_progress'))
-      .mockRejectedValueOnce(new ApiError('terminal conflict', 409, 'control_invalid_state'))
+      .mockRejectedValueOnce(new ApiError('terminal conflict', 409, 'control_idempotency_conflict'))
       .mockResolvedValueOnce(command)
       .mockResolvedValueOnce(command);
     const wrapper = mountView(['control:view', 'control:execute']); await flushPromises();
@@ -154,6 +165,28 @@ describe('ControlCommandView', () => {
     expect(new Set(keys.slice(0, 6)).size).toBe(1);
     expect(keys[6]).not.toBe(keys[5]);
     expect(keys[7]).not.toBe(keys[6]);
+    wrapper.unmount();
+  });
+
+  it.each([
+    ['execute', 'approved', '执行命令', '确认执行命令'],
+    ['rollback', 'deviation', '回滚命令', '确认物理回滚命令'],
+  ] as const)('reuses %s identity after timeout and control_invalid_state', async (kind, status, actionLabel, confirmLabel) => {
+    vi.mocked(controlApi.listCommands).mockResolvedValue([{ ...command, id: `invalid-state-${kind}`, status }]);
+    const operation = vi.mocked(controlApi[kind]);
+    operation.mockRejectedValueOnce(new ApiError('timeout', 408))
+      .mockRejectedValueOnce(new ApiError('uncertain state', 409, 'control_invalid_state'))
+      .mockResolvedValueOnce(command)
+      .mockResolvedValueOnce(command);
+    const wrapper = mountView(['control:view', 'control:execute']); await flushPromises();
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await wrapper.find(`[aria-label="${actionLabel}"]`).trigger('click'); await flushPromises();
+      (document.body.querySelector(`[aria-label="${confirmLabel}"]`) as HTMLButtonElement).click(); await flushPromises();
+    }
+    const keys = operation.mock.calls.map(([, key]) => key);
+    expect(keys[1]).toBe(keys[0]);
+    expect(keys[2]).toBe(keys[0]);
+    expect(keys[3]).not.toBe(keys[2]);
     wrapper.unmount();
   });
 
@@ -231,6 +264,26 @@ describe('ControlCommandView', () => {
     const keys = vi.mocked(controlApi.propose).mock.calls.map(([body]) => body.idempotency_key);
     expect(keys[0]).toBe(keys[1]);
     second.unmount();
+  });
+
+  it.each([
+    ['project', authContext('operator-scope', 'project-a'), authContext('operator-scope', 'project-b')],
+    ['user', authContext('operator-a', 'project-scope'), authContext('operator-b', 'project-scope')],
+  ])('keeps unresolved proposal identity after switching %s scope and remounting', async (_kind, firstScope, secondScope) => {
+    const draft: ControlProposal = {
+      policy_id: 'policy-1', target: { id: 'gate-scope' }, parameters: { opening: 27 },
+      simulation_artifact_id: 'simulation-scope', valid_from: '2026-09-15T12:00:00Z', valid_until: '2026-09-15T12:10:00Z',
+      rollback_plan: {}, expected_state: null, idempotency_key: 'ignored-modal-key',
+    };
+    vi.mocked(controlApi.propose).mockRejectedValue(new ApiError('offline', 0));
+    for (const scope of [firstScope, secondScope, firstScope]) {
+      const wrapper = mountView(['control:view', 'control:propose'], scope); await flushPromises();
+      wrapper.findComponent(ControlCommandProposalModal).vm.$emit('submit', draft); await flushPromises();
+      wrapper.unmount();
+    }
+    const keys = vi.mocked(controlApi.propose).mock.calls.map(([body]) => body.idempotency_key);
+    expect(keys[1]).not.toBe(keys[0]);
+    expect(keys[2]).toBe(keys[0]);
   });
 
   it('renders stable safe error messages and preserves current list data on action failure', async () => {
