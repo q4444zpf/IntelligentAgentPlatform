@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
@@ -140,6 +141,7 @@ class ControlService:
     def create_policy(self, context: RequestContext, request: ControlPolicyCreateRequest) -> ControlPolicyInfo:
         self._require(context, "manage")
         self._check_policy_schema(request.parameter_schema)
+        self._check_thresholds(request.deviation_thresholds)
         policy = ControlPolicy(unit_id=context.unit_id, project_id=context.project_id, owner_id=context.user_id, **request.model_dump())
         policy.id = new_id()
         self.session.add(policy)
@@ -156,6 +158,15 @@ class ControlService:
             raise ControlValidationError("policy already exists") from error
         self.session.refresh(policy)
         return ControlPolicyInfo.model_validate(policy)
+
+    @staticmethod
+    def _check_thresholds(thresholds: Any) -> None:
+        if not isinstance(thresholds, dict) or any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            or value < 0 or (isinstance(value, float) and not math.isfinite(value))
+            for value in thresholds.values()
+        ):
+            raise ControlValidationError("deviation thresholds must be finite nonnegative numbers")
 
     @staticmethod
     def _check_policy_schema(schema: dict[str, Any]) -> None:
@@ -195,6 +206,7 @@ class ControlService:
             raise ControlValidationError("policy fields cannot be null")
         if "parameter_schema" in changes:
             self._check_policy_schema(changes["parameter_schema"])
+        self._check_thresholds(changes.get("deviation_thresholds", policy.deviation_thresholds))
         if changes and any(getattr(policy, key) != value for key, value in changes.items()):
             for key, value in changes.items():
                 setattr(policy, key, value)
@@ -214,6 +226,7 @@ class ControlService:
             if existing.parameter_digest != parameter_digest or existing.policy_id != policy.id:
                 raise ControlIdempotencyConflict("idempotency key is already used")
             return ControlCommandInfo.model_validate(existing)
+        self._check_thresholds(policy.deviation_thresholds)
         if Draft202012Validator is not None:
             try:
                 validator = Draft202012Validator(policy.parameter_schema)
@@ -299,6 +312,19 @@ class ControlService:
             ControlCommandApproval.command_id == command_id, ControlCommandApproval.decision == "approve",
         )) or 0
 
+    def _recovery_operation(self, command: ControlCommand) -> dict[str, str] | None:
+        attempts = self.session.scalars(select(ControlExecutionAttempt).where(
+            ControlExecutionAttempt.command_id == command.id,
+        )).all()
+        rollback = next((attempt for attempt in attempts if attempt.kind == "rollback"), None)
+        attempt = rollback or next((attempt for attempt in attempts if attempt.kind == "execute"), None)
+        if attempt is None or attempt.completed_at is not None:
+            return None
+        states = {"rollback_pending", "unknown"} if attempt.kind == "rollback" else {"executing", "unknown"}
+        if command.status not in states:
+            return None
+        return {"kind": attempt.kind, "request_key": attempt.request_key}
+
     def list_commands(self, context: RequestContext, *, status: str | None = None, policy_id: str | None = None,
                       created_after: datetime | None = None, created_before: datetime | None = None) -> list[ControlCommandListItem]:
         self._require(context, "read")
@@ -311,7 +337,7 @@ class ControlService:
             query = query.where(ControlCommand.created_at >= _aware(created_after))
         if created_before is not None:
             query = query.where(ControlCommand.created_at <= _aware(created_before))
-        return [ControlCommandListItem(**ControlCommandInfo.model_validate(row).model_dump(), approval_count=self._approval_count(row.id))
+        return [ControlCommandListItem(**ControlCommandInfo.model_validate(row).model_dump(), approval_count=self._approval_count(row.id), recovery_operation=self._recovery_operation(row))
                 for row in self.session.scalars(query.order_by(ControlCommand.created_at, ControlCommand.id))]
 
     def get_command_detail(self, context: RequestContext, command_id: str) -> ControlCommandDetail:
@@ -326,6 +352,7 @@ class ControlService:
                          for attempt in attempts if attempt.kind == "rollback"), None)
         return ControlCommandDetail(
             **ControlCommandInfo.model_validate(command).model_dump(), approval_count=self._approval_count(command.id),
+            recovery_operation=self._recovery_operation(command),
             approval_decisions=[{"approver_id": row.approver_id, "decision": row.decision, "reason": row.reason, "decided_at": row.decided_at} for row in approvals],
             attempts=[{"id": row.id, "kind": row.kind, "outcome": row.outcome, "external_id": row.external_id, "created_at": row.created_at, "completed_at": row.completed_at} for row in attempts],
             feedback_records=[{"id": row.id, "recorder_id": row.recorder_id, "observed_at": row.observed_at, "actual_state": row.actual_state, "deviation_result": row.deviation_result} for row in feedback],
@@ -437,21 +464,29 @@ class ControlService:
             attempt = self._begin_attempt(command, kind, request_key)
             if attempt.completed_at is not None:
                 return ControlCommandInfo.model_validate(command)
-            if kind == "execute" and not _stored_aware(command.valid_from) <= _stored_aware(self.clock()) < _stored_aware(command.valid_until):
-                raise ControlCommandExpired()
+            if kind == "execute":
+                now = _stored_aware(self.clock())
+                if now < _stored_aware(command.valid_from):
+                    raise ControlExecutionError("command validity window has not started")
+                if now >= _stored_aware(command.valid_until):
+                    raise ControlCommandExpired()
             if kind == "execute" and self.session.scalar(select(ControlExecutionAttempt.id).where(
                 ControlExecutionAttempt.command_id == command.id, ControlExecutionAttempt.kind == "rollback",
             )):
                 raise ControlExecutionError("execute reconciliation is not allowed after rollback started")
         elif kind == "execute":
             now = _stored_aware(self.clock())
-            if now < _stored_aware(command.valid_from) or now >= _stored_aware(command.valid_until):
+            if now < _stored_aware(command.valid_from):
+                raise ControlExecutionError("command validity window has not started")
+            if now >= _stored_aware(command.valid_until):
                 command.status = "expired"
                 self._audit(context, "control_command.expired", "control_command", command.id, "expired")
                 self.session.commit()
                 raise ControlCommandExpired()
         elif command.status not in {"failed", "unknown", "deviation", "rollback_pending"}:
             raise ControlExecutionError("rollback is not allowed for command state")
+        if kind == "execute":
+            self._check_thresholds(command.deviation_thresholds_snapshot)
         executor = self.executors.get(self.session.get(ControlPolicy, command.policy_id).asset_type)
         if executor is None:
             raise ControlExecutorUnavailable()
@@ -502,13 +537,14 @@ class ControlService:
             raise ControlValidationError("feedback observation is stale or in the future")
         if command.feedback_observed_at is not None and observed_at <= _stored_aware(command.feedback_observed_at):
             raise ControlValidationError("feedback observations must increase monotonically")
+        self._check_thresholds(command.deviation_thresholds_snapshot)
         command.actual_state = request.actual_state
         deviations = {}
         for key, threshold in command.deviation_thresholds_snapshot.items():
             expected = (command.expected_state or {}).get(key)
             actual = request.actual_state.get(key)
             numeric = all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in (expected, actual))
-            if not numeric or not abs(actual - expected) <= float(threshold):
+            if not numeric or not abs(actual - expected) <= threshold:
                 deviations[key] = {"expected": expected, "actual": actual, "threshold": threshold}
         command.deviation_result = {"deviations": deviations, "within_threshold": not deviations}
         command.feedback_observed_at = observed_at
@@ -517,7 +553,7 @@ class ControlService:
             actual_state=deepcopy(request.actual_state), deviation_result=deepcopy(command.deviation_result),
         )
         self.session.add(feedback)
-        if command.status == "awaiting_feedback":
+        if command.status in {"awaiting_feedback", "succeeded", "deviation"}:
             command.status = "deviation" if deviations else "succeeded"
         self._audit(context, "control_command.feedback", "control_command", command.id, f"feedback:{feedback.id}")
         self.session.commit()

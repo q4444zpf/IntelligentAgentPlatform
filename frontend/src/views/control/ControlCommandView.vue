@@ -17,8 +17,9 @@
               <a-button v-if="canApprove && command.status === 'pending_approval'" size="small" :disabled="busyId === command.id" aria-label="批准命令" @click="runDecision(command, 'approve')">批准</a-button>
               <a-button v-if="canApprove && command.status === 'pending_approval'" size="small" danger :disabled="busyId === command.id" aria-label="拒绝命令" @click="runDecision(command, 'reject')">拒绝</a-button>
               <a-button v-if="canExecute && command.status === 'approved'" size="small" type="primary" :disabled="busyId === command.id" aria-label="执行命令" @click="requestConfirmation(command, 'execute')">执行</a-button>
+              <a-button v-if="canExecute && command.recovery_operation" size="small" :danger="command.recovery_operation.kind === 'rollback'" :disabled="busyId === command.id" :aria-label="command.recovery_operation.kind === 'execute' ? '核对执行结果' : '核对回滚结果'" @click="requestConfirmation(command, command.recovery_operation.kind)">{{ command.recovery_operation.kind === 'execute' ? '核对执行结果' : '核对回滚结果' }}</a-button>
               <a-button v-if="canFeedback && feedbackStatuses.includes(command.status)" size="small" :disabled="busyId === command.id" aria-label="记录反馈" @click="openFeedback(command)">反馈</a-button>
-              <a-button v-if="canExecute && rollbackStatuses.includes(command.status)" size="small" danger :disabled="busyId === command.id" aria-label="回滚命令" @click="requestConfirmation(command, 'rollback')">回滚</a-button>
+              <a-button v-if="canExecute && rollbackStatuses.includes(command.status) && command.recovery_operation?.kind !== 'rollback'" size="small" danger :disabled="busyId === command.id" aria-label="回滚命令" @click="requestConfirmation(command, 'rollback')">回滚</a-button>
             </div>
           </article>
         </div>
@@ -80,7 +81,9 @@ async function confirmAction() {
   const command = confirmTarget.value; const kind = confirmKind.value;
   if (!command || !canExecute.value || busyId.value) return;
   busyId.value = command.id; error.value = ''; confirmTarget.value = null;
-  const key = controlActionKeys.keyFor(command.id, kind);
+  const key = command.recovery_operation?.kind === kind
+    ? command.recovery_operation.request_key
+    : controlActionKeys.keyFor(command.id, kind);
   try {
     if (kind === 'execute') await controlApi.execute(command.id, key); else await controlApi.rollback(command.id, key);
     controlActionKeys.clear(command.id, kind);

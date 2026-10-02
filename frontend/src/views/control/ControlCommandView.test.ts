@@ -145,6 +145,26 @@ describe('ControlCommandView', () => {
     rollbackView.unmount();
   });
 
+  it.each([
+    ['execute', 'executing', '核对执行结果', '确认执行命令'],
+    ['execute', 'unknown', '核对执行结果', '确认执行命令'],
+    ['rollback', 'rollback_pending', '核对回滚结果', '确认物理回滚命令'],
+    ['rollback', 'unknown', '核对回滚结果', '确认物理回滚命令'],
+  ] as const)('recovers %s in refreshed %s state using the server request key', async (kind, status, label, confirmation) => {
+    vi.mocked(controlApi.listCommands).mockResolvedValue([{ ...command, status, recovery_operation: { kind, request_key: `persisted-${kind}` } }]);
+    const viewer = mountView(['control:view']); await flushPromises();
+    expect(viewer.find(`[aria-label="${label}"]`).exists()).toBe(false);
+    viewer.unmount();
+    for (let revisit = 0; revisit < 2; revisit += 1) {
+      const wrapper = mountView(['control:view', 'control:execute']); await flushPromises();
+      await wrapper.get(`[aria-label="${label}"]`).trigger('click'); await flushPromises();
+      expect(controlApi[kind]).toHaveBeenCalledTimes(revisit);
+      (document.body.querySelector(`[aria-label="${confirmation}"]`) as HTMLButtonElement).click(); await flushPromises();
+      expect(controlApi[kind]).toHaveBeenLastCalledWith('command-1', `persisted-${kind}`);
+      wrapper.unmount();
+    }
+  });
+
   it('retains action identity through auth, network, server and in-progress failures until terminal conflict', async () => {
     vi.mocked(controlApi.listCommands).mockResolvedValue([{ ...command, id: 'identity-sequence', status: 'approved' }]);
     vi.mocked(controlApi.execute)

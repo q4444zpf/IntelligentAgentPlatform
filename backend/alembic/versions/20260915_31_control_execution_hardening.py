@@ -17,9 +17,25 @@ branch_labels = None
 depends_on = None
 
 _OLD_STATUSES = "'pending_approval','approved','rejected','expired','executing','succeeded','failed','unknown','deviation','rollback_pending','rolled_back'"
+_MENU_CATALOGUE = (
+    "(kind = 'group' AND route_key IS NULL AND visibility_target IS NULL "
+    "AND requires_current_project = false) OR "
+    "(kind = 'route' AND route_key IS NOT NULL AND visibility_target IS NOT NULL AND "
+    "((route_key IN ('dashboard','chat','agent-manage','llm','mcp','skill','tools',"
+    "'external-agents','unit-resources','sandbox','policies','credentials','audit','users',"
+    "'unit-projects','roles','integration','settings') AND visibility_target = 'unit' "
+    "AND requires_current_project = (route_key = 'chat')) OR "
+    "(route_key IN ({control_route}'collaboration','workflow','knowledge','prompt','my-agents','my-mcp',"
+    "'my-skills','my-publish','project-resources','hydraulic-topology','public-agents',"
+    "'public-mcp','public-skills','publish-review','runs','async-tasks','artifacts','approvals') "
+    "AND visibility_target = 'current_project' AND requires_current_project = true)))"
+)
 
 
 def upgrade() -> None:
+    with op.batch_alter_table("menus") as batch:
+        batch.drop_constraint("ck_menu_catalogue", type_="check")
+        batch.create_check_constraint("ck_menu_catalogue", _MENU_CATALOGUE.format(control_route="'control',"))
     with op.batch_alter_table("control_policies") as batch:
         batch.add_column(sa.Column("revision", sa.Integer(), nullable=False, server_default="1"))
     with op.batch_alter_table("control_commands") as batch:
@@ -90,6 +106,8 @@ def upgrade() -> None:
 def downgrade() -> None:
     # An older schema cannot faithfully represent new feedback history or scoped keys.
     connection = op.get_bind()
+    if connection.scalar(sa.text("SELECT COUNT(*) FROM menus WHERE route_key = 'control'")):
+        raise RuntimeError("cannot downgrade while the control menu exists; remove its catalogue bindings first")
     if connection.scalar(sa.text("SELECT COUNT(*) FROM control_feedback_records")):
         raise RuntimeError("cannot downgrade while control feedback records exist")
     if connection.scalar(sa.text("SELECT COUNT(*) FROM control_commands WHERE status = 'awaiting_feedback'")):
@@ -99,6 +117,9 @@ def downgrade() -> None:
     )).first():
         raise RuntimeError("cannot downgrade kind-scoped execution request keys")
     op.drop_index("ix_control_feedback_records_command_id", table_name="control_feedback_records")
+    with op.batch_alter_table("menus") as batch:
+        batch.drop_constraint("ck_menu_catalogue", type_="check")
+        batch.create_check_constraint("ck_menu_catalogue", _MENU_CATALOGUE.format(control_route=""))
     op.drop_table("control_feedback_records")
     with op.batch_alter_table("control_execution_attempts") as batch:
         batch.drop_constraint("uq_control_execution_request", type_="unique")

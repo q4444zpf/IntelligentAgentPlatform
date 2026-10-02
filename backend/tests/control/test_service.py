@@ -259,10 +259,10 @@ def test_execute_rejects_before_valid_from_and_target_asset_mismatch(session):
     policy = service.create_policy(admin, _policy_request())
     command = service.propose(_context(), _propose_request(policy.id, valid_from=now + timedelta(minutes=1), valid_until=now + timedelta(minutes=11)))
     service.decide(command.id, _context("reviewer", roles=("project_admin",)), "approve", "ok")
-    with pytest.raises(ControlValidationError) as expired:
+    with pytest.raises(ControlExecutionError) as early:
         service.execute(command.id, admin, "before-window")
-    assert expired.value.status_code == 410
-    assert session.get(ControlCommand, command.id).status == "expired"
+    assert (early.value.status_code, early.value.code) == (409, "control_invalid_state")
+    assert session.get(ControlCommand, command.id).status == "approved"
     with pytest.raises(ControlValidationError):
         service.propose(_context(), _propose_request(policy.id, idempotency_key="bad-target", target={"asset_type": "gate"}))
 

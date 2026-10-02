@@ -164,7 +164,13 @@ Team 负责提供 Supervisor 与已发布成员的拓扑和运行快照；控制
 
 执行器返回成功只表示命令已执行，平台进入 `awaiting_feedback`。只有采集真实设备状态并按命令创建时冻结的策略阈值评估后才进入 `succeeded` 或 `deviation`。反馈 `observed_at` 必须不早于本次执行完成（尚未完成时为尝试创建）时间，晚于上一条反馈，且不超过服务器当前时间 5 分钟；未提供时采用服务器时间。偏差需要人工核查并按已保存方案回滚。
 
+后续新反馈会重新计算 `succeeded` / `deviation`：成功后的新偏差允许物理回滚，偏差后的阈值内反馈恢复观测成功，所有历史反馈仍追加保留且时间严格递增。`unknown` 和 `rollback_pending` 不会仅因观测值正常而变成执行成功。策略创建、更新和命令准入要求每个偏差阈值都是有限、非负的 JSON 数字，不接受布尔、字符串、NaN 或无穷大。执行和反馈还会校验冻结快照；旧数据含无效阈值时返回 422 `control_validation_failed`，不创建设备执行尝试、不调用执行器、不写反馈。旧快照不会自动修正；修正策略后重新申请并审批命令。已有异常操作的回滚不依赖这些阈值，仍可按保存方案恢复设备。
+
+命令生效前执行返回 409 `control_invalid_state`，保留 `approved` 状态与审批记录，不写过期审计；生效后可用原请求键重试。未发起执行的命令到达 `valid_until` 后，才原子写入 `expired` 和过期审计并返回 410。已有未完成物理尝试超过有效期时仍返回 410，但保留其不确定状态和恢复证据供人工核实。
+
 超时或网络中断后，先读取命令详情和执行尝试，保留原请求键。对尚未完成且仍可执行的尝试，用同一个键重试原操作；平台复用已持久化的外部键，执行器必须对该键提供物理幂等与结果查询语义。已完成尝试的同键重放直接返回持久化结果。执行和回滚分别计数，即使客户端使用相同请求键也不会互相覆盖。禁止为绕过不确定结果生成新键；有效期结束或状态不允许重试时必须人工核实设备状态。
+
+命令列表与详情的 `recovery_operation` 为 `null` 或 `{"kind":"execute","request_key":"原请求键"}`（回滚为 `kind:"rollback"`）。它只标识尚未完成的执行或回滚尝试；已开始回滚时不再提供执行恢复操作。该键不是授权凭据，读接口仍限定项目，重试端点仍要求 `control.execute` 权限和相同操作键。浏览器刷新或重新进入页面后使用该字段核对结果，保留执行/物理回滚确认。
 
 ### 控制迁移与发布门禁
 
@@ -180,7 +186,9 @@ SELECT id, failure_strategy FROM collaboration_team_versions WHERE failure_strat
 
 revision 31 对旧命令冻结迁移时可见的策略（历史策略无法恢复）；未收到反馈的旧 `succeeded` 改为 `awaiting_feedback`，已有实际状态的成功命令保留状态；缺少执行尝试的旧 `executing` 改为 `unknown`。降级会拒绝存在反馈历史、待反馈命令或跨操作重复请求键的数据，避免悄悄丢失新语义。应先由运维处理这些状态再降级。
 
-PostgreSQL 迁移测试只接受显式 `TEST_DATABASE_URL`，数据库名必须含 `test`，且不得指向服务或开发数据库。测试在随机专用 schema 内运行 Alembic 子进程，在 `finally` 删除该 schema，使数据库恢复原有状态；账号需要建删 schema 权限。缺少变量时 14 个 PostgreSQL 集成测试明确跳过，不能据此宣称 PostgreSQL 发布门禁已通过。以下命令可在仓库根目录运行：
+revision 31 同时替换历史 `ck_menu_catalogue`，允许项目范围的 `control` 菜单，保持原目录的空值、范围和项目要求校验。已播种控制菜单时降级会拒绝执行，需先按维护方案移除该菜单及绑定，避免删除授权数据。阈值迁移保留旧值，由执行前校验拒绝不可用快照；不可通过迁移静默改变已批准命令。
+
+PostgreSQL 迁移测试只接受显式 `TEST_DATABASE_URL`，数据库名必须含 `test`，且不得指向服务或开发数据库。测试在随机专用 schema 内运行 Alembic 子进程，在 `finally` 删除该 schema，使数据库恢复原有状态；账号需要建删 schema 权限。缺少变量时 PostgreSQL 集成测试明确跳过，不能据此宣称 PostgreSQL 发布门禁已通过。以下命令可在仓库根目录运行：
 
 ```powershell
 python -m pytest backend/tests/integration/test_control_migrations_postgres.py backend/tests/integration/test_postgres_migrations.py -q -p no:cacheprovider

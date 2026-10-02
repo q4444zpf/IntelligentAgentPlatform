@@ -32,7 +32,10 @@ export interface ControlCommand {
   actual_state: JsonObject | null; deviation_result: JsonObject | null; external_command_ref: string | null;
   idempotency_key: string; status: ControlStatus;
 }
-export interface ControlCommandListItem extends ControlCommand { approval_count: number }
+export interface ControlCommandListItem extends ControlCommand {
+  approval_count: number;
+  recovery_operation?: { kind: 'execute' | 'rollback'; request_key: string } | null;
+}
 export interface ControlCommandDetail extends ControlCommandListItem {
   approval_decisions: { approver_id: string; decision: 'approve' | 'reject'; reason: string | null; decided_at: string }[];
   attempts: { id: string; kind: 'execute' | 'rollback'; outcome: 'pending' | 'succeeded' | 'failed' | 'unknown'; external_id: string | null; created_at: string; completed_at: string | null }[];

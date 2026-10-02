@@ -186,6 +186,8 @@ def test_migration_backfills_unevaluated_success_and_preserves_evaluated_success
     engine = sa.create_engine("sqlite://")
     with engine.begin() as connection:
         metadata = sa.MetaData()
+        from app.identity.models import Menu
+        Menu.__table__.to_metadata(metadata)
         sa.Table("collaboration_team_versions", metadata, sa.Column("id", sa.String, primary_key=True), sa.Column("failure_strategy", sa.String))
         sa.Table("artifacts", metadata, sa.Column("id", sa.String, primary_key=True))
         metadata.create_all(connection)
@@ -338,6 +340,8 @@ def test_migration_recovers_legacy_executing_without_attempt_and_downgrades_safe
     engine = sa.create_engine("sqlite://")
     with engine.begin() as connection:
         metadata = sa.MetaData()
+        from app.identity.models import Menu
+        Menu.__table__.to_metadata(metadata)
         sa.Table("collaboration_team_versions", metadata, sa.Column("id", sa.String, primary_key=True), sa.Column("failure_strategy", sa.String))
         sa.Table("artifacts", metadata, sa.Column("id", sa.String, primary_key=True))
         metadata.create_all(connection)

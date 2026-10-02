@@ -139,6 +139,68 @@ def test_control_upgrade_from_skill_availability_head_reaches_single_head(databa
         assert connection.execute(sa.text("SELECT version_num FROM alembic_version")).scalars().all() == ["20260915_31"]
 
 
+def test_alembic_upgraded_postgres_seeds_control_catalogue(database):
+    from sqlalchemy.orm import Session
+    from app.identity.catalogue import seed_builtin_catalogue
+    from app.identity.models import Menu, Unit
+
+    engine, migrate = database
+    migrate("20260914_30")
+    migrate("20260915_31")
+    with Session(engine) as session:
+        session.add(Unit(id="catalogue-unit", code="catalogue-unit", name="Catalogue test", status="active"))
+        session.flush()
+        seed_builtin_catalogue(session, "catalogue-unit")
+        session.commit()
+        control = session.scalar(sa.select(Menu).where(Menu.route_key == "control"))
+        assert (control.visibility_target, control.requires_current_project) == ("current_project", True)
+        seed_builtin_catalogue(session, "catalogue-unit")
+        session.commit()
+        assert len(session.scalars(sa.select(Menu).where(Menu.route_key == "control")).all()) == 1
+        for field, invalid in (("visibility_target", None), ("route_key", None), ("visibility_target", "unit"), ("requires_current_project", False)):
+            with pytest.raises(IntegrityError):
+                with session.begin_nested():
+                    setattr(control, field, invalid)
+                    session.flush()
+    refused = migrate("20260914_30", direction="downgrade", check=False)
+    assert refused.returncode != 0 and "control menu exists" in refused.stderr
+    with engine.connect() as connection:
+        assert connection.scalar(sa.text("SELECT version_num FROM alembic_version")) == "20260915_31"
+        assert connection.scalar(sa.text("SELECT COUNT(*) FROM menus WHERE route_key='control'")) == 1
+
+
+def test_migrated_invalid_threshold_snapshot_cannot_reach_executor(database):
+    from sqlalchemy.orm import Session
+    from app.control.errors import ControlValidationError
+    from app.control.models import ControlCommand
+    from app.control.service import ControlService
+    from backend.tests.control.test_service import FakeExecutor
+    from backend.tests.control.test_api import _context
+
+    engine, migrate = database
+    migrate("20260914_30")
+    seed_commands(engine)
+    with engine.begin() as connection:
+        connection.execute(table(connection, "control_policies").update().values(deviation_thresholds={"opening": "invalid"}))
+        connection.execute(sa.text("UPDATE control_commands SET status='approved' WHERE id='unevaluated'"))
+    migrate("20260915_31")
+    executor = FakeExecutor()
+    with Session(engine) as session:
+        command = session.get(ControlCommand, "unevaluated")
+        assert command.deviation_thresholds_snapshot == {"opening": "invalid"}
+        context = _context("control.execute", project_id="project")
+        context = context.model_copy(update={
+            "unit_id": "unit",
+            "authorization_context": context.authorization_context.model_copy(update={"unit_id": "unit"}),
+        })
+        service = ControlService(session, executors={"gate": executor}, clock=lambda: command.valid_from)
+        with pytest.raises(ControlValidationError) as error:
+            service.execute(command.id, context, "legacy-execute")
+        assert (error.value.status_code, error.value.code) == (422, "control_validation_failed")
+        assert command.status == "approved"
+        assert executor.calls == []
+
+
 def test_control_migration_aborts_with_actionable_error_for_invalid_legacy_failure_strategy(database):
     engine, migrate = database
     migrate("20260908_27")

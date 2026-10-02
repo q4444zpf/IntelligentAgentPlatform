@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import json
 
 import pytest
 from fastapi import FastAPI
@@ -99,6 +100,76 @@ def test_stable_service_error_mapping(client, monkeypatch):
 def test_approve_body_cannot_contain_contradictory_decision(client):
     response = client.post("/api/control/commands/missing/approve", json={"decision": "reject"})
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize("threshold", [True, "5", -1, None, float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("operation", ["create", "update"])
+def test_policy_api_rejects_invalid_thresholds(client, threshold, operation):
+    body = _policy_request().model_dump()
+    if operation == "create":
+        body["deviation_thresholds"] = {"amount": threshold}
+        response = client.post("/api/control/policies", content=json.dumps(body), headers={"Content-Type": "application/json"})
+    else:
+        policy = client.post("/api/control/policies", json=body).json()
+        response = client.patch(f"/api/control/policies/{policy['id']}", content=json.dumps({"deviation_thresholds": {"amount": threshold}}), headers={"Content-Type": "application/json"})
+    assert (response.status_code, response.json().get("code")) == (422, "control_validation_failed")
+
+
+@pytest.mark.parametrize("kind", ["execute", "rollback"])
+@pytest.mark.parametrize("interruption", ["timeout", "process_exit"])
+def test_refreshed_api_exposes_original_recovery_key_and_reconciles_once(client, kind, interruption):
+    from tests.control.test_execution_recovery import TimeoutExecutor
+
+    class ProcessInterrupted(BaseException):
+        pass
+
+    class RecoverableExecutor(TimeoutExecutor):
+        def execute(self, command, external_idempotency_key):
+            try:
+                return super().execute(command, external_idempotency_key)
+            except TimeoutError:
+                if interruption == "process_exit":
+                    raise ProcessInterrupted()
+                raise
+
+        def rollback(self, command, rollback_plan, external_idempotency_key):
+            return self.execute(command, external_idempotency_key)
+
+    session = client.app.dependency_overrides[get_session]()
+    executor = RecoverableExecutor()
+    manager = ControlService(session, executors={"reservoir": executor})
+    client.app.dependency_overrides[_service] = lambda: ControlService(session, executors={"reservoir": executor})
+    admin = service_context("admin", roles=("project_admin",))
+    _artifact(session)
+    policy = manager.create_policy(admin, _policy_request())
+    command = manager.propose(service_context(), _propose_request(policy.id))
+    manager.decide(command.id, admin, "approve")
+    if kind == "rollback":
+        executor.result = {"outcome": "failed"}
+        with pytest.raises((ControlExecutorUnavailable, ProcessInterrupted)):
+            manager.execute(command.id, admin, "execute-before-rollback")
+        if interruption == "process_exit":
+            assert manager.execute(command.id, admin, "execute-before-rollback").status == "failed"
+        executor.result = {"outcome": "succeeded"}
+    with pytest.raises((ControlExecutorUnavailable, ProcessInterrupted)):
+        getattr(manager, kind)(command.id, admin, f"original-{kind}")
+    session.expire_all()
+    listed = client.get("/api/control/commands").json()[0]
+    detail = client.get(f"/api/control/commands/{command.id}").json()
+    expected = {"kind": kind, "request_key": f"original-{kind}"}
+    assert listed.get("recovery_operation") == expected
+    assert detail.get("recovery_operation") == expected
+    headers = {"Idempotency-Key": listed["recovery_operation"]["request_key"]}
+    result = client.post(f"/api/control/commands/{command.id}/{kind}", headers=headers)
+    assert result.status_code == 200
+    assert result.json()["status"] == ("awaiting_feedback" if kind == "execute" else "rolled_back")
+    calls = len(executor.calls)
+    assert client.post(f"/api/control/commands/{command.id}/{kind}", headers=headers).status_code == 200
+    assert len(executor.calls) == calls
+    assert len(executor.physical_results) == (1 if kind == "execute" else 2)
+    assert client.get("/api/control/commands").json()[0]["recovery_operation"] is None
+    client.app.dependency_overrides[require_request_context] = lambda: _context("control.read", project_id="other")
+    assert client.get("/api/control/commands").json() == []
 
 
 def test_policy_detail_patch_and_filters_are_project_scoped(client):

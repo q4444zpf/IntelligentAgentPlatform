@@ -91,8 +91,14 @@ class ControlCommandInfo(BaseModel):
     status: ControlCommandStatus
 
 
+class ControlRecoveryOperation(BaseModel):
+    kind: Literal["execute", "rollback"]
+    request_key: str
+
+
 class ControlCommandListItem(ControlCommandInfo):
     approval_count: int
+    recovery_operation: ControlRecoveryOperation | None = None
 
 
 class ControlApprovalDecision(BaseModel):
