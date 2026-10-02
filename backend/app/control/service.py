@@ -3,14 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.artifacts.models import ArtifactRecord
 from app.conversations.models import AgentRun, Conversation
@@ -19,8 +19,8 @@ from app.runtime.runner_gateway_schemas import ArtifactProvenance, SimulationAtt
 from app.audit.recorder import AuditRecordRequest, AuditRecorder
 from app.core.request_context import RequestContext
 
-from .models import ControlCommand, ControlCommandApproval, ControlExecutionAttempt, ControlPolicy
-from .schemas import ControlCommandInfo, ControlCommandProposeRequest, ControlFeedbackRequest, ControlPolicyCreateRequest, ControlPolicyInfo
+from .models import ControlCommand, ControlCommandApproval, ControlExecutionAttempt, ControlFeedbackRecord, ControlPolicy
+from .schemas import ControlCommandInfo, ControlCommandProposeRequest, ControlExecutionOutcome, ControlFeedbackRequest, ControlPolicyCreateRequest, ControlPolicyInfo
 
 try:
     from jsonschema import Draft202012Validator
@@ -48,10 +48,10 @@ class ControlExecutionError(ControlError):
     pass
 
 
-@dataclass(frozen=True)
-class ControlExecutorResult:
-    outcome: str
-    external_id: str | None = None
+class ControlExecutorResult(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
+    outcome: ControlExecutionOutcome
+    external_id: str | None = Field(default=None, max_length=160)
     summary: dict[str, Any] | None = None
 
 
@@ -201,7 +201,8 @@ class ControlService:
         target_type = request.target.get("asset_type")
         if target_type != policy.asset_type:
             raise ControlValidationError("target asset type does not match policy")
-        command = ControlCommand(unit_id=context.unit_id, project_id=context.project_id, policy_id=policy.id, requester_id=context.user_id, run_id=request.run_id, team_version=request.team_version_id, target=request.target, parameters=request.parameters, parameter_digest=parameter_digest, simulation_artifact_id=artifact.id, simulation_digest=artifact.sha256, valid_from=valid_from, valid_until=valid_until, required_approvals=1 if policy.approval_mode == "single" else 2, rollback_plan=request.rollback_plan, expected_state=request.expected_state, idempotency_key=request.idempotency_key, status="pending_approval")
+        policy_snapshot = {key: getattr(policy, key) for key in ControlPolicyCreateRequest.model_fields}
+        command = ControlCommand(unit_id=context.unit_id, project_id=context.project_id, policy_id=policy.id, requester_id=context.user_id, run_id=request.run_id, team_version_id=request.team_version_id, policy_digest=_digest(policy_snapshot), deviation_thresholds_snapshot=deepcopy(policy.deviation_thresholds), target=request.target, parameters=request.parameters, parameter_digest=parameter_digest, simulation_artifact_id=artifact.id, simulation_digest=artifact.sha256, valid_from=valid_from, valid_until=valid_until, required_approvals=1 if policy.approval_mode == "single" else 2, rollback_plan=request.rollback_plan, expected_state=request.expected_state, idempotency_key=request.idempotency_key, status="pending_approval")
         self.session.add(command)
         try:
             self.session.commit()
@@ -280,99 +281,160 @@ class ControlService:
 
     @staticmethod
     def _result(value: ControlExecutorResult | dict[str, Any]) -> ControlExecutorResult:
-        return value if isinstance(value, ControlExecutorResult) else ControlExecutorResult(outcome=value.get("outcome", "failed"), external_id=value.get("external_id"), summary=value.get("summary") or value)
+        result = ControlExecutorResult.model_validate(value)
+        json.dumps(result.summary, allow_nan=False)
+        return result
 
-    def execute(self, command_id: str, context: RequestContext, request_key: str) -> ControlCommandInfo:
+    def _begin_attempt(self, command: ControlCommand, kind: str, request_key: str) -> ControlExecutionAttempt:
+        """Stage an operation while the caller holds the command lock."""
+        existing = self.session.scalar(select(ControlExecutionAttempt).where(
+            ControlExecutionAttempt.command_id == command.id,
+            ControlExecutionAttempt.kind == kind,
+        ).execution_options(populate_existing=True))
+        if existing is not None:
+            if existing.request_key == request_key:
+                return existing
+            if existing.completed_at is None:
+                raise ControlExecutionError("control_execution_in_progress")
+            raise ControlExecutionError("control operation already attempted")
+        allowed = {"approved"} if kind == "execute" else {"failed", "unknown", "deviation", "rollback_pending"}
+        if command.status not in allowed:
+            raise ControlExecutionError("command is not approved" if kind == "execute" else "rollback is not allowed for command state")
+        attempt = ControlExecutionAttempt(
+            command_id=command.id, kind=kind, request_key=request_key,
+            external_idempotency_key=f"control:{command.id}:{kind}",
+            outcome="pending", result_summary={}, created_at=self.clock(),
+        )
+        self.session.add(attempt)
+        command.status = "executing" if kind == "execute" else "rollback_pending"
+        self.session.flush()
+        return attempt
+
+    def _complete_attempt(self, command_id: str, attempt_id: str, result: ControlExecutorResult | None) -> ControlCommandInfo:
+        """Stage the result; a missing response leaves reconciliation open."""
+        command = self.session.scalar(select(ControlCommand).where(
+            ControlCommand.id == command_id,
+        ).with_for_update().execution_options(populate_existing=True))
+        attempt = self.session.scalar(select(ControlExecutionAttempt).where(
+            ControlExecutionAttempt.id == attempt_id,
+            ControlExecutionAttempt.command_id == command_id,
+        ).with_for_update().execution_options(populate_existing=True))
+        if command is None or attempt is None:
+            raise ControlExecutionError("control execution attempt not found")
+        if attempt.completed_at is not None:
+            return ControlCommandInfo.model_validate(command)
+        attempt.outcome = result.outcome if result is not None else "unknown"
+        attempt.external_id = result.external_id if result is not None else None
+        attempt.result_summary = (result.summary or {}) if result is not None else {"error": "executor response unavailable or invalid"}
+        attempt.completed_at = self.clock() if result is not None else None
+        if attempt.kind == "execute":
+            # A late execute response must not overwrite a physical rollback.
+            rollback_started = self.session.scalar(select(ControlExecutionAttempt.id).where(
+                ControlExecutionAttempt.command_id == command.id, ControlExecutionAttempt.kind == "rollback",
+            ))
+            if command.status in {"executing", "unknown"} and rollback_started is None:
+                command.external_command_ref = attempt.external_id
+                command.status = "awaiting_feedback" if attempt.outcome == "succeeded" else attempt.outcome
+        else:
+            command.status = {"succeeded": "rolled_back", "unknown": "unknown"}.get(attempt.outcome, "rollback_pending")
+        return ControlCommandInfo.model_validate(command)
+
+    def _run_attempt(self, command_id: str, context: RequestContext, request_key: str, kind: str) -> ControlCommandInfo:
         self._require(context, "execute")
-        command = self.session.scalar(select(ControlCommand).where(ControlCommand.id == command_id, ControlCommand.unit_id == context.unit_id, ControlCommand.project_id == context.project_id).with_for_update())
+        command = self.session.scalar(select(ControlCommand).where(
+            ControlCommand.id == command_id, ControlCommand.unit_id == context.unit_id,
+            ControlCommand.project_id == context.project_id,
+        ).with_for_update().execution_options(populate_existing=True))
         if command is None:
             raise ControlForbiddenError("control command not found")
-        existing = self.session.scalar(select(ControlExecutionAttempt).where(ControlExecutionAttempt.command_id == command.id, ControlExecutionAttempt.request_key == request_key))
+        existing = self.session.scalar(select(ControlExecutionAttempt).where(
+            ControlExecutionAttempt.command_id == command.id,
+            ControlExecutionAttempt.kind == kind,
+        ))
         if existing is not None:
-            return ControlCommandInfo.model_validate(command)
-        now = _stored_aware(self.clock())
-        if now < _stored_aware(command.valid_from) or now >= _stored_aware(command.valid_until):
-            command.status = "expired"
-            self.session.commit()
-            return ControlCommandInfo.model_validate(command)
-        if command.status != "approved":
-            raise ControlExecutionError("command is not approved")
+            attempt = self._begin_attempt(command, kind, request_key)
+            if attempt.completed_at is not None:
+                return ControlCommandInfo.model_validate(command)
+            if kind == "execute" and not _stored_aware(command.valid_from) <= _stored_aware(self.clock()) < _stored_aware(command.valid_until):
+                raise ControlExecutionError("command is outside validity window")
+            if kind == "execute" and self.session.scalar(select(ControlExecutionAttempt.id).where(
+                ControlExecutionAttempt.command_id == command.id, ControlExecutionAttempt.kind == "rollback",
+            )):
+                raise ControlExecutionError("execute reconciliation is not allowed after rollback started")
+        elif kind == "execute":
+            now = _stored_aware(self.clock())
+            if now < _stored_aware(command.valid_from) or now >= _stored_aware(command.valid_until):
+                command.status = "expired"
+                self._audit(context, "control_command.expired", "control_command", command.id)
+                self.session.commit()
+                return ControlCommandInfo.model_validate(command)
         executor = self.executors.get(self.session.get(ControlPolicy, command.policy_id).asset_type)
         if executor is None:
             raise ControlExecutionError("no executor registered")
-        command.status = "executing"
-        external_key = f"control:{command.id}:execute"
+        attempt = self._begin_attempt(command, kind, request_key)
+        attempt_id, external_key = attempt.id, attempt.external_idempotency_key
+        self._audit(context, f"control_command.{kind}_started", "control_command", command.id, status="started")
         self.session.commit()
+        transport_error = None
         try:
-            result = self._result(executor.execute(command, external_key))
+            raw_result = executor.execute(command, external_key) if kind == "execute" else executor.rollback(command, command.rollback_plan, external_key)
         except Exception as error:
-            command.status = "unknown"
-            self.session.add(ControlExecutionAttempt(command_id=command.id, kind="execute", request_key=request_key, external_idempotency_key=external_key, outcome="unknown", result_summary={"error": "executor failure"}))
-            self.session.commit()
-            raise ControlExecutionError("executor failed") from error
-        command.external_command_ref = result.external_id
-        command.status = {"succeeded": "succeeded", "unknown": "unknown"}.get(result.outcome, "failed")
-        self.session.add(ControlExecutionAttempt(command_id=command.id, kind="execute", request_key=request_key, external_idempotency_key=external_key, outcome=result.outcome, result_summary=result.summary or {}))
+            transport_error = error
+            result = None
+        else:
+            try:
+                result = self._result(raw_result)
+            except (ValueError, TypeError):
+                result = None
+        self._complete_attempt(command_id, attempt_id, result)
+        self._audit(context, f"control_command.{kind}_completed", "control_command", command_id,
+                    status="succeeded" if result is not None and result.outcome == "succeeded" else "failed")
         self.session.commit()
-        self._audit(context, "control_command.executed", "control_command", command.id)
-        self.session.commit()
+        if transport_error is not None:
+            raise ControlExecutionError("executor failed") from transport_error
         return ControlCommandInfo.model_validate(command)
+
+    def execute(self, command_id: str, context: RequestContext, request_key: str) -> ControlCommandInfo:
+        return self._run_attempt(command_id, context, request_key, "execute")
 
     def record_feedback(self, command_id: str, context: RequestContext, request: ControlFeedbackRequest) -> ControlCommandInfo:
         self._require(context, "feedback")
-        command = self.session.scalar(select(ControlCommand).where(ControlCommand.id == command_id, ControlCommand.unit_id == context.unit_id, ControlCommand.project_id == context.project_id).with_for_update())
+        command = self.session.scalar(select(ControlCommand).where(ControlCommand.id == command_id, ControlCommand.unit_id == context.unit_id, ControlCommand.project_id == context.project_id).with_for_update().execution_options(populate_existing=True))
         if command is None:
             raise ControlForbiddenError("control command not found")
-        if request.observed_at is not None:
-            _aware(request.observed_at)
-        if command.status not in {"unknown", "executing", "succeeded", "deviation", "rollback_pending"}:
+        now = _stored_aware(self.clock())
+        observed_at = _aware(request.observed_at) if request.observed_at is not None else now
+        if command.status not in {"awaiting_feedback", "unknown", "succeeded", "deviation", "rollback_pending"}:
             raise ControlValidationError("feedback is not allowed for command state")
-        policy = self.session.get(ControlPolicy, command.policy_id)
+        attempt = self.session.scalar(select(ControlExecutionAttempt).where(
+            ControlExecutionAttempt.command_id == command.id, ControlExecutionAttempt.kind == "execute",
+        ))
+        if attempt is None:
+            raise ControlValidationError("feedback requires an execution attempt")
+        lower_bound = attempt.completed_at or attempt.created_at
+        if observed_at < _stored_aware(lower_bound) or observed_at > now + timedelta(minutes=5):
+            raise ControlValidationError("feedback observation is stale or in the future")
+        if command.feedback_observed_at is not None and observed_at <= _stored_aware(command.feedback_observed_at):
+            raise ControlValidationError("feedback observations must increase monotonically")
         command.actual_state = request.actual_state
         deviations = {}
-        for key, threshold in (policy.deviation_thresholds or {}).items():
+        for key, threshold in command.deviation_thresholds_snapshot.items():
             expected = (command.expected_state or {}).get(key)
             actual = request.actual_state.get(key)
-            if expected is None or actual is None:
-                deviations[key] = {"expected": expected, "actual": actual, "threshold": threshold}
-            elif isinstance(expected, (int, float)) and isinstance(actual, (int, float)) and abs(actual - expected) > float(threshold):
+            numeric = all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in (expected, actual))
+            if not numeric or not abs(actual - expected) <= float(threshold):
                 deviations[key] = {"expected": expected, "actual": actual, "threshold": threshold}
         command.deviation_result = {"deviations": deviations, "within_threshold": not deviations}
-        if command.status in {"unknown", "succeeded", "executing"}:
+        command.feedback_observed_at = observed_at
+        self.session.add(ControlFeedbackRecord(
+            command_id=command.id, recorder_id=context.user_id, observed_at=observed_at,
+            actual_state=deepcopy(request.actual_state), deviation_result=deepcopy(command.deviation_result),
+        ))
+        if command.status == "awaiting_feedback":
             command.status = "deviation" if deviations else "succeeded"
-        self.session.commit()
         self._audit(context, "control_command.feedback", "control_command", command.id)
         self.session.commit()
         return ControlCommandInfo.model_validate(command)
 
     def rollback(self, command_id: str, context: RequestContext, request_key: str) -> ControlCommandInfo:
-        self._require(context, "execute")
-        command = self.session.scalar(select(ControlCommand).where(ControlCommand.id == command_id, ControlCommand.unit_id == context.unit_id, ControlCommand.project_id == context.project_id).with_for_update())
-        if command is None:
-            raise ControlForbiddenError("control command not found")
-        if command.status not in {"failed", "unknown", "deviation", "rollback_pending"}:
-            raise ControlExecutionError("rollback is not allowed for command state")
-        existing = self.session.scalar(select(ControlExecutionAttempt).where(ControlExecutionAttempt.command_id == command.id, ControlExecutionAttempt.request_key == request_key))
-        if existing is not None:
-            return ControlCommandInfo.model_validate(command)
-        policy = self.session.get(ControlPolicy, command.policy_id)
-        executor = self.executors.get(policy.asset_type)
-        if executor is None:
-            command.status = "rollback_pending"
-            self.session.commit()
-            raise ControlExecutionError("no executor registered")
-        command.status = "rollback_pending"
-        external_key = f"control:{command.id}:rollback"
-        try:
-            result = self._result(executor.rollback(command, command.rollback_plan, external_key))
-        except Exception as error:
-            command.status = "rollback_pending"
-            self.session.add(ControlExecutionAttempt(command_id=command.id, kind="rollback", request_key=request_key, external_idempotency_key=external_key, outcome="unknown", result_summary={"error": "executor failure"}))
-            self.session.commit()
-            raise ControlExecutionError("rollback executor failed") from error
-        command.status = "rolled_back" if result.outcome == "succeeded" else ("unknown" if result.outcome == "unknown" else "rollback_pending")
-        self.session.add(ControlExecutionAttempt(command_id=command.id, kind="rollback", request_key=request_key, external_idempotency_key=external_key, outcome=result.outcome, result_summary=result.summary or {}))
-        self.session.commit()
-        self._audit(context, "control_command.rolled_back", "control_command", command.id)
-        self.session.commit()
-        return ControlCommandInfo.model_validate(command)
+        return self._run_attempt(command_id, context, request_key, "rollback")

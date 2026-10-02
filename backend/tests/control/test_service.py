@@ -236,7 +236,7 @@ def test_executor_fail_closed_replay_unknown_feedback_and_rollback(session):
     assert service.execute(command.id, admin, "request-1").id == command.id
 
     feedback = service.record_feedback(command.id, _context(), ControlFeedbackRequest(actual_state={"amount": 30}))
-    assert feedback.status == "deviation"
+    assert feedback.status == "unknown"
     executor.result = {"outcome": "succeeded", "external_id": "ext-rb"}
     rolled = service.rollback(command.id, admin, "rollback-1")
     assert rolled.status == "rolled_back"

@@ -38,7 +38,7 @@ class ControlPolicy(Base):
 class ControlCommand(Base):
     __tablename__ = "control_commands"
     __table_args__ = (
-        CheckConstraint("status IN ('pending_approval','approved','rejected','expired','executing','succeeded','failed','unknown','deviation','rollback_pending','rolled_back')", name="ck_control_command_status"),
+        CheckConstraint("status IN ('pending_approval','approved','rejected','expired','executing','awaiting_feedback','succeeded','failed','unknown','deviation','rollback_pending','rolled_back')", name="ck_control_command_status"),
         CheckConstraint("required_approvals IN (1,2)", name="ck_control_command_required_approvals"),
         CheckConstraint("valid_until > valid_from", name="ck_control_command_validity"),
         UniqueConstraint("unit_id", "project_id", "idempotency_key", name="uq_control_command_idempotency"),
@@ -50,7 +50,10 @@ class ControlCommand(Base):
     policy_id: Mapped[str] = mapped_column(ForeignKey("control_policies.id", ondelete="RESTRICT"), nullable=False)
     requester_id: Mapped[str] = mapped_column(String(64), nullable=False)
     run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    team_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    team_version_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    policy_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    deviation_thresholds_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    feedback_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     target: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     parameters: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     parameter_digest: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -83,7 +86,7 @@ class ControlCommandApproval(Base):
 
 class ControlExecutionAttempt(Base):
     __tablename__ = "control_execution_attempts"
-    __table_args__ = (CheckConstraint("kind IN ('execute','rollback')", name="ck_control_execution_kind"), CheckConstraint("outcome IN ('pending','succeeded','failed','unknown')", name="ck_control_execution_outcome"), UniqueConstraint("command_id", "request_key", name="uq_control_execution_request"), UniqueConstraint("external_idempotency_key", name="uq_control_execution_external_key"))
+    __table_args__ = (CheckConstraint("kind IN ('execute','rollback')", name="ck_control_execution_kind"), CheckConstraint("outcome IN ('pending','succeeded','failed','unknown')", name="ck_control_execution_outcome"), UniqueConstraint("command_id", "kind", "request_key", name="uq_control_execution_request"), UniqueConstraint("external_idempotency_key", name="uq_control_execution_external_key"))
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     command_id: Mapped[str] = mapped_column(ForeignKey("control_commands.id", ondelete="CASCADE"), nullable=False, index=True)
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -91,4 +94,18 @@ class ControlExecutionAttempt(Base):
     external_idempotency_key: Mapped[str] = mapped_column(String(180), nullable=False)
     outcome: Mapped[str] = mapped_column(String(24), nullable=False)
     result_summary: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    external_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ControlFeedbackRecord(Base):
+    __tablename__ = "control_feedback_records"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    command_id: Mapped[str] = mapped_column(ForeignKey("control_commands.id", ondelete="CASCADE"), nullable=False, index=True)
+    recorder_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    actual_state: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    deviation_result: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

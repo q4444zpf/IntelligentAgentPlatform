@@ -3,6 +3,14 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
+ControlExecutionOutcome = Literal["succeeded", "failed", "unknown"]
+ControlCommandStatus = Literal[
+    "pending_approval", "approved", "rejected", "expired", "executing",
+    "awaiting_feedback", "succeeded", "failed", "unknown", "deviation",
+    "rollback_pending", "rolled_back",
+]
+
+
 class ControlPolicyCreateRequest(BaseModel):
     asset_type: str = Field(min_length=1, max_length=80)
     command_type: str = Field(min_length=1, max_length=80)
@@ -51,7 +59,10 @@ class ControlCommandInfo(BaseModel):
     policy_id: str
     requester_id: str
     run_id: str | None
-    team_version: str | None
+    team_version_id: str | None
+    policy_digest: str
+    deviation_thresholds_snapshot: dict[str, Any]
+    feedback_observed_at: datetime | None
     target: dict[str, Any]
     parameters: dict[str, Any]
     parameter_digest: str
@@ -66,4 +77,4 @@ class ControlCommandInfo(BaseModel):
     deviation_result: dict[str, Any] | None
     external_command_ref: str | None
     idempotency_key: str
-    status: str
+    status: ControlCommandStatus
